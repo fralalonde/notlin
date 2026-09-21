@@ -53,6 +53,13 @@ impl<'a, 'u> Stmt<'a, 'u> {
     fn transpile_local_property(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
         let is_val = kt::child(decl, "val").is_some();
         let _ = is_val; // locals are always effectively mutable in Java unless final
+        // destructuring `val (a, b) = expr`: multi_variable_declaration
+        if kt::child(decl, "variable_declaration").is_none()
+            && kt::child(decl, "multi_variable_declaration").is_some()
+        {
+            self.transpile_local_destructuring(decl, out);
+            return;
+        }
         let vd = kt::child(decl, "variable_declaration");
         let name = vd
             .and_then(|v| kt::child(v, "identifier"))
@@ -84,6 +91,63 @@ impl<'a, 'u> Stmt<'a, 'u> {
                 name,
                 init_java.map(|j| format!(" = {}", j)).unwrap_or_default()
             ));
+        }
+    }
+
+    /// Collect (name, java type) pairs from a multi_variable_declaration.
+    fn destructuring_components(&self, mvd: tree_sitter::Node) -> Vec<(String, String)> {
+        let mut cursor = mvd.walk();
+        mvd.children(&mut cursor)
+            .filter(|c| c.kind() == "variable_declaration")
+            .map(|vd| {
+                let name = kt::child(vd, "identifier")
+                    .map(|n| self.unit.text(n).to_string())
+                    .unwrap_or_else(|| "comp".to_string());
+                let ty = kt::child(vd, "user_type")
+                    .or_else(|| kt::child(vd, "nullable_type"))
+                    .map(|t| kt::java_type_ann(t, self.unit.source, self.unit.annots))
+                    .unwrap_or_else(|| "Object".to_string());
+                (name, ty)
+            })
+            .collect()
+    }
+
+    /// `val (a, b) = expr`: compiler-generated componentN() extraction can't
+    /// be reproduced without the receiver's data shape, so emit one local per
+    /// component (first binds the value, the rest null) + N002.
+    fn transpile_local_destructuring(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
+        let Some(mvd) = kt::child(decl, "multi_variable_declaration") else {
+            return;
+        };
+        let comps = self.destructuring_components(mvd);
+        if comps.is_empty() {
+            self.unit.diags.warn_approx(
+                decl,
+                self.unit.file,
+                "destructuring declaration without components",
+            );
+            return;
+        }
+        let init = self.unit.property_initializer(decl);
+        let mut e = Expr { unit: self.unit };
+        let init_java = init
+            .map(|i| e.transpile(i))
+            .unwrap_or_else(|| "null".to_string());
+        let names: Vec<&str> = comps.iter().map(|(n, _)| n.as_str()).collect();
+        self.unit.diags.warn_approx(
+            decl,
+            self.unit.file,
+            format!(
+                "destructuring declaration '({})': componentN() extraction not reproduced; first component binds the value, the rest bind null",
+                names.join(", ")
+            ),
+        );
+        for (i, (name, ty)) in comps.iter().enumerate() {
+            if i == 0 {
+                out.line(format!("{} {} = {};", ty, name, init_java));
+            } else {
+                out.line(format!("{} {} = null;", ty, name));
+            }
         }
     }
 
@@ -200,6 +264,11 @@ impl<'a, 'u> Stmt<'a, 'u> {
     }
 
     fn transpile_for(&mut self, stmt: tree_sitter::Node, out: &mut JavaOut) {
+        // destructuring `for ((a, b) in xs)`: multi_variable_declaration
+        if let Some(mvd) = kt::child(stmt, "multi_variable_declaration") {
+            self.transpile_for_destructuring(stmt, mvd, out);
+            return;
+        }
         let var = kt::child(stmt, "variable_declaration")
             .and_then(|v| kt::child(v, "identifier"))
             .map(|n| self.unit.text(n).to_string())
@@ -225,6 +294,53 @@ impl<'a, 'u> Stmt<'a, 'u> {
                     .diags
                     .warn_approx(stmt, self.unit.file, "for loop without iterable");
             }
+        }
+    }
+
+    /// `for ((a, b) in xs)`: first component is the loop variable, the rest
+    /// are null locals at the top of the body (componentN() approximated).
+    fn transpile_for_destructuring(
+        &mut self,
+        stmt: tree_sitter::Node,
+        mvd: tree_sitter::Node,
+        out: &mut JavaOut,
+    ) {
+        let comps = self.destructuring_components(mvd);
+        if comps.is_empty() {
+            self.unit.diags.warn_approx(
+                stmt,
+                self.unit.file,
+                "for destructuring without components",
+            );
+            return;
+        }
+        let iterable = Self::find_iterable(stmt);
+        let body = kt::child(stmt, "block")
+            .or_else(|| kt::child(stmt, "control_structure_body"))
+            .or_else(|| single_stmt_body(stmt, iterable));
+        let names: Vec<&str> = comps.iter().map(|(n, _)| n.as_str()).collect();
+        self.unit.diags.warn_approx(
+            stmt,
+            self.unit.file,
+            format!(
+                "destructuring in 'for (({}))': componentN() extraction not reproduced; non-first components bind null",
+                names.join(", ")
+            ),
+        );
+        if let Some(iter) = iterable {
+            let iter_java = self.translate_iterable(iter, &comps[0].0);
+            out.open(format!("for ({}", iter_java));
+            if let Some(b) = body {
+                for (name, ty) in &comps[1..] {
+                    out.line(format!("{} {} = null;", ty, name));
+                }
+                self.transpile_body(b, out);
+            }
+            out.close();
+        } else {
+            self.unit
+                .diags
+                .warn_approx(stmt, self.unit.file, "for loop without iterable");
         }
     }
 
