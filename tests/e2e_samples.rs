@@ -181,7 +181,7 @@ fn nullable_types_get_annotations() {
         return nick
     }
 }"#;
-    let (files, errors, _) = {
+    let (files, errors, _, _) = {
         let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Holder.kt"]);
         let path = PathBuf::from("Holder.kt");
         notlin::transpiler::transpile(source, &path, &cli)
