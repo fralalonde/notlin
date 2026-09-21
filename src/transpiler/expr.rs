@@ -504,7 +504,7 @@ impl<'a, 'u> Expr<'a, 'u> {
             .filter(|p| !p.is_empty() && p != "it")
             .collect::<Vec<_>>()
             .join(", ");
-        let body_java = self.transpile_body_text(body);
+        let body_java = self.transpile_body_text(node, body);
         if params_java.is_empty() {
             // `{ it * 2 }`: implicit `it` parameter — the body references it.
             if body_java.contains("it") {
@@ -518,7 +518,8 @@ impl<'a, 'u> Expr<'a, 'u> {
     }
 
     /// Translate a plain-text lambda body (best-effort; single expression).
-    fn transpile_body_text(&mut self, body: &str) -> String {
+    /// `node` backs the lambda for diagnostic positions.
+    fn transpile_body_text(&mut self, node: tree_sitter::Node, body: &str) -> String {
         // For now: pass through simple expressions, warn otherwise.
         if body
             .chars()
@@ -528,7 +529,11 @@ impl<'a, 'u> Expr<'a, 'u> {
         {
             body.replace("?.", ".").replace('$', "")
         } else {
-            log::warn!("complex lambda body passed through: {}", body);
+            self.unit.diags.warn_approx(
+                node,
+                self.unit.file,
+                format!("complex lambda body passed through raw: {}", body),
+            );
             body.replace("?.", ".").replace('$', "")
         }
     }

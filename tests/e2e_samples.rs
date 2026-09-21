@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 fn transpile_src(source: &str, name: &str) -> (Vec<(String, String)>, usize) {
     let cli = notlin::cli::Cli::parse_from(vec!["notlin", name]);
     let path = PathBuf::from(name);
-    let (files, errors, _warnings) = notlin::transpiler::transpile(source, &path, &cli);
+    let (files, errors, _warnings, _cov) = notlin::transpiler::transpile(source, &path, &cli);
     (files, errors)
 }
 
@@ -138,7 +138,7 @@ fn untranslatable_mode_error_fails_the_run() {
     let source = r#"value class Bad(val raw: Int)"#;
     let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--untranslatable=error", "Bad.kt"]);
     let path = PathBuf::from("Bad.kt");
-    let (_, errors, warnings) = notlin::transpiler::transpile(source, &path, &cli);
+    let (_, errors, warnings, _cov) = notlin::transpiler::transpile(source, &path, &cli);
     // value classes are untranslatable -> diagnostic; in error mode it becomes
     // an error, in warn mode a warning. Either way something is flagged.
     assert!(errors > 0 || warnings > 0);
@@ -150,7 +150,7 @@ fn annotations_option_controls_import() {
     let cli_jet = notlin::cli::Cli::parse_from(vec!["notlin", "-o", "/tmp", "X.kt"]);
     let (files, _) = {
         let path = PathBuf::from("X.kt");
-        let (_, errors, _) = notlin::transpiler::transpile(source, &path, &cli_jet);
+        let (_, errors, _, _) = notlin::transpiler::transpile(source, &path, &cli_jet);
         let _ = errors;
         (notlin::transpiler::transpile(source, &path, &cli_jet).0, 0)
     };
@@ -165,7 +165,7 @@ fn annotations_option_controls_import() {
         "none",
         "X.kt",
     ]);
-    let (files2, _, _) = {
+    let (files2, _, _, _) = {
         let path = PathBuf::from("X.kt");
         notlin::transpiler::transpile(source, &path, &cli_none)
     };

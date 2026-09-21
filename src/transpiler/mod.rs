@@ -1,5 +1,5 @@
 use crate::cli::{Annotations, Cli, UntranslatableMode};
-use crate::diagnostics::Diagnostics;
+use crate::diagnostics::{Diagnostics, FileCoverage};
 use crate::transpiler::unit::Unit;
 use std::path::Path;
 
@@ -58,8 +58,13 @@ fn render_node(node: tree_sitter::Node, source: &str, depth: usize, out: &mut St
     }
 }
 
-/// Transpile one file. Returns (java text, error count, warning count).
-pub fn transpile(source: &str, file: &Path, cli: &Cli) -> (Vec<(String, String)>, usize, usize) {
+/// Transpile one file.
+/// Returns (java files, error count, warning count, coverage).
+pub fn transpile(
+    source: &str,
+    file: &Path,
+    cli: &Cli,
+) -> (Vec<(String, String)>, usize, usize, FileCoverage) {
     let tree = parse(source);
 
     let mut diags = Diagnostics::new();
@@ -70,8 +75,12 @@ pub fn transpile(source: &str, file: &Path, cli: &Cli) -> (Vec<(String, String)>
     };
     let untranslatable_as_error = matches!(cli.untranslatable, UntranslatableMode::Error);
 
-    let mut unit = Unit::new(source, file, &mut diags, annots, untranslatable_as_error);
-    let java_files = unit.run(tree.root_node());
+    let (java_files, unit) = {
+        let mut unit = Unit::new(source, file, &mut diags, annots, untranslatable_as_error);
+        let java_files = unit.run(tree.root_node());
+        let coverage = std::mem::take(&mut unit.coverage);
+        (java_files, coverage)
+    };
 
     if tree.root_node().has_error() {
         diags.warn_parse(
@@ -83,5 +92,5 @@ pub fn transpile(source: &str, file: &Path, cli: &Cli) -> (Vec<(String, String)>
 
     let (errors, warnings) = (diags.error_count(), diags.warning_count());
     diags.print();
-    (java_files, errors, warnings)
+    (java_files, errors, warnings, unit)
 }

@@ -1,6 +1,7 @@
 use clap::Parser as _;
 use colored::Colorize;
 use notlin::cli::{Cli, UntranslatableMode};
+use notlin::migrate;
 use notlin::transpiler;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,11 +44,19 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             continue;
         }
 
-        let (java_files, errors, warnings) = transpiler::transpile(&source, file, cli);
+        let (java_files, errors, warnings, coverage) = transpiler::transpile(&source, file, cli);
         total_errors += errors;
         total_warnings += warnings;
 
-        match &cli.out_dir {
+        // Output dir precedence: explicit -o, else --in-place writes next to
+        // the input, else stdout.
+        let effective_out_dir = match (&cli.out_dir, cli.in_place) {
+            (Some(d), _) => Some(d.clone()),
+            (None, true) => file.parent().map(|p| p.to_path_buf()),
+            (None, false) => None,
+        };
+
+        match &effective_out_dir {
             Some(out_dir) => {
                 for (name, content) in &java_files {
                     let target = out_dir.join(name);
@@ -67,6 +76,41 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                     }
                     print!("{content}");
                 }
+            }
+        }
+
+        // --in-place: strip translated declarations from the .kt file;
+        // delete it when fully translated. Files with only untranslatable
+        // content are untouched. Dump-ast mode never mutates input.
+        if cli.in_place && !cli.dump_ast {
+            // In strict (--untranslatable=error) mode an untranslatable makes
+            // the run fail; never delete/trim input on such a run. In warn
+            // mode untranslatables don't block migration — the taint system
+            // already kept them in the .kt file.
+            let strict_block = matches!(cli.untranslatable, UntranslatableMode::Error)
+                && (errors > 0 || warnings > 0);
+            if !strict_block {
+                match migrate::migrate(file, &source, &coverage)? {
+                    migrate::MigrateOutcome::Deleted => {
+                        println!("{}: {}", "deleted".green(), file.display());
+                    }
+                    migrate::MigrateOutcome::Trimmed { remaining_bytes } => {
+                        println!(
+                            "{}: {} ({} bytes remain)",
+                            "trimmed".yellow(),
+                            file.display(),
+                            remaining_bytes
+                        );
+                    }
+                    migrate::MigrateOutcome::Untouched => {
+                        log::info!("{}: no translated content; untouched", file.display());
+                    }
+                }
+            } else {
+                log::info!(
+                    "{}: kept — run had errors/warnings in --untranslatable=error mode",
+                    file.display()
+                );
             }
         }
     }

@@ -28,6 +28,11 @@ pub struct Cli {
     #[arg(long)]
     pub dump_ast: bool,
 
+    /// Migration mode: strip translated declarations from the .kt files
+    /// (deleting fully-translated ones). Implies writing Java next to input.
+    #[arg(long)]
+    pub in_place: bool,
+
     /// Verbose logging (-v debug, -vv trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
