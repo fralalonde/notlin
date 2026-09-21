@@ -53,14 +53,17 @@ Despite claims to the contrary, it makes your code more complicated than if you 
 
 # Something something coroutines
 
-Async shit is the source of so much pain. Prove to me it's faster than blocking IO. _With your actual prod workload._ 
+The async/await mind virus was invented by JS weenies because they didn't have threads.
+And it's now a source of pain in every language that forces regular code to care about continuations.
+
+Go ahead, prove to me async is faster than blocking IO. _With your actual prod workload._ 
 
 Hint: It's not.
 
 # But, but, null-checking (mumbles, drools)
 
 Null isn't a problem in Java like it is in C. Just don't use null to represent absence of values in your code. 
-Use marker values or Optional. Know where Java stdlib  uses null (Map.get(), etc.) In short, git gud.
+Use marker values or Optional. Know where Java stdlib  uses null (Map.get(), etc.) In short: **git gud**.
 
 # My dad told me Java sucks!
 
