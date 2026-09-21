@@ -491,14 +491,24 @@ impl<'a> Unit<'a> {
             return;
         }
         if is_data && !params.is_empty() {
-            // record: parameters become record components. NOTE: records are
-            // immutable — Kotlin data classes with `var` components lose
-            // setter semantics; warn when any component is a var.
+            // record: parameters become record components. Records are
+            // immutable — a data class with any `var` component loses setter
+            // semantics, which is a semantic drop, so without --lombok the
+            // declaration is TAINTED (stays in the .kt, warns N001) instead
+            // of silently emitting a broken translation.
             if params.iter().any(|(is_val, _, _)| !*is_val) {
-                self.diag_approx(
+                // --lombok data-class path is handled above with an early
+                // return, so `self.lombok` cannot be true here.
+                debug_assert!(!self.lombok);
+                if let Some(dn) = self.current_decl {
+                    let label = self.decl_labels.get(&dn.id()).cloned().unwrap_or_default();
+                    self.taint_decl(&label);
+                }
+                self.diag_untranslatable(
                     decl,
-                    "data class emitted as an immutable record: `var` components lose setters (use --lombok for a mutable @Data class)",
+                    "data class has `var` components; Java records are immutable — use --lombok for a mutable @Data class",
                 );
+                return;
             }
             let comps: Vec<String> = params
                 .iter()

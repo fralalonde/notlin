@@ -244,15 +244,20 @@ fn lombok_flag_emits_mutable_data_class() {
         "@AllArgsConstructor should own the ctor"
     );
 
-    // without --lombok the same source degrades to an immutable record + warning
+    // without --lombok the same source is TAINTED (not emitted at all) with
+    // an N001: an immutable record silently loses setters, so plain mode
+    // refuses rather than degrading.
     let cli_plain = notlin::cli::Cli::parse_from(vec!["notlin", "Point.kt"]);
     let (files2, errors2, warnings2, _cov2) =
         notlin::transpiler::transpile(source, &path, &cli_plain);
     assert_eq!(errors2, 0);
     assert!(
         warnings2 > 0,
-        "var component should warn when degraded to a record"
+        "var component should warn when --lombok is off"
     );
     let all2 = files2.iter().map(|(_, c)| c.as_str()).collect::<String>();
-    assert!(all2.contains("public record Point(int x, String y)"));
+    assert!(
+        !all2.contains("record Point"),
+        "plain mode must not emit an immutable record for a var data class"
+    );
 }

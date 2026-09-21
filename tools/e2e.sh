@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # notlin end-to-end test: transpile all samples, javac them, report failures.
-# Usage: tools/e2e.sh [javac-path]  (default ~/.local/java/jdk-27/bin/javac)
+# Usage: tools/e2e.sh [javac-path]  (default JDK 25 temurin — see DEV.md)
 set -u
-JAVAC="${1:-$HOME/.local/java/jdk-27/bin/javac}"
+JAVAC="${1:-$HOME/.rsdk/tools/java/25.0.4-tem/bin/javac}"
 ANN_JAR="${ANN_JAR:-$(dirname "$0")/../vendor/jetbrains-annotations.jar}"
 NOTLIN="$(cd "$(dirname "$0")/.." && pwd)/target/debug/notlin"
 OUT=/tmp/notlin-e2e
