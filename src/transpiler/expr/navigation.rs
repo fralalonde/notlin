@@ -150,6 +150,13 @@ impl<'a, 'u> Expr<'a, 'u> {
             let member = &raw_trimmed[dot + 1..member_end];
             if let Some(java_member) = kotlin_member_to_java(member) {
                 if java_member != member {
+                    if java_member.contains('(') {
+                        // Full-call mapping (`stream().findFirst().orElse(null)`,
+                        // `reversed()`): the mapped text is the whole member
+                        // expression — emit as-is so the caller's `()` wrapper
+                        // doesn't produce `...orElse(null)()`.
+                        return format!("{}{}", &raw_trimmed[..dot + 1], java_member);
+                    }
                     return format!(
                         "{}{}",
                         &raw_trimmed[..dot + 1],
@@ -208,9 +215,13 @@ fn kotlin_member_to_java(member: &str) -> Option<String> {
         "lowercase" => Some("toLowerCase"),
         "keys" => Some("keySet"),
         "entries" => Some("entrySet"),
-        // no-arg collection ops with Java Collection/Stream equivalents
+        // no-arg collection ops with Java Collection/Stream equivalents.
+        // Lambda params `__left`/`__right` can never collide with Kotlin
+        // identifiers (Kotlin forbids leading underscores), so `(a, b) -> b`
+        // can't shadow user locals named a/b.
         "firstOrNull" => Some("stream().findFirst().orElse(null)"),
-        "last" => Some("stream().reduce((a, b) -> b).orElse(null)"),
+        "last" => Some("stream().reduce((__left, __right) -> __right).orElse(null)"),
+        "lastOrNull" => Some("stream().reduce((__left, __right) -> __right).orElse(null)"),
         "reversed" => Some("reversed()"),
         "count" => Some("size()"),
         _ => None,

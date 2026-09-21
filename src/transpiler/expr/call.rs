@@ -191,6 +191,11 @@ impl<'a, 'u> Expr<'a, 'u> {
                         .is_some_and(|c| c.is_ascii_uppercase())
                 {
                     format!("new {}({})", callee_java, args.join(", "))
+                } else if callee_java.ends_with(')') && args.is_empty() {
+                    // Mapped member that is already a complete call expression
+                    // (`xs.get(0)`, `xs.stream().findFirst().orElse(null)`):
+                    // it IS the call — no `()` wrapper to add.
+                    callee_java
                 } else {
                     format!("{}({})", callee_java, args.join(", "))
                 }
