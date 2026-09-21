@@ -21,12 +21,12 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # JDK 27 is required by tools/e2e.sh (javac compiles the transpiled
-      # output of every sample). Temurin publishes JDK 27+ under java,
-      # so a fixed major version keeps the gate deterministic.
+      # Temurin does not reliably publish day-one JDK releases, so the e2e
+      # javac gate uses Zulu (Azul) — same OpenJDK, GA builds available
+      # immediately.
       - uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: zulu
           java-version: '27'
       - run: cargo fmt --all --check
       - run: cargo clippy --locked -- -D warnings
