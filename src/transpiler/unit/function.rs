@@ -168,7 +168,9 @@ impl<'a> Unit<'a> {
         }
 
         // parameters
-        let mut params: Vec<String> = Vec::new();
+        let mut params: Vec<String> = Vec::new(); // signature fragments "ty name"
+        let mut param_names: Vec<String> = Vec::new();
+        let mut param_defaults: Vec<Option<tree_sitter::Node>> = Vec::new();
         if let Some(fvp) = kt::child(decl, "function_value_parameters") {
             // Default values (`= expr`) sit between/before parameters as
             // siblings inside function_value_parameters. Kotlin binds `= x`
@@ -176,23 +178,17 @@ impl<'a> Unit<'a> {
             let mut cursor = fvp.walk();
             let kids: Vec<tree_sitter::Node> = fvp.children(&mut cursor).collect();
             let mut last_param: Option<tree_sitter::Node> = None;
-            for k in &kids {
+            let mut defaults: Vec<(tree_sitter::Node, tree_sitter::Node)> = Vec::new(); // (param, expr)
+            for (i, k) in kids.iter().enumerate() {
                 match k.kind() {
                     "parameter" => last_param = Some(*k),
                     "=" => {
-                        // default value binds to the preceding parameter
-                        if let Some(prev) = last_param.take() {
-                            let pname2 = kt::child(prev, "identifier")
-                                .map(|n| self.text(n).to_string())
-                                .unwrap_or_default();
-                            self.diags.warn_approx(
-                                prev,
-                                self.file,
-                                format!(
-                                    "default parameter value on '{}' has no Java counterpart (caller must pass it explicitly)",
-                                    pname2
-                                ),
-                            );
+                        // default value binds to the preceding parameter; the
+                        // expression is the next named child of the list
+                        if let Some(prev) = last_param
+                            && let Some(expr) = kids.get(i + 1).copied().filter(|n| n.is_named())
+                        {
+                            defaults.push((prev, expr));
                         }
                     }
                     _ => {}
@@ -219,6 +215,13 @@ impl<'a> Unit<'a> {
                         } else {
                             params.push(format!("{} {}", pty, pname));
                         }
+                        param_names.push(pname.clone());
+                        param_defaults.push(
+                            defaults
+                                .iter()
+                                .find(|(p, _)| p.id() == k.id())
+                                .map(|(_, d)| *d),
+                        );
                         self.var_types.insert(pname, pty.clone());
                     }
                     _ => {}
@@ -332,6 +335,71 @@ impl<'a> Unit<'a> {
             self.transpile_function_body(fb, out);
         }
         out.close();
+
+        // Kotlin default parameters -> Java overloads. Only a defaulted
+        // *suffix* is expressible as overloads (a defaulted middle param
+        // can't be skipped without named arguments); each suffix overload
+        // delegates to the full method filling the omitted defaults.
+        let trailing_defaults: Vec<(String, tree_sitter::Node)> = {
+            let mut td: Vec<(String, tree_sitter::Node)> = Vec::new();
+            for i in (0..param_names.len()).rev() {
+                match param_defaults.get(i).copied().flatten() {
+                    Some(d) => td.push((param_names[i].clone(), d)),
+                    None => break,
+                }
+            }
+            td.reverse();
+            td
+        };
+        if has_body {
+            let defaulted: Vec<&str> = param_names
+                .iter()
+                .zip(param_defaults.iter())
+                .filter(|(_, d)| d.is_some())
+                .map(|(n, _)| n.as_str())
+                .collect();
+            if !defaulted.is_empty() && trailing_defaults.is_empty() {
+                // Defaults exist but none form a trailing suffix: no overload
+                // can stand in — callers must pass these explicitly.
+                self.diags.warn_approx(
+                    decl,
+                    self.file,
+                    format!(
+                        "default parameter value(s) on '{}' (params: {}) have no Java counterpart — callers must pass them explicitly",
+                        name,
+                        defaulted.join(", ")
+                    ),
+                );
+            } else if !trailing_defaults.is_empty() {
+                // One N002 per function (not per param), as user policy.
+                self.diags.warn_approx(
+                    decl,
+                    self.file,
+                    format!(
+                        "default parameter values on '{}' approximated by synthesizing {} Java overload(s); named-argument and mid-parameter skipping semantics not reproduced",
+                        name,
+                        trailing_defaults.len()
+                    ),
+                );
+                let n = params.len();
+                let m = trailing_defaults.len();
+                for k in 1..=m {
+                    let sig = params[..n - k].join(", ");
+                    let mut call_args: Vec<String> = param_names[..n - k].to_vec();
+                    for (_, dnode) in &trailing_defaults[m - k..] {
+                        let mut e = Expr { unit: self };
+                        call_args.push(e.transpile(*dnode));
+                    }
+                    out.blank();
+                    out.open(format!(
+                        "{}{}{}{} {}({})",
+                        visibility, is_static, type_params, ret, name, sig
+                    ));
+                    out.line(format!("return {}({});", name, call_args.join(", ")));
+                    out.close();
+                }
+            }
+        }
         self.ext_receiver_name = prev_receiver;
     }
 
