@@ -20,6 +20,9 @@ pub struct Unit<'a> {
     current_decl: Option<tree_sitter::Node<'a>>,
     /// node-id -> label for open declarations.
     decl_labels: std::collections::HashMap<usize, String>,
+    /// identifier name -> primitive marker, from inferred local decls and
+    /// primitive-typed function parameters in the current translation scope.
+    pub var_types: std::collections::HashMap<String, String>,
 }
 
 impl<'a> Unit<'a> {
@@ -39,6 +42,7 @@ impl<'a> Unit<'a> {
             coverage: FileCoverage::default(),
             current_decl: None,
             decl_labels: std::collections::HashMap::new(),
+            var_types: std::collections::HashMap::new(),
         }
     }
 
@@ -700,6 +704,8 @@ impl<'a> Unit<'a> {
                         .map(|t| kt::java_type_ann(t, self.source, self.annots))
                         .unwrap_or_else(|| "Object".to_string());
                     params.push(format!("{} {}", pty, pname));
+                    // Track param types for == and ordered-comparison logic
+                    self.var_types.insert(pname, pty.clone());
                 }
             }
         }

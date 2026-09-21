@@ -63,3 +63,7 @@ class Person2(var name: String) {
         nickname = n
     }
 }
+// String ordered comparison: a > b -> a.compareTo(b) > 0 (warned N002)
+fun pick(a: String, b: String): String {
+    return if (a > b) a else b
+}

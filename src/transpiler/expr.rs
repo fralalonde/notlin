@@ -7,6 +7,19 @@ pub struct Expr<'a, 'u> {
 }
 
 impl<'a, 'u> Expr<'a, 'u> {
+    /// True if the identifier node is a known primitive-typed variable in the
+    /// current translation scope (params/local decls recorded in var_types).
+    fn known_primitive_operand(&self, node: tree_sitter::Node) -> bool {
+        if node.kind() == "identifier" {
+            self.unit
+                .var_types
+                .get(self.unit.text(node).trim())
+                .is_some_and(|t| is_primitive_type(t))
+        } else {
+            false
+        }
+    }
+
     pub fn transpile(&mut self, node: tree_sitter::Node) -> String {
         match node.kind() {
             "string_literal" => self.string_literal(node),
@@ -438,10 +451,50 @@ impl<'a, 'u> Expr<'a, 'u> {
                     "||" | "or" => "||",
                     _ => op.as_str(),
                 };
+                // Ordered comparisons on non-primitive operands require
+                // Comparable in Java (`a > b` is `a.compareTo(b) > 0`).
+                // Without type information we keep the operator as-is (correct
+                // for primitives, the common case) and warn that object
+                // operands need a compareTo-based form.
+                let is_ordered_cmp = matches!(java_op, "<" | ">" | "<=" | ">=");
+                if is_ordered_cmp {
+                    let lhs_text = self.unit.text(l).trim();
+                    let rhs_text = self.unit.text(r).trim();
+                    let either_primitive = lhs_text.parse::<i64>().is_ok()
+                        || lhs_text.parse::<f64>().is_ok()
+                        || rhs_text.parse::<i64>().is_ok()
+                        || rhs_text.parse::<f64>().is_ok()
+                        || is_likely_primitive(lhs_text)
+                        || is_likely_primitive(rhs_text)
+                        || self.known_primitive_operand(l)
+                        || self.known_primitive_operand(r);
+                    if !either_primitive {
+                        self.unit.diags.warn_approx(
+                            node,
+                            self.unit.file,
+                            "ordered comparison on non-primitive operands requires Comparable; emitted a.compareTo(b) form",
+                        );
+                        let l_java = self.transpile(l);
+                        let r_java = self.transpile(r);
+                        let cmp = format!("{}.compareTo({})", l_java, r_java);
+                        return match java_op {
+                            "<" => format!("{} < 0", cmp),
+                            ">" => format!("{} > 0", cmp),
+                            "<=" => format!("{} <= 0", cmp),
+                            _ => format!("{} >= 0", cmp),
+                        };
+                    }
+                }
                 // Kotlin `==` is structural equals for objects; Java `==` is identity.
                 let op_java = if java_op == "==" || java_op == "!=" {
                     let lhs_text = self.unit.text(l);
-                    let is_primitive = is_likely_primitive(lhs_text);
+                    // Primitive when a literal, or a known primitive param/local.
+                    let is_primitive = is_likely_primitive(lhs_text)
+                        || self
+                            .unit
+                            .var_types
+                            .get(lhs_text.trim())
+                            .is_some_and(|t| is_primitive_type(t));
                     if !is_primitive {
                         let rhs = self.transpile(r);
                         let lhs = self.transpile(l);
@@ -742,4 +795,12 @@ fn box_primitive(ty: &str) -> String {
         "char" => "Character".to_string(),
         other => other.to_string(),
     }
+}
+
+/// True for Java primitive type names (as emitted by map_type_name).
+fn is_primitive_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "int" | "long" | "short" | "byte" | "double" | "float" | "boolean" | "char"
+    )
 }
