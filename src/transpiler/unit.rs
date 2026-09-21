@@ -553,7 +553,8 @@ impl<'a> Unit<'a> {
                             out.blank();
                         }
                         "property_declaration" => {
-                            // interface property: accessor signatures only
+                            // interface property: abstract accessor unless a
+                            // getter/setter body is declared -> default method
                             let vd = kt::child(member, "variable_declaration");
                             if let Some(vd) = vd {
                                 let ident = kt::child(vd, "identifier");
@@ -564,9 +565,30 @@ impl<'a> Unit<'a> {
                                         .map(|t| kt::java_type_ann(t, self.source, self.annots))
                                         .unwrap_or_else(|| "Object".to_string());
                                     let cap = capitalize(&pname);
-                                    out.line(format!("{} get{}();", pty, cap));
+                                    let getter = kt::child(member, "getter");
+                                    match getter.and_then(|g| kt::child(g, "function_body")) {
+                                        Some(gb) => {
+                                            out.open(format!("default {} get{}()", pty, cap));
+                                            self.transpile_function_body(gb, out);
+                                            out.close();
+                                        }
+                                        None => out.line(format!("{} get{}();", pty, cap)),
+                                    }
                                     if kt::child(member, "val").is_none() {
-                                        out.line(format!("void set{}({} value);", cap, pty));
+                                        let setter = kt::child(member, "setter");
+                                        match setter.and_then(|s| kt::child(s, "function_body")) {
+                                            Some(sb) => {
+                                                out.open(format!(
+                                                    "default void set{}({} value)",
+                                                    cap, pty
+                                                ));
+                                                self.transpile_function_body(sb, out);
+                                                out.close();
+                                            }
+                                            None => {
+                                                out.line(format!("void set{}({} value);", cap, pty))
+                                            }
+                                        }
                                     }
                                     out.blank();
                                 }
@@ -1112,6 +1134,34 @@ impl<'a> Unit<'a> {
             .map(|t| kt::java_type_ann(t, self.source, self.annots));
         let _visibility = self.visibility_of(decl);
 
+        // Destructuring class property `val (a, b) = expr`: field + accessor
+        // shapes don't apply; flag it instead of emitting a junk `prop` field.
+        if vd.is_none() && kt::child(decl, "multi_variable_declaration").is_some() {
+            self.diag_approx(
+                decl,
+                format!(
+                    "destructuring class property '{}': componentN() extraction not reproduced; emitted as a single backing field",
+                    name
+                ),
+            );
+            return;
+        }
+
+        // lateinit: Kotlin promises non-null after init, Java fields start
+        // null — flag the null-init gap.
+        if kt::child(decl, "modifiers")
+            .map(|m| self.text(m).contains("lateinit"))
+            .unwrap_or(false)
+        {
+            self.diag_approx(
+                decl,
+                format!(
+                    "lateinit var '{}': Java fields default to null — no non-null enforcement (reading before init returns null instead of throwing)",
+                    name
+                ),
+            );
+        }
+
         // Delegated property (`by lazy {}` / `by observable` / ...): the
         // delegate expression becomes the initializer; lazy semantics are
         // approximated by an eager initializer + getter (functional superset,
@@ -1267,8 +1317,19 @@ impl<'a> Unit<'a> {
         }
 
         if !is_val && !has_setter_method {
+            // Kotlin `private set`: the setter exists but is private.
+            let set_vis = if setter
+                .as_ref()
+                .and_then(|s| kt::child(*s, "modifiers"))
+                .map(|m| self.text(m).contains("private"))
+                .unwrap_or(false)
+            {
+                "private "
+            } else {
+                "public "
+            };
             out.blank();
-            out.open(format!("public void set{}({} {})", cap, ty, name));
+            out.open(format!("{}void set{}({} {})", set_vis, cap, ty, name));
             match setter_body {
                 Some(sb) => {
                     let mut cursor = sb.walk();
