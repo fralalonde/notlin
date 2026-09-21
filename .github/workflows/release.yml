@@ -73,8 +73,21 @@ jobs:
           name: release-${{ matrix.target }}
           path: dist/*
 
+  # scripts/ installers are attached verbatim so the documented
+  # releases/latest/download/install.sh|ps1 one-liners resolve.
+  installers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-installers
+          path: |
+            scripts/install.sh
+            scripts/install.ps1
+
   release:
-    needs: [test, assets]
+    needs: [test, assets, installers]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
