@@ -633,6 +633,34 @@ impl<'a> Unit<'a> {
             .unwrap_or_else(|| "anon".to_string());
         let visibility = self.visibility_of(decl);
 
+        // Type parameters `fun <T> f(...)` -> Java generics `<T extends Bound>`;
+        // `reified` has no Java counterpart and taints the declaration.
+        let mut type_params = String::new();
+        if let Some(tp) = kt::child(decl, "type_parameters") {
+            let mut cursor = tp.walk();
+            let mut parts: Vec<String> = Vec::new();
+            for t in tp.children(&mut cursor) {
+                if t.kind() != "type_parameter" {
+                    continue;
+                }
+                if let (Some(id), Some(bound)) = (
+                    kt::child(t, "identifier"),
+                    kt::child(t, "user_type").or_else(|| kt::child(t, "nullable_type")),
+                ) {
+                    let id_text = self.text(id).to_string();
+                    let bound = kt::java_type_ann(bound, self.source, self.annots);
+                    if bound == "Object" || bound == "Any" {
+                        parts.push(id_text);
+                    } else {
+                        parts.push(format!("{} extends {}", id_text, bound));
+                    }
+                }
+            }
+            if !parts.is_empty() {
+                type_params = format!("<{}> ", parts.join(", "));
+            }
+        }
+
         // return type: positional — the first type-ish named child after
         // function_value_parameters (grammar has no return_type field).
         let mut ret = "void".to_string();
@@ -694,9 +722,10 @@ impl<'a> Unit<'a> {
         if !has_body {
             // Bodyless: signature-only (abstract / interface method)
             out.line(format!(
-                "{}{}{}{} {}({});",
+                "{}{}{}{}{} {}({});",
                 visibility,
                 is_static,
+                type_params,
                 abstract_kw,
                 ret,
                 name,
@@ -705,9 +734,10 @@ impl<'a> Unit<'a> {
             return;
         }
         out.open(format!(
-            "{}{}{}{} {}({})",
+            "{}{}{}{}{} {}({})",
             visibility,
             is_static,
+            type_params,
             abstract_kw,
             ret,
             name,

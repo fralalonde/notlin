@@ -656,6 +656,7 @@ impl<'a, 'u> Expr<'a, 'u> {
             .find(|c| {
                 cursor.field_name() == Some("condition")
                     || c.kind() == "is_expression"
+                    || c.kind() == "binary_expression"
                     || c.kind() == "parenthesized"
             })
             .copied();
@@ -674,10 +675,12 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .nth(1)
                     .map(|t| box_primitive(&kt::java_type(t, self.unit.source)))
             });
-        // Branches: named children excluding the condition expression itself.
+        // Branches: named children after the condition. When the condition is
+        // a field-named node we skip only that node; else skip all up to `else`.
+        let cond_id = cond_node.map(|c| c.id());
         let branches: Vec<_> = kids
             .iter()
-            .filter(|c| c.is_named() && c.kind() != "is_expression")
+            .filter(|c| c.is_named() && c.kind() != "is_expression" && Some(c.id()) != cond_id)
             .copied()
             .collect();
         match (cond.clone(), branches.len()) {
