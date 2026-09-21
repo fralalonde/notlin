@@ -1,5 +1,7 @@
 # PowerShell installer for notlin: fetch the release zip and drop notlin.exe
-# on the user PATH (%LOCALAPPDATA%\Programs\notlin). No profile edits.
+# in %LOCALAPPDATA%\Programs\notlin, and add that dir to the USER-scope PATH
+# (Windows has no default user bin dir; registry PATH write IS the mechanism).
+# No profile edits. -NoPath skips the PATH write.
 # Documented invocation:
 #   irm https://github.com/fralalonde/notlin/releases/latest/download/install.ps1 | iex
 $ErrorActionPreference = 'Stop'
@@ -42,13 +44,23 @@ try {
 
     Write-Host ""
     Write-Host "Installed notlin $version to $destDir\notlin.exe"
-
-    # Only warn when the dir is missing from PATH — never edit profile/registry.
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (($userPath -split ';') -notcontains $destDir) {
-        Write-Host "Note: $destDir is not on your user PATH."
+    # Windows has no default user bin dir on PATH; the OS-native equivalent of
+    # the Unix "~/.local/bin" convention is adding the dir to the USER-scope
+    # PATH via the registry. Default: do it. -NoPath opts out (then the
+    # installer prints the manual path syntax instead of editing anything).
+    if ($NoPath) {
+        Write-Host "Set $destDir on your PATH to use notlin."
+    } else {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $parts = @()
+        if ($userPath) { $parts = $userPath -split ';' | Where-Object { $_ } }
+        if ($parts -notcontains $destDir) {
+            $newPath = (@($parts) + $destDir) -join ';'
+            [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+            Write-Host "Added $destDir to user PATH (new terminals only)."
+        }
     }
-    Write-Host "Run: notlin --help"
+    Write-Host "Run: notlin --help   (new terminal if PATH was just modified)"
 } finally {
     if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
 }

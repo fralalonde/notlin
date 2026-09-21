@@ -34,7 +34,9 @@ curl -fsSL https://github.com/fralalonde/notlin/releases/latest/download/install
 
 Windows PowerShell:
 ```powershell
-# installs to %LOCALAPPDATA%\Programs\notlin\notlin.exe
+# installs to %LOCALAPPDATA%\Programs\notlin\notlin.exe and (unless -NoPath)
+# adds that dir to your user PATH via the registry — Windows has no default
+# user bin dir on PATH, that write is the standard mechanism
 irm https://github.com/fralalonde/notlin/releases/latest/download/install.ps1 | iex
 ```
 
