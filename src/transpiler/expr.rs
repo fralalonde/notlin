@@ -233,7 +233,17 @@ impl<'a, 'u> Expr<'a, 'u> {
                             "entries" => "entrySet()".to_string(),
                             other => format!("{}()", other),
                         };
-                        result.push_str(&format!(".{}", java_member));
+                        if matches!(member_name.as_str(), "size" | "length")
+                            && base
+                                .map(|b| self.unit.receiver_is_array(b))
+                                .unwrap_or(false)
+                        {
+                            // Kotlin arrays expose `size`, Java exposes the
+                            // `length` field — no parens for a field read.
+                            result.push_str(".length");
+                        } else {
+                            result.push_str(&format!(".{}", java_member));
+                        }
                     } else if member_name
                         .chars()
                         .next()
@@ -281,7 +291,6 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .and_then(|al| kt::child(*al, "lambda_literal"))
             });
 
-        let callee_java = callee.map(|c| self.transpile_callee(c)).unwrap_or_default();
         let mut args: Vec<String> = Vec::new();
         if let Some(an) = args_node {
             let mut inner = an.walk();
@@ -300,6 +309,25 @@ impl<'a, 'u> Expr<'a, 'u> {
         if let Some(l) = lambda_arg {
             args.push(self.transpile(l));
         }
+
+        // Navigation callee with type context: array `.size`/`.length` and
+        // same-file extension call sites are rewritten BEFORE the generic
+        // callee path so private messages don't fire for them.
+        if let Some(nav) = kids
+            .iter()
+            .find(|c| c.kind() == "navigation_expression")
+            .copied()
+        {
+            if let Some((base, member)) = self.unit.nav_base_member(nav) {
+                if self.unit.receiver_is_array(base) && matches!(member.as_str(), "size" | "length")
+                {
+                    // Kotlin `arr.size()`/`arr.size` -> Java `arr.length`.
+                    return format!("{}.length", self.transpile(base));
+                }
+            }
+        }
+
+        let callee_java = callee.map(|c| self.transpile_callee(c)).unwrap_or_default();
 
         // println -> System.out.println
         if callee_java == "println" {

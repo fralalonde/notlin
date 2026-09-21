@@ -1195,6 +1195,9 @@ impl<'a> Unit<'a> {
         }
         if is_main && params.is_empty() {
             params.push("String[] args".to_string());
+            // Kotlin `fun main()` implicitly takes Array<String> args.
+            self.var_types
+                .insert("args".to_string(), "String[]".to_string());
         }
 
         let is_static = if make_static { "static " } else { "" };
