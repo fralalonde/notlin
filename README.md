@@ -24,23 +24,19 @@ notlin -o build/java src/kotlin/
 
 # Install
 
-One-liners (fetch the binary from the latest GitHub release, drop it in your
-user bin — no shell integration, no rc edits):
-
 Linux/macOS (bash, zsh, fish):
 ```sh
+# installs to `~/.local/bin/notlin`
 curl -fsSL https://github.com/fralalonde/notlin/releases/latest/download/install.sh | sh
 ```
 
+
+
 Windows PowerShell:
 ```powershell
+# installs to %LOCALAPPDATA%\Programs\notlin\notlin.exe
 irm https://github.com/fralalonde/notlin/releases/latest/download/install.ps1 | iex
 ```
-
-Install location: `~/.local/bin/notlin` (Linux) or
-`%LOCALAPPDATA%\Programs\notlin\notlin.exe` (Windows) — override with
-`NOTLIN_DIR`/`NOTLIN_VERSION` env vars. Installers just fetch and unzip to a
-PATH dir; they never touch your shell config.
 
 # Why 
 
