@@ -148,6 +148,26 @@ impl<'a, 'u> Expr<'a, 'u> {
                 .map(|i| dot + 1 + i)
                 .unwrap_or(raw_trimmed.len());
             let member = &raw_trimmed[dot + 1..member_end];
+            // `first()` on a known List-typed receiver: Java has no `first`;
+            // `get(0)` is the List API closest in semantics. The warn stays
+            // because on an empty list Java throws IndexOutOfBoundsException
+            // while Kotlin throws NoSuchElementException.
+            if member == "first"
+                && let Some(b) = base
+                && b.kind() == "identifier"
+                && self
+                    .unit
+                    .var_types
+                    .get(self.unit.text(b).trim())
+                    .is_some_and(|t| t.starts_with("List<"))
+            {
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "Kotlin `first()` mapped to Java `get(0)`: throws IndexOutOfBoundsException instead of NoSuchElementException on an empty list",
+                );
+                return format!("{}.get(0)", self.transpile(b));
+            }
             if let Some(java_member) = kotlin_member_to_java(member) {
                 if java_member != member {
                     if java_member.contains('(') {
