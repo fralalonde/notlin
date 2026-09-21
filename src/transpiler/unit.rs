@@ -385,6 +385,12 @@ impl<'a> Unit<'a> {
         imports: &[String],
         f: impl FnOnce(&mut Self, &mut JavaOut),
     ) {
+        // Provenance header: every generated .java records which .kt produced
+        // it (in-place migration trims the .kt, so the pair must stay matchable).
+        out.line(format!(
+            "// NOTLIN: generated from {} — do not edit by hand while the source .kt exists",
+            self.file.display()
+        ));
         if !package.is_empty() {
             out.line(format!("package {};", package));
             out.blank();
