@@ -1,0 +1,35 @@
+name: check
+
+# Push-triggered workflow (NOT tag-gated). Runs fmt, clippy, the Rust test
+# suite and the javac e2e gate on every branch push and pull request.
+# Packaging/publishing is reserved for the tag-triggered release workflow
+# (.github/workflows/release.yml).
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # JDK 27 is required by tools/e2e.sh (javac compiles the transpiled
+      # output of every sample). Temurin publishes JDK 27+ under java,
+      # so a fixed major version keeps the gate deterministic.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '27'
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - run: tools/e2e.sh "$JAVA_HOME/bin/javac"

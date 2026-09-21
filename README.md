@@ -1,6 +1,26 @@
 # notlin
 
-A Kotlin to Java converter. 
+A Kotlin to Java converter.
+
+# Usage
+
+```sh
+# Transpile a single file (Java written next to the input):
+notlin src/main.kt
+
+# Write output to a directory:
+notlin -o build/java src/main.kt
+
+# Untranslatable constructs: fail instead of warn
+notlin --untranslatable=error src/main.kt
+
+# Migrate in place: removes translated code from the .kt file,
+# deletes the .kt entirely when everything translates
+notlin --in-place src/main.kt
+
+# Whole tree at once:
+notlin -o build/java src/kotlin/
+```
 
 # Why 
 
