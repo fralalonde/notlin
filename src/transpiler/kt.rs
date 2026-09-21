@@ -65,11 +65,34 @@ pub fn java_type_ann(node: tree_sitter::Node, source: &str, annots: AnnotationSe
 pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
     match node.kind() {
         "user_type" => {
-            // dotted or generic types; reconstruct from children
+            // dotted or generic types; reconstruct from children.
+            // Type arguments box primitives (`List<Int>` -> `List<Integer>`
+            // — generics can't hold primitives).
             let mut out = String::new();
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if child.kind() == "user_type" {
+                if child.kind() == "type_arguments" {
+                    // rebuild each argument with boxing
+                    let mut args = String::new();
+                    let mut acur = child.walk();
+                    for arg in child.children(&mut acur) {
+                        if !arg.is_named() {
+                            // punctuation: keep verbatim
+                            args.push_str(text(arg, source));
+                        } else {
+                            // type_projection wraps the actual type; find the
+                            // nested type node
+                            let inner = arg.children(&mut arg.walk()).find(|c| c.is_named());
+                            let jt = match inner {
+                                Some(n) => java_type(n, source),
+                                None => java_type(arg, source),
+                            };
+                            let boxed = crate::transpiler::types::boxed_name(&jt).unwrap_or(&jt);
+                            args.push_str(boxed);
+                        }
+                    }
+                    out.push_str(&args);
+                } else if child.kind() == "user_type" {
                     out.push_str(&java_type(child, source));
                 } else if child.is_named() {
                     out.push_str(text(child, source));
@@ -78,7 +101,20 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                     out.push_str(text(child, source));
                 }
             }
-            crate::transpiler::types::map_type_name(out.trim()).to_string()
+            let mapped = crate::transpiler::types::map_type_name(out.trim());
+            if mapped == "__NOTLIN_ARRAY__" || out.trim().starts_with("Array<") {
+                // `Array<T>` -> `T[]`; rebuild from the type_arguments child
+                let mut cursor = node.walk();
+                let inner = node
+                    .children(&mut cursor)
+                    .find(|c| c.kind() == "type_arguments")
+                    .and_then(|ta| ta.children(&mut ta.walk()).find(|c| c.is_named()));
+                return match inner {
+                    Some(n) => format!("{}[]", java_type(n, source)),
+                    None => "Object[]".to_string(),
+                };
+            }
+            mapped.to_string()
         }
         "nullable_type" => {
             let inner = child(node, "user_type")

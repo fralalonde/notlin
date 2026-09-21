@@ -40,8 +40,25 @@ pub fn map_type_name(kotlin_type: &str) -> &str {
         "FloatArray" => "float[]",
         "BooleanArray" => "boolean[]",
         "CharArray" => "char[]",
+        "Array" => "__NOTLIN_ARRAY__",
         "UByte" | "UShort" | "UInt" | "ULong" => "long",
         _ => kotlin_type,
+    }
+}
+
+/// Boxed names for generic type arguments: Java generics cannot hold
+/// primitives, so `List<Int>` must be `List<Integer>`.
+pub fn boxed_name(java_primitive: &str) -> Option<&'static str> {
+    match java_primitive {
+        "int" => Some("Integer"),
+        "long" => Some("Long"),
+        "short" => Some("Short"),
+        "byte" => Some("Byte"),
+        "double" => Some("Double"),
+        "float" => Some("Float"),
+        "boolean" => Some("Boolean"),
+        "char" => Some("Character"),
+        _ => None,
     }
 }
 
