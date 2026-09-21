@@ -78,6 +78,13 @@ impl<'a, 'u> Stmt<'a, 'u> {
             None => "var".to_string(),
         });
 
+        // Record the local's Java type so later statements in this function
+        // get receiver context: `arr.size` -> `arr.length` for arrays, known
+        // primitive operands in comparisons, member-call inference, etc.
+        if ty != "var" {
+            self.unit.var_types.insert(name.clone(), ty.clone());
+        }
+
         if ty == "var" {
             out.line(format!(
                 "var {}{};",

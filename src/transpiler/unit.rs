@@ -1510,9 +1510,20 @@ impl<'a> Unit<'a> {
         None
     }
 
-    /// Best-effort type inference from an initializer expression.
-    pub fn infer_type(&self, expr: tree_sitter::Node) -> String {
+    /// Best-effort type inference from an initializer expression. Known
+    /// receiver types (var_types + Map/List/Set shapes) propagate into the
+    /// result for member reads and member calls (`m.keys` -> Set<K>,
+    /// `xs.first()` -> element, `"abc".uppercase()` -> String). When a
+    /// call/navigation initializer's type cannot be determined the local
+    /// degrades to Object and N002 is raised (caller-visible approximation).
+    pub fn infer_type(&mut self, expr: tree_sitter::Node) -> String {
         match expr.kind() {
+            "identifier" => self
+                .var_types
+                .get(self.text(expr).trim())
+                .cloned()
+                .unwrap_or_else(|| "Object".to_string()),
+            "navigation_expression" => self.infer_navigation(expr),
             "string_literal" => "String".to_string(),
             "number_literal" => {
                 let t = self.text(expr);
@@ -1541,6 +1552,12 @@ impl<'a> Unit<'a> {
                     .map(|n| self.text(n).to_string())
                     .unwrap_or_default();
                 let targs = kt::child(expr, "type_arguments").map(|t| self.text(t).to_string());
+                // primitive array factories: intArrayOf(...) -> int[]
+                if !callee.is_empty() && !callee.contains('.') {
+                    if let Some(prim) = primitive_array_factory(&callee) {
+                        return prim.to_string();
+                    }
+                }
                 if targs.is_none()
                     && matches!(
                         callee.as_str(),
@@ -1578,6 +1595,12 @@ impl<'a> Unit<'a> {
                     ("mapOf", Some(t)) => format!("Map{}", t),
                     ("mapOf", None) => "Map<Object, Object>".to_string(),
                     _ => {
+                        // member call on a receiver: `m.keys()`, `xs.first()`
+                        if let Some(nav) = kt::child(expr, "navigation_expression") {
+                            if let Some((base, member)) = self.nav_base_member(nav) {
+                                return self.infer_member_type(base, &member, expr);
+                            }
+                        }
                         // Uppercase callee with no dot: constructor call
                         if !callee.contains('.')
                             && callee
@@ -1587,6 +1610,14 @@ impl<'a> Unit<'a> {
                         {
                             callee
                         } else {
+                            self.diags.warn_approx(
+                                expr,
+                                self.file,
+                                format!(
+                                    "cannot infer type of call `{}`; local emitted as Object",
+                                    self.text(expr).trim()
+                                ),
+                            );
                             "Object".to_string()
                         }
                     }
@@ -1594,6 +1625,118 @@ impl<'a> Unit<'a> {
             }
             _ => "Object".to_string(),
         }
+    }
+
+    /// Infer the type of a bare member read (`m.keys`, `s.length`).
+    fn infer_navigation(&mut self, expr: tree_sitter::Node) -> String {
+        match self.nav_base_member(expr) {
+            Some((base, member)) => self.infer_member_type(base, &member, expr),
+            None => "Object".to_string(),
+        }
+    }
+
+    /// Infer `base.member` from the receiver's known Java type. N002 when
+    /// the member is not in the known mapping set (type unknowable).
+    fn infer_member_type(
+        &mut self,
+        base: tree_sitter::Node,
+        member: &str,
+        node: tree_sitter::Node,
+    ) -> String {
+        let recv_ty: Option<String> = match base.kind() {
+            "identifier" => self.var_types.get(self.text(base).trim()).cloned(),
+            "string_literal" => Some("String".to_string()),
+            _ => None,
+        };
+        let unknown = |u: &mut Self| {
+            u.diags.warn_approx(
+                node,
+                u.file,
+                format!(
+                    "cannot infer type of `{}` (member not in known-mapping table); local emitted as Object",
+                    member
+                ),
+            );
+            "Object".to_string()
+        };
+        match member {
+            "uppercase" | "lowercase" | "trim" | "toString" => "String".to_string(),
+            "size" | "length" | "count" => "int".to_string(),
+            "isEmpty" | "isNotEmpty" | "any" | "all" | "none" => "boolean".to_string(),
+            "keys" | "keySet" => {
+                let key = recv_ty
+                    .as_deref()
+                    .and_then(|t| type_arg(t, 0))
+                    .unwrap_or_else(|| "Object".to_string());
+                format!("Set<{}>", key)
+            }
+            "entries" | "entrySet" => {
+                let key = recv_ty
+                    .as_deref()
+                    .and_then(|t| type_arg(t, 0))
+                    .unwrap_or_else(|| "Object".to_string());
+                let val = recv_ty
+                    .as_deref()
+                    .and_then(|t| type_arg(t, 1))
+                    .unwrap_or_else(|| "Object".to_string());
+                format!("Set<Map.Entry<{}, {}>>", key, val)
+            }
+            "values" => {
+                let val = recv_ty
+                    .as_deref()
+                    .and_then(|t| type_arg(t, 1))
+                    .unwrap_or_else(|| "Object".to_string());
+                format!("Collection<{}>", val)
+            }
+            "first" | "last" | "firstOrNull" | "lastOrNull" => match recv_ty.as_deref() {
+                Some(t) => elem_type_of(t),
+                None => unknown(self),
+            },
+            // Stream-approximated collection ops keep the element type
+            "map" | "filter" | "flatMap" | "sorted" | "distinct" | "mapNotNull" | "mapIndexed"
+            | "filterIndexed" | "associateBy" | "groupBy" => match recv_ty.as_deref() {
+                Some(t) if is_collection_ty(t) => format!("List<{}>", elem_type_of(t)),
+                _ => unknown(self),
+            },
+            "forEach" => match recv_ty.as_deref() {
+                Some(t) if is_collection_ty(t) => "void".to_string(),
+                _ => unknown(self),
+            },
+            "joinToString" => "String".to_string(),
+            "fold" | "reduce" => match recv_ty.as_deref() {
+                Some(t) if is_collection_ty(t) => elem_type_of(t),
+                _ => unknown(self),
+            },
+            _ => unknown(self),
+        }
+    }
+
+    /// Split a navigation_expression into its receiver (first named child)
+    /// and the last member name (`a.b.c` -> (a, "c")). `?.` treated as `.`.
+    pub fn nav_base_member<'t>(
+        &self,
+        node: tree_sitter::Node<'t>,
+    ) -> Option<(tree_sitter::Node<'t>, String)> {
+        let mut cursor = node.walk();
+        let kids: Vec<tree_sitter::Node<'t>> = node.children(&mut cursor).collect();
+        let base = kids.iter().find(|c| c.is_named()).copied()?;
+        let member = kids
+            .windows(2)
+            .filter(|w| w[0].kind() == "." || w[0].kind() == "?.")
+            .filter(|w| w[1].kind() == "identifier")
+            .map(|w| self.text(w[1]).to_string())
+            .last();
+        member.map(|m| (base, m))
+    }
+
+    /// True when the receiver is a simple identifier whose known type is a
+    /// Java array (`String[]`, `int[]`, ...) — drives `.size` -> `.length`.
+    pub fn receiver_is_array(&self, base: tree_sitter::Node) -> bool {
+        base.kind() == "identifier"
+            && self
+                .var_types
+                .get(self.text(base).trim())
+                .is_some_and(|t| t.ends_with("[]"))
     }
 
     /// top-level property -> static field + static accessors in the file class
@@ -1625,4 +1768,79 @@ pub fn capitalize(s: &str) -> String {
         Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+/// Kotlin primitive-array factories -> Java array type.
+fn primitive_array_factory(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "intArrayOf" => "int[]",
+        "longArrayOf" => "long[]",
+        "shortArrayOf" => "short[]",
+        "byteArrayOf" => "byte[]",
+        "doubleArrayOf" => "double[]",
+        "floatArrayOf" => "float[]",
+        "booleanArrayOf" => "boolean[]",
+        "charArrayOf" => "char[]",
+        "arrayOf" => "Object[]",
+        _ => return None,
+    })
+}
+
+/// The nth type argument of a generic Java type text
+/// (`Map<String, Integer>` -> idx 0 "String", 1 "Integer").
+fn type_arg(java_ty: &str, idx: usize) -> Option<String> {
+    let open = java_ty.find('<')?;
+    let close = java_ty.rfind('>')?;
+    if close < open {
+        return None;
+    }
+    let inner = &java_ty[open + 1..close];
+    split_top_level(inner, ',')
+        .get(idx)
+        .map(|s| s.trim().to_string())
+}
+
+/// Split on a separator, respecting nested `<...>` (generics).
+fn split_top_level(s: &str, sep: char) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            _ if c == sep && depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    parts.push(cur);
+    parts
+}
+
+/// Element type of a collection/array Java type: `List<Integer>` -> Integer,
+/// `int[]` -> int, `Set<String>` -> String; else Object.
+fn elem_type_of(java_ty: &str) -> String {
+    if java_ty.ends_with("[]") {
+        java_ty.trim_end_matches("[]").trim().to_string()
+    } else if java_ty.contains('<') {
+        type_arg(java_ty, 0).unwrap_or_else(|| "Object".to_string())
+    } else {
+        "Object".to_string()
+    }
+}
+
+/// True for Java collection-ish type texts (List/Set/Map/Collection/Iterable
+/// plus array suffix), used to gate element-typed inference.
+fn is_collection_ty(java_ty: &str) -> bool {
+    let t = java_ty.trim();
+    t.ends_with("[]")
+        || t.starts_with("List<")
+        || t.starts_with("Set<")
+        || t.starts_with("Map<")
+        || t.starts_with("Collection<")
+        || t.starts_with("Iterable<")
 }
