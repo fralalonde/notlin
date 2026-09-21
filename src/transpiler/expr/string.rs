@@ -4,78 +4,86 @@ use super::Expr;
 
 impl<'a, 'u> Expr<'a, 'u> {
     pub(crate) fn string_literal(&mut self, node: tree_sitter::Node) -> String {
-        // Reconstruct from children, converting $name and ${expr} to concatenation.
-        let raw = self.unit.text(node);
-        if !raw.contains('$') {
-            // plain string: escape and return
-            return format!("{:?}", raw.trim_matches('"').replace("\\\"", "\""));
-        }
-
-        // Interpolated string: split into parts. The grammar gives us
-        // string_content pieces; `$` and `${...}` markers.
-        let mut out = String::new();
+        // Walk the grammar's own children. Two forms:
+        //  - `${expr}`: a real `interpolation` node — transpile its expression
+        //    child so member access/calls keep working.
+        //  - `$ident`: the grammar gives `string_content "$"` followed by
+        //    `string_content` holding the identifier text (or the rest of the
+        //    piece). `$` followed by an identifier-start char pushes that
+        //    identifier; any other `$` (template-literal edge) passes through.
+        let mut cursor = node.walk();
         let mut parts: Vec<String> = Vec::new();
-        let mut current = String::new();
-        let inner = raw
-            .trim_start_matches('"')
-            .trim_end_matches('"')
-            .to_string();
-        let mut chars = inner.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '$'
-                && let Some(&next) = chars.peek()
-            {
-                if next == '{' {
-                    // ${expr}
-                    if !current.is_empty() {
-                        parts.push(format!("{:?}", current));
-                        current = String::new();
+        let mut dollar_pending = false;
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "string_content" => {
+                    let raw = self.unit.text(child);
+                    if raw.is_empty() {
+                        continue;
                     }
-                    let mut expr = String::new();
-                    chars.next(); // consume '{'
-                    let mut depth = 1;
-                    for ec in chars.by_ref() {
-                        if ec == '{' {
-                            depth += 1;
-                        } else if ec == '}' {
-                            depth -= 1;
-                            if depth == 0 {
+                    if raw == "$" {
+                        // `$` + identifier continues in the next piece —
+                        // defer emission until we see the name.
+                        dollar_pending = true;
+                        continue;
+                    }
+                    if dollar_pending
+                        && raw
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphabetic() || c == '_')
+                    {
+                        let mut ident = String::new();
+                        let mut rest = raw;
+                        for (i, c) in raw.char_indices() {
+                            if i == 0 || c.is_alphanumeric() || c == '_' {
+                                if i > 0 && !c.is_alphanumeric() && c != '_' {
+                                    rest = &raw[i..];
+                                    break;
+                                }
+                                ident.push(c);
+                            } else {
+                                rest = &raw[i..];
                                 break;
                             }
                         }
-                        expr.push(ec);
-                    }
-                    parts.push(format!("({})", expr));
-                    continue;
-                } else if next.is_alphabetic() || next == '_' {
-                    // $identifier
-                    if !current.is_empty() {
-                        parts.push(format!("{:?}", current));
-                        current = String::new();
-                    }
-                    let mut ident = String::new();
-                    while let Some(&ic) = chars.peek() {
-                        if ic.is_alphanumeric() || ic == '_' {
-                            ident.push(ic);
-                            chars.next();
-                        } else {
-                            break;
+                        parts.push(ident);
+                        if !rest.is_empty() {
+                            parts.push(format!("{:?}", rest));
                         }
+                        dollar_pending = false;
+                        continue;
                     }
-                    parts.push(ident);
-                    continue;
+                    if dollar_pending {
+                        parts.push("\\\"$\\\"".to_string());
+                        dollar_pending = false;
+                    }
+                    parts.push(format!("{:?}", raw));
                 }
+                "interpolation" => {
+                    dollar_pending = false;
+                    let mut icur = child.walk();
+                    let expr_node = child
+                        .children(&mut icur)
+                        .find(|c| c.is_named() && c.kind() != "interpolation");
+                    if let Some(expr_node) = expr_node {
+                        let java = self.transpile(expr_node);
+                        // parenthesize: interpolation splices into a `+`
+                        // chain; `x + 1` unparenthesized would change the
+                        // expression's meaning (string concat vs arithmetic).
+                        parts.push(format!("({})", java));
+                    }
+                }
+                _ => {}
             }
-            current.push(c);
         }
-        if !current.is_empty() {
-            parts.push(format!("{:?}", current));
+        if dollar_pending {
+            parts.push("\"$\"".to_string());
         }
         if parts.is_empty() {
-            out.push_str("\"\"");
+            "\"\"".to_string()
         } else {
-            out.push_str(&parts.join(" + "));
+            parts.join(" + ")
         }
-        out
     }
 }
