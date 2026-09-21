@@ -1150,6 +1150,7 @@ impl<'a> Unit<'a> {
         // Extension receiver (`fun String.shout()`): the grammar puts the
         // receiver type as a bare user_type before the function name. Emit
         // it as the first parameter; `this` in the body refers to it.
+        let mut prev_receiver: Option<String> = None;
         {
             // Extension receiver: a bare user_type before the `name` field.
             // Collect (field, kind) per child in one synced cursor walk.
@@ -1185,11 +1186,17 @@ impl<'a> Unit<'a> {
                 let recv_java = kt::java_type_ann(recv_ty, self.source, self.annots);
                 self.var_types
                     .insert("__receiver__".to_string(), recv_java.clone());
-                params.insert(0, recv_java);
+                params.insert(0, format!("{} __receiver__", recv_java));
+                if make_static {
+                    // Same-file statics: call sites `x.f(...)` can be
+                    // rewritten to `f(x, ...)` (see expr.rs call handling).
+                    self.extension_fns.insert(name.clone(), recv_java);
+                }
+                prev_receiver = self.ext_receiver_name.replace("__receiver__".to_string());
                 self.diags.warn_approx(
                     decl,
                     self.file,
-                    "extension function: receiver emitted as first parameter; call sites `x.f()` become `F.f(x)`",
+                    "extension function: receiver emitted as first parameter; call sites `x.f()` become `f(x)` in the same file",
                 );
             }
         }
@@ -1218,6 +1225,7 @@ impl<'a> Unit<'a> {
         let has_body = has_body && !is_external;
         if !has_body {
             // Bodyless: signature-only (abstract / interface method)
+            self.ext_receiver_name = prev_receiver;
             out.line(format!(
                 "{}{}{}{}{} {}({});",
                 visibility,
@@ -1246,6 +1254,7 @@ impl<'a> Unit<'a> {
             self.transpile_function_body(fb, out);
         }
         out.close();
+        self.ext_receiver_name = prev_receiver;
     }
 
     /// function_body = block | expression (expression-body)

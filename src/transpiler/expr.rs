@@ -26,6 +26,14 @@ impl<'a, 'u> Expr<'a, 'u> {
             "number_literal" | "boolean_literal" | "hex_literal" | "long_literal"
             | "real_literal" => self.unit.text(node).to_string(),
             "identifier" => self.unit.text(node).to_string(),
+            // `this` inside an extension function body refers to the receiver
+            // parameter (emitted as a regular first param, so `this` must map
+            // to it in the static method's body).
+            "this_expression" => self
+                .unit
+                .ext_receiver_name
+                .clone()
+                .unwrap_or_else(|| "this".to_string()),
             "navigation_expression" => self.navigation(node),
             "call_expression" => self.call(node),
             "binary_expression" => self.binary(node),
@@ -324,6 +332,26 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // Kotlin `arr.size()`/`arr.size` -> Java `arr.length`.
                     return format!("{}.length", self.transpile(base));
                 }
+                if let Some(_recv_ty) = self.unit.extension_fns.get(member.as_str()) {
+                    // `x.f(...)` for a same-file extension -> static `f(x, ...)`.
+                    let recv_java = self.transpile(base);
+                    self.unit.diags.warn_approx(
+                        nav,
+                        self.unit.file,
+                        format!(
+                            "extension call site `{base}.{member}(...)` rewritten to static `{member}({base}, ...)` (same-file approximation; caller-visible signature change)",
+                            base = self.unit.text(base).trim(),
+                        ),
+                    );
+                    return format!(
+                        "{}({})",
+                        member,
+                        std::iter::once(recv_java)
+                            .chain(args.into_iter())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
             }
         }
 
@@ -462,7 +490,57 @@ impl<'a, 'u> Expr<'a, 'u> {
     fn navigation_call(&mut self, node: tree_sitter::Node) -> String {
         let raw = self.unit.text(node).replace("?.", ".");
         // member call: `.name(...)`
-        let raw_trimmed = raw.trim();
+        let mut raw_trimmed = raw.trim().to_string();
+        if let Some(r) = &self.unit.ext_receiver_name {
+            // `this.x` inside an extension body refers to the receiver param.
+            if raw_trimmed.starts_with("this.") {
+                raw_trimmed = format!("{}{}", r, &raw_trimmed[4..]);
+            }
+        }
+        // Compound receiver (itself a call/index/nav chain): the base must be
+        // translated as an expression — raw-text surgery would leave inner
+        // extension call sites verbatim (`s.shout().lowercase` would stay
+        // `s.shout().toLowerCase` instead of `shout(s).toLowerCase`).
+        let mut cursor = node.walk();
+        let kids: Vec<_> = node.children(&mut cursor).collect();
+        let base = kids.iter().find(|c| c.is_named()).copied();
+        if let Some(b) = base {
+            let compound = matches!(
+                b.kind(),
+                "call_expression"
+                    | "navigation_expression"
+                    | "indexing_expression"
+                    | "parenthesized"
+                    | "if_expression"
+                    | "when_expression"
+            );
+            if compound {
+                let member = kids
+                    .windows(2)
+                    .filter(|w| w[0].kind() == "." || w[0].kind() == "?.")
+                    .filter(|w| w[1].kind() == "identifier")
+                    .map(|w| self.unit.text(w[1]).to_string())
+                    .last();
+                if let Some(member) = member {
+                    let base_java = self.transpile(b);
+                    return match kotlin_member_to_java(&member) {
+                        Some(jm) if jm != member => format!("{}.{}", base_java, jm),
+                        Some(_) => format!("{}.{}", base_java, member),
+                        None => {
+                            self.unit.diags.warn_approx(
+                                node,
+                                self.unit.file,
+                                format!(
+                                    "stdlib member `.{}` not mapped; emitted verbatim (verify Java equivalent exists)",
+                                    member
+                                ),
+                            );
+                            format!("{}.{}", base_java, member)
+                        }
+                    };
+                }
+            }
+        }
         if let Some(dot) = raw_trimmed.rfind('.') {
             let member_end = raw_trimmed[dot + 1..]
                 .find('(')
