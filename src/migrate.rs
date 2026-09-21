@@ -17,31 +17,11 @@ pub enum MigrateOutcome {
     Deleted,
 }
 
-/// Pop and return the blockers (rendered `// NOTLIN: …` comment lines) whose
-/// byte offset falls inside [start..end), sorted by offset.
-fn take_blockers_in_range(
-    blockers: &mut Vec<(usize, String)>,
-    start: usize,
-    end: usize,
-) -> Vec<(usize, String)> {
-    let mut in_region: Vec<(usize, String)> = Vec::new();
-    blockers.retain(|(offset, text)| {
-        if *offset >= start && *offset < end {
-            in_region.push((*offset, text.clone()));
-            false
-        } else {
-            true
-        }
-    });
-    in_region.sort();
-    in_region
-}
-
 /// Strip translated spans from the source, insert `// NOTLIN: …` blocker
 /// comments ahead of untranslated residue, return the new text.
 pub fn strip_translated(source: &str, coverage: &FileCoverage) -> String {
     // Collect non-overlapping byte ranges to remove, sorted.
-    let mut spans: Vec<(usize, usize)> = coverage.translated_spans.iter().copied().collect();
+    let mut spans: Vec<(usize, usize)> = coverage.translated_spans.to_vec();
     spans.sort();
     spans.dedup();
 
@@ -76,7 +56,7 @@ pub fn strip_translated(source: &str, coverage: &FileCoverage) -> String {
     // lands immediately above the residue.
     let mut out = String::with_capacity(source.len());
     let mut cursor = 0usize;
-    let mut blockers: Vec<(usize, String)> = coverage.blockers.iter().cloned().collect();
+    let mut blockers: Vec<(usize, String)> = coverage.blockers.to_vec();
     for (start, end) in merged {
         flush_blockers(&mut blockers, cursor, start, &mut out);
         out.push_str(&source[cursor..start]);

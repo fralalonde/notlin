@@ -376,10 +376,10 @@ impl<'a, 'u> Stmt<'a, 'u> {
             return self.translate_range(range, var);
         }
         // downTo/step chains arrive as infix_expression with operator words.
-        if iter.kind() == "infix_expression" {
-            if let Some(java) = self.translate_infix_range(iter, var) {
-                return java;
-            }
+        if iter.kind() == "infix_expression"
+            && let Some(java) = self.translate_infix_range(iter, var)
+        {
+            return java;
         }
         // general iterable: for (var x : expr)
         let mut e = Expr { unit: self.unit };
@@ -437,7 +437,7 @@ impl<'a, 'u> Stmt<'a, 'u> {
                     self.unit.diags.warn_approx(
                         expr,
                         self.unit.file,
-                        format!("bare step on non-range operand not supported"),
+                        "bare step on non-range operand not supported".to_string(),
                     );
                     return None;
                 }
@@ -558,10 +558,10 @@ fn single_stmt_body<'t>(
 }
 
 fn unwrap_parens(node: tree_sitter::Node) -> tree_sitter::Node {
-    if node.kind() == "parenthesized" {
-        if let Some(inner) = node.children(&mut node.walk()).find(|c| c.is_named()) {
-            return inner;
-        }
+    if node.kind() == "parenthesized"
+        && let Some(inner) = node.children(&mut node.walk()).find(|c| c.is_named())
+    {
+        return inner;
     }
     node
 }

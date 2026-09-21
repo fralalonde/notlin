@@ -369,10 +369,10 @@ impl<'a> Unit<'a> {
             {
                 continue;
             }
-            if let Some(nm) = kt::field(n, "name") {
-                if self.text(nm) == name {
-                    return true;
-                }
+            if let Some(nm) = kt::field(n, "name")
+                && self.text(nm) == name
+            {
+                return true;
             }
         }
         false
@@ -1348,7 +1348,7 @@ impl<'a> Unit<'a> {
                     })
                     .and_then(|al| kt::child(al, "lambda_literal"))
                     .and_then(|ll| ll.children(&mut ll.walk()).find(|c| c.is_named()));
-                let cap = capitalize(&name);
+                let _cap = capitalize(&name);
                 match expr {
                     Some(body) => {
                         // if the body is a lambda (collection literal), take its
@@ -1452,10 +1452,10 @@ impl<'a> Unit<'a> {
         if let Some(body) = kt::parent_of(decl).filter(|p| p.kind() == "class_body") {
             let mut cursor = body.walk();
             for member in body.children(&mut cursor) {
-                if member.kind() == "function_declaration" {
-                    if let Some(mname) = kt::field(member, "name") {
-                        conflicts.push(self.text(mname).to_string());
-                    }
+                if member.kind() == "function_declaration"
+                    && let Some(mname) = kt::field(member, "name")
+                {
+                    conflicts.push(self.text(mname).to_string());
                 }
             }
         }
@@ -1581,10 +1581,11 @@ impl<'a> Unit<'a> {
                     .unwrap_or_default();
                 let targs = kt::child(expr, "type_arguments").map(|t| self.text(t).to_string());
                 // primitive array factories: intArrayOf(...) -> int[]
-                if !callee.is_empty() && !callee.contains('.') {
-                    if let Some(prim) = primitive_array_factory(&callee) {
-                        return prim.to_string();
-                    }
+                if !callee.is_empty()
+                    && !callee.contains('.')
+                    && let Some(prim) = primitive_array_factory(&callee)
+                {
+                    return prim.to_string();
                 }
                 if targs.is_none()
                     && matches!(
@@ -1624,10 +1625,10 @@ impl<'a> Unit<'a> {
                     ("mapOf", None) => "Map<Object, Object>".to_string(),
                     _ => {
                         // member call on a receiver: `m.keys()`, `xs.first()`
-                        if let Some(nav) = kt::child(expr, "navigation_expression") {
-                            if let Some((base, member)) = self.nav_base_member(nav) {
-                                return self.infer_member_type(base, &member, expr);
-                            }
+                        if let Some(nav) = kt::child(expr, "navigation_expression")
+                            && let Some((base, member)) = self.nav_base_member(nav)
+                        {
+                            return self.infer_member_type(base, &member, expr);
                         }
                         // Uppercase callee with no dot: constructor call
                         if !callee.contains('.')
@@ -1753,7 +1754,7 @@ impl<'a> Unit<'a> {
             .filter(|w| w[0].kind() == "." || w[0].kind() == "?.")
             .filter(|w| w[1].kind() == "identifier")
             .map(|w| self.text(w[1]).to_string())
-            .last();
+            .next_back();
         member.map(|m| (base, m))
     }
 

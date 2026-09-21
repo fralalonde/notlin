@@ -140,48 +140,48 @@ impl<'a, 'u> Expr<'a, 'u> {
             .to_string();
         let mut chars = inner.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '$' {
-                if let Some(&next) = chars.peek() {
-                    if next == '{' {
-                        // ${expr}
-                        if !current.is_empty() {
-                            parts.push(format!("{:?}", current));
-                            current = String::new();
-                        }
-                        let mut expr = String::new();
-                        chars.next(); // consume '{'
-                        let mut depth = 1;
-                        for ec in chars.by_ref() {
-                            if ec == '{' {
-                                depth += 1;
-                            } else if ec == '}' {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            expr.push(ec);
-                        }
-                        parts.push(format!("({})", expr));
-                        continue;
-                    } else if next.is_alphabetic() || next == '_' {
-                        // $identifier
-                        if !current.is_empty() {
-                            parts.push(format!("{:?}", current));
-                            current = String::new();
-                        }
-                        let mut ident = String::new();
-                        while let Some(&ic) = chars.peek() {
-                            if ic.is_alphanumeric() || ic == '_' {
-                                ident.push(ic);
-                                chars.next();
-                            } else {
+            if c == '$'
+                && let Some(&next) = chars.peek()
+            {
+                if next == '{' {
+                    // ${expr}
+                    if !current.is_empty() {
+                        parts.push(format!("{:?}", current));
+                        current = String::new();
+                    }
+                    let mut expr = String::new();
+                    chars.next(); // consume '{'
+                    let mut depth = 1;
+                    for ec in chars.by_ref() {
+                        if ec == '{' {
+                            depth += 1;
+                        } else if ec == '}' {
+                            depth -= 1;
+                            if depth == 0 {
                                 break;
                             }
                         }
-                        parts.push(ident);
-                        continue;
+                        expr.push(ec);
                     }
+                    parts.push(format!("({})", expr));
+                    continue;
+                } else if next.is_alphabetic() || next == '_' {
+                    // $identifier
+                    if !current.is_empty() {
+                        parts.push(format!("{:?}", current));
+                        current = String::new();
+                    }
+                    let mut ident = String::new();
+                    while let Some(&ic) = chars.peek() {
+                        if ic.is_alphanumeric() || ic == '_' {
+                            ident.push(ic);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    parts.push(ident);
+                    continue;
                 }
             }
             current.push(c);
@@ -325,17 +325,16 @@ impl<'a, 'u> Expr<'a, 'u> {
             .iter()
             .find(|c| c.kind() == "navigation_expression")
             .copied()
+            && let Some((base, member)) = self.unit.nav_base_member(nav)
         {
-            if let Some((base, member)) = self.unit.nav_base_member(nav) {
-                if self.unit.receiver_is_array(base) && matches!(member.as_str(), "size" | "length")
-                {
-                    // Kotlin `arr.size()`/`arr.size` -> Java `arr.length`.
-                    return format!("{}.length", self.transpile(base));
-                }
-                if let Some(_recv_ty) = self.unit.extension_fns.get(member.as_str()) {
-                    // `x.f(...)` for a same-file extension -> static `f(x, ...)`.
-                    let recv_java = self.transpile(base);
-                    self.unit.diags.warn_approx(
+            if self.unit.receiver_is_array(base) && matches!(member.as_str(), "size" | "length") {
+                // Kotlin `arr.size()`/`arr.size` -> Java `arr.length`.
+                return format!("{}.length", self.transpile(base));
+            }
+            if let Some(_recv_ty) = self.unit.extension_fns.get(member.as_str()) {
+                // `x.f(...)` for a same-file extension -> static `f(x, ...)`.
+                let recv_java = self.transpile(base);
+                self.unit.diags.warn_approx(
                         nav,
                         self.unit.file,
                         format!(
@@ -343,15 +342,14 @@ impl<'a, 'u> Expr<'a, 'u> {
                             base = self.unit.text(base).trim(),
                         ),
                     );
-                    return format!(
-                        "{}({})",
-                        member,
-                        std::iter::once(recv_java)
-                            .chain(args.into_iter())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
+                return format!(
+                    "{}({})",
+                    member,
+                    std::iter::once(recv_java)
+                        .chain(args.into_iter())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         }
 
@@ -520,7 +518,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .filter(|w| w[0].kind() == "." || w[0].kind() == "?.")
                     .filter(|w| w[1].kind() == "identifier")
                     .map(|w| self.unit.text(w[1]).to_string())
-                    .last();
+                    .next_back();
                 if let Some(member) = member {
                     let base_java = self.transpile(b);
                     return match kotlin_member_to_java(&member) {
@@ -552,7 +550,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                     return format!(
                         "{}{}",
                         &raw_trimmed[..dot + 1],
-                        &raw_trimmed[dot + 1..].replacen(member, &java_member, 1)
+                        raw_trimmed[dot + 1..].replacen(member, &java_member, 1)
                     );
                 }
                 return raw_trimmed.to_string();
@@ -912,10 +910,10 @@ impl<'a, 'u> Expr<'a, 'u> {
 }
 
 fn unwrap_paren_node(node: tree_sitter::Node) -> tree_sitter::Node {
-    if node.kind() == "parenthesized" {
-        if let Some(inner) = node.children(&mut node.walk()).find(|c| c.is_named()) {
-            return inner;
-        }
+    if node.kind() == "parenthesized"
+        && let Some(inner) = node.children(&mut node.walk()).find(|c| c.is_named())
+    {
+        return inner;
     }
     node
 }
