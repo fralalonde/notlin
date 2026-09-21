@@ -20,9 +20,22 @@ pub struct Unit<'a> {
     current_decl: Option<tree_sitter::Node<'a>>,
     /// node-id -> label for open declarations.
     decl_labels: std::collections::HashMap<usize, String>,
-    /// identifier name -> primitive marker, from inferred local decls and
-    /// primitive-typed function parameters in the current translation scope.
+    /// identifier name -> Java type (from params and local decls in the
+    /// current translation scope). Array params/locals map to `String[]`,
+    /// `int[]`, ... so callers can special-case `.size` -> `.length`.
     pub var_types: std::collections::HashMap<String, String>,
+    /// Extension functions declared in this file as statics: fn name ->
+    /// Java receiver type. Call sites `x.f(...)` are rewritten to the
+    /// static form `f(x, ...)` when the callee lands in this map
+    /// (same-file approximation; cross-file callers unaware).
+    pub extension_fns: std::collections::HashMap<String, String>,
+    /// Receiver parameter name while an extension function body is being
+    /// translated (None elsewhere). `this` inside the body maps to it.
+    pub ext_receiver_name: Option<String>,
+    /// superclass simple name -> direct subclasses declared in this file.
+    subclass_map: std::collections::HashMap<String, Vec<String>>,
+    /// names of sealed class declarations in this file.
+    sealed_types: std::collections::HashSet<String>,
 }
 
 impl<'a> Unit<'a> {
@@ -43,6 +56,10 @@ impl<'a> Unit<'a> {
             current_decl: None,
             decl_labels: std::collections::HashMap::new(),
             var_types: std::collections::HashMap::new(),
+            extension_fns: std::collections::HashMap::new(),
+            ext_receiver_name: None,
+            subclass_map: std::collections::HashMap::new(),
+            sealed_types: std::collections::HashSet::new(),
         }
     }
 
@@ -172,6 +189,10 @@ impl<'a> Unit<'a> {
             }
         }
 
+        // Pre-pass: superclass -> subclass relations drive `permits` emission
+        // for sealed classes and `final` on their subclasses.
+        self.collect_type_relations(root);
+
         // Partition: named types each get their own file; loose functions and
         // top-level properties go into ONE file named after the .kt source.
         let mut files: Vec<(String, String)> = Vec::new();
@@ -275,7 +296,76 @@ impl<'a> Unit<'a> {
         files
     }
 
-    /// Emit package + imports + annotation import into a new output file.
+    /// Pre-pass: walk the whole file for class declarations, recording
+    /// superclass -> direct subclasses and the set of sealed type names.
+    fn collect_type_relations(&mut self, root: tree_sitter::Node<'a>) {
+        let mut stack: Vec<tree_sitter::Node<'a>> = vec![root];
+        while let Some(n) = stack.pop() {
+            for c in n.children(&mut n.walk()) {
+                stack.push(c);
+            }
+            if n.kind() != "class_declaration" {
+                continue;
+            }
+            let Some(nm) = kt::field(n, "name") else {
+                continue;
+            };
+            let tname = self.text(nm).to_string();
+            let is_sealed = kt::child(n, "modifiers")
+                .map(|m| self.text(m).contains("sealed"))
+                .unwrap_or(false);
+            if is_sealed {
+                self.sealed_types.insert(tname.clone());
+            }
+            if let Some(sup) = self.superclass_name(n) {
+                self.subclass_map.entry(sup).or_default().push(tname);
+            }
+        }
+    }
+
+    /// Simple name of the direct superclass (constructor_invocation supertype).
+    fn superclass_name(&self, decl: tree_sitter::Node<'a>) -> Option<String> {
+        let dc = kt::child(decl, "delegation_specifiers")?;
+        let spec = dc
+            .children(&mut dc.walk())
+            .find(|s| s.kind() == "delegation_specifier")?;
+        let ci = spec
+            .children(&mut spec.walk())
+            .find(|c| c.kind() == "constructor_invocation")?;
+        let ut = ci
+            .children(&mut ci.walk())
+            .find(|c| c.kind() == "user_type")?;
+        let mut last: Option<tree_sitter::Node<'a>> = None;
+        for ch in ut.children(&mut ut.walk()) {
+            if ch.kind() == "identifier" {
+                last = Some(ch);
+            }
+        }
+        last.map(|n| self.text(n).to_string())
+    }
+
+    /// Whether `name` names a class declared somewhere inside `decl`'s subtree
+    /// (a nested class — shares `decl`'s emitted file, no permits needed).
+    fn decl_contains(&self, decl: tree_sitter::Node<'a>, name: &str) -> bool {
+        let mut stack: Vec<tree_sitter::Node<'a>> = vec![decl];
+        while let Some(n) = stack.pop() {
+            for c in n.children(&mut n.walk()) {
+                stack.push(c);
+            }
+            if n.id() == decl.id()
+                || !matches!(n.kind(), "class_declaration" | "object_declaration")
+            {
+                continue;
+            }
+            if let Some(nm) = kt::field(n, "name") {
+                if self.text(nm) == name {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn transpile_type_decl_set(
         &mut self,
         out: &mut JavaOut,
@@ -304,6 +394,7 @@ impl<'a> Unit<'a> {
     /// class / object (class-like) declarations
     fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
         let mut is_data = false;
+        let mut is_sealed = false;
         // Kotlin `interface` parses as class_declaration with an unnamed
         // `interface` keyword child.
         let is_interface = decl
@@ -320,7 +411,11 @@ impl<'a> Unit<'a> {
                             match cm.kind() {
                                 "data" => is_data = true,
                                 "open" | "abstract" | "sealed" => {
-                                    modifiers.push_str(self.text(cm));
+                                    let word = self.text(cm).trim();
+                                    if word == "sealed" {
+                                        is_sealed = true;
+                                    }
+                                    modifiers.push_str(word);
                                     modifiers.push(' ');
                                 }
                                 "annotation" | "companion" | "enum" | "inline" | "value"
@@ -453,6 +548,7 @@ impl<'a> Unit<'a> {
         // The grammar wraps each supertype in `delegation_specifier`
         // (constructor_invocation / explicit_delegation / user_type).
         let mut extends = String::new();
+        let mut superclass: Option<String> = None;
         if let Some(dc) = kt::child(decl, "delegation_specifiers") {
             let mut parts: Vec<String> = Vec::new();
             let mut cursor = dc.walk();
@@ -518,15 +614,50 @@ impl<'a> Unit<'a> {
                     .iter()
                     .filter_map(|p| p.strip_prefix("iface:"))
                     .collect();
+                if let Some(c) = classes.first() {
+                    superclass = Some(c.to_string());
+                }
                 let mut j = String::new();
                 if let Some(c) = classes.first() {
-                    j.push_str(&format!(" extends {}", c));
+                    j.push_str(&format!(" extends {c}"));
                 }
                 if !ifaces.is_empty() {
                     j.push_str(&format!(" implements {}", ifaces.join(", ")));
                 }
                 if !j.is_empty() {
                     extends = j;
+                }
+            }
+        }
+
+        // Sealed classes: Java needs a `permits` clause for direct subclasses
+        // that land in other files; same-file nested subclasses share this
+        // compilation unit and need none. With no in-file subclasses at all,
+        // `sealed` has no legal Java form — fall back to a plain class.
+        let mut permits = String::new();
+        if is_sealed {
+            let subs = self
+                .subclass_map
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or_default();
+            if subs.is_empty() {
+                modifiers = modifiers.replace("sealed ", "");
+                self.diag_approx(
+                    decl,
+                    format!(
+                        "sealed class '{}': no subclasses declared in this file; emitted as a plain class (sealed restriction lost)",
+                        name
+                    ),
+                );
+            } else {
+                let top: Vec<String> = subs
+                    .iter()
+                    .filter(|s| !self.decl_contains(decl, s))
+                    .cloned()
+                    .collect();
+                if !top.is_empty() {
+                    permits = format!(" permits {}", top.join(", "));
                 }
             }
         }
@@ -641,9 +772,22 @@ impl<'a> Unit<'a> {
         } else {
             // Java places type params after the class name: `class Name<T>`.
             let tp = type_params.trim_end(); // "<T>" or "" (no space needed before '{')
+            // Subclasses of a file-sealed type must be final in Java (Kotlin
+            // classes are final by default unless open/abstract/sealed).
+            let final_kw = if is_sealed || modifiers.contains("abstract") {
+                ""
+            } else if let Some(sp) = &superclass {
+                if self.sealed_types.contains(sp) {
+                    "final "
+                } else {
+                    ""
+                }
+            } else {
+                ""
+            };
             out.open(format!(
-                "{}{}{} {}{}{}",
-                visibility, modifiers, kind_word, name, tp, extends
+                "{}{}{}{} {}{}{}{}",
+                visibility, final_kw, modifiers, kind_word, name, tp, extends, permits
             ));
             // fields
             for (is_val, fname, ftype) in &params {
