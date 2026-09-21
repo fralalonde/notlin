@@ -84,7 +84,7 @@ fn migration_on_tmpdir_trim_and_delete() {
         untranslated: vec!["Bad".into()],
         ..Default::default()
     };
-    let out = migrate::migrate(&partial, src, &cov_partial_placeholder()).unwrap();
+    let out = migrate::migrate(&partial, src, &cov_partial).unwrap();
     match out {
         migrate::MigrateOutcome::Trimmed { remaining_bytes } => {
             let kept = std::fs::read_to_string(&partial).unwrap();
@@ -96,11 +96,4 @@ fn migration_on_tmpdir_trim_and_delete() {
     }
 
     std::fs::remove_dir_all(&dir).ok();
-}
-
-fn cov_partial_placeholder() -> FileCoverage {
-    let mut cov = FileCoverage::default();
-    cov.translated_spans.push((0, 20));
-    cov.untranslated.push("Bad".into());
-    cov
 }
