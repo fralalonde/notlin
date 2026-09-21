@@ -410,6 +410,10 @@ impl<'a> Unit<'a> {
                                     let getter = kt::child(member, "getter");
                                     match getter.and_then(|g| kt::child(g, "function_body")) {
                                         Some(gb) => {
+                                            // Fresh scope for the accessor body:
+                                            // locals must not leak into later
+                                            // interface members.
+                                            self.var_types.clear();
                                             out.open(format!("default {} get{}()", pty, cap));
                                             self.transpile_function_body(gb, out);
                                             out.close();
@@ -420,6 +424,7 @@ impl<'a> Unit<'a> {
                                         let setter = kt::child(member, "setter");
                                         match setter.and_then(|s| kt::child(s, "function_body")) {
                                             Some(sb) => {
+                                                self.var_types.clear();
                                                 out.open(format!(
                                                     "default void set{}({} value)",
                                                     cap, pty
