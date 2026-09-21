@@ -8,6 +8,9 @@ use crate::transpiler::kt;
 
 impl<'a> Unit<'a> {
     pub(crate) fn transpile_property(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
+        // Fresh scope per property: getter/setter bodies must not see locals
+        // declared while a previous property was translated.
+        self.var_types.clear();
         let is_val = kt::child(decl, "val").is_some();
         let vd = kt::child(decl, "variable_declaration");
         let name = vd

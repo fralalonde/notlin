@@ -23,6 +23,10 @@ impl<'a> Unit<'a> {
         is_main: bool,
         out: &mut JavaOut,
     ) {
+        // Each declaration is its own translation scope: params and locals
+        // must not leak from a previously emitted function (var_types
+        // persists on Unit across top-level and member declarations).
+        self.var_types.clear();
         let name = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_else(|| "anon".to_string());
