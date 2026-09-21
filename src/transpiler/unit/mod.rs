@@ -24,6 +24,9 @@ pub struct Unit<'a> {
     pub diags: &'a mut Diagnostics,
     pub annots: AnnotationSet,
     pub untranslatable_as_error: bool,
+    /// Assume Lombok on target classpath (--lombok): data classes emit as
+    /// @Data classes (mutable), hand-rolled accessors become annotations.
+    pub lombok: bool,
     /// Per-file coverage: which declarations translated, which didn't.
     pub coverage: FileCoverage,
     /// Name of the declaration currently being translated; diagnostics raised
@@ -56,6 +59,7 @@ impl<'a> Unit<'a> {
         diags: &'a mut Diagnostics,
         annots: AnnotationSet,
         untranslatable_as_error: bool,
+        lombok: bool,
     ) -> Self {
         Self {
             source,
@@ -63,6 +67,7 @@ impl<'a> Unit<'a> {
             diags,
             annots,
             untranslatable_as_error,
+            lombok,
             coverage: FileCoverage::default(),
             current_decl: None,
             decl_labels: std::collections::HashMap::new(),

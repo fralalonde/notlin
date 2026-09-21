@@ -24,6 +24,12 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "jetbrains")]
     pub annotations: Annotations,
 
+    /// Assume Lombok on the target classpath: data classes emit as
+    /// @Data classes with mutable fields instead of records; getter/setter
+    /// hand-rolling is replaced by Lombok annotations elsewhere.
+    #[arg(long)]
+    pub lombok: bool,
+
     /// Print the tree-sitter parse tree instead of transpiling
     #[arg(long)]
     pub dump_ast: bool,

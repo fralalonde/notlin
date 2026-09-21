@@ -92,6 +92,16 @@ impl<'a> Unit<'a> {
         for imp in imports {
             out.line(format!("import {};", imp));
         }
+        // Under --lombok the emitted @Data/@AllArgsConstructor need their
+        // imports; user-declared lombok imports (Lombok-flagged source) may
+        // already provide some — add only what's missing, exactly once.
+        if self.lombok {
+            for want in ["lombok.Data", "lombok.AllArgsConstructor"] {
+                if !imports.iter().any(|i| i == want) {
+                    out.line(format!("import {};", want));
+                }
+            }
+        }
         // The generated body uses ArrayList/HashMap/HashSet/List/Map/Set from
         // stdlib collections; java.util.* covers them all in one line.
         out.line("import java.util.*;");
@@ -456,8 +466,40 @@ impl<'a> Unit<'a> {
             out.close();
             return;
         }
+        if is_data && !params.is_empty() && self.lombok {
+            // --lombok: data class -> @Data class with mutable fields
+            // (@Data generates equals/hashCode/toString/getters/setters;
+            // var properties keep their setters semantically).
+            out.line("@Data");
+            out.line("@AllArgsConstructor");
+            out.blank();
+            let tp = type_params.trim_end();
+            out.open(format!(
+                "{}{}class {}{}{}",
+                visibility, modifiers, name, tp, extends
+            ));
+            for (is_val, fname, ftype) in &params {
+                // final val fields: @Data omits the setter automatically
+                let final_kw = if *is_val { "final " } else { "" };
+                out.line(format!("private {}{} {};", final_kw, ftype, fname));
+            }
+            out.blank();
+            if let Some(body) = kt::child(decl, "class_body") {
+                self.transpile_class_body(body, out);
+            }
+            out.close();
+            return;
+        }
         if is_data && !params.is_empty() {
-            // record: parameters become record components
+            // record: parameters become record components. NOTE: records are
+            // immutable — Kotlin data classes with `var` components lose
+            // setter semantics; warn when any component is a var.
+            if params.iter().any(|(is_val, _, _)| !*is_val) {
+                self.diag_approx(
+                    decl,
+                    "data class emitted as an immutable record: `var` components lose setters (use --lombok for a mutable @Data class)",
+                );
+            }
             let comps: Vec<String> = params
                 .iter()
                 .map(|(_, n, t)| format!("{} {}", t, n))
@@ -501,20 +543,27 @@ impl<'a> Unit<'a> {
             } else {
                 ""
             };
+            // --lombok: hand-rolled accessors/equals/hashCode/toString become
+            // Lombok annotations placed BEFORE the class declaration.
+            if self.lombok && !params.is_empty() {
+                out.line("@Data");
+                out.line("@AllArgsConstructor");
+                out.blank();
+            }
             out.open(format!(
                 "{}{}{}{} {}{}{}{}",
                 visibility, final_kw, modifiers, kind_word, name, tp, extends, permits
             ));
-            // fields
+            // fields (final for val: @Data skips the setter on a final field)
             for (is_val, fname, ftype) in &params {
-                let _ = is_val;
-                out.line(format!("private {} {};", ftype, fname));
+                let final_kw = if *is_val { "final " } else { "" };
+                out.line(format!("private {}{} {};", final_kw, ftype, fname));
             }
             if !params.is_empty() {
                 out.blank();
             }
-            // constructor
-            if !params.is_empty() {
+            // constructor (redundant under --lombok: AllArgsConstructor)
+            if !params.is_empty() && !self.lombok {
                 out.open(format!("public {}({})", name, {
                     params
                         .iter()
@@ -528,19 +577,21 @@ impl<'a> Unit<'a> {
                 out.close();
                 out.blank();
             }
-            // accessors
-            for (is_val, fname, ftype) in &params {
-                let cap = capitalize(fname);
-                out.open(format!("public {} get{}()", ftype, cap));
-                out.line(format!("return {};", fname));
-                out.close();
-                if !*is_val {
-                    out.blank();
-                    out.open(format!("public void set{}({} {})", cap, ftype, fname));
-                    out.line(format!("this.{} = {};", fname, fname));
+            // accessors (skipped under --lombok: @Data generates them)
+            if !self.lombok {
+                for (is_val, fname, ftype) in &params {
+                    let cap = capitalize(fname);
+                    out.open(format!("public {} get{}()", ftype, cap));
+                    out.line(format!("return {};", fname));
                     out.close();
+                    if !*is_val {
+                        out.blank();
+                        out.open(format!("public void set{}({} {})", cap, ftype, fname));
+                        out.line(format!("this.{} = {};", fname, fname));
+                        out.close();
+                    }
+                    out.blank();
                 }
-                out.blank();
             } // body members
             if let Some(body) = kt::child(decl, "class_body") {
                 self.transpile_class_body(body, out);

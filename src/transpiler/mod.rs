@@ -76,7 +76,14 @@ pub fn transpile(
     let untranslatable_as_error = matches!(cli.untranslatable, UntranslatableMode::Error);
 
     let (java_files, unit) = {
-        let mut unit = Unit::new(source, file, &mut diags, annots, untranslatable_as_error);
+        let mut unit = Unit::new(
+            source,
+            file,
+            &mut diags,
+            annots,
+            untranslatable_as_error,
+            cli.lombok,
+        );
         let java_files = unit.run(tree.root_node());
         let coverage = std::mem::take(&mut unit.coverage);
         (java_files, coverage)

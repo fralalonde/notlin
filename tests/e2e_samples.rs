@@ -212,3 +212,47 @@ fun topLevel() {}
     assert!(names.contains(&"Beta.java"));
     assert!(names.contains(&"Multi.java")); // file-level utility class
 }
+
+#[test]
+fn lombok_flag_emits_mutable_data_class() {
+    let source = r#"data class Point(var x: Int, val y: String)"#;
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--lombok", "Point.kt"]);
+    let path = PathBuf::from("Point.kt");
+    let (files, errors, _warnings, _cov) = notlin::transpiler::transpile(source, &path, &cli);
+    assert_eq!(errors, 0);
+    let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
+    // @Data/@AllArgsConstructor replace the record; var field stays mutable
+    assert!(all.contains("@Data"), "missing @Data");
+    assert!(all.contains("@AllArgsConstructor"));
+    assert!(all.contains("import lombok.Data;"));
+    assert!(all.contains("import lombok.AllArgsConstructor;"));
+    assert!(
+        all.contains("private int x;"),
+        "var component must stay mutable"
+    );
+    assert!(
+        all.contains("private final String y;"),
+        "val component is final"
+    );
+    // hand-rolled boilerplate suppressed: Lombok owns accessors/ctor
+    assert!(
+        !all.contains("public int getX()"),
+        "@Data should own accessors"
+    );
+    assert!(
+        !all.contains("public Point(int x, String y)"),
+        "@AllArgsConstructor should own the ctor"
+    );
+
+    // without --lombok the same source degrades to an immutable record + warning
+    let cli_plain = notlin::cli::Cli::parse_from(vec!["notlin", "Point.kt"]);
+    let (files2, errors2, warnings2, _cov2) =
+        notlin::transpiler::transpile(source, &path, &cli_plain);
+    assert_eq!(errors2, 0);
+    assert!(
+        warnings2 > 0,
+        "var component should warn when degraded to a record"
+    );
+    let all2 = files2.iter().map(|(_, c)| c.as_str()).collect::<String>();
+    assert!(all2.contains("public record Point(int x, String y)"));
+}
