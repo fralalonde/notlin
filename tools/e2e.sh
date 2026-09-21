@@ -29,7 +29,7 @@ for kt in "$(dirname "$0")"/../samples/*.kt; do
         ok=0
     fi
     if [ "$ok" -eq 1 ]; then
-        javac_out=$("$JAVAC" -d "$dir" -cp "$extra_cp" "$dir"/*.java 2>&1)
+        javac_out=$("$JAVAC" -d "$dir" -cp "$extra_cp" "$dir"/*.java 2>&1 | grep -v '^Picked up JAVA_TOOL_OPTIONS')
         if [ -n "$javac_out" ]; then
             echo "FAIL(javac) $name:"
             echo "$javac_out" | head -8
