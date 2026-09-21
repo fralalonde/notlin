@@ -1,5 +1,5 @@
 //! Top-level compilation unit: package, imports, declarations.
-use crate::diagnostics::{DiagnosticKind, Diagnostics};
+use crate::diagnostics::{DiagnosticKind, Diagnostics, FileCoverage};
 use crate::transpiler::expr::Expr;
 use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
@@ -13,6 +13,13 @@ pub struct Unit<'a> {
     pub diags: &'a mut Diagnostics,
     pub annots: AnnotationSet,
     pub untranslatable_as_error: bool,
+    /// Per-file coverage: which declarations translated, which didn't.
+    pub coverage: FileCoverage,
+    /// Name of the declaration currently being translated; diagnostics raised
+    /// while this is Some are attributed to it for in-place migration policy.
+    current_decl: Option<tree_sitter::Node<'a>>,
+    /// node-id -> label for open declarations.
+    decl_labels: std::collections::HashMap<usize, String>,
 }
 
 impl<'a> Unit<'a> {
@@ -29,7 +36,47 @@ impl<'a> Unit<'a> {
             diags,
             annots,
             untranslatable_as_error,
+            coverage: FileCoverage::default(),
+            current_decl: None,
+            decl_labels: std::collections::HashMap::new(),
         }
+    }
+
+    /// Mark `node` as the declaration under translation: any untranslatable
+    /// diagnostic raised inside its subtree taints the whole declaration.
+    fn begin_decl(&mut self, node: tree_sitter::Node<'a>, label: String) {
+        self.current_decl = Some(node);
+        self.coverage.translated.push(label.clone());
+        self.decl_labels.insert(node.id(), label);
+    }
+
+    fn end_decl(&mut self) {
+        // Record the translated span for in-place stripping.
+        if let Some(node) = self.current_decl.take() {
+            let label = self
+                .decl_labels
+                .get(&node.id())
+                .cloned()
+                .unwrap_or_default();
+            let tainted = self.coverage.untranslated.contains(&label);
+            if !tainted {
+                self.coverage
+                    .translated_spans
+                    .push((node.start_byte(), node.end_byte()));
+            } else {
+                // stays in the .kt file; not counted as translated
+                self.coverage.translated.retain(|l| l != &label);
+            }
+            self.decl_labels.remove(&node.id());
+        }
+    }
+
+    /// Mark a declaration label as untranslated (must remain in the .kt file).
+    fn taint_decl(&mut self, label: &str) {
+        if !self.coverage.untranslated.iter().any(|l| l == label) {
+            self.coverage.untranslated.push(label.to_string());
+        }
+        self.coverage.translated.retain(|l| l != label);
     }
 
     pub fn text<'t>(&self, node: tree_sitter::Node<'t>) -> &'t str
@@ -45,6 +92,24 @@ impl<'a> Unit<'a> {
         } else {
             crate::diagnostics::Severity::Warning
         };
+
+        // Taint the enclosing declaration (if any) so --in-place migration
+        // knows this declaration must stay in the .kt file.
+        if let Some(decl_node) = self.current_decl {
+            // Simple containment: diagnostic node's byte range inside the
+            // declaration's byte range.
+            let inside = node.start_byte() >= decl_node.start_byte()
+                && node.end_byte() <= decl_node.end_byte();
+            if inside {
+                let label = self
+                    .decl_labels
+                    .get(&decl_node.id())
+                    .cloned()
+                    .unwrap_or_default();
+                self.taint_decl(&label);
+            }
+        }
+
         self.diags.push(crate::diagnostics::Diagnostic {
             severity: sev,
             kind: DiagnosticKind::Untranslatable,
@@ -66,7 +131,7 @@ impl<'a> Unit<'a> {
         });
     }
 
-    pub fn run(&mut self, root: tree_sitter::Node) -> Vec<(String, String)> {
+    pub fn run(&mut self, root: tree_sitter::Node<'a>) -> Vec<(String, String)> {
         // Collect top-level structure
         let mut package = String::new();
         let mut imports: Vec<String> = Vec::new();
@@ -116,10 +181,19 @@ impl<'a> Unit<'a> {
                     let mut out = JavaOut::new();
                     let imports2 = imports.clone();
                     let package2 = package.clone();
+                    self.begin_decl(*decl, type_name.clone());
                     self.transpile_type_decl_set(&mut out, &package2, &imports2, |unit, out| {
                         unit.transpile_type_decl(*decl, out);
                     });
-                    files.push((format!("{}.java", type_name), out.finish()));
+                    self.end_decl();
+                    if !self.coverage.untranslated.iter().any(|l| l == &type_name) {
+                        files.push((format!("{}.java", type_name), out.finish()));
+                    } else {
+                        log::info!(
+                            "skipping {}.java — declaration has untranslatables",
+                            type_name
+                        );
+                    }
                 }
                 "function_declaration" | "property_declaration" => {
                     // accumulate for the file-level utility class below
@@ -154,6 +228,10 @@ impl<'a> Unit<'a> {
                 out.line(format!("private {}() {{}}", file_class_name));
                 out.blank();
                 for decl in &loose {
+                    let label = kt::field(**decl, "name")
+                        .map(|n| unit.text(n).to_string())
+                        .unwrap_or_else(|| "<anonymous>".to_string());
+                    unit.begin_decl(**decl, label.clone());
                     match decl.kind() {
                         "function_declaration" => {
                             let is_main = kt::field(**decl, "name")
@@ -168,10 +246,26 @@ impl<'a> Unit<'a> {
                         }
                         _ => {}
                     }
+                    unit.end_decl();
                 }
                 out.close();
             });
-            files.push((format!("{}.java", file_class_name), out.finish()));
+            // The file-level utility class is emitted only if at least one
+            // loose declaration survived (clean members are in `translated`).
+            let clean_count = loose
+                .iter()
+                .filter(|d| {
+                    let label = kt::field(***d, "name")
+                        .map(|n| self.text(n).to_string())
+                        .unwrap_or_else(|| "<anonymous>".to_string());
+                    !self.coverage.untranslated.iter().any(|l| l == &label)
+                })
+                .count();
+            if clean_count > 0 {
+                files.push((format!("{}.java", file_class_name), out.finish()));
+            } else {
+                log::info!("all top-level members untranslatable; skipping utility class");
+            }
         }
 
         files

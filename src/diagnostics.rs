@@ -177,3 +177,29 @@ impl Diagnostics {
         });
     }
 }
+
+/// Per-file coverage accounting, driving the in-place migration policy.
+#[derive(Debug, Default)]
+pub struct FileCoverage {
+    /// Top-level and member declarations successfully emitted to Java.
+    pub translated: Vec<String>,
+    /// Declarations that could not be translated (untranslatable constructs
+    /// inside them, or no Java counterpart at all).
+    pub untranslated: Vec<String>,
+    /// Declaration source spans (byte ranges) that were translated — used to
+    /// strip them from the .kt file in --in-place mode.
+    pub translated_spans: Vec<(usize, usize)>,
+    /// Byte ranges of comments attached to translated declarations, so the
+    /// doc-comment travels with the code into the Java file conceptually.
+    pub attached_comment_spans: Vec<(usize, usize)>,
+}
+
+impl FileCoverage {
+    pub fn is_fully_translated(&self) -> bool {
+        !self.translated_spans.is_empty() && self.untranslated.is_empty()
+    }
+
+    pub fn is_partially_translated(&self) -> bool {
+        !self.translated_spans.is_empty() && !self.untranslated.is_empty()
+    }
+}
