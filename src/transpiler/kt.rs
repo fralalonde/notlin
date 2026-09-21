@@ -1,4 +1,5 @@
 //! Node helpers shared by all translation modules.
+use crate::transpiler::types::AnnotationSet;
 
 /// Get a named child by kind (first match).
 pub fn child<'t>(node: tree_sitter::Node<'t>, kind: &str) -> Option<tree_sitter::Node<'t>> {
@@ -34,6 +35,33 @@ pub fn text<'t>(node: tree_sitter::Node<'t>, source: &'t str) -> &'t str {
 }
 
 /// Translate a Kotlin user_type / type node into Java source text.
+/// `mark_nullable` prefixes the result with the annotation set's @Nullable
+/// when the type is nullable (annotation-then-hope-for-the-best policy).
+/// Nullable primitives must box (`Int?` can never be `@Nullable int` — null
+/// needs a reference type), so their Java name is swapped for the boxed form.
+pub fn java_type_ann(node: tree_sitter::Node, source: &str, annots: AnnotationSet) -> String {
+    let java = java_type(node, source);
+    if node.kind() == "nullable_type" {
+        let java = match java.as_str() {
+            "int" => "Integer",
+            "long" => "Long",
+            "short" => "Short",
+            "byte" => "Byte",
+            "double" => "Double",
+            "float" => "Float",
+            "boolean" => "Boolean",
+            "char" => "Character",
+            other => other,
+        }
+        .to_string();
+        if let Some(a) = annots.nullable() {
+            return format!("{} {}", a, java);
+        }
+        return java;
+    }
+    java
+}
+
 pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
     match node.kind() {
         "user_type" => {

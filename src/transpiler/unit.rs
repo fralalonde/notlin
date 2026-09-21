@@ -365,7 +365,7 @@ impl<'a> Unit<'a> {
                         Some((
                             is_val,
                             self.text(ident).to_string(),
-                            kt::java_type(ty, self.source),
+                            kt::java_type_ann(ty, self.source, self.annots),
                         ))
                     })
                     .collect()
@@ -423,7 +423,7 @@ impl<'a> Unit<'a> {
                                     let pname = self.text(ident).to_string();
                                     let pty = kt::child(vd, "user_type")
                                         .or_else(|| kt::child(vd, "nullable_type"))
-                                        .map(|t| kt::java_type(t, self.source))
+                                        .map(|t| kt::java_type_ann(t, self.source, self.annots))
                                         .unwrap_or_else(|| "Object".to_string());
                                     let cap = capitalize(&pname);
                                     out.line(format!("{} get{}();", pty, cap));
@@ -649,7 +649,7 @@ impl<'a> Unit<'a> {
                     match k.kind() {
                         "user_type" | "nullable_type" | "function_type" | "type"
                         | "parenthesized_type" => {
-                            ret = kt::java_type(k, self.source);
+                            ret = kt::java_type_ann(k, self.source, self.annots);
                         }
                         _ => {}
                     }
@@ -669,7 +669,7 @@ impl<'a> Unit<'a> {
                         .unwrap_or_else(|| "arg".to_string());
                     let pty = kt::child(p, "user_type")
                         .or_else(|| kt::child(p, "nullable_type"))
-                        .map(|t| kt::java_type(t, self.source))
+                        .map(|t| kt::java_type_ann(t, self.source, self.annots))
                         .unwrap_or_else(|| "Object".to_string());
                     params.push(format!("{} {}", pty, pname));
                 }
@@ -751,7 +751,7 @@ impl<'a> Unit<'a> {
             .unwrap_or_else(|| "prop".to_string());
         let ty = vd
             .and_then(|v| kt::child(v, "user_type").or_else(|| kt::child(v, "nullable_type")))
-            .map(|t| kt::java_type(t, self.source));
+            .map(|t| kt::java_type_ann(t, self.source, self.annots));
         let _visibility = self.visibility_of(decl);
 
         let getter = kt::child(decl, "getter");

@@ -174,6 +174,29 @@ fn annotations_option_controls_import() {
 }
 
 #[test]
+fn nullable_types_get_annotations() {
+    let source = r#"class Holder(var name: String) {
+    var nick: String? = null
+    fun find(q: String?): String? {
+        return nick
+    }
+}"#;
+    let (files, errors, _) = {
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Holder.kt"]);
+        let path = PathBuf::from("Holder.kt");
+        notlin::transpiler::transpile(source, &path, &cli)
+    };
+    assert_eq!(errors, 0);
+    let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
+    assert!(all.contains("@Nullable String nick"), "field anno missing");
+    assert!(
+        all.contains("public @Nullable String find"),
+        "ret anno missing"
+    );
+    assert!(all.contains("(@Nullable String q)"), "param anno missing");
+}
+
+#[test]
 fn multi_file_output_one_type_per_file() {
     let source = r#"package p
 

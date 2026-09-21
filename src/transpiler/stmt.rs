@@ -60,7 +60,7 @@ impl<'a, 'u> Stmt<'a, 'u> {
             .unwrap_or_else(|| "local".to_string());
         let declared_ty = vd
             .and_then(|v| kt::child(v, "user_type").or_else(|| kt::child(v, "nullable_type")))
-            .map(|t| kt::java_type(t, self.unit.source));
+            .map(|t| kt::java_type_ann(t, self.unit.source, self.unit.annots));
 
         let init = self.unit.property_initializer(decl);
         let mut e = Expr { unit: self.unit };
