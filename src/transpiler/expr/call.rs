@@ -3,6 +3,7 @@
 
 use super::Expr;
 use crate::transpiler::kt;
+use crate::transpiler::unit::primitive_array_factory;
 
 impl<'a, 'u> Expr<'a, 'u> {
     pub(crate) fn call(&mut self, node: tree_sitter::Node) -> String {
@@ -182,6 +183,13 @@ impl<'a, 'u> Expr<'a, 'u> {
             "emptyList" => "List.of()".to_string(),
             "emptyMap" => "Map.of()".to_string(),
             "emptySet" => "Set.of()".to_string(),
+            k if primitive_array_factory(k).is_some() => {
+                // Kotlin array literal factories -> Java array literals:
+                // `intArrayOf(1, 2)` -> `new int[]{1, 2}`, `arrayOf(...)` ->
+                // `new Object[]{...}` (reuses the inference table).
+                let elem = primitive_array_factory(k).unwrap().trim_end_matches("[]");
+                format!("new {}[]{{{}}}", elem, args.join(", "))
+            }
             _ => {
                 // Uppercase callee with no dot = constructor call
                 if !callee_java.contains('.')

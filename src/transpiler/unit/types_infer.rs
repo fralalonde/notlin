@@ -223,7 +223,7 @@ impl<'a> Unit<'a> {
 }
 
 /// Kotlin primitive-array factories -> Java array type.
-fn primitive_array_factory(name: &str) -> Option<&'static str> {
+pub(crate) fn primitive_array_factory(name: &str) -> Option<&'static str> {
     Some(match name {
         "intArrayOf" => "int[]",
         "longArrayOf" => "long[]",

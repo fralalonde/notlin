@@ -16,6 +16,8 @@ mod function;
 mod property;
 mod types_infer;
 
+pub(crate) use types_infer::primitive_array_factory;
+
 pub struct Unit<'a> {
     pub source: &'a str,
     pub file: &'a Path,
