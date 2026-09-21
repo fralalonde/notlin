@@ -415,9 +415,40 @@ impl<'a, 'u> Expr<'a, 'u> {
         }
     }
 
-    /// navigation used as a call target: keep dots, strip ?.
+    /// navigation used as a call target: keep dots, strip ?., and rewrite
+    /// Kotlin-stdlib method names to their Java counterparts; anything not in
+    /// the known-mapping set warns (call-site portability risk).
     fn navigation_call(&mut self, node: tree_sitter::Node) -> String {
-        self.unit.text(node).replace("?.", ".")
+        let raw = self.unit.text(node).replace("?.", ".");
+        // member call: `.name(...)`
+        let raw_trimmed = raw.trim();
+        if let Some(dot) = raw_trimmed.rfind('.') {
+            let member_end = raw_trimmed[dot + 1..]
+                .find('(')
+                .map(|i| dot + 1 + i)
+                .unwrap_or(raw_trimmed.len());
+            let member = &raw_trimmed[dot + 1..member_end];
+            if let Some(java_member) = kotlin_member_to_java(member) {
+                if java_member != member {
+                    return format!(
+                        "{}{}",
+                        &raw_trimmed[..dot + 1],
+                        &raw_trimmed[dot + 1..].replacen(member, &java_member, 1)
+                    );
+                }
+                return raw_trimmed.to_string();
+            }
+            // Unknown member on a receiver: warn, pass through
+            self.unit.diags.warn_approx(
+                node,
+                self.unit.file,
+                format!(
+                    "stdlib member `.{}` not mapped; emitted verbatim (verify Java equivalent exists)",
+                    member
+                ),
+            );
+        }
+        raw_trimmed.to_string()
     }
 
     fn type_arg_of(&self, call: tree_sitter::Node) -> Option<String> {
@@ -768,6 +799,60 @@ fn unwrap_paren_node(node: tree_sitter::Node) -> tree_sitter::Node {
         }
     }
     node
+}
+
+/// Kotlin stdlib member -> Java counterpart. None = not recognized as
+/// stdlib (user-defined methods pass through unmapped).
+fn kotlin_member_to_java(member: &str) -> Option<String> {
+    let mapped: Option<&str> = match member {
+        "uppercase" => Some("toUpperCase"),
+        "lowercase" => Some("toLowerCase"),
+        "keys" => Some("keySet"),
+        "entries" => Some("entrySet"),
+        // no-arg collection ops with Java Collection/Stream equivalents
+        "firstOrNull" => Some("stream().findFirst().orElse(null)"),
+        "last" => Some("stream().reduce((a, b) -> b).orElse(null)"),
+        "reversed" => Some("reversed()"),
+        "count" => Some("size()"),
+        _ => None,
+    };
+    if let Some(m) = mapped {
+        return Some(m.to_string());
+    }
+    // Same-spelling names that exist in Java: safe pass-through, no warn
+    const SAFE: &[&str] = &[
+        "trim",
+        "size",
+        "isEmpty",
+        "values",
+        "length",
+        "put",
+        "stream",
+        "iterator",
+        "hashCode",
+        "toString",
+        "equals",
+        "compareTo",
+        "contains",
+        "indexOf",
+        "lastIndexOf",
+        "startsWith",
+        "endsWith",
+        "substring",
+        "replace",
+        "split",
+        "chars",
+        "get",
+        "containsKey",
+        "containsValue",
+        "remove",
+        "clear",
+        "add",
+    ];
+    if SAFE.contains(&member) {
+        return Some(member.to_string());
+    }
+    None
 }
 
 fn is_likely_primitive(expr_text: &str) -> bool {
