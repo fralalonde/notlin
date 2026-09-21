@@ -192,6 +192,10 @@ pub struct FileCoverage {
     /// Byte ranges of comments attached to translated declarations, so the
     /// doc-comment travels with the code into the Java file conceptually.
     pub attached_comment_spans: Vec<(usize, usize)>,
+    /// Blocking diagnostics attached to untranslated deletions, mapped by
+    /// insertion byte offset (start of the untranslated span): rendered
+    /// `// NOTLIN: <CODE> <message>` stubs for --in-place residue.
+    pub blockers: Vec<(usize, String)>,
 }
 
 impl FileCoverage {

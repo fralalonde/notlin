@@ -1,6 +1,8 @@
 //! In-place migration: after transpiling a .kt file, strip the declarations
 //! that produced Java output from the .kt source. Fully-translated files are
-//! deleted; partially-translated files are rewritten with the leftovers.
+//! deleted; partially-translated files are rewritten with the leftovers,
+//! each blocking construct annotated with a `// NOTLIN: <code> <message>`
+//! stub that mirrors the console diagnostic.
 use crate::diagnostics::FileCoverage;
 use std::path::Path;
 
@@ -15,7 +17,28 @@ pub enum MigrateOutcome {
     Deleted,
 }
 
-/// Strip translated spans from the source, tidy whitespace, return the new text.
+/// Pop and return the blockers (rendered `// NOTLIN: …` comment lines) whose
+/// byte offset falls inside [start..end), sorted by offset.
+fn take_blockers_in_range(
+    blockers: &mut Vec<(usize, String)>,
+    start: usize,
+    end: usize,
+) -> Vec<(usize, String)> {
+    let mut in_region: Vec<(usize, String)> = Vec::new();
+    blockers.retain(|(offset, text)| {
+        if *offset >= start && *offset < end {
+            in_region.push((*offset, text.clone()));
+            false
+        } else {
+            true
+        }
+    });
+    in_region.sort();
+    in_region
+}
+
+/// Strip translated spans from the source, insert `// NOTLIN: …` blocker
+/// comments ahead of untranslated residue, return the new text.
 pub fn strip_translated(source: &str, coverage: &FileCoverage) -> String {
     // Collect non-overlapping byte ranges to remove, sorted.
     let mut spans: Vec<(usize, usize)> = coverage.translated_spans.iter().copied().collect();
@@ -46,15 +69,34 @@ pub fn strip_translated(source: &str, coverage: &FileCoverage) -> String {
         }
     }
 
-    // Build the result by skipping merged spans.
+    // Build the result by skipping merged spans. Blockers are keyed by byte
+    // offset in SOURCE coordinates and flushed in order before the source
+    // segment that contains them — so a blocker inside stripped code lands
+    // right where the code used to start, and one in untranslated residue
+    // lands immediately above the residue.
     let mut out = String::with_capacity(source.len());
     let mut cursor = 0usize;
+    let mut blockers: Vec<(usize, String)> = coverage.blockers.iter().cloned().collect();
     for (start, end) in merged {
+        flush_blockers(&mut blockers, cursor, start, &mut out);
         out.push_str(&source[cursor..start]);
         cursor = end;
     }
+    flush_blockers(&mut blockers, cursor, source.len(), &mut out);
     out.push_str(&source[cursor..]);
     out
+}
+
+/// Emit (and remove) blockers with `from <= offset < to`, in offset order.
+fn flush_blockers(blockers: &mut Vec<(usize, String)>, from: usize, to: usize, out: &mut String) {
+    blockers.retain(|(offset, text)| {
+        if *offset >= from && *offset < to {
+            out.push_str(text);
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Collapse more than one consecutive blank line into one and trim leading
@@ -96,10 +138,15 @@ pub fn migrate(
         return Ok(MigrateOutcome::Deleted);
     }
 
-    // Partially translated: rewrite with only untranslated code.
+    // Partially translated: rewrite with only untranslated code (plus any
+    // blocker comments explaining what could not translate).
     let stripped = tidy(&strip_translated(source, coverage));
-    if stripped.trim().is_empty() {
-        // Nothing meaningful remained — treat as fully translated.
+    if stripped.trim().is_empty()
+        || stripped
+            .lines()
+            .all(|l| l.trim().is_empty() || l.trim_start().starts_with("//"))
+    {
+        // Only comment stubs remained — treat as fully translated.
         std::fs::remove_file(kt_path).map_err(|e| format!("{}: {e}", kt_path.display()))?;
         log::info!(
             "{}: fully translated after strip; deleted",

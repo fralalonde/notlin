@@ -116,25 +116,37 @@ impl<'a> Unit<'a> {
 
         // Taint the enclosing declaration (if any) so --in-place migration
         // knows this declaration must stay in the .kt file.
-        if let Some(decl_node) = self.current_decl {
-            // Simple containment: diagnostic node's byte range inside the
-            // declaration's byte range.
-            let inside = node.start_byte() >= decl_node.start_byte()
-                && node.end_byte() <= decl_node.end_byte();
-            if inside {
-                let label = self
-                    .decl_labels
-                    .get(&decl_node.id())
-                    .cloned()
-                    .unwrap_or_default();
-                self.taint_decl(&label);
+        {
+            // Walk up through the AST: the nearest enclosing declaration node
+            // that began via begin_decl (tracked by decl_labels). Handles both
+            // top-level decls and members nested in class bodies.
+            let mut ancestor = node.parent();
+            while let Some(n) = ancestor {
+                if self.decl_labels.contains_key(&n.id()) {
+                    let label = self.decl_labels.get(&n.id()).cloned().unwrap_or_default();
+                    self.taint_decl(&label);
+                    break;
+                }
+                ancestor = n.parent();
             }
         }
+        // Record a blocker stub (`// NOTLIN: <code> <message>`), anchored at
+        // the diagnostic node's byte offset — migrate.rs emits these comments
+        // in --in-place residue when the surrounding declaration is stripped.
+        let message: String = msg.into();
+        self.coverage.blockers.push((
+            node.start_byte(),
+            format!(
+                "// NOTLIN: {} {}\n",
+                DiagnosticKind::Untranslatable.code(),
+                message
+            ),
+        ));
 
         self.diags.push(crate::diagnostics::Diagnostic {
             severity: sev,
             kind: DiagnosticKind::Untranslatable,
-            message: msg.into(),
+            message,
             file: self.file.to_path_buf(),
             line: node.start_position().row + 1,
             col: node.start_position().column + 1,
@@ -1373,6 +1385,10 @@ impl<'a> Unit<'a> {
                     }
                 }
             } else {
+                if let Some(dn) = self.current_decl {
+                    let label = self.decl_labels.get(&dn.id()).cloned().unwrap_or_default();
+                    self.taint_decl(&label);
+                }
                 self.diag_untranslatable(
                     delim,
                     format!("property delegate not supported: {}", dtext.trim()),

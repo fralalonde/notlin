@@ -33,6 +33,7 @@ fn fully_translated_means_no_untranslated() {
         untranslated: vec![],
         translated_spans: vec![(0, 10)],
         attached_comment_spans: vec![],
+        blockers: vec![],
     };
     assert!(cov.is_fully_translated());
     assert!(!cov.is_partially_translated());
@@ -45,6 +46,7 @@ fn taint_makes_partial() {
         untranslated: vec!["Bad".into()],
         translated_spans: vec![(5, 20)],
         attached_comment_spans: vec![],
+        blockers: vec![],
     };
     assert!(cov.is_partially_translated());
     assert!(!cov.is_fully_translated());
