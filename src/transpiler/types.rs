@@ -45,6 +45,11 @@ pub fn map_type_name(kotlin_type: &str) -> &str {
     }
 }
 
+/// Marker emitted for `() -> R` function types: the type itself can't map to
+/// Java source (no SAM syntax for arbitrary shapes without arity analysis).
+/// Callers must recognize this string and flag the declaration untranslatable.
+pub const FUNCTION_TYPE_PLACEHOLDER: &str = "\u{0}NOTLIN_FUNCTION_TYPE";
+
 /// Root package of the nullability annotation set, for `import ...Nullable;`
 pub fn nullable_import(set: AnnotationSet) -> Option<&'static str> {
     match set {

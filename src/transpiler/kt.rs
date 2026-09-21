@@ -89,6 +89,13 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                 None => text(node, source).to_string(),
             }
         }
+        "function_type" => {
+            // `(params) -> R` has no Java counterpart -> functional interface
+            // approximation: emit a Consumer/Function-shaped warning-free
+            // placeholder is impossible without arity info; emit a taint
+            // signal via a dedicated untranslatable marker type text.
+            crate::transpiler::types::FUNCTION_TYPE_PLACEHOLDER.to_string()
+        }
         _ => text(node, source).to_string(),
     }
 }

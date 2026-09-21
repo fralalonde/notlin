@@ -129,15 +129,12 @@ impl<'a, 'u> Stmt<'a, 'u> {
             children.push(c);
         }
         let cond = kt::field(stmt, "condition").or_else(|| {
-            children
-                .iter()
-                .copied()
-                .find(|c| {
-                    matches!(
-                        c.kind(),
-                        "binary_expression" | "is_expression" | "parenthesized_expression"
-                    )
-                })
+            children.iter().copied().find(|c| {
+                matches!(
+                    c.kind(),
+                    "binary_expression" | "is_expression" | "parenthesized_expression"
+                )
+            })
         });
         // Then-branch: first named child after the condition (single-statement
         // form has no `block`; `control_structure_body` isn't in this grammar).
@@ -434,10 +431,7 @@ fn single_stmt_body<'t>(
     let skip = cond
         .and_then(|c| kids.iter().position(|k| k.id() == c.id()))
         .unwrap_or(0);
-    kids.iter()
-        .skip(skip + 1)
-        .find(|c| c.is_named())
-        .copied()
+    kids.iter().skip(skip + 1).find(|c| c.is_named()).copied()
 }
 
 fn unwrap_parens(node: tree_sitter::Node) -> tree_sitter::Node {

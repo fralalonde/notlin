@@ -410,7 +410,21 @@ impl<'a> Unit<'a> {
                             .or_else(|| kt::child(cp, "function_type"))
                             .or_else(|| kt::child(cp, "parenthesized_type"));
                         let ty_java = match ty {
-                            Some(t) => kt::java_type_ann(t, self.source, self.annots),
+                            Some(t) => {
+                                let t_java = kt::java_type_ann(t, self.source, self.annots);
+                                if t_java == crate::transpiler::types::FUNCTION_TYPE_PLACEHOLDER {
+                                    self.diag_untranslatable(
+                                        t,
+                                        format!(
+                                            "function type on param '{}' has no Java counterpart (functional-interface mapping not implemented)",
+                                            self.text(ident)
+                                        ),
+                                    );
+                                    "Object".to_string()
+                                } else {
+                                    t_java
+                                }
+                            }
                             None => {
                                 // Param with unrecognized type shape: flag it
                                 // instead of silently dropping the field.
@@ -447,9 +461,7 @@ impl<'a> Unit<'a> {
                     continue;
                 }
                 // unwrap: take the first named inner node
-                let inner = spec
-                    .children(&mut spec.walk())
-                    .find(|c| c.is_named());
+                let inner = spec.children(&mut spec.walk()).find(|c| c.is_named());
                 let Some(inner) = inner else {
                     continue;
                 };
@@ -595,9 +607,7 @@ impl<'a> Unit<'a> {
                     if member.kind() == "function_declaration" {
                         out.blank();
                         self.transpile_function(member, false, out);
-                    } else if member.is_named()
-                        && !matches!(member.kind(), ";" | "{" | "}")
-                    {
+                    } else if member.is_named() && !matches!(member.kind(), ";" | "{" | "}") {
                         self.diag_untranslatable(
                             member,
                             format!("record member not supported: {}", member.kind()),
@@ -788,16 +798,42 @@ impl<'a> Unit<'a> {
                 if t.kind() != "type_parameter" {
                     continue;
                 }
-                if let (Some(id), Some(bound)) = (
-                    kt::child(t, "identifier"),
-                    kt::child(t, "user_type").or_else(|| kt::child(t, "nullable_type")),
-                ) {
-                    let id_text = self.text(id).to_string();
-                    let bound = kt::java_type_ann(bound, self.source, self.annots);
-                    if bound == "Object" || bound == "Any" {
-                        parts.push(id_text);
-                    } else {
-                        parts.push(format!("{} extends {}", id_text, bound));
+                let id = kt::child(t, "identifier");
+                let bound = kt::child(t, "user_type").or_else(|| kt::child(t, "nullable_type"));
+                match (id, bound) {
+                    (Some(id), Some(bound)) => {
+                        let id_text = self.text(id).to_string();
+                        let bound = kt::java_type_ann(bound, self.source, self.annots);
+                        if bound == "Object" || bound == "Any" {
+                            parts.push(id_text);
+                        } else {
+                            parts.push(format!("{} extends {}", id_text, bound));
+                        }
+                    }
+                    (Some(id), None) => {
+                        // unbounded type param: `<T>` is valid Java
+                        parts.push(self.text(id).to_string());
+                    }
+                    (None, _) => {
+                        self.diag_untranslatable(t, "type parameter without a name");
+                    }
+                }
+                // reified has no Java counterpart (inline-only); approximate
+                for m in t.children(&mut t.walk()) {
+                    if m.kind() == "type_parameter_modifiers" {
+                        let txt = self.text(m).trim().to_string();
+                        if txt.contains("reified") {
+                            self.diags.warn_approx(
+                                m,
+                                self.file,
+                                "reified type parameter has no Java counterpart; emitted without it",
+                            );
+                        } else if !txt.is_empty() {
+                            self.diag_untranslatable(
+                                m,
+                                format!("type-parameter modifier not supported: {}", txt),
+                            );
+                        }
                     }
                 }
             }
@@ -834,20 +870,105 @@ impl<'a> Unit<'a> {
         // parameters
         let mut params: Vec<String> = Vec::new();
         if let Some(fvp) = kt::child(decl, "function_value_parameters") {
+            // Default values (`= expr`) sit between/before parameters as
+            // siblings inside function_value_parameters. Kotlin binds `= x`
+            // to the parameter that immediately precedes it.
             let mut cursor = fvp.walk();
-            for p in fvp.children(&mut cursor) {
-                if p.kind() == "parameter" {
-                    let pname = kt::child(p, "identifier")
-                        .map(|n| self.text(n).to_string())
-                        .unwrap_or_else(|| "arg".to_string());
-                    let pty = kt::child(p, "user_type")
-                        .or_else(|| kt::child(p, "nullable_type"))
-                        .map(|t| kt::java_type_ann(t, self.source, self.annots))
-                        .unwrap_or_else(|| "Object".to_string());
-                    params.push(format!("{} {}", pty, pname));
-                    // Track param types for == and ordered-comparison logic
-                    self.var_types.insert(pname, pty.clone());
+            let kids: Vec<tree_sitter::Node> = fvp.children(&mut cursor).collect();
+            let mut last_param: Option<tree_sitter::Node> = None;
+            for k in &kids {
+                match k.kind() {
+                    "parameter" => last_param = Some(*k),
+                    "=" => {
+                        // default value binds to the preceding parameter
+                        if let Some(prev) = last_param.take() {
+                            let pname2 = kt::child(prev, "identifier")
+                                .map(|n| self.text(n).to_string())
+                                .unwrap_or_default();
+                            self.diags.warn_approx(
+                                prev,
+                                self.file,
+                                format!(
+                                    "default parameter value on '{}' has no Java counterpart (caller must pass it explicitly)",
+                                    pname2
+                                ),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
+            }
+            let mut prev_modifiers: Option<tree_sitter::Node> = None;
+            for k in &kids {
+                match k.kind() {
+                    "parameter_modifiers" => prev_modifiers = Some(*k),
+                    "parameter" => {
+                        let is_vararg = prev_modifiers
+                            .take()
+                            .map(|m| self.text(m).contains("vararg"))
+                            .unwrap_or(false);
+                        let pname = kt::child(*k, "identifier")
+                            .map(|n| self.text(n).to_string())
+                            .unwrap_or_else(|| "arg".to_string());
+                        let pty = kt::child(*k, "user_type")
+                            .or_else(|| kt::child(*k, "nullable_type"))
+                            .map(|t| kt::java_type_ann(t, self.source, self.annots))
+                            .unwrap_or_else(|| "Object".to_string());
+                        if is_vararg {
+                            params.push(format!("{}... {}", pty, pname));
+                        } else {
+                            params.push(format!("{} {}", pty, pname));
+                        }
+                        self.var_types.insert(pname, pty.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Extension receiver (`fun String.shout()`): the grammar puts the
+        // receiver type as a bare user_type before the function name. Emit
+        // it as the first parameter; `this` in the body refers to it.
+        {
+            // Extension receiver: a bare user_type before the `name` field.
+            // Collect (field, kind) per child in one synced cursor walk.
+            let mut fcur = decl.walk();
+            let mut fields: Vec<(Option<String>, String, tree_sitter::Node)> = Vec::new();
+            if fcur.goto_first_child() {
+                loop {
+                    fields.push((
+                        fcur.field_name().map(|s| s.to_string()),
+                        fcur.node().kind().to_string(),
+                        fcur.node(),
+                    ));
+                    if !fcur.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+            let name_pos = fields
+                .iter()
+                .position(|(f, _, _)| f.as_deref() == Some("name"));
+            let recv = fields.iter().enumerate().find_map(|(i, (f, k, n))| {
+                let is_type = k == "user_type" || k == "nullable_type";
+                if !is_type || f.is_some() {
+                    return None;
+                }
+                match name_pos {
+                    // receiver: unfielded type strictly before the name
+                    Some(np) if i < np => Some(*n),
+                    _ => None,
+                }
+            });
+            if let Some(recv_ty) = recv {
+                let recv_java = kt::java_type_ann(recv_ty, self.source, self.annots);
+                self.var_types
+                    .insert("__receiver__".to_string(), recv_java.clone());
+                params.insert(0, recv_java);
+                self.diags.warn_approx(
+                    decl,
+                    self.file,
+                    "extension function: receiver emitted as first parameter; call sites `x.f()` become `F.f(x)`",
+                );
             }
         }
         if is_main && params.is_empty() {
