@@ -1112,6 +1112,69 @@ impl<'a> Unit<'a> {
             .map(|t| kt::java_type_ann(t, self.source, self.annots));
         let _visibility = self.visibility_of(decl);
 
+        // Delegated property (`by lazy {}` / `by observable` / ...): the
+        // delegate expression becomes the initializer; lazy semantics are
+        // approximated by an eager initializer + getter (functional superset,
+        // minor imbalance).
+        let delegate = kt::child(decl, "property_delegate");
+        if let Some(delim) = delegate {
+            let dtext = self.text(delim);
+            if dtext.contains("lazy") {
+                // initializer is the lambda body after `lazy { ... }`
+                let expr = delim
+                    .children(&mut delim.walk())
+                    .find(|c| c.kind() == "call_expression")
+                    .and_then(|ce| {
+                        ce.children(&mut ce.walk())
+                            .find(|c| c.kind() == "annotated_lambda")
+                    })
+                    .and_then(|al| kt::child(al, "lambda_literal"))
+                    .and_then(|ll| ll.children(&mut ll.walk()).find(|c| c.is_named()));
+                let cap = capitalize(&name);
+                match expr {
+                    Some(body) => {
+                        // if the body is a lambda (collection literal), take its
+                        // statements into the initializer best-effort
+                        let mut e = Expr { unit: self };
+                        let java = e.transpile(body);
+                        let tyy = ty.clone().unwrap_or_else(|| "Object".to_string());
+                        if java.contains("LAMBDA") || body.kind() == "lambda_literal" {
+                            out.line(format!("private {} {} = null;", tyy, name));
+                            self.diags.warn_approx(
+                                delim,
+                                self.file,
+                                format!(
+                                    "`by lazy {{ ... }}` for '{}' emitted as `= null` + warning (lambda body not representable in field initializer); body reads: {}",
+                                    name, self.text(body).trim()
+                                ),
+                            );
+                        } else {
+                            out.line(format!("private {} {} = {};", tyy, name, java));
+                            self.diags.warn_approx(
+                                delim,
+                                self.file,
+                                format!(
+                                    "`by lazy` for '{}' emitted as eager initializer (memoization not reproduced)",
+                                    name
+                                ),
+                            );
+                        }
+                        return;
+                    }
+                    None => {
+                        self.diag_untranslatable(delim, "delegate `lazy` without body");
+                        return;
+                    }
+                }
+            } else {
+                self.diag_untranslatable(
+                    delim,
+                    format!("property delegate not supported: {}", dtext.trim()),
+                );
+                return;
+            }
+        }
+
         let getter = kt::child(decl, "getter");
         let setter = kt::child(decl, "setter");
         let initializer = kt::child(decl, "initializer"); // hmm: may not exist; handle '=' expr below
