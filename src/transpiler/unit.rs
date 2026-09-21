@@ -436,23 +436,86 @@ impl<'a> Unit<'a> {
             .unwrap_or_default();
 
         // superclass / interfaces
+        // The grammar wraps each supertype in `delegation_specifier`
+        // (constructor_invocation / explicit_delegation / user_type).
         let mut extends = String::new();
         if let Some(dc) = kt::child(decl, "delegation_specifiers") {
             let mut parts: Vec<String> = Vec::new();
             let mut cursor = dc.walk();
-            for sp in dc.children(&mut cursor) {
-                if sp.kind() == "super_type"
-                    || sp.kind() == "user_type"
-                    || sp.kind() == "annotation"
-                {
-                    let t = self.text(sp).replace(" ", "");
-                    if !t.starts_with("@") {
-                        parts.push(t);
+            for spec in dc.children(&mut cursor) {
+                if spec.kind() != "delegation_specifier" {
+                    continue;
+                }
+                // unwrap: take the first named inner node
+                let inner = spec
+                    .children(&mut spec.walk())
+                    .find(|c| c.is_named());
+                let Some(inner) = inner else {
+                    continue;
+                };
+                match inner.kind() {
+                    // `: Parent()` — constructor invocation => class superclass
+                    "constructor_invocation" => {
+                        if let Some(ut) = inner
+                            .children(&mut inner.walk())
+                            .find(|c| c.kind() == "user_type")
+                        {
+                            parts.push(format!("class:{}", self.text(ut).replace(" ", "")));
+                        }
+                    }
+                    // `: Greeter by Parent2()` — delegation: implement the
+                    // interface; the `by` delegate is approximated (warned).
+                    "explicit_delegation" => {
+                        if let Some(ut) = inner
+                            .children(&mut inner.walk())
+                            .find(|c| c.kind() == "user_type")
+                        {
+                            parts.push(format!("iface:{}", self.text(ut).replace(" ", "")));
+                        }
+                        self.diags.warn_approx(
+                            inner,
+                            self.file,
+                            "interface delegation `by` has no Java counterpart; emitted as plain implements",
+                        );
+                    }
+                    // `: Greeter` — bare supertype; can't tell class vs
+                    // interface without cross-file metadata, assume interface
+                    "user_type" | "nullable_type" => {
+                        let t = self.text(inner).replace(" ", "");
+                        if !t.starts_with("@") {
+                            parts.push(format!("iface:{}", t));
+                        }
+                    }
+                    other => {
+                        self.diag_untranslatable(
+                            inner,
+                            format!("supertype form not supported: {}", other),
+                        );
                     }
                 }
             }
             if !parts.is_empty() {
-                extends = format!(" extends {}", parts.join(", "));
+                // constructor_invocation => extends; everything else =>
+                // implements (a class superclass must come first, which the
+                // Kotlin grammar guarantees).
+                let classes: Vec<&str> = parts
+                    .iter()
+                    .filter_map(|p| p.strip_prefix("class:"))
+                    .collect();
+                let ifaces: Vec<&str> = parts
+                    .iter()
+                    .filter_map(|p| p.strip_prefix("iface:"))
+                    .collect();
+                let mut j = String::new();
+                if let Some(c) = classes.first() {
+                    j.push_str(&format!(" extends {}", c));
+                }
+                if !ifaces.is_empty() {
+                    j.push_str(&format!(" implements {}", ifaces.join(", ")));
+                }
+                if !j.is_empty() {
+                    extends = j;
+                }
             }
         }
 
@@ -525,6 +588,23 @@ impl<'a> Unit<'a> {
                 comps.join(", "),
                 extends
             ));
+            // record members: body content after the header (overrides etc.)
+            if let Some(body) = kt::child(decl, "class_body") {
+                let mut cursor = body.walk();
+                for member in body.children(&mut cursor) {
+                    if member.kind() == "function_declaration" {
+                        out.blank();
+                        self.transpile_function(member, false, out);
+                    } else if member.is_named()
+                        && !matches!(member.kind(), ";" | "{" | "}")
+                    {
+                        self.diag_untranslatable(
+                            member,
+                            format!("record member not supported: {}", member.kind()),
+                        );
+                    }
+                }
+            }
             out.close();
         } else {
             // Java places type params after the class name: `class Name<T>`.
