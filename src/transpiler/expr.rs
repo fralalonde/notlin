@@ -218,9 +218,22 @@ impl<'a, 'u> Expr<'a, 'u> {
                         result.push_str(&format!(".{}", member_name));
                     } else if matches!(
                         member_name.as_str(),
-                        "length" | "size" | "isEmpty" | "isNotEmpty" | "keys" | "values"
+                        "length"
+                            | "size"
+                            | "isEmpty"
+                            | "isNotEmpty"
+                            | "keys"
+                            | "values"
+                            | "entries"
                     ) {
-                        result.push_str(&format!(".{}()", member_name));
+                        // property-like reads -> Java accessor calls; keys/
+                        // entries have different Java names (Map API)
+                        let java_member: String = match member_name.as_str() {
+                            "keys" => "keySet()".to_string(),
+                            "entries" => "entrySet()".to_string(),
+                            other => format!("{}()", other),
+                        };
+                        result.push_str(&format!(".{}", java_member));
                     } else if member_name
                         .chars()
                         .next()
