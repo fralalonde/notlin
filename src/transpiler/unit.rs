@@ -355,6 +355,47 @@ impl<'a> Unit<'a> {
         }
 
         // primary constructor parameters -> fields + constructor
+        // Class type parameters `class Gen<T : Bound>(...)` must be emitted or
+        // field/ctor references to them won't resolve (P0 audit finding).
+        let mut type_params = String::new();
+        if let Some(tp) = kt::child(decl, "type_parameters") {
+            let mut cursor = tp.walk();
+            let mut parts: Vec<String> = Vec::new();
+            for t in tp.children(&mut cursor) {
+                if t.kind() != "type_parameter" {
+                    continue;
+                }
+                if let Some(id) = kt::child(t, "identifier") {
+                    let id_text = self.text(id).to_string();
+                    match kt::child(t, "user_type").or_else(|| kt::child(t, "nullable_type")) {
+                        Some(bound) => {
+                            let b = kt::java_type_ann(bound, self.source, self.annots);
+                            if b == "Object" || b == "Any" {
+                                parts.push(id_text);
+                            } else {
+                                parts.push(format!("{} extends {}", id_text, b));
+                            }
+                        }
+                        None => parts.push(id_text),
+                    }
+                }
+                // variance/reified modifiers inside type_parameter: untranslatable
+                for extra in t.children(&mut t.walk()) {
+                    if extra.kind() == "type_parameter_modifiers" {
+                        self.diag_untranslatable(
+                            extra,
+                            format!(
+                                "type-parameter modifier '{}' has no Java counterpart",
+                                self.text(extra).trim()
+                            ),
+                        );
+                    }
+                }
+            }
+            if !parts.is_empty() {
+                type_params = format!("<{}> ", parts.join(", "));
+            }
+        }
         let params: Vec<(bool, String, String)> = kt::child(decl, "primary_constructor")
             .and_then(|pc| kt::child(pc, "class_parameters"))
             .map(|cps| {
@@ -365,12 +406,30 @@ impl<'a> Unit<'a> {
                         let is_val = kt::child(cp, "val").is_some();
                         let ident = kt::child(cp, "identifier")?;
                         let ty = kt::child(cp, "user_type")
-                            .or_else(|| kt::child(cp, "nullable_type"))?;
-                        Some((
-                            is_val,
-                            self.text(ident).to_string(),
-                            kt::java_type_ann(ty, self.source, self.annots),
-                        ))
+                            .or_else(|| kt::child(cp, "nullable_type"))
+                            .or_else(|| kt::child(cp, "function_type"))
+                            .or_else(|| kt::child(cp, "parenthesized_type"));
+                        let ty_java = match ty {
+                            Some(t) => kt::java_type_ann(t, self.source, self.annots),
+                            None => {
+                                // Param with unrecognized type shape: flag it
+                                // instead of silently dropping the field.
+                                self.diags.push(crate::diagnostics::Diagnostic {
+                                    severity: crate::diagnostics::Severity::Warning,
+                                    kind: DiagnosticKind::Approximated,
+                                    message: format!(
+                                        "primary-ctor param '{}' has unsupported type shape ({}); emitted as Object",
+                                        self.text(ident),
+                                        cp.kind()
+                                    ),
+                                    file: self.file.to_path_buf(),
+                                    line: cp.start_position().row + 1,
+                                    col: cp.start_position().column + 1,
+                                });
+                                "Object".to_string()
+                            }
+                        };
+                        Some((is_val, self.text(ident).to_string(), ty_java))
                     })
                     .collect()
             })
@@ -468,9 +527,11 @@ impl<'a> Unit<'a> {
             ));
             out.close();
         } else {
+            // Java places type params after the class name: `class Name<T>`.
+            let tp = type_params.trim_end(); // "<T>" or "" (no space needed before '{')
             out.open(format!(
-                "{}{}{} {}{}",
-                visibility, modifiers, kind_word, name, extends
+                "{}{}{} {}{}{}",
+                visibility, modifiers, kind_word, name, tp, extends
             ));
             // fields
             for (is_val, fname, ftype) in &params {

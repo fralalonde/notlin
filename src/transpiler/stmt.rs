@@ -128,22 +128,42 @@ impl<'a, 'u> Stmt<'a, 'u> {
         for c in stmt.children(&mut cursor) {
             children.push(c);
         }
-        let cond = children
+        let cond = kt::field(stmt, "condition").or_else(|| {
+            children
+                .iter()
+                .copied()
+                .find(|c| {
+                    matches!(
+                        c.kind(),
+                        "binary_expression" | "is_expression" | "parenthesized_expression"
+                    )
+                })
+        });
+        // Then-branch: first named child after the condition (single-statement
+        // form has no `block`; `control_structure_body` isn't in this grammar).
+        let cond_pos = cond
+            .and_then(|c| children.iter().position(|k| k.id() == c.id()))
+            .unwrap_or(0);
+        let then_node = children
             .iter()
-            .find(|c| c.kind() == "parenthesized" || c.kind() == "expression")
+            .skip(cond_pos + 1)
+            .find(|c| c.is_named() && c.kind() != "else")
             .copied();
-        let blocks: Vec<tree_sitter::Node> = children
-            .iter()
-            .filter(|c| c.kind() == "block" || c.kind() == "control_structure_body")
-            .copied()
-            .collect();
+        let blocks: Vec<tree_sitter::Node> = then_node.into_iter().collect();
 
         let cond_java = cond
             .map(|c| {
                 let mut e = Expr { unit: self.unit };
                 e.transpile(unwrap_parens(c))
             })
-            .unwrap_or_else(|| "true".to_string());
+            .unwrap_or_else(|| {
+                self.unit.diags.warn_approx(
+                    stmt,
+                    self.unit.file,
+                    "if condition not resolved; emitted as true",
+                );
+                "true".to_string()
+            });
 
         out.open(format!("if ({})", cond_java));
         if let Some(b) = blocks.first() {
@@ -189,7 +209,9 @@ impl<'a, 'u> Stmt<'a, 'u> {
             .unwrap_or_else(|| "i".to_string());
         // The iterable is the named node between `in` and `)`.
         let iterable = Self::find_iterable(stmt);
-        let body = kt::child(stmt, "block").or_else(|| kt::child(stmt, "control_structure_body"));
+        let body = kt::child(stmt, "block")
+            .or_else(|| kt::child(stmt, "control_structure_body"))
+            .or_else(|| single_stmt_body(stmt, iterable));
 
         match iterable {
             Some(iter) => {
@@ -361,8 +383,10 @@ impl<'a, 'u> Stmt<'a, 'u> {
     }
 
     fn transpile_while(&mut self, stmt: tree_sitter::Node, out: &mut JavaOut) {
-        let cond = kt::child(stmt, "expression");
-        let body = kt::child(stmt, "block").or_else(|| kt::child(stmt, "control_structure_body"));
+        let cond = kt::field(stmt, "condition");
+        let body = kt::child(stmt, "block")
+            .or_else(|| kt::child(stmt, "control_structure_body"))
+            .or_else(|| single_stmt_body(stmt, cond));
         let cond_java = cond
             .map(|c| {
                 let mut e = Expr { unit: self.unit };
@@ -377,8 +401,10 @@ impl<'a, 'u> Stmt<'a, 'u> {
     }
 
     fn transpile_do_while(&mut self, stmt: tree_sitter::Node, out: &mut JavaOut) {
-        let cond = kt::child(stmt, "expression");
-        let body = kt::child(stmt, "block").or_else(|| kt::child(stmt, "control_structure_body"));
+        let cond = kt::field(stmt, "condition");
+        let body = kt::child(stmt, "block")
+            .or_else(|| kt::child(stmt, "control_structure_body"))
+            .or_else(|| single_stmt_body(stmt, cond));
         let cond_java = cond
             .map(|c| {
                 let mut e = Expr { unit: self.unit };
@@ -396,6 +422,22 @@ impl<'a, 'u> Stmt<'a, 'u> {
             cond_java
         ));
     }
+}
+
+/// Single-statement loop body: the first named child after the condition
+/// (e.g. `while (y < 3) y++` — body is the bare `unary_expression`).
+fn single_stmt_body<'t>(
+    stmt: tree_sitter::Node<'t>,
+    cond: Option<tree_sitter::Node<'t>>,
+) -> Option<tree_sitter::Node<'t>> {
+    let kids: Vec<tree_sitter::Node<'t>> = stmt.children(&mut stmt.walk()).collect();
+    let skip = cond
+        .and_then(|c| kids.iter().position(|k| k.id() == c.id()))
+        .unwrap_or(0);
+    kids.iter()
+        .skip(skip + 1)
+        .find(|c| c.is_named())
+        .copied()
 }
 
 fn unwrap_parens(node: tree_sitter::Node) -> tree_sitter::Node {
