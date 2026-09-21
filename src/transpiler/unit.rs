@@ -788,6 +788,62 @@ impl<'a> Unit<'a> {
             .unwrap_or_else(|| "anon".to_string());
         let visibility = self.visibility_of(decl);
 
+        // function_modifier children (suspend/operator/infix/tailrec/
+        // external/inline...): suspend changes semantics, external can't be
+        // a java method body; both must be flagged, the rest warn.
+        let mut is_external = false;
+        if let Some(mods) = kt::child(decl, "modifiers") {
+            let mut mcur = mods.walk();
+            for m in mods.children(&mut mcur) {
+                if m.kind() != "function_modifier" {
+                    continue;
+                }
+                let mut icur = m.walk();
+                for f in m.children(&mut icur) {
+                    let word = self.text(f).trim().to_string();
+                    match word.as_str() {
+                        "suspend" => {
+                            self.diags.warn_approx(
+                                f,
+                                self.file,
+                                "Kotlin `suspend` compiled to a plain blocking method; coroutine semantics lost",
+                            );
+                        }
+                        "external" => {
+                            // JNI-shaped; bodyless native method is closest
+                            self.diags.warn_approx(
+                                f,
+                                self.file,
+                                "Kotlin `external` emitted as JNI `native` method",
+                            );
+                            is_external = true;
+                        }
+                        "operator" | "infix" | "tailrec" => {
+                            self.diags.warn_approx(
+                                f,
+                                self.file,
+                                format!("Kotlin function modifier `{}` has no Java counterpart; emitted as a plain method", word),
+                            );
+                        }
+                        "inline" => {
+                            // Java can't inline functions; harmless no-op
+                            self.diags.warn_approx(
+                                f,
+                                self.file,
+                                "Kotlin `inline` dropped (JIT inlines anyway)",
+                            );
+                        }
+                        _ => {
+                            self.diag_untranslatable(
+                                f,
+                                format!("function modifier not supported: {}", word),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Type parameters `fun <T> f(...)` -> Java generics `<T extends Bound>`;
         // `reified` has no Java counterpart and taints the declaration.
         let mut type_params = String::new();
@@ -982,11 +1038,15 @@ impl<'a> Unit<'a> {
             .and_then(|p| kt::parent_of(p))
             .map(|gp| gp.children(&mut gp.walk()).any(|c| c.kind() == "interface"))
             .unwrap_or(false);
-        let abstract_kw = if has_body {
+        // `external` fun has no JVM body; emit `native` and skip the body.
+        let abstract_kw = if is_external {
+            "native "
+        } else if has_body {
             if in_interface { "default " } else { "" }
         } else {
             "abstract "
         };
+        let has_body = has_body && !is_external;
         if !has_body {
             // Bodyless: signature-only (abstract / interface method)
             out.line(format!(
