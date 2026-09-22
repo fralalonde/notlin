@@ -81,7 +81,6 @@ pub struct Unit<'a> {
     pub(crate) fn_rets: std::collections::HashMap<String, String>,
     /// Set by navigation_call's assembled stream reducers — call.rs must
     /// not re-run the stream-op path over the already-complete text.
-    pub(crate) pending_nav_assembled: bool,
     /// Fully-assembled stream text from navigation_call's curried fold —
     /// the call.rs frame holding the lambda must return it verbatim.
     pub(crate) pending_nav_text: Option<String>,
@@ -122,7 +121,6 @@ impl<'a> Unit<'a> {
             pending_setter: false,
             pending_full_call: false,
             fn_rets: std::collections::HashMap::new(),
-            pending_nav_assembled: false,
             pending_nav_text: None,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),

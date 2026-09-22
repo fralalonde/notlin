@@ -314,11 +314,6 @@ impl<'a, 'u> Expr<'a, 'u> {
                         }
                     }
                 }
-                let cond_java = if cond_parts.is_empty() {
-                    "true".to_string()
-                } else {
-                    cond_parts.join(" || ")
-                };
                 let arm = result
                     .map(|r| self.transpile(r))
                     .unwrap_or_else(|| "null".to_string());

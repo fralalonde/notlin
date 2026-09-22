@@ -570,38 +570,3 @@ impl<'a, 'u> Expr<'a, 'u> {
 fn it_subst(pred: &str) -> String {
     pred.replace("it", "__e")
 }
-
-/// Split an `associate` lambda mapped to `new SimpleImmutableEntry<>(K, V)`
-/// into (keyFn, valueFn) strings for Collectors.toMap.
-fn entry_lambda_to_kv(mapped: &str) -> (String, String) {
-    if let Some(start) = mapped.find("SimpleImmutableEntry<>(") {
-        let inner_start = start + "SimpleImmutableEntry<>(".len();
-        if let Some(end) = mapped.rfind(')') {
-            let inner = &mapped[inner_start..end];
-            if let Some(comma) = split_top_comma(inner) {
-                // The `to` lambda's body referenced the element as `it` —
-                // toMap's key/value fns also see the element, so keep the
-                // original lambda param name.
-                return (
-                    format!("__e -> {}", inner[..comma].trim().replace("it", "__e")),
-                    format!("__e -> {}", inner[comma + 1..].trim().replace("it", "__e")),
-                );
-            }
-        }
-    }
-    (mapped.trim().to_string(), "__e -> __e".to_string())
-}
-
-/// Find the first top-level comma (not inside parens/angles).
-fn split_top_comma(s: &str) -> Option<usize> {
-    let mut depth = 0i32;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' | '<' => depth += 1,
-            ')' | '>' => depth -= 1,
-            ',' if depth == 0 => return Some(i),
-            _ => {}
-        }
-    }
-    None
-}
