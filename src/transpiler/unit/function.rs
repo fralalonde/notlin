@@ -139,6 +139,12 @@ impl<'a> Unit<'a> {
         // return type: positional — the first type-ish named child after
         // function_value_parameters (grammar has no return_type field).
         let mut ret = "void".to_string();
+        // `override fun toString() = ...` overrides Any.toString(): String —
+        // Kotlin infers the return type from the override; Java needs it
+        // spelled out or javac sees an unrelated void toString().
+        let fname_raw = kt::field(decl, "name")
+            .map(|n| self.source[n.start_byte()..n.end_byte()].to_string())
+            .unwrap_or_default();
         {
             let mut cursor = decl.walk();
             let kids: Vec<_> = decl.children(&mut cursor).collect();
@@ -149,6 +155,9 @@ impl<'a> Unit<'a> {
                     continue;
                 }
                 if after_params && k.is_named() {
+                    if fname_raw == "toString" {
+                        ret = "String".to_string();
+                    }
                     match k.kind() {
                         "user_type" | "nullable_type" | "function_type" | "type"
                         | "parenthesized_type" => {

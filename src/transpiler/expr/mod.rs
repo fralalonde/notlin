@@ -203,12 +203,28 @@ impl<'a, 'u> Expr<'a, 'u> {
             // `in 2..9 ->` is a range test over the when subject; `else`
             // is the fallthrough arm.
             let mut cond_parts: Vec<String> = Vec::new();
+            // Smart-cast type when any condition is a `is T` test:
+            // member accesses on the subject in this arm need (T) subject.
+            let mut cast_type: Option<String> = None;
             for c in &conditions {
                 let text = self.unit.text(*c);
                 if text == "else" {
                     cond_parts.push("true".to_string());
                 } else if c.kind() == "range_test" {
                     cond_parts.push(self.range_test_cond(*c, &subject_java));
+                } else if c.kind() == "type_test" {
+                    // `is State.Running` -> subject instanceof State.Running.
+                    // Kotlin smart-casts the subject to the tested type, so
+                    // member accesses on the subject in the arm must see a
+                    // narrowed receiver: force a cast in the emitted arm.
+                    let mut tcur = c.walk();
+                    let ty = c
+                        .children(&mut tcur)
+                        .find(|t| t.is_named())
+                        .map(|t| self.unit.text(t).trim().replace(" ", ""))
+                        .unwrap_or_default();
+                    cond_parts.push(format!("{} instanceof {}", subject_java, ty));
+                    cast_type = Some(ty.clone());
                 } else {
                     let cj = self.transpile(*c);
                     if subject.is_some() && cj != "true" {
@@ -222,6 +238,20 @@ impl<'a, 'u> Expr<'a, 'u> {
                 "true".to_string()
             } else {
                 cond_parts.join(" || ")
+            };
+            // Apply the smart cast AFTER conditions loop filled cast_type:
+            // member reads on the subject in this arm need the narrowed type
+            // (Kotlin smart-cast semantics).
+            let result_java = match (&cast_type, subject) {
+                (Some(ty), Some(_)) => {
+                    // wrap the cast around the RECEIVER: ((T) s).getPid(),
+                    // not (T) s.getPid() which casts the whole call result.
+                    result_java.replace(
+                        &format!("{}.", subject_java),
+                        &format!("(({}) {}).", ty, subject_java),
+                    )
+                }
+                _ => result_java,
             };
             ternary = if ternary.is_empty() {
                 result_java.clone()

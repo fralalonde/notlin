@@ -229,6 +229,25 @@ impl<'a, 'u> Expr<'a, 'u> {
                     }
                 }
             }
+            // Uppercase member could be a nested-type constructor
+            // (`State.Running(7)`) OR an object/companion member read with
+            // call syntax (`Registry.register("x")` — register is a static
+            // METHOD on the object's Java class). Only treat it as a
+            // constructor when the outer name is itself uppercase (a type);
+            // lowercase outer (`Registry`) is a value/instance reference.
+            if member
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+                && !member.ends_with(')')
+                && raw_trimmed[..dot]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+            {
+                let outer = &raw_trimmed[..dot];
+                return format!("new {}.{}", outer, member);
+            }
             if let Some(java_member) = kotlin_member_to_java(member) {
                 if java_member != member {
                     if java_member.contains('(') {

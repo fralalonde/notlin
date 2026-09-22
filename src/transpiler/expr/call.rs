@@ -257,9 +257,15 @@ impl<'a, 'u> Expr<'a, 'u> {
                 format!("new {}[]{{{}}}", elem, args.join(", "))
             }
             _ => {
-                // Uppercase callee with no dot = constructor call
-                if !callee_java.contains('.')
-                    && callee_java
+                // Uppercase callee = constructor call — bare `Foo` or nested
+                // `Outer.Inner` both need `new` (data subclasses of a sealed
+                // nesting parent are the common case).
+                let last_seg = callee_java.rsplit('.').next().unwrap_or("");
+                if callee_java
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+                    && last_seg
                         .chars()
                         .next()
                         .is_some_and(|c| c.is_ascii_uppercase())

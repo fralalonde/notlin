@@ -510,13 +510,58 @@ impl<'a> Unit<'a> {
                 .iter()
                 .map(|(_, n, t)| format!("{} {}", t, n))
                 .collect();
-            out.open(format!(
-                "{}record {}({}){}",
-                visibility,
-                name,
-                comps.join(", "),
-                extends
-            ));
+            // Java records can't extend anything. A data class with a
+            // superclass can't be a record — default to a final class with
+            // explicit fields + accessors (signature-identical to the
+            // record's: final fields, equals/hashCode/toString inherited or
+            // approximated). With `extends` present, emit that form.
+            if extends.is_empty() {
+                out.open(format!(
+                    "{}record {}({})",
+                    visibility,
+                    name,
+                    comps.join(", ")
+                ));
+            } else {
+                let inner = if extends.is_empty() {
+                    format!("{}final class {}", visibility, name)
+                } else {
+                    // must nest inside `extends X` clause: nested class
+                    // inheritance in one line
+                    // static nested: no enclosing instance needed at `new` —
+                    // but only legal INSIDE a class (top-level classes reject
+                    // the `static` modifier).
+                    let static_kw = if decl.parent().is_some_and(|p| p.kind() == "class_body") {
+                        "static "
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{}{}final class {} {}",
+                        visibility, static_kw, name, extends
+                    )
+                };
+                out.open(inner);
+                out.blank();
+                for (is_val, fname, ftype) in &params {
+                    let final_kw = if *is_val { "final " } else { "" };
+                    out.line(format!("private {}{} {};", final_kw, ftype, fname));
+                }
+                out.blank();
+                out.open(format!("public {}({})", name, comps.join(", ")));
+                for (_, fname, _) in &params {
+                    out.line(format!("this.{} = {};", fname, fname));
+                }
+                out.close();
+                out.blank();
+                for (_is_val, fname, ftype) in &params {
+                    let cap = capitalize(fname);
+                    out.open(format!("public {} get{}()", ftype, cap));
+                    out.line(format!("return {};", fname));
+                    out.close();
+                }
+                out.blank();
+            }
             // record members: body content after the header (overrides etc.)
             if let Some(body) = kt::child(decl, "class_body") {
                 let mut cursor = body.walk();
@@ -1017,7 +1062,37 @@ impl<'a> Unit<'a> {
         visibility: &str,
         out: &mut JavaOut,
     ) {
-        out.open(format!("{}final class {}", visibility, name));
+        // Supertypes: `object Idle : State()` — the nested class must extend
+        // the supertype or `instanceof Foo.El`/sealed membership fails.
+        let mut obj_extends = String::new();
+        if let Some(ds) = kt::child(decl, "delegation_specifiers") {
+            let mut dcur = ds.walk();
+            for spec in ds.children(&mut dcur) {
+                if spec.kind() == "delegation_specifier" {
+                    let sup = kt::child(spec, "super_type")
+                        .or_else(|| spec.children(&mut spec.walk()).find(|c| c.is_named()));
+                    if let Some(st) = sup {
+                        let mut scur = st.walk();
+                        let base = st.children(&mut scur).find(|c| c.is_named()).unwrap_or(st);
+                        obj_extends = format!(
+                            " extends {}",
+                            kt::text(base, self.source).trim().replace(" ", "")
+                        );
+                    }
+                }
+            }
+        }
+        // `static` only legal for a NESTED class (inner inside class_body);
+        // a top-level object is a plain public final class.
+        let static_kw = if decl.parent().is_some_and(|p| p.kind() == "class_body") {
+            "static "
+        } else {
+            ""
+        };
+        out.open(format!(
+            "{}{}final class {}{}",
+            visibility, static_kw, name, obj_extends
+        ));
         out.line(format!(
             "public static final {} INSTANCE = new {}();",
             name, name
