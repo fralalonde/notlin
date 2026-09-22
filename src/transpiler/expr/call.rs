@@ -56,6 +56,30 @@ impl<'a, 'u> Expr<'a, 'u> {
                 // Kotlin `arr.size()`/`arr.size` -> Java `arr.length`.
                 return format!("{}.length", self.transpile(base));
             }
+            // Primitive-valued receivers (`.size()`, `.length`, `.count()`)
+            // also can't take `.toString()` — same static wrapper path.
+            if member == "toString"
+                && base.kind() == "navigation_expression"
+                && let Some((b, m)) = self.unit.nav_base_member(base)
+                && matches!(m.as_str(), "size" | "length" | "count" | "size()")
+            {
+                let access = if m == "length" {
+                    m.to_string()
+                } else {
+                    format!("{}()", m)
+                };
+                let recv = format!("{}.{}", self.transpile(b), access);
+                self.unit.diags.warn_approx(
+                    nav,
+                    self.unit.file,
+                    "Kotlin primitive `toString(...)` mapped to `String.valueOf(...)`",
+                );
+                return if args.len() == 1 {
+                    format!("Integer.toString({}, {})", recv, args[0])
+                } else {
+                    format!("String.valueOf({})", recv)
+                };
+            }
             // Primitive receivers cannot be dereferenced in Java: Kotlin
             // `x.toString(radix)` -> `Integer.toString(x, radix)`,
             // `x.toString()` -> `String.valueOf(x)`, other primitive member
@@ -288,6 +312,14 @@ impl<'a, 'u> Expr<'a, 'u> {
             // Arrays.stream(...) already IS a Stream — no .stream() tail.
             let stream_base = if base.starts_with("java.util.Arrays.stream") {
                 base.clone()
+            } else if self
+                .unit
+                .var_types
+                .get(base.trim())
+                .is_some_and(|t| t.starts_with("Map<"))
+            {
+                // Kotlin maps stream over their ENTRIES (Map.Entry pairs).
+                format!("{}.entrySet().stream()", base)
             } else {
                 format!("{}.stream()", base)
             };
@@ -469,12 +501,27 @@ impl<'a, 'u> Expr<'a, 'u> {
                 if args.is_empty() {
                     "new HashMap<>()".to_string()
                 } else {
-                    self.unit.diags.warn_approx(
-                        node,
-                        self.unit.file,
-                        "mapOf with entries approximated as empty HashMap",
-                    );
-                    "new HashMap<>()".to_string()
+                    // args are `new SimpleImmutableEntry<>(k, v)` forms from
+                    // the `to` infix mapping — Map.ofEntries accepts them
+                    // (Map.Entry impl); immutable semantics match mapOf.
+                    let entries: Vec<String> = args
+                        .iter()
+                        .map(|a| {
+                            a.trim_start_matches("Map.ofEntries(")
+                                .trim_end()
+                                .to_string()
+                        })
+                        .collect();
+                    if args.len() == 1 {
+                        format!("java.util.Map.ofEntries({})", entries[0])
+                    } else {
+                        self.unit.diags.warn_approx(
+                            node,
+                            self.unit.file,
+                            "mapOf with multiple entries: Map.ofEntries(e1, e2, ...)",
+                        );
+                        format!("java.util.Map.ofEntries({})", entries.join(", "))
+                    }
                 }
             }
             "mutableSetOf" | "setOf" | "hashSetOf" => {

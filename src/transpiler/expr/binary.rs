@@ -73,21 +73,36 @@ impl<'a, 'u> Expr<'a, 'u> {
                     self.unit.diags.warn_approx(
                         node,
                         self.unit.file,
-                        "elvis operator approximated with Optional.ofNullable(...).orElse(...)",
+                        "elvis operator approximated with a null-check ternary",
                     );
                     let l_java = self.transpile(l);
                     let r_java = self.transpile(r);
-                    // `lhs ?: println(...)`-style void arms: orElse(void) is
-                    // illegal Java — fall back to a null-check ternary.
-                    if r_java.starts_with("System.out.println")
-                        || l_java.starts_with("System.out.println")
-                    {
-                        return format!("({} != null ? {} : {})", l_java, l_java, r_java);
-                    }
-                    return format!(
-                        "java.util.Optional.ofNullable({}).orElse({})",
-                        l_java, r_java
-                    );
+                    // Always ternary: Optional.ofNullable(...).orElse(...)
+                    // boxes and breaks primitive/Int inference in Java
+                    // (Kotlin `a ?: 0` returns Int, not Optional<Integer>).
+                    // for `a ?: b` Kotlin evaluates `a` twice in the naive
+                    // ternary — correct as long as the transpiled `a` isn't
+                    // side-effecting (noted as N002).
+                    // safe-call lhs already emitted `x != null ? x.m : null`
+                    // — collapse into one ternary: x != null ? inner : rhs.
+                    let (base, inner) = if let Some(q) = l_java.find(" != null ? ") {
+                        let b = l_java[..q].trim().trim_start_matches('(').to_string();
+                        if l_java.ends_with(" : null") || l_java.ends_with(" : null)") {
+                            let m0 = q + " != null ? ".len();
+                            let m1 = if l_java.ends_with(" : null)") {
+                                l_java.len() - " : null)".len()
+                            } else {
+                                l_java.len() - " : null".len()
+                            };
+                            (b.to_string(), l_java[m0..m1.max(m0)].to_string())
+                        } else {
+                            (b.clone(), l_java.clone())
+                        }
+                    } else {
+                        (l_java.clone(), l_java.clone())
+                    };
+                    let _ = &base;
+                    return format!("({} != null ? {} : {})", base, inner, r_java);
                 }
                 // Infix functions: and/or are keywords; others pass through
                 let java_op = match op.as_str() {
@@ -208,39 +223,6 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .warn_approx(node, self.unit.file, "malformed binary expression");
                 self.unit.text(node).to_string()
             }
-        }
-    }
-
-    pub(crate) fn elvis(&mut self, node: tree_sitter::Node) -> String {
-        self.unit.diags.warn_approx(
-            node,
-            self.unit.file,
-            "elvis operator approximated with Optional.ofNullable(...).orElse(...)",
-        );
-        let mut cursor = node.walk();
-        let kids: Vec<_> = node
-            .children(&mut cursor)
-            .filter(|c| c.is_named())
-            .collect();
-        if kids.len() >= 2 {
-            let lhs = self.transpile(kids[0]);
-            let rhs = self.transpile(kids[1]);
-            // orElse of a void/println arm is illegal Java. A ternary is
-            // always valid (works for void-as-statement contexts too when
-            // emitted inside an expression-only parent? no — statement
-            // parents get it via when/if rules). The correct semantics for
-            // `x ?: y` is a ternary on truthy-only-for-refs: use the plain
-            // null-check ternary for string/nullable shapes.
-            if rhs.contains("void")
-                || rhs.starts_with("System.out.println")
-                || lhs.starts_with("System.out.println")
-            {
-                format!("({} != null ? {} : {})", lhs.trim_end(), lhs, rhs)
-            } else {
-                format!("java.util.Optional.ofNullable({}).orElse({})", lhs, rhs)
-            }
-        } else {
-            "null".to_string()
         }
     }
 }

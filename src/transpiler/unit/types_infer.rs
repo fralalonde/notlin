@@ -38,6 +38,30 @@ impl<'a> Unit<'a> {
                     .unwrap_or_else(|| "Object".to_string())
             }
             "navigation_expression" => self.infer_navigation(expr),
+            // elvis arrives as binary_expression with `?:` — its Kotlin type
+            // is the RIGHT arm's type (`a ?: 0` -> Int). Inferred BEFORE the
+            // generic infix arm (match order).
+            "binary_expression" if self.text(expr).contains("?:") => {
+                let r = kt::field(expr, "right");
+                r.map(|r| self.infer_type(r))
+                    .unwrap_or_else(|| "Object".to_string())
+            }
+            // elvis: Kotlin type is the RIGHT arm's type when the left is
+            // nullable (`a ?: 0` -> Int from `0`); the ternary's Java type
+            // would otherwise be inferred as Object -> boolean junk.
+            "?:" | "elvis_expression" | "infix_expression" if self.text(expr).contains("?:") => {
+                let mut cur = expr.walk();
+                let mut kids: Vec<_> = expr.children(&mut cur).collect();
+                // binary_expression holds left/right fields
+                let l = kt::field(expr, "left");
+                let r = kt::field(expr, "right");
+                if let (Some(_), Some(r)) = (l, r) {
+                    let _ = &mut kids;
+                    self.infer_type(r)
+                } else {
+                    "Object".to_string()
+                }
+            }
             "string_literal" => "String".to_string(),
             "number_literal" => {
                 let t = self.text(expr);

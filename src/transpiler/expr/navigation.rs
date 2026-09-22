@@ -14,10 +14,13 @@ impl<'a, 'u> Expr<'a, 'u> {
         for w in kids.windows(3) {
             if w[1].kind() == "." || w[1].kind() == "?." {
                 if w[1].kind() == "?." {
+                    // proper safe-call: `x?.m` -> `x == null ? null : x.m`
+                    // (or a ternary on the whole nav text if in a value
+                    // context). Textual: wrap the segment.
                     self.unit.diags.warn_approx(
                         w[1],
                         self.unit.file,
-                        "safe-call `?.` approximated as plain `.`; NPEs possible",
+                        "safe-call `?.` -> null-check ternary",
                     );
                 }
                 if w[2].is_named() {
@@ -175,6 +178,27 @@ impl<'a, 'u> Expr<'a, 'u> {
         // Fallback: if windows didn't yield members, join verbatim
         if result.is_empty() {
             result = self.unit.text(node).replace("?.", ".");
+        }
+        // safe-call: if the source had any `?.`, wrap the whole nav in a
+        // null-check ternary: `a?.b` -> `a != null ? a.b : null`.
+        // (Do it AFTER windoing so the inner members are already mapped.)
+        if self.unit.text(node).contains("?.") {
+            // re-derive base text: everything before the last `?.`
+            let raw = self.unit.text(node).replace("?.", ".");
+            // base = first segment; member chain = the rest
+            if let Some(q) = raw.find('.') {
+                let (b, m) = raw.split_at(q);
+                let m = &m[1..];
+                let mut res = format!("{} != null ? {}.{} : null", b, b, m);
+                // if the member chain already carries an accessor method
+                // applied (getter etc.) the rewritten form here might be
+                // stale — leave the current result as-is; the ternary wrap
+                // only applies when the whole raw nav is what came out.
+                if result.contains(b) {
+                    res = format!("{} != null ? {} : null", b, result);
+                }
+                result = res;
+            }
         }
         // Mid-chain joinToString: the stream arm terminated with
         // `collect(toList())`; swap the tail for joining(sep) so the chain

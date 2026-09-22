@@ -104,8 +104,8 @@ fn expressions_translate_operators_and_strings() {
     let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
     // string interpolation
     assert!(all.contains("\"user=\"") && all.contains("+ count"));
-    // elvis -> Optional
-    assert!(all.contains("Optional.ofNullable"));
+    // elvis -> null-check ternary (Optional form broke primitive inference)
+    assert!(all.contains("!= null ? ") && all.contains(" ? "));
     // != / == on objects -> Objects.equals
     assert!(all.contains("Objects.equals"));
     // instanceof for `is`
@@ -118,7 +118,7 @@ fn elvis_becomes_optional() {
     let (files, errors) = transpile_src(source, "Pick.kt");
     assert_eq!(errors, 0);
     let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
-    assert!(all.contains("Optional.ofNullable"));
+    assert!(all.contains("!= null ? ") && all.contains(" ? "));
 }
 
 #[test]

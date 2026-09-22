@@ -64,7 +64,8 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .unwrap_or_default();
                 format!("({})", inner)
             }
-            "elvis_expression" => self.elvis(node),
+            // elvis_expression: use binary()'s unified ternary rewrite
+            "elvis_expression" => self.binary(node),
             "range_expression" => {
                 self.unit.diags.warn_approx(
                     node,
