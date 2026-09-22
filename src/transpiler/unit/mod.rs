@@ -79,6 +79,12 @@ pub struct Unit<'a> {
     /// emitted; lets `val p = pair()` infer the fn's return type for
     /// member-call context (Pair.first -> getKey()).
     pub(crate) fn_rets: std::collections::HashMap<String, String>,
+    /// Set by navigation_call's assembled stream reducers — call.rs must
+    /// not re-run the stream-op path over the already-complete text.
+    pub(crate) pending_nav_assembled: bool,
+    /// Fully-assembled stream text from navigation_call's curried fold —
+    /// the call.rs frame holding the lambda must return it verbatim.
+    pub(crate) pending_nav_text: Option<String>,
     /// data class name -> record component list `(type, name)` in declaration
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
@@ -116,6 +122,8 @@ impl<'a> Unit<'a> {
             pending_setter: false,
             pending_full_call: false,
             fn_rets: std::collections::HashMap::new(),
+            pending_nav_assembled: false,
+            pending_nav_text: None,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
         }

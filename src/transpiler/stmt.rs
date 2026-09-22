@@ -58,7 +58,10 @@ impl<'a, 'u> Stmt<'a, 'u> {
                         out.line(format!("if ({}) {} else {};", cond, a, b));
                     }
                 } else if !java.is_empty() {
-                    out.line(format!("{};", java));
+                    // Emitted fragments may already carry a trailing `;`
+                    // (if/else lifters) — avoid `;;`.
+                    let jt = java.trim_end().trim_end_matches(';');
+                    out.line(format!("{};", jt));
                 } else {
                     self.unit.diags.warn_approx(
                         stmt,

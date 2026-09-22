@@ -171,6 +171,55 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .next_back();
                 if let Some(member) = member {
                     let base_java = self.transpile(b);
+                    // Curried stream ops: fold(0){lambda}. Identity arg +
+                    // lambda both belong here — assemble stream reduce
+                    // immediately (call.rs must not re-emit).
+                    if matches!(member.as_str(), "fold" | "foldIndexed") {
+                        let outer = node.parent().map(|mut p| {
+                            loop {
+                                if p.kind() == "call_expression"
+                                    && kt::child(p, "annotated_lambda").is_some()
+                                {
+                                    break p;
+                                }
+                                p = match p.parent() {
+                                    Some(q) => q,
+                                    None => break p,
+                                };
+                            }
+                        });
+                        let inner = node.parent().filter(|p| p.kind() == "call_expression");
+                        let identity = inner
+                            .and_then(|p| kt::child(p, "value_arguments"))
+                            .and_then(|va| {
+                                va.children(&mut va.walk())
+                                    .find(|c| c.kind() == "value_argument")
+                            })
+                            .and_then(|arg0| arg0.children(&mut arg0.walk()).find(|c| c.is_named()))
+                            .map(|e| self.transpile(e))
+                            .unwrap_or_else(|| "null".to_string());
+                        self.unit.diags.warn_approx(
+                            node,
+                            self.unit.file,
+                            format!(
+                                "fold approximated with Stream.reduce(identity={}, op)",
+                                identity
+                            ),
+                        );
+                        let lambda = outer.and_then(|p| {
+                            kt::child(p, "lambda_literal").or_else(|| {
+                                kt::child(p, "annotated_lambda")
+                                    .and_then(|al| kt::child(al, "lambda_literal"))
+                            })
+                        });
+                        if let Some(l) = lambda {
+                            let lam = self.transpile(l);
+                            let assembled =
+                                format!("{}.stream().reduce({}, {})", base_java, identity, lam);
+                            self.unit.pending_nav_text = Some(assembled.clone());
+                            return assembled;
+                        }
+                    }
                     return match kotlin_member_to_java(&member) {
                         Some(jm) if jm != member => format!("{}.{}", base_java, jm),
                         Some(_) => format!("{}.{}", base_java, member),
@@ -308,6 +357,18 @@ impl<'a, 'u> Expr<'a, 'u> {
                 let outer = &raw_trimmed[..dot];
                 return format!("new {}.{}", outer, member);
             }
+            // Curried stream ops: `xs.fold(0) { acc, x -> ... }` — the arg
+            // list belongs to fold and the lambda arrives at the OUTER call.
+            // Return `base.member` bare so call.rs's stream arm assembles
+            // stream().reduce(identity, lambda).
+            if matches!(
+                member,
+                "fold" | "foldIndexed" | "reduce" | "sortedBy" | "sortedByDescending"
+            ) {
+                let base = &raw_trimmed[..dot];
+                self.unit.pending_full_call = true;
+                return format!("{}.{}", base, member);
+            }
             if let Some(java_member) = kotlin_member_to_java(member) {
                 if java_member != member {
                     if java_member.contains('(') {
@@ -386,6 +447,10 @@ fn kotlin_member_to_java(member: &str) -> Option<String> {
         "lastOrNull" => Some("stream().reduce((__left, __right) -> __right).orElse(null)"),
         "reversed" => Some("reversed()"),
         "count" => Some("size()"),
+        "first" => Some("stream().findFirst().orElseThrow()"),
+        // firstOrNull { pred } handled in call.rs (needs the lambda pred);
+        // bare firstOrNull() uses the Optional-friendly form below.
+        "firstOrNull" => Some("stream().findFirst().orElse(null)"),
         // joinToString(sep) needs the sep argument — handled upstream in the
         // call path where args are available, not by this name table.
         _ => None,

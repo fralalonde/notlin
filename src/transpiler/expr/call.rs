@@ -181,6 +181,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                         | "fold"
                         | "reduce"
                         | "foldIndexed"
+                        | "sortedBy"
                         | "any"
                         | "all"
                         | "none"
@@ -261,7 +262,13 @@ impl<'a, 'u> Expr<'a, 'u> {
                 return "null".to_string();
             }
         }
-        if let (true, Some(lambda)) = (is_stream_op, lambda_arg) {
+        // A curried fold already assembled its full `stream().reduce(...)`
+        // text in navigation_call — take it verbatim and clear it.
+        let nav_text = self.unit.pending_nav_text.take();
+        let nav_assembled = nav_text.is_some();
+        if let (true, Some(lambda)) = (is_stream_op, lambda_arg)
+            && !nav_assembled
+        {
             let member = callee_java
                 .rfind('.')
                 .map(|i| &callee_java[i + 1..])
@@ -309,32 +316,45 @@ impl<'a, 'u> Expr<'a, 'u> {
             }
             // Collectors-backed ops with distinct Java shapes:
             let mapped_lambda = self.transpile(lambda);
+            let base_str = callee_java[..callee_java.len() - member.len()]
+                .trim_end_matches('.')
+                .to_string();
             match member {
-                "groupBy" => {
-                    // `xs.groupBy { it % 2 }` -> groupingBy(keyFn)
+                // fold(init) { acc, x -> ... } -> reduce(identity, op)
+                "fold" => {
                     self.unit.diags.warn_approx(
                         node,
                         self.unit.file,
-                        "groupBy approximated with Collectors.groupingBy (value lists, LinkedHashMap default ordering differs)",
+                        "fold approximated with Stream.reduce(identity, op)",
                     );
+                    // The lambda maps to `(acc, x) -> body`; reduce wants a
+                    // BiFunction — the transpiled form already is one.
                     return format!(
-                        "{}.stream().collect(java.util.stream.Collectors.groupingBy({}))",
-                        base, mapped_lambda
+                        "{}.stream().reduce({}, {})",
+                        base_str, args[0], mapped_lambda
                     );
                 }
-                "associate" => {
-                    // `xs.associate { it to it * 2 }`: the lambda was mapped
-                    // to `new SimpleImmutableEntry<>(k, v)` by infix `to` —
-                    // convert to toMap(kFn, vFn).
+                "reduce" => {
                     self.unit.diags.warn_approx(
                         node,
                         self.unit.file,
-                        "associate approximated with Collectors.toMap",
+                        "reduce approximated with Stream.reduce(op) (Optional; Kotlin throws — .orElseThrow() added)",
                     );
-                    let kv = entry_lambda_to_kv(&mapped_lambda);
                     return format!(
-                        "{}.stream().collect(java.util.stream.Collectors.toMap({}, {}))",
-                        base, kv.0, kv.1
+                        "{}.stream().reduce({}).orElseThrow()",
+                        base_str, mapped_lambda
+                    );
+                }
+                "sortedBy" => {
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "sortedBy approximated with sorted(Comparator.comparing(key))",
+                    );
+                    return format!(
+                        "{}.stream().sorted(java.util.Comparator.comparing({})).collect(java.util.stream.Collectors.toList())",
+                        base_str,
+                        it_subst(&mapped_lambda)
                     );
                 }
                 _ => {}
@@ -422,11 +442,23 @@ impl<'a, 'u> Expr<'a, 'u> {
                         .is_some_and(|c| c.is_ascii_uppercase())
                 {
                     format!("new {}({})", callee_java, args.join(", "))
-                } else if callee_java.ends_with(')') && args.is_empty() {
+                } else if callee_java.ends_with(')') && (args.is_empty() || nav_assembled) {
                     // Mapped member that is already a complete call expression
                     // (`xs.get(0)`, `xs.stream().findFirst().orElse(null)`):
-                    // it IS the call — no `()` wrapper to add.
-                    callee_java
+                    // it IS the call — no `()` wrapper to add. A trailing
+                    // lambda argument still appends (fold(idx) { ... }).
+                    if let Some(la) = lambda_arg {
+                        if let Some(assembled) = nav_text {
+                            // navigation_call already merged the lambda and
+                            // assembled `stream().reduce(identity, op)`.
+                            let _ = la;
+                            assembled
+                        } else {
+                            format!("{} {}", callee_java, self.transpile(la))
+                        }
+                    } else {
+                        callee_java
+                    }
                 } else if std::mem::replace(&mut self.unit.pending_full_call, false) {
                     // joinToString style: callee mapping already emitted the
                     // full call with args — nothing to append.
@@ -506,6 +538,9 @@ impl<'a, 'u> Expr<'a, 'u> {
             } else {
                 format!("() -> {}", body_java)
             }
+        } else if params_java.contains(',') {
+            // Multi-param lambda: Java requires the paren list
+            format!("({}) -> {}", params_java, body_java)
         } else {
             format!("{} -> {}", params_java, body_java)
         }

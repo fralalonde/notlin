@@ -282,14 +282,71 @@ impl<'a, 'u> Expr<'a, 'u> {
         if ternary.is_empty() {
             "null".to_string()
         } else if ternary.contains("System.out.println") && ternary.contains(" : ") {
-            // when-as-statement with void arms: a ternary over void calls is
-            // illegal Java — real if/else chain preserves the logic.
-            if let Some((c, rest)) = ternary.split_once(" ? ")
-                && let Some((a, b)) = rest.split_once(" : ")
-            {
-                return format!("if ({}) {}; else {};", c, a, b);
+            // when-as-statement with void arms: build the if/else chain
+            // structurally from entries (fwd order) rather than re-parsing
+            // ternary text (which mis-splits on `:` inside strings).
+            let mut out = String::new();
+            for entry in entries.iter().rev() {
+                let mut ec = entry.walk();
+                let e_kids: Vec<_> = entry.children(&mut ec).collect();
+                let e_named: Vec<_> = e_kids.iter().filter(|c| c.is_named()).copied().collect();
+                let result = e_named.last().copied();
+                let conditions: Vec<_> = e_named[..e_named.len().saturating_sub(1)].to_vec();
+                let mut cond_parts: Vec<String> = Vec::new();
+                for c in &conditions {
+                    let text = self.unit.text(*c);
+                    if text == "else" {
+                        cond_parts.push("true".to_string());
+                    } else if c.kind() == "type_test" {
+                        let mut tcur = c.walk();
+                        let ty = c
+                            .children(&mut tcur)
+                            .find(|t| t.is_named())
+                            .map(|t| self.unit.text(t).trim().replace(" ", ""))
+                            .unwrap_or_default();
+                        cond_parts.push(format!("{} instanceof {}", subject_java, ty));
+                    } else {
+                        let cj = self.transpile(*c);
+                        if subject.is_some() && cj != "true" {
+                            cond_parts.push(format!("Objects.equals({}, {})", subject_java, cj));
+                        } else {
+                            cond_parts.push(cj);
+                        }
+                    }
+                }
+                let cond_java = if cond_parts.is_empty() {
+                    "true".to_string()
+                } else {
+                    cond_parts.join(" || ")
+                };
+                let arm = result
+                    .map(|r| self.transpile(r))
+                    .unwrap_or_else(|| "null".to_string());
+                let ender = if out.is_empty() { ";" } else { "" };
+                let _ = ender;
+                if out.is_empty() {
+                    // last entry (reversed) = else arm; do NOT prefix `else`
+                    // — the wrapping statement builder adds it.
+                    out = format!("{};", arm);
+                } else {
+                    let cj = if cond_parts.iter().all(|c| c == "true") {
+                        "true".to_string()
+                    } else {
+                        cond_parts.join(" || ")
+                    };
+                    out = format!(
+                        "if ({}) {} else {}",
+                        cj,
+                        if arm.ends_with(';') {
+                            arm.clone()
+                        } else {
+                            format!("{};", arm)
+                        },
+                        out
+                    );
+                }
             }
-            ternary
+            format!("{};", out.trim_start_matches("else "))
         } else {
             ternary
         }
