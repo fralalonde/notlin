@@ -182,6 +182,8 @@ impl<'a, 'u> Expr<'a, 'u> {
                         | "reduce"
                         | "foldIndexed"
                         | "sortedBy"
+                        | "sortedByDescending"
+                        | "mapValues"
                         | "any"
                         | "all"
                         | "none"
@@ -262,6 +264,10 @@ impl<'a, 'u> Expr<'a, 'u> {
                 return "null".to_string();
             }
         }
+        // Any stream arm below emits its own text — clear any stale
+        // curried-callee flag set by navigation_call, or the next call
+        // statement silently drops its arguments.
+        self.unit.pending_full_call = false;
         // A curried fold already assembled its full `stream().reduce(...)`
         // text in navigation_call — take it verbatim and clear it.
         let nav_text = self.unit.pending_nav_text.take();
@@ -345,7 +351,53 @@ impl<'a, 'u> Expr<'a, 'u> {
                         base_str, mapped_lambda
                     );
                 }
-                "sortedBy" => {
+                "mapValues" => {
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "mapValues approximated with entrySet().stream().collect(toMap(keySet, valueFn))",
+                    );
+                    // mapped_lambda is `<param> -> body` from the lambda
+                    // transpile; toMap wants a bare value fn.
+                    let vfn = mapped_lambda
+                        .split_once(" -> ")
+                        .map(|(_, b)| b.to_string())
+                        .unwrap_or_else(|| mapped_lambda.clone())
+                        .replace("it.getValue()", "__e.getValue()")
+                        .replace("it.value", "__e.getValue()");
+                    return format!(
+                        "{}.entrySet().stream().collect(java.util.stream.Collectors.toMap(java.util.Map.Entry::getKey, __e -> {}))",
+                        base_str, vfn
+                    );
+                }
+                "groupBy" => {
+                    // `xs.groupBy { it % 2 }` -> groupingBy(keyFn)
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "groupBy approximated with Collectors.groupingBy (value lists, LinkedHashMap default ordering differs)",
+                    );
+                    return format!(
+                        "{}.stream().collect(java.util.stream.Collectors.groupingBy({}))",
+                        base, mapped_lambda
+                    );
+                }
+                "associate" => {
+                    // `xs.associate { it to it * 2 }`: the lambda was mapped
+                    // to `new SimpleImmutableEntry<>(k, v)` by infix `to` —
+                    // convert to toMap(kFn, vFn).
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "associate approximated with Collectors.toMap",
+                    );
+                    let kv = entry_lambda_to_kv(&mapped_lambda);
+                    return format!(
+                        "{}.stream().collect(java.util.stream.Collectors.toMap({}, {}))",
+                        base, kv.0, kv.1
+                    );
+                }
+                "sortedBy" | "sortedByDescending" => {
                     self.unit.diags.warn_approx(
                         node,
                         self.unit.file,
@@ -563,6 +615,39 @@ impl<'a, 'u> Expr<'a, 'u> {
         }
         false
     }
+}
+
+fn entry_lambda_to_kv(mapped: &str) -> (String, String) {
+    if let Some(start) = mapped.find("SimpleImmutableEntry<>(") {
+        let inner_start = start + "SimpleImmutableEntry<>(".len();
+        if let Some(end) = mapped.rfind(')') {
+            let inner = &mapped[inner_start..end];
+            if let Some(comma) = split_top_comma(inner) {
+                // The `to` lambda's body referenced the element as `it` —
+                // toMap's key/value fns also see the element, so keep the
+                // original lambda param name.
+                return (
+                    format!("__e -> {}", inner[..comma].trim().replace("it", "__e")),
+                    format!("__e -> {}", inner[comma + 1..].trim().replace("it", "__e")),
+                );
+            }
+        }
+    }
+    (mapped.trim().to_string(), "__e -> __e".to_string())
+}
+
+/// Find the first top-level comma (not inside parens/angles).
+fn split_top_comma(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' | '<' => depth += 1,
+            ')' | '>' => depth -= 1,
+            ',' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Replace bare `it` identifier in a transpiled lambda body with the

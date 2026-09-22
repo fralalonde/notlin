@@ -171,6 +171,25 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .next_back();
                 if let Some(member) = member {
                     let base_java = self.transpile(b);
+                    // `x.first()`: collection -> stream(); String -> charAt(0)
+                    if member == "first" && base_java.trim() == "it" {
+                        self.unit.diags.warn_approx(
+                            node,
+                            self.unit.file,
+                            "String.first() inferred: charAt(0) (N002)",
+                        );
+                        return format!("{}.charAt(0)", base_java);
+                    }
+                    if member == "first"
+                        && self
+                            .unit
+                            .var_types
+                            .get(self.unit.text(b).trim())
+                            .map(|t| t.contains("String"))
+                            .unwrap_or(false)
+                    {
+                        return format!("{}.charAt(0)", base_java);
+                    }
                     // Curried stream ops: fold(0){lambda}. Identity arg +
                     // lambda both belong here — assemble stream reduce
                     // immediately (call.rs must not re-emit).
@@ -291,6 +310,21 @@ impl<'a, 'u> Expr<'a, 'u> {
                 );
                 return format!("{}.get(0)", self.transpile(b));
             }
+            // `it.first()` inside a lambda (base not a typed var — lambda
+            // param): the overwhelmingly common case is String.first() ->
+            // first char.
+            if member == "first"
+                && let Some(b) = base
+                && b.kind() == "identifier"
+                && self.unit.text(b).trim() == "it"
+            {
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "String.first() inferred: charAt(0) (N002)",
+                );
+                return format!("{}.charAt(0)", self.transpile(b));
+            }
             // joinToString(sep) -> stream().collect(joining(sep)): need the
             // call's args from the AST — the raw path runs inside call.rs
             // AFTER callee translation, so handle it there via a marker or
@@ -363,7 +397,13 @@ impl<'a, 'u> Expr<'a, 'u> {
             // stream().reduce(identity, lambda).
             if matches!(
                 member,
-                "fold" | "foldIndexed" | "reduce" | "sortedBy" | "sortedByDescending"
+                "fold"
+                    | "foldIndexed"
+                    | "reduce"
+                    | "sortedBy"
+                    | "sortedByDescending"
+                    | "groupBy"
+                    | "mapValues"
             ) {
                 let base = &raw_trimmed[..dot];
                 self.unit.pending_full_call = true;
@@ -404,7 +444,15 @@ impl<'a, 'u> Expr<'a, 'u> {
         let mut cursor = node.walk();
         let kids: Vec<_> = node.children(&mut cursor).collect();
         let base = kids.iter().find(|c| c.is_named()).copied();
-        let indices: Vec<_> = kids
+        // Both shapes: `indexing_expression` wraps the index in an
+        // `indexing_suffix` node; `index_expression` (tree-sitter-kotlin-ng)
+        // puts base and index as direct children with bracket punctuators
+        // between them.
+        // Both shapes: `indexing_expression` wraps each index in an
+        // `indexing_suffix` node; `index_expression` (tree-sitter-kotlin-ng)
+        // puts base and index(es) as direct children with bracket
+        // punctuators between them.
+        let mut indices: Vec<_> = kids
             .iter()
             .filter(|c| c.kind() == "indexing_suffix")
             .flat_map(|s| {
@@ -413,6 +461,16 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .collect::<Vec<_>>()
             })
             .collect();
+        if indices.is_empty() {
+            // index_expression shape: named children after the first are
+            // the indices (base is kids[0]).
+            indices = kids
+                .iter()
+                .skip(1)
+                .filter(|c| c.is_named())
+                .copied()
+                .collect();
+        }
         let base_java = base.map(|b| self.transpile(b)).unwrap_or_default();
         if indices.len() == 1 {
             let idx = self.transpile(indices[0]);

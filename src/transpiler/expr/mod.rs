@@ -56,7 +56,7 @@ impl<'a, 'u> Expr<'a, 'u> {
             "call_expression" => self.call(node),
             "infix_expression" => self.infix_expr(node),
             "binary_expression" => self.binary(node),
-            "parenthesized" => {
+            "parenthesized_expression" | "parenthesized" => {
                 let inner = node
                     .children(&mut node.walk())
                     .find(|c| c.is_named())
@@ -101,7 +101,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                     None => "false".to_string(),
                 }
             }
-            "indexing_expression" => self.indexing(node),
+            "indexing_expression" | "index_expression" => self.indexing(node),
             "jump_expression" => self.jump(node),
             "if_expression" => self.if_expr(node),
             _ => {
