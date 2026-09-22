@@ -101,7 +101,7 @@ impl<'a, 'u> Stmt<'a, 'u> {
         let mut e = Expr { unit: self.unit };
         let init_java = init.map(|i| e.transpile(i));
 
-        let ty = declared_ty.unwrap_or_else(|| match init {
+        let mut ty = declared_ty.unwrap_or_else(|| match init {
             Some(i) => self.unit.infer_type(i),
             None => "var".to_string(),
         });
@@ -109,10 +109,29 @@ impl<'a, 'u> Stmt<'a, 'u> {
         // Record the local's Java type so later statements in this function
         // get receiver context: `arr.size` -> `arr.length` for arrays, known
         // primitive operands in comparisons, member-call inference, etc.
-        if ty != "var" {
-            self.unit.var_types.insert(name.clone(), ty.clone());
+        // `var x = …` locals: infer the initializer's concrete Java type and
+        // record THAT (Java `var` reifies to the initializer type; later
+        // member inference needs the concrete shape, not the literal "var").
+        let mut record_ty = ty.clone();
+        if ty == "var" {
+            if let Some(i) = init {
+                eprintln!("[dbgK] kind={}", i.kind());
+                let concrete = self.unit.infer_type(i);
+                eprintln!("[dbgC] concrete={concrete:}");
+                if concrete != "var" && concrete != "Object" {
+                    record_ty = concrete.clone();
+                }
+            }
         }
+        self.unit.var_types.insert(name.clone(), record_ty.clone());
 
+        eprintln!("[dbgT] name={name} ty={ty:}");
+        // Stream-collected containers: Java mapper types are invariant
+        // (List<List<Integer>> vs List<List<Object>>) — emit `var` and let
+        // the collector infer the precise element shape.
+        if ty.contains("List<List<Object>>") || ty.contains("SimpleImmutableEntry<Object, Object>") {
+            ty = "var".to_string();
+        }
         if ty == "var" {
             out.line(format!(
                 "var {}{};",
@@ -195,6 +214,28 @@ impl<'a, 'u> Stmt<'a, 'u> {
                     shape_ty, name, init_java, accessor
                 ));
             }
+            return;
+        }
+        // Map.Entry-shaped initializer (`val (k, v) = zipList.first()`):
+        // destructures to getKey()/getValue() — bytecode-compatible.
+        eprintln!("[dbgD] init_ty={init_ty:?} comps={}", comps.len());
+        if (init_ty.starts_with("java.util.AbstractMap.SimpleImmutableEntry<")
+            || init_ty.contains("Map.Entry<"))
+            && comps.len() == 2
+        {
+            let generics = &init_ty[init_ty.find('<').unwrap() + 1..init_ty.rfind('>').unwrap()];
+            let mut gsplit = generics.splitn(2, ',');
+            let kty = gsplit.next().unwrap_or("Object").trim().to_string();
+            let vty = gsplit.next().unwrap_or("Object").trim().to_string();
+            out.line(format!("{} {} = {}.getKey();", kty, names[0], init_java));
+            out.line(format!("{} {} = {}.getValue();", vty, names[1], init_java));
+            // register component types for downstream member inference
+            self.unit
+                .var_types
+                .insert(names[0].to_string(), kty.clone());
+            self.unit
+                .var_types
+                .insert(names[1].to_string(), vty.clone());
             return;
         }
         self.unit.diags.warn_approx(

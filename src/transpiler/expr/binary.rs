@@ -215,6 +215,28 @@ impl<'a, 'u> Expr<'a, 'u> {
                         l_java, r_java
                     );
                 }
+                // Unknown/Object-typed operands for `+`: the Kotlin `+` on
+                // an unknown pair is a String concat in the practical case
+                // (entry destructure then println). `"" + a + b` coerces.
+                if is_arith
+                    && op == "+"
+                    // receivers are plain identifiers, not String/prim
+                    // typed (=Object), and not literals: only then the
+                    // Kotlin plus target is unknowable.
+                    && l.kind() == "identifier"
+                    && r.kind() == "identifier"
+                    && self.unit.var_types.get(l_java.trim())
+                        .is_some_and(|t| t == "Object")
+                    && self.unit.var_types.get(r_java.trim())
+                        .is_some_and(|t| t == "Object")
+                {
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "binary `+` on Object-typed operands -> string concat (`\"\" + a + b`); Kotlin plus-selection unverifiable here",
+                    );
+                    return format!("(\"\" + {} + {})", l_java, r_java);
+                }
                 format!("{} {} {}", l_java, op_java, r_java)
             }
             _ => {
@@ -246,6 +268,17 @@ impl Expr<'_, '_> {
         }
         None
     }
+}
+
+/// Operand resolves to a primitive/String via literal — used to gate the
+/// Object + string-concat rewrite. This is only a text-level gate; the
+/// var_types lookup happens through the Expr method form in binary().
+fn is_primitive_or_string_operand_text(
+    e: &tree_sitter::Node,
+) -> bool {
+    let t = format!("{:?}", e.kind());
+    let _ = t;
+    false // text-level unreachable; the var_types check is authoritative
 }
 
 fn is_likely_primitive(expr_text: &str) -> bool {

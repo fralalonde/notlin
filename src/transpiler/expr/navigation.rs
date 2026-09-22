@@ -440,7 +440,16 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .unit
                     .var_types
                     .get(self.unit.text(b).trim())
-                    .is_some_and(|t| t.contains("Entry<") || t.contains("Pair<"))
+                    .is_some_and(|t| {
+                        // Only direct Pair/Entry receivers: a List of
+                        // entries (`List<Entry<K,V>>`) takes `.first()`
+                        // as a collection op, not an accessor.
+                        (t.starts_with("Pair<")
+                            || t.starts_with("java.util.AbstractMap.SimpleImmutableEntry<")
+                            || t.contains("Map.Entry")
+                            || t.starts_with("Triple"))
+                            && !t.starts_with("List<")
+                    })
             {
                 let jfn = if member == "first" {
                     "getKey()"

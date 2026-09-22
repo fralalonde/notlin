@@ -41,6 +41,22 @@ impl<'a> Unit<'a> {
             // elvis arrives as binary_expression with `?:` — its Kotlin type
             // is the RIGHT arm's type (`a ?: 0` -> Int). Inferred BEFORE the
             // generic infix arm (match order).
+            // Stream-collect initializer (`…mapToObj(...).collect(…)`):
+            // the source text tells the element type; list/entry shapes
+            // below survive destructuring and method dispatch.
+            // Stream-collect initializer text-shape: `…mapToObj(...).collect(…)`
+            // — matched BEFORE the generic call arm.
+            "call_expression" | "navigation_expression"
+                if self.text(expr).contains("mapToObj") =>
+            {
+                let t = self.text(expr);
+                if t.contains("SimpleImmutableEntry<") {
+                    "List<java.util.AbstractMap.SimpleImmutableEntry<Object, Object>>"
+                        .to_string()
+                } else {
+                    "List<List<Object>>".to_string()
+                }
+            }
             "binary_expression" if self.text(expr).contains("?:") => {
                 let r = kt::field(expr, "right");
                 r.map(|r| self.infer_type(r))
@@ -295,6 +311,22 @@ impl<'a> Unit<'a> {
         // `Regex.matches(s)` -> boolean.
         if member == "matches" {
             return "boolean".to_string();
+        }
+        // Kotlin take(n)/drop(n) -> limit/skip collect: List<elem>.
+        if matches!(member, "take" | "drop" | "slice") {
+            return if is_collection_ty(recv_ty.as_deref().unwrap_or("")) {
+                format!("List<{}>", elem_type_of(recv_ty.as_deref().unwrap_or("")))
+            } else {
+                "Object".to_string()
+            };
+        // the emitted decl uses Object elements — destructuring & size()
+        // still work (N002: precise element type lost for member dispatch).
+        } else if member == "zip" {
+            return "List<java.util.AbstractMap.SimpleImmutableEntry<Object, Object>>"
+                .to_string();
+        }
+        if member == "chunked" {
+            return "List<List<Object>>".to_string();
         }
         let unknown = |u: &mut Self| {
             u.diag_approx(

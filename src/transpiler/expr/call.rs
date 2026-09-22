@@ -278,7 +278,62 @@ impl<'a, 'u> Expr<'a, 'u> {
                 }
             }
         }
-        // `Regex.matches(str)` -> Kotlin Regex ≈ java.util.regex.Pattern:
+        // Collection slice ops on List receivers (Kotlin -> Java streams):
+        // take(n) -> stream().limit(n).collect(toList());
+        // drop(n) -> stream().skip(n).collect(toList()); chunked(n) ->
+        // no direct API — marked below.
+        if args.len() == 1 {
+            let tail = callee_java.rsplit('.').next().unwrap_or("");
+            if matches!(tail, "take" | "drop") && callee_java.rfind('.').is_some() {
+                let recv = callee_java[..callee_java.len() - tail.len() - 1]
+                    .trim()
+                    .to_string();
+                let jop = if tail == "take" { "limit" } else { "skip" };
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    format!("Kotlin collection `.{tail}` -> stream().{jop}().collect(toList())"),
+                );
+                return format!(
+                    "{}.stream().{}({}).collect(java.util.stream.Collectors.toList())",
+                    recv, jop, args[0]
+                );
+            }
+            // chunked(n): sliding-free partition via IntStream over chunk
+            // indices — logic-equal, emits a List<List<T>>.
+            if tail == "chunked" && callee_java.rfind('.').is_some() {
+                let recv = callee_java[..callee_java.len() - tail.len() - 1]
+                    .trim()
+                    .to_string();
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "Kotlin `.chunked(n)` -> IntStream partition (List<List<T>>)",
+                );
+                return format!(
+                    "java.util.stream.IntStream.range(0, (int) (({}.stream().count() + {} - 1) / {})).mapToObj(i -> {}.subList(i * {}, Math.min((i + 1) * {}, {}.size()))).collect(java.util.stream.Collectors.toList())",
+                    recv, args[0], args[0], recv, args[0], args[0], recv
+                );
+            }
+            // zip(other): pair up positionally with SimpleImmutableEntry
+            // values -> List<SimpleImmutableEntry<A,B>> (matches the Kotlin
+            // Pair approximation used by `to`).
+            if tail == "zip" && callee_java.rfind('.').is_some() {
+                let recv = callee_java[..callee_java.len() - tail.len() - 1]
+                    .trim()
+                    .to_string();
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "Kotlin `.zip(other)` -> IntStream pairwise zip with SimpleImmutableEntry pairs",
+                );
+                return format!(
+                    "java.util.stream.IntStream.range(0, Math.min({}.size(), {}.size())).mapToObj(i -> new java.util.AbstractMap.SimpleImmutableEntry<>({}.get(i), {}.get(i))).collect(java.util.stream.Collectors.toList())",
+                    recv, args[0], recv, args[0]
+                );
+            }
+        }
+
         // `new Regex(p)` -> `Pattern.compile(p)`; matches(input) ->
         // `Pattern.compile(p).matcher(input).matches()`.
         if callee_java == "Regex" && !args.is_empty() {
