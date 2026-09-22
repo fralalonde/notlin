@@ -177,7 +177,11 @@ impl<'a, 'u> Expr<'a, 'u> {
                 let user_ty = [l_ty.as_deref(), r_ty.as_deref()]
                     .into_iter()
                     .flatten()
-                    .find(|t| !is_primitive_type(t) && *t != "String");
+                    // "Object" is an UNKNOWN operand (entry generics lost),
+                    // not a user class with an overloaded `plus` — and it
+                    // must not route `k + v` to `k.plus(v)`; the
+                    // Object+Object string-concat arm below handles it.
+                    .find(|t| !is_primitive_type(t) && *t != "String" && *t != "Object");
                 let is_arith = matches!(op.as_str(), "+" | "-" | "*" | "/" | "%");
                 if is_arith && let Some(ty) = user_ty {
                     let mname = match op.as_str() {
@@ -268,17 +272,6 @@ impl Expr<'_, '_> {
         }
         None
     }
-}
-
-/// Operand resolves to a primitive/String via literal — used to gate the
-/// Object + string-concat rewrite. This is only a text-level gate; the
-/// var_types lookup happens through the Expr method form in binary().
-fn is_primitive_or_string_operand_text(
-    e: &tree_sitter::Node,
-) -> bool {
-    let t = format!("{:?}", e.kind());
-    let _ = t;
-    false // text-level unreachable; the var_types check is authoritative
 }
 
 fn is_likely_primitive(expr_text: &str) -> bool {

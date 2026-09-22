@@ -299,6 +299,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                     | "navigation_expression"
                     | "indexing_expression"
                     | "parenthesized"
+                    | "parenthesized_expression"
                     | "if_expression"
                     | "when_expression"
             );

@@ -113,23 +113,21 @@ impl<'a, 'u> Stmt<'a, 'u> {
         // record THAT (Java `var` reifies to the initializer type; later
         // member inference needs the concrete shape, not the literal "var").
         let mut record_ty = ty.clone();
-        if ty == "var" {
-            if let Some(i) = init {
-                eprintln!("[dbgK] kind={}", i.kind());
-                let concrete = self.unit.infer_type(i);
-                eprintln!("[dbgC] concrete={concrete:}");
-                if concrete != "var" && concrete != "Object" {
-                    record_ty = concrete.clone();
-                }
+        if ty == "var"
+            && let Some(i) = init
+        {
+            let concrete = self.unit.infer_type(i);
+            if concrete != "var" && concrete != "Object" {
+                record_ty = concrete.clone();
             }
         }
         self.unit.var_types.insert(name.clone(), record_ty.clone());
 
-        eprintln!("[dbgT] name={name} ty={ty:}");
         // Stream-collected containers: Java mapper types are invariant
         // (List<List<Integer>> vs List<List<Object>>) — emit `var` and let
         // the collector infer the precise element shape.
-        if ty.contains("List<List<Object>>") || ty.contains("SimpleImmutableEntry<Object, Object>") {
+        if ty.contains("List<List<Object>>") || ty.contains("SimpleImmutableEntry<Object, Object>")
+        {
             ty = "var".to_string();
         }
         if ty == "var" {
@@ -218,7 +216,6 @@ impl<'a, 'u> Stmt<'a, 'u> {
         }
         // Map.Entry-shaped initializer (`val (k, v) = zipList.first()`):
         // destructures to getKey()/getValue() — bytecode-compatible.
-        eprintln!("[dbgD] init_ty={init_ty:?} comps={}", comps.len());
         if (init_ty.starts_with("java.util.AbstractMap.SimpleImmutableEntry<")
             || init_ty.contains("Map.Entry<"))
             && comps.len() == 2

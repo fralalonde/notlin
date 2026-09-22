@@ -215,10 +215,6 @@ impl<'a, 'u> Expr<'a, 'u> {
             let recv = callee_java[..cpos].to_string();
             if let Some(ctor) = recv.strip_prefix("new ") {
                 let tname = ctor.split('(').next().unwrap_or("").trim().to_string();
-                eprintln!(
-                    "[dbg16c] tname={tname}? {}",
-                    self.unit.data_components.contains_key(&tname)
-                );
                 if let Some(comps) = self.unit.data_components.get(&tname).cloned() {
                     // ctor args, in order
                     if let (Some(op), Some(cp)) = (ctor.find('('), ctor.rfind(')')) {
@@ -720,12 +716,6 @@ impl<'a, 'u> Expr<'a, 'u> {
                 format!("new {}[]{{{}}}", elem, args.join(", "))
             }
             _ => {
-                eprintln!(
-                    "[dbgF] callee={} args={} pend={}",
-                    callee_java,
-                    args.is_empty(),
-                    self.unit.pending_full_call
-                );
                 // Uppercase callee = constructor call — bare `Foo` or nested
                 // `Outer.Inner` both need `new` (data subclasses of a sealed
                 // nesting parent are the common case).

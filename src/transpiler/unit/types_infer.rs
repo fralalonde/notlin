@@ -46,13 +46,10 @@ impl<'a> Unit<'a> {
             // below survive destructuring and method dispatch.
             // Stream-collect initializer text-shape: `…mapToObj(...).collect(…)`
             // — matched BEFORE the generic call arm.
-            "call_expression" | "navigation_expression"
-                if self.text(expr).contains("mapToObj") =>
-            {
+            "call_expression" if self.text(expr).contains("mapToObj") => {
                 let t = self.text(expr);
                 if t.contains("SimpleImmutableEntry<") {
-                    "List<java.util.AbstractMap.SimpleImmutableEntry<Object, Object>>"
-                        .to_string()
+                    "List<java.util.AbstractMap.SimpleImmutableEntry<Object, Object>>".to_string()
                 } else {
                     "List<List<Object>>".to_string()
                 }
@@ -322,8 +319,7 @@ impl<'a> Unit<'a> {
         // the emitted decl uses Object elements — destructuring & size()
         // still work (N002: precise element type lost for member dispatch).
         } else if member == "zip" {
-            return "List<java.util.AbstractMap.SimpleImmutableEntry<Object, Object>>"
-                .to_string();
+            return "List<java.util.AbstractMap.SimpleImmutableEntry<Object, Object>>".to_string();
         }
         if member == "chunked" {
             return "List<List<Object>>".to_string();
