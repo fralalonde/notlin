@@ -154,6 +154,37 @@ impl<'a, 'u> Expr<'a, 'u> {
                 };
                 let l_java = self.transpile(l);
                 let r_java = self.transpile(r);
+                // Operator overloads: if either operand is a user-class
+                // value (constructor call or class-typed local), `a + b`
+                // is Kotlin's `operator fun plus(o)` — emit `a.plus(b)`.
+                let l_ty = self.infer_operand_type(l);
+                let r_ty = self.infer_operand_type(r);
+                let user_ty = [l_ty.as_deref(), r_ty.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|t| !is_primitive_type(t) && *t != "String");
+                let is_arith = matches!(op.as_str(), "+" | "-" | "*" | "/" | "%");
+                if is_arith && let Some(ty) = user_ty {
+                    let mname = match op.as_str() {
+                        "+" => "plus",
+                        "-" => "minus",
+                        "*" => "times",
+                        "/" => "div",
+                        "%" => "rem",
+                        _ => "",
+                    };
+                    if !mname.is_empty() {
+                        self.unit.diags.warn_approx(
+                            node,
+                            self.unit.file,
+                            format!(
+                                "`operator+` overload: `{} a {} b` emitted as `a.{}(b)` (Kotlin operator name)",
+                                ty, ty, mname
+                            ),
+                        );
+                        return format!("{}.{}({})", l_java, mname, r_java);
+                    }
+                }
                 if op == "to" {
                     // Infix `to` builds a Pair. Closest pure-JDK value:
                     // AbstractMap.SimpleImmutableEntry — getKey/getValue map
@@ -211,6 +242,27 @@ impl<'a, 'u> Expr<'a, 'u> {
         } else {
             "null".to_string()
         }
+    }
+}
+
+impl Expr<'_, '_> {
+    /// Java type of an operand (for operator-overload detection): known
+    /// locals via var_types; constructor calls via callee name; else None.
+    fn infer_operand_type(&self, node: tree_sitter::Node) -> Option<String> {
+        let t = self.unit.text(node).trim().to_string();
+        if let Some(vt) = self.unit.var_types.get(&t) {
+            if is_primitive_type(vt) || vt == "String" {
+                return None;
+            }
+            return Some(vt.clone());
+        }
+        // constructor call: `Pt(1, 2)` -> first word before '('
+        let head = t.split('(').next().unwrap_or("").trim().to_string();
+        if head.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && !is_primitive_type(&head)
+        {
+            return Some(head);
+        }
+        None
     }
 }
 

@@ -64,6 +64,47 @@ impl<'a> Unit<'a> {
                     .map(|o| self.text(o).to_string())
                     .unwrap_or_default();
                 let is_arith = matches!(op.as_str(), "+" | "-" | "*" | "/" | "%");
+                // Operator overload: `Pt(1,2) + Pt(3,4)` — operands are
+                // constructor/data-class values, not numbers. The operator
+                // `fun plus(o: Pt): Pt` returns the receiver's type. Take it
+                // from the LEFT operand even without overload knowledge
+                // (Kotlin arithmetic on user classes is always via an
+                // operator fun whose return is the class in practice).
+                let operands_are_user = kt::field(expr, "left")
+                    .map(|l| {
+                        let c = kt::child(l, "identifier")
+                            .or_else(|| {
+                                kt::child(expr, "call_expression")
+                                    .and_then(|ce| kt::child(ce, "identifier"))
+                            })
+                            .map(|n| self.text(n).to_string())
+                            .unwrap_or_else(|| self.text(l).trim().to_string());
+                        let t = self
+                            .text(l)
+                            .trim()
+                            .split('(')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let _ = c;
+                        t.chars().next().is_some_and(|x| x.is_ascii_uppercase())
+                    })
+                    .unwrap_or(false);
+                if is_arith && operands_are_user {
+                    let left = kt::field(expr, "left").map(|l| {
+                        self.text(l)
+                            .trim()
+                            .split('(')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    });
+                    if let Some(t) = left {
+                        return t;
+                    }
+                }
                 if is_arith {
                     // widen when either operand is a floating literal
                     let has_dot = self
