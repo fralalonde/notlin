@@ -33,21 +33,15 @@ impl<'a, 'u> Expr<'a, 'u> {
                             .next()
                             .is_some_and(|c| c.is_alphabetic() || c == '_')
                     {
-                        let mut ident = String::new();
-                        let mut rest = raw;
-                        for (i, c) in raw.char_indices() {
-                            if i == 0 || c.is_alphanumeric() || c == '_' {
-                                if i > 0 && !c.is_alphanumeric() && c != '_' {
-                                    rest = &raw[i..];
-                                    break;
-                                }
-                                ident.push(c);
-                            } else {
-                                rest = &raw[i..];
-                                break;
-                            }
-                        }
-                        parts.push(ident);
+                        let ident_end = raw
+                            .char_indices()
+                            .take_while(|(i, c)| *i == 0 || c.is_alphanumeric() || *c == '_')
+                            .map(|(i, c)| i + c.len_utf8())
+                            .last()
+                            .unwrap_or(0);
+                        let ident = &raw[..ident_end];
+                        let rest = &raw[ident_end..];
+                        parts.push(ident.to_string());
                         if !rest.is_empty() {
                             parts.push(format!("{:?}", rest));
                         }

@@ -1024,6 +1024,9 @@ impl<'a> Unit<'a> {
         ));
         out.line(format!("private {}() {{}}", name));
         out.blank();
+        // Self-references inside the body (`val self = Registry`) point at
+        // the singleton in Java (`Registry.INSTANCE`).
+        self.current_object = Some(name.to_string());
         if let Some(body) = kt::child(decl, "class_body") {
             let mut cursor = body.walk();
             for member in body.children(&mut cursor) {
@@ -1059,6 +1062,7 @@ impl<'a> Unit<'a> {
                 }
             }
         }
+        self.current_object = None;
         out.close();
     }
 

@@ -18,7 +18,16 @@ impl<'a, 'u> Expr<'a, 'u> {
             "string_literal" => self.string_literal(node),
             "number_literal" | "boolean_literal" | "hex_literal" | "long_literal"
             | "real_literal" => self.unit.text(node).to_string(),
-            "identifier" => self.unit.text(node).to_string(),
+            "identifier" => {
+                let name = self.unit.text(node).trim().to_string();
+                // Bare self-reference inside an object body: Kotlin resolves
+                // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
+                if self.unit.current_object.as_deref() == Some(name.as_str()) {
+                    format!("{}.INSTANCE", name)
+                } else {
+                    name
+                }
+            }
             // `this` inside an extension function body refers to the receiver
             // parameter (emitted as a regular first param, so `this` must map
             // to it in the static method's body).
@@ -108,7 +117,46 @@ impl<'a, 'u> Expr<'a, 'u> {
 
     pub fn transpile_target(&mut self, node: tree_sitter::Node) -> String {
         match node.kind() {
-            "identifier" | "navigation_expression" => self.transpile(node),
+            "identifier" => {
+                let name = self.unit.text(node).trim().to_string();
+                // Bare self-reference inside an object body: Kotlin resolves
+                // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
+                if self.unit.current_object.as_deref() == Some(name.as_str()) {
+                    format!("{}.INSTANCE", name)
+                } else {
+                    name
+                }
+            }
+            "navigation_expression" => {
+                // Assignment target: the property-read path emits getter calls
+                // (`h.late = "x"` -> `h.getLate() = "x"`, illegal Java). A
+                // known class property rewrites to its setter; unknown/local
+                // targets pass through.
+                let raw = self.unit.text(node).replace("?.", ".");
+                if let Some(dot) = raw.rfind('.') {
+                    let member = &raw[dot + 1..];
+                    if member
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_lowercase())
+                        && let Some(setter) = self.unit.class_props.get(member)
+                    {
+                        if setter.is_empty() {
+                            self.unit.diag_untranslatable(
+                                node,
+                                format!(
+                                    "assignment to `val {}` — Kotlin rejects this too (no setter); declaration taints, emitted Java mirrors the Kotlin error",
+                                    member
+                                ),
+                            );
+                        } else {
+                            self.unit.pending_setter = true;
+                            return format!("{}{}(", &raw[..dot + 1], setter);
+                        }
+                    }
+                }
+                self.transpile(node)
+            }
             _ => self.transpile(node),
         }
     }

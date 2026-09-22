@@ -189,6 +189,23 @@ impl<'a> Unit<'a> {
         let cap = capitalize(&name);
         let getter_name = format!("get{}", cap);
         let setter_name = format!("set{}", cap);
+        let set_private = setter
+            .as_ref()
+            .and_then(|s| kt::child(*s, "modifiers"))
+            .map(|m| self.text(m).contains("private"))
+            .unwrap_or(false);
+        // Registry for assignment-target rewriting (`obj.prop = v` ->
+        // `obj.setProp(v)`). val properties (and `private set`, which is
+        // assignment-illegal outside the class in Kotlin too) register an
+        // empty setter name, which the assignment emitter flags as a N002.
+        self.class_props.insert(
+            name.clone(),
+            if is_val || set_private {
+                String::new()
+            } else {
+                setter_name.clone()
+            },
+        );
         let mut conflicts: Vec<String> = Vec::new();
         if let Some(body) = kt::parent_of(decl).filter(|p| p.kind() == "class_body") {
             let mut cursor = body.walk();

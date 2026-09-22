@@ -57,6 +57,18 @@ pub struct Unit<'a> {
     /// Field types to re-seed into every enclosing declaration scope: enum
     /// ctor params are instance fields visible to all enum body methods.
     pub(crate) pending_field_types: Vec<(String, String)>,
+    /// Class property registry: property name -> Java setter method name
+    /// (`late` -> `setLate`). Assignment targets read through this instead of
+    /// emitting an illegal `obj.getProp() = value`. Empty setter name = val
+    /// (no setter; assignment to it is a compile error in Kotlin too).
+    pub(crate) class_props: std::collections::HashMap<String, String>,
+    /// Name of the object currently being translated: bare self-references
+    /// inside an object body (`val self = Registry`) must map to
+    /// `Registry.INSTANCE` — a plain `Registry` is an unresolved symbol.
+    pub(crate) current_object: Option<String>,
+    /// Set by transpile_target when the LHS was rewritten to a setter call —
+    /// the assignment emitter then closes the call instead of emitting `=`.
+    pub(crate) pending_setter: bool,
     /// data class name -> record component list `(type, name)` in declaration
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
@@ -88,6 +100,9 @@ impl<'a> Unit<'a> {
             subclass_map: std::collections::HashMap::new(),
             sealed_types: std::collections::HashSet::new(),
             companion_members: std::collections::HashMap::new(),
+            class_props: std::collections::HashMap::new(),
+            current_object: None,
+            pending_setter: false,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
         }

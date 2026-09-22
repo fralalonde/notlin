@@ -195,7 +195,12 @@ impl<'a, 'u> Stmt<'a, 'u> {
                 let mut e = Expr { unit: self.unit };
                 let l_java = e.transpile_target(l);
                 let r_java = e.transpile(r);
-                out.line(format!("{} {} {};", l_java, op, r_java));
+                if std::mem::replace(&mut self.unit.pending_setter, false) {
+                    // setter-call rewrite: `h.late = "x"` -> `h.setLate("x");`
+                    out.line(format!("{}{});", l_java, r_java));
+                } else {
+                    out.line(format!("{} {} {};", l_java, op, r_java));
+                }
             }
             _ => {
                 self.unit
