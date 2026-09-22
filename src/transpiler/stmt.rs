@@ -216,8 +216,32 @@ impl<'a, 'u> Stmt<'a, 'u> {
         match (left, right, op) {
             (Some(l), Some(r), Some(op)) => {
                 let mut e = Expr { unit: self.unit };
-                let l_java = e.transpile_target(l);
                 let r_java = e.transpile(r);
+                // Index-assign on a map (`m[k] = v`): rewrite to `m.put(k, v)`
+                // — indexing_expression targets can't be assignment vars in
+                // Java. Detect via index_expression + trailing '=' kept from
+                // transpile_target.
+                if let Some(l) = kt::field(stmt, "left")
+                    && l.kind() == "index_expression"
+                {
+                    let mut lcur = l.walk();
+                    let named: Vec<_> = l.children(&mut lcur).filter(|c| c.is_named()).collect();
+                    // [base, index]
+                    let lb = named
+                        .first()
+                        .map(|b| self.unit.text(*b).to_string())
+                        .unwrap_or_default();
+                    let li = named
+                        .get(1)
+                        .map(|i| {
+                            let mut ee = Expr { unit: self.unit };
+                            ee.transpile(*i)
+                        })
+                        .unwrap_or_else(|| "null".to_string());
+                    out.line(format!("{}.put({}, {});", lb.trim(), li, r_java));
+                    return;
+                }
+                let l_java = e.transpile_target(l);
                 if std::mem::replace(&mut self.unit.pending_setter, false) {
                     // setter-call rewrite: `h.late = "x"` -> `h.setLate("x");`
                     out.line(format!("{}{});", l_java, r_java));

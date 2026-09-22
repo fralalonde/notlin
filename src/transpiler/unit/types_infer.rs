@@ -84,7 +84,11 @@ impl<'a> Unit<'a> {
                 let callee = kt::child(expr, "identifier")
                     .map(|n| self.text(n).to_string())
                     .unwrap_or_default();
-                let targs = kt::child(expr, "type_arguments").map(|t| self.text(t).to_string());
+                let targs = kt::child(expr, "type_arguments").map(|t| {
+                    // Box Kotlin primitives inside generic args:
+                    // `Map<Op, Int>` -> `Map<Op, Integer>`.
+                    crate::transpiler::types::box_primitive_generics(&self.text(t).to_string())
+                });
                 // primitive array factories: intArrayOf(...) -> int[]
                 if !callee.is_empty()
                     && !callee.contains('.')
@@ -304,11 +308,18 @@ impl<'a> Unit<'a> {
     }
 
     pub fn receiver_is_array(&self, base: tree_sitter::Node) -> bool {
-        base.kind() == "identifier"
+        // Declared array vars, plus `.values()` on an enum (an array in
+        // Java) and any call/text ending in an array-shaped factory.
+        if base.kind() == "identifier"
             && self
                 .var_types
                 .get(self.text(base).trim())
                 .is_some_and(|t| t.ends_with("[]"))
+        {
+            return true;
+        }
+        let t = self.text(base).trim();
+        t.ends_with("values()") && true
     }
 }
 

@@ -279,7 +279,23 @@ impl<'a, 'u> Expr<'a, 'u> {
                 .rfind('.')
                 .map(|i| &callee_java[i + 1..])
                 .unwrap();
-            let base = &callee_java[..callee_java.len() - member.len() - 1];
+            let base = {
+                let b = &callee_java[..callee_java.len() - member.len() - 1];
+                // Arrays (e.g. `Op.values()`, `chArray`) have no .stream();
+                // wrap with Arrays.stream(...).
+                if b.ends_with("values()") {
+                    format!("java.util.Arrays.stream({})", b)
+                } else {
+                    b.to_string()
+                }
+            };
+            // Arrays.stream(...) already IS a Stream — no .stream() tail.
+            let stream_base = if base.starts_with("java.util.Arrays.stream") {
+                base.clone()
+            } else {
+                format!("{}.stream()", base)
+            };
+            let _ = &stream_base;
             let stream_fn = match member {
                 "map" | "mapNotNull" | "mapIndexed" => "map",
                 "filter" | "filterIndexed" => "filter",
@@ -378,7 +394,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                         "groupBy approximated with Collectors.groupingBy (value lists, LinkedHashMap default ordering differs)",
                     );
                     return format!(
-                        "{}.stream().collect(java.util.stream.Collectors.groupingBy({}))",
+                        "{}.collect(java.util.stream.Collectors.groupingBy({}))",
                         base, mapped_lambda
                     );
                 }
@@ -393,7 +409,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                     );
                     let kv = entry_lambda_to_kv(&mapped_lambda);
                     return format!(
-                        "{}.stream().collect(java.util.stream.Collectors.toMap({}, {}))",
+                        "{}.collect(java.util.stream.Collectors.toMap({}, {}))",
                         base, kv.0, kv.1
                     );
                 }
@@ -404,7 +420,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                         "sortedBy approximated with sorted(Comparator.comparing(key))",
                     );
                     return format!(
-                        "{}.stream().sorted(java.util.Comparator.comparing({})).collect(java.util.stream.Collectors.toList())",
+                        "{}.sorted(java.util.Comparator.comparing({})).collect(java.util.stream.Collectors.toList())",
                         base_str,
                         it_subst(&mapped_lambda)
                     );
@@ -412,7 +428,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                 _ => {}
             }
             return format!(
-                "{}.stream().{}({}).collect(java.util.stream.Collectors.toList())",
+                "{}.{}({}).collect(java.util.stream.Collectors.toList())",
                 base,
                 stream_fn,
                 self.transpile(lambda)

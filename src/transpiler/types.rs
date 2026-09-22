@@ -80,3 +80,48 @@ pub fn nullable_import(set: AnnotationSet) -> Option<&'static str> {
         AnnotationSet::None => None,
     }
 }
+
+/// Box Kotlin primitive abbreviations inside a `type_arguments` text blob
+/// (`<Op, Int>` -> `<Op, Integer>`). Splits on `<`, `,`, `>` and maps the
+/// standalone primitive names.
+pub fn box_primitive_generics(targs: &str) -> String {
+    let mut out = String::new();
+    let mut tok = String::new();
+    for ch in targs.chars() {
+        if ch == ',' || ch == '<' || ch == '>' {
+            if !tok.is_empty() {
+                let t = tok.trim();
+                out.push_str(match t {
+                    "Int" => "Integer",
+                    "Long" => "Long",
+                    "Short" => "Short",
+                    "Byte" => "Byte",
+                    "Double" => "Double",
+                    "Float" => "Float",
+                    "Boolean" => "Boolean",
+                    "Char" => "Character",
+                    _ => t,
+                });
+                tok.clear();
+            }
+            out.push(ch);
+        } else {
+            tok.push(ch);
+        }
+    }
+    if !tok.is_empty() {
+        let t = tok.trim();
+        out.push_str(match t {
+            "Int" => "Integer",
+            "Long" => "Long",
+            "Short" => "Short",
+            "Byte" => "Byte",
+            "Double" => "Double",
+            "Float" => "Float",
+            "Boolean" => "Boolean",
+            "Char" => "Character",
+            _ => t,
+        });
+    }
+    out
+}

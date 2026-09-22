@@ -149,6 +149,16 @@ impl<'a, 'u> Expr<'a, 'u> {
                             result.push_str(&format!(".{}()", member_name));
                             continue;
                         }
+                        // `it.name` on an untyped lambda param: the common
+                        // case is enum/string name access -> `name()` (JDK
+                        // enum accessor). Strings don't have `name`, but a
+                        // Kotlin `val name` user prop would have been a
+                        // getter — this context is the LIMITED-subset case
+                        // (N002 recorded at the stream-op site).
+                        if member_name == "name" {
+                            result.push_str(".name()");
+                            continue;
+                        }
                         let cap: String = member_name
                             .chars()
                             .next()
@@ -205,6 +215,21 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .next_back();
                 if let Some(member) = member {
                     let base_java = self.transpile(b);
+                    // `chained.sorted()` (no args) on a mid-stream List —
+                    // Kotlin sorted() returns a NEW sorted list; the Java
+                    // List API has no equivalent member.
+                    if member == "sorted" {
+                        self.unit.diags.warn_approx(
+                            node,
+                            self.unit.file,
+                            "List.sorted() approximated as stream().sorted().collect(toList())",
+                        );
+                        self.unit.pending_full_call = true;
+                        return format!(
+                            "{}.stream().sorted().collect(java.util.stream.Collectors.toList())",
+                            base_java
+                        );
+                    }
                     // `x.first()`: collection -> stream(); String -> charAt(0)
                     if member == "first" && base_java.trim() == "it" {
                         self.unit.diags.warn_approx(
@@ -359,6 +384,15 @@ impl<'a, 'u> Expr<'a, 'u> {
                 );
                 return format!("{}.charAt(0)", self.transpile(b));
             }
+            // `it.<prop>` inside a lambda (param type unknown): `.name()`
+            // covers the common enum-names mapping case (String.tname has
+            // none); N002-note rather than guessing a getter.
+            if base
+                .map(|b| self.unit.text(b).trim() == "it")
+                .unwrap_or(false)
+            {
+                // name (String/enum) handled below via cap-getter fallback
+            }
             // joinToString(sep) -> stream().collect(joining(sep)): need the
             // call's args from the AST — the raw path runs inside call.rs
             // AFTER callee translation, so handle it there via a marker or
@@ -442,6 +476,20 @@ impl<'a, 'u> Expr<'a, 'u> {
                 let base = &raw_trimmed[..dot];
                 self.unit.pending_full_call = true;
                 return format!("{}.{}", base, member);
+            }
+            // Kotlin `List.sorted()` (no args) has no direct List member in
+            // Java; sort a fresh stream pass and collect.
+            if member == "sorted" {
+                let base = &raw_trimmed[..dot];
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "List.sorted() approximated as stream().sorted().collect(toList())",
+                );
+                return format!(
+                    "{}.stream().sorted().collect(java.util.stream.Collectors.toList())",
+                    base
+                );
             }
             if let Some(java_member) = kotlin_member_to_java(member) {
                 if java_member != member {
