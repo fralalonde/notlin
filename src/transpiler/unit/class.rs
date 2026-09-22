@@ -147,6 +147,7 @@ impl<'a> Unit<'a> {
         // The generated body uses ArrayList/HashMap/HashSet/List/Map/Set from
         // stdlib collections; java.util.* covers them all in one line.
         out.line("import java.util.*;");
+        out.line("import java.util.stream.Stream;");
         out.blank();
         if let Some(pkg) = crate::transpiler::types::nullable_import(self.annots) {
             out.line(format!("import {}.*;", pkg));

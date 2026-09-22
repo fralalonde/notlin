@@ -11,6 +11,20 @@ impl<'a> Unit<'a> {
     }
 
     pub fn infer_type(&mut self, expr: tree_sitter::Node) -> String {
+        let t = self.infer_type_inner(expr);
+        // Kotlin stdlib `Pair`/`Triple` don't exist in the JDK: the emitted
+        // value is a SimpleImmutableEntry, so rewrite the recorded type too
+        // (member reads .first/.second key off it).
+        if let Some(stripped) = t.strip_prefix("Pair<") {
+            format!("java.util.AbstractMap.SimpleImmutableEntry<{}", stripped)
+        } else if t == "Triple" {
+            "Object".to_string()
+        } else {
+            t
+        }
+    }
+
+    fn infer_type_inner(&mut self, expr: tree_sitter::Node) -> String {
         match expr.kind() {
             "identifier" => {
                 // Grammar quirk: bare `false`/`true` parses as identifier,
@@ -33,6 +47,16 @@ impl<'a> Unit<'a> {
                     "int".to_string()
                 }
             }
+            "infix_expression" => {
+                // Arithmetic infix inside inference (e.g. `0.5 + 0.25`):
+                // widen to double when either operand is a double literal.
+                let txt = self.text(expr);
+                if txt.contains('.') {
+                    "double".to_string()
+                } else {
+                    "int".to_string()
+                }
+            }
             "boolean_literal" => "boolean".to_string(),
             "binary_expression" => {
                 // Arithmetic ops produce numeric results; comparisons produce boolean.
@@ -41,7 +65,16 @@ impl<'a> Unit<'a> {
                     .unwrap_or_default();
                 let is_arith = matches!(op.as_str(), "+" | "-" | "*" | "/" | "%");
                 if is_arith {
-                    "int".to_string()
+                    // widen when either operand is a floating literal
+                    let has_dot = self
+                        .text(expr)
+                        .split(op.trim())
+                        .any(|side| side.contains('.'));
+                    if has_dot {
+                        "double".to_string()
+                    } else {
+                        "int".to_string()
+                    }
                 } else {
                     "boolean".to_string()
                 }
@@ -95,6 +128,15 @@ impl<'a> Unit<'a> {
                     ("setOf", None) => "Set<Object>".to_string(),
                     ("mapOf", Some(t)) => format!("Map{}", t),
                     ("mapOf", None) => "Map<Object, Object>".to_string(),
+                    // user function call: registered return type wins;
+                    // NOT a known fn and uppercase => constructor, fall
+                    // through to the constructor arm below.
+                    _ if !callee.contains('.') && self.fn_rets.contains_key(callee.as_str()) => {
+                        self.fn_rets
+                            .get(callee.as_str())
+                            .cloned()
+                            .unwrap_or_default()
+                    }
                     _ => {
                         // member call on a receiver: `m.keys()`, `xs.first()`
                         if let Some(nav) = kt::child(expr, "navigation_expression")

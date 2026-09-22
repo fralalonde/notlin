@@ -75,6 +75,10 @@ pub struct Unit<'a> {
     /// Set by navigation_call when the member mapping already consumed the
     /// call args (joinToString) — call.rs must not append its own `(args)`.
     pub(crate) pending_full_call: bool,
+    /// function name -> Java return type, filled when each function is
+    /// emitted; lets `val p = pair()` infer the fn's return type for
+    /// member-call context (Pair.first -> getKey()).
+    pub(crate) fn_rets: std::collections::HashMap<String, String>,
     /// data class name -> record component list `(type, name)` in declaration
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
@@ -111,6 +115,7 @@ impl<'a> Unit<'a> {
             static_member_types: std::collections::HashMap::new(),
             pending_setter: false,
             pending_full_call: false,
+            fn_rets: std::collections::HashMap::new(),
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
         }

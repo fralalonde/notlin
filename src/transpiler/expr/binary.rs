@@ -16,6 +16,51 @@ impl<'a, 'u> Expr<'a, 'u> {
         }
     }
 
+    /// Kotlin infix function calls (`a to b`, `x shr 1`) — the grammar uses
+    /// its own infix_expression node, not binary_expression.
+    pub(crate) fn infix_expr(&mut self, node: tree_sitter::Node) -> String {
+        let mut cursor = node.walk();
+        let named: Vec<_> = node
+            .children(&mut cursor)
+            .filter(|c| c.is_named())
+            .collect();
+        if named.len() == 3 {
+            let op = self.unit.text(named[1]).trim().to_string();
+            let op_java = match op.as_str() {
+                "shl" => "<<",
+                "shr" => ">>",
+                "ushr" => ">>>",
+                "and" => "&",
+                "or" => "|",
+                "xor" => "^",
+                "rem" => "%",
+                _ => op.as_str(),
+            };
+            let l_java = self.transpile(named[0]);
+            let r_java = self.transpile(named[2]);
+            if op == "to" {
+                // Infix `to` builds a Pair. Closest pure-JDK value:
+                // AbstractMap.SimpleImmutableEntry (getKey/getValue mapped
+                // at call sites that read .first/.second on Pair-typed vars).
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "infix `to` pair approximated with AbstractMap.SimpleImmutableEntry (getKey/getValue instead of first/second)",
+                );
+                return format!(
+                    "new java.util.AbstractMap.SimpleImmutableEntry<>({}, {})",
+                    l_java, r_java
+                );
+            }
+            format!("{} {} {}", l_java, op_java, r_java)
+        } else {
+            self.unit
+                .diags
+                .warn_approx(node, self.unit.file, "malformed infix expression");
+            self.unit.text(node).to_string()
+        }
+    }
+
     pub(crate) fn binary(&mut self, node: tree_sitter::Node) -> String {
         let left = kt::field(node, "left");
         let right = kt::field(node, "right");
@@ -109,6 +154,21 @@ impl<'a, 'u> Expr<'a, 'u> {
                 };
                 let l_java = self.transpile(l);
                 let r_java = self.transpile(r);
+                if op == "to" {
+                    // Infix `to` builds a Pair. Closest pure-JDK value:
+                    // AbstractMap.SimpleImmutableEntry — getKey/getValue map
+                    // to first/second reads with a member rewrite; record
+                    // the pair semantics with an approximation warning.
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "infix `to` pair approximated with AbstractMap.SimpleImmutableEntry (getKey/getValue instead of first/second)",
+                    );
+                    return format!(
+                        "new java.util.AbstractMap.SimpleImmutableEntry<>({}, {})",
+                        l_java, r_java
+                    );
+                }
                 format!("{} {} {}", l_java, op_java, r_java)
             }
             _ => {

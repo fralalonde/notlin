@@ -42,6 +42,11 @@ pub fn map_type_name(kotlin_type: &str) -> &str {
         "CharArray" => "char[]",
         "Array" => "__NOTLIN_ARRAY__",
         "UByte" | "UShort" | "UInt" | "ULong" => "long",
+        // stdlib container types have no JDK twin; `to` emits a
+        // SimpleImmutableEntry, so declared Pair<..> types rewrite to it
+        // (member reads map .first/.second -> getKey/getValue).
+        "Pair" => "java.util.AbstractMap.SimpleImmutableEntry",
+        "Triple" => "__NOTLIN_TRIPLE__",
         _ => kotlin_type,
     }
 }

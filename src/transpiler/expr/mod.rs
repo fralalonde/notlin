@@ -17,7 +17,23 @@ impl<'a, 'u> Expr<'a, 'u> {
         match node.kind() {
             "string_literal" => self.string_literal(node),
             "number_literal" | "boolean_literal" | "hex_literal" | "long_literal"
-            | "real_literal" => self.unit.text(node).to_string(),
+            | "real_literal" => {
+                let raw = self.unit.text(node).trim().to_string();
+                // Kotlin unsigned suffixes (u/U/L/UL/uL) have no Java
+                // equivalent for the plain literal; strip to the base type.
+                if raw.ends_with("uL")
+                    || raw.ends_with("UL")
+                    || raw.ends_with("Lu")
+                    || raw.ends_with("LU")
+                {
+                    // unsigned markers vanish in Java
+                    raw.trim_end_matches(['u', 'U', 'L']).to_string()
+                } else if raw.ends_with('L') {
+                    raw.trim_end_matches('L').to_string()
+                } else {
+                    raw
+                }
+            }
             "identifier" => {
                 let name = self.unit.text(node).trim().to_string();
                 // Bare self-reference inside an object body: Kotlin resolves
@@ -38,6 +54,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                 .unwrap_or_else(|| "this".to_string()),
             "navigation_expression" => self.navigation(node),
             "call_expression" => self.call(node),
+            "infix_expression" => self.infix_expr(node),
             "binary_expression" => self.binary(node),
             "parenthesized" => {
                 let inner = node

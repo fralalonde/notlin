@@ -114,6 +114,16 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                     None => "Object[]".to_string(),
                 };
             }
+            if mapped == "__NOTLIN_TRIPLE__" {
+                // Triple has no JDK equivalent (JDK lacks a 3-tuple); the
+                // caller taints the declaration. Type erases to Object.
+                return "Object".to_string();
+            }
+            // Parameterized `Pair<A, B>`: the plain-name map only fires on
+            // bare "Pair"; generic forms rewrite on prefix.
+            if let Some(rest) = mapped.strip_prefix("Pair<") {
+                return format!("java.util.AbstractMap.SimpleImmutableEntry<{}", rest);
+            }
             mapped.to_string()
         }
         "nullable_type" => {

@@ -81,7 +81,27 @@ impl<'a, 'u> Expr<'a, 'u> {
                             result.push_str(&format!(".{}", member_name));
                         }
                     } else {
-                        // user-defined property read -> getter call
+                        // user-defined property read -> getter call; Pair/
+                        // Entry receivers map first/second to the JDK
+                        // SimpleImmutableEntry accessors emitted by `to`.
+                        let recv_ty = base
+                            .and_then(|b| {
+                                self.unit.var_types.get(self.unit.text(b).trim()).cloned()
+                            })
+                            .unwrap_or_default();
+                        if recv_ty.contains("Pair<") || recv_ty.contains("Entry<") {
+                            let jfn = if member_name == "first" {
+                                "getKey()"
+                            } else if member_name == "second" {
+                                "getValue()"
+                            } else {
+                                ""
+                            };
+                            if !jfn.is_empty() {
+                                result.push_str(&format!(".{}", jfn));
+                                continue;
+                            }
+                        }
                         let cap: String = member_name
                             .chars()
                             .next()
@@ -162,6 +182,33 @@ impl<'a, 'u> Expr<'a, 'u> {
                 .map(|i| dot + 1 + i)
                 .unwrap_or(raw_trimmed.len());
             let member = &raw_trimmed[dot + 1..member_end];
+            // Pair.first/.second on a Pair/Entry-typed receiver: the `to`
+            // approximation uses AbstractMap.SimpleImmutableEntry, whose
+            // accessors are getKey()/getValue().
+            if matches!(member, "first" | "second")
+                && let Some(b) = base
+                && b.kind() == "identifier"
+                && self
+                    .unit
+                    .var_types
+                    .get(self.unit.text(b).trim())
+                    .is_some_and(|t| t.contains("Entry<") || t.contains("Pair<"))
+            {
+                let jfn = if member == "first" {
+                    "getKey()"
+                } else {
+                    "getValue()"
+                };
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    format!(
+                        "`.{member}` on Pair approximated as `{}` on SimpleImmutableEntry",
+                        jfn
+                    ),
+                );
+                return format!("{}.{}", self.transpile(b), jfn);
+            }
             // `first()` on a known List-typed receiver: Java has no `first`;
             // `get(0)` is the List API closest in semantics. The warn stays
             // because on an empty list Java throws IndexOutOfBoundsException

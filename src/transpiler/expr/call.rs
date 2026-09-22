@@ -85,16 +85,47 @@ impl<'a, 'u> Expr<'a, 'u> {
                     "toLong" => return format!("((long) {})", recv),
                     "toDouble" => return format!("((double) {})", recv),
                     "toFloat" => return format!("((float) {})", recv),
-                    "and" | "or" | "xor" if args.len() == 1 => {
-                        let op = member.as_str();
-                        self.unit.diags.warn_approx(
-                            nav,
-                            self.unit.file,
-                            format!("Kotlin infix `{}` mapped to Java `{}` operator", op, op),
-                        );
-                        return format!("{} {} {}", recv, op, args[0]);
-                    }
                     _ => {}
+                }
+                // takeIf/takeUnless with a trailing-lambda predicate: no
+                // Java deref possible for primitives; lambda-less element
+                // read must fall back to a N001 taint instead of a broken
+                // `int.takeIf` method reference.
+                if let (true, Some(lnode)) = (
+                    matches!(member.as_str(), "takeIf" | "takeUnless"),
+                    lambda_arg,
+                ) {
+                    // Kotlin `v.takeIf { it > 0 }` -> `v > 0 ? v : null`
+                    // (`takeUnless` -> negation). The subtree beyond the
+                    // params/arrow is the predicate expression.
+                    let mut body_children: Vec<tree_sitter::Node> = {
+                        let mut cur = lnode.walk();
+                        lnode
+                            .children(&mut cur)
+                            .filter(|c| c.is_named() && c.kind() != "lambda_parameters")
+                            .collect()
+                    };
+                    if let Some(pos_arrow) = body_children.iter().position(|c| c.kind() == "->") {
+                        body_children = body_children[pos_arrow + 1..].to_vec();
+                    }
+                    if body_children.len() == 1 {
+                        let pred = self.transpile(body_children[0]);
+                        let recv_name = self.unit.text(base).trim();
+                        let pred = pred.replace("it", recv_name);
+                        self.unit.diags.warn_approx(
+                            node,
+                            self.unit.file,
+                            format!(
+                                "primitive `.{}` inlined as null-check ternary (no receiver deref in Java)",
+                                member
+                            ),
+                        );
+                        return if member == "takeIf" {
+                            format!("({} ? {} : null)", pred, recv)
+                        } else {
+                            format!("(!({}) ? {} : null)", pred, recv)
+                        };
+                    }
                 }
             }
             if let Some(_recv_ty) = self.unit.extension_fns.get(member.as_str()) {
@@ -247,6 +278,19 @@ impl<'a, 'u> Expr<'a, 'u> {
                     format!("new ArrayList<>(List.of({}))", args.join(", "))
                 }
             }
+            "listOfNotNull" => {
+                // Filters nulls: List.of rejects nulls, so stream the args
+                // and keep non-nulls.
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "listOfNotNull approximated with Stream.filter(Objects::nonNull) over List.of",
+                );
+                format!(
+                    "Stream.of({}).filter(java.util.Objects::nonNull).collect(java.util.stream.Collectors.toList())",
+                    args.join(", ")
+                )
+            }
             "mutableMapOf" | "mapOf" | "hashMapOf" => {
                 if args.is_empty() {
                     "new HashMap<>()".to_string()
@@ -281,7 +325,14 @@ impl<'a, 'u> Expr<'a, 'u> {
                 // `Outer.Inner` both need `new` (data subclasses of a sealed
                 // nesting parent are the common case).
                 let last_seg = callee_java.rsplit('.').next().unwrap_or("");
-                if callee_java
+                if callee_java == "Triple" {
+                    // JDK has no 3-tuple; N001 taint, null emit.
+                    self.unit.diag_untranslatable(
+                        node,
+                        "Triple not translatable: JDK has no 3-tuple type; hand-migrate to a small record",
+                    );
+                    "null".to_string()
+                } else if callee_java
                     .chars()
                     .next()
                     .is_some_and(|c| c.is_ascii_uppercase())

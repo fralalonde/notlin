@@ -169,6 +169,9 @@ impl<'a> Unit<'a> {
                 }
             }
         }
+        // Register the return type so `val x = fname()` call sites infer
+        // (Pair.first -> getKey() and friends need fn-receiver context).
+        self.fn_rets.insert(fname_raw.clone(), ret.clone());
 
         // parameters
         let mut params: Vec<String> = Vec::new(); // signature fragments "ty name"
