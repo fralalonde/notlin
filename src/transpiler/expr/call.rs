@@ -167,7 +167,7 @@ impl<'a, 'u> Expr<'a, 'u> {
         // nearest logic-preserving form is a nested block with a typed
         // local. Left as an explicit N001 when the callee is a receiver-scope
         // function to avoid silently emitting a method that does not exist.
-        if let Some(lambda) = lambda_arg {
+        if lambda_arg.is_some() {
             let member = callee_java.rsplit('.').next().unwrap_or("");
             if matches!(member, "apply" | "also" | "run" | "with" | "let") {
                 self.unit.diag_untranslatable(
