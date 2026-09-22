@@ -84,6 +84,7 @@ impl<'a> Unit<'a> {
                     .and_then(|al| kt::child(al, "lambda_literal"))
                     .and_then(|ll| ll.children(&mut ll.walk()).find(|c| c.is_named()));
                 let _cap = capitalize(&name);
+                let dkw = if make_static { "static " } else { "" };
                 match expr {
                     Some(body) => {
                         // if the body is a lambda (collection literal), take its
@@ -92,7 +93,7 @@ impl<'a> Unit<'a> {
                         let java = e.transpile(body);
                         let tyy = ty.clone().unwrap_or_else(|| "Object".to_string());
                         if java.contains("LAMBDA") || body.kind() == "lambda_literal" {
-                            out.line(format!("private {} {} = null;", tyy, name));
+                            out.line(format!("private {}{} {} = null;", dkw, tyy, name));
                             self.diag_approx(
                                 delim,
                                 format!(
@@ -101,7 +102,7 @@ impl<'a> Unit<'a> {
                                 ),
                             );
                         } else {
-                            out.line(format!("private {} {} = {};", tyy, name, java));
+                            out.line(format!("private {}{} {} = {};", dkw, tyy, name, java));
                             self.diag_approx(
                                 delim,
                                 format!(

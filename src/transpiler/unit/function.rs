@@ -145,6 +145,7 @@ impl<'a> Unit<'a> {
         let fname_raw = kt::field(decl, "name")
             .map(|n| self.source[n.start_byte()..n.end_byte()].to_string())
             .unwrap_or_default();
+        let mut explicit_ret = false;
         {
             let mut cursor = decl.walk();
             let kids: Vec<_> = decl.children(&mut cursor).collect();
@@ -162,6 +163,7 @@ impl<'a> Unit<'a> {
                         "user_type" | "nullable_type" | "function_type" | "type"
                         | "parenthesized_type" => {
                             ret = kt::java_type_ann(k, self.source, self.annots);
+                            explicit_ret = true;
                         }
                         _ => {}
                     }
@@ -171,6 +173,59 @@ impl<'a> Unit<'a> {
         }
         // Register the return type so `val x = fname()` call sites infer
         // (Pair.first -> getKey() and friends need fn-receiver context).
+        // Expression-body infer when no explicit type: Kotlin infers from
+        // the body (`= when ... -> int` would otherwise emit void and
+        // break `return`). Number literal -> int; string -> String;
+        // else keep void with an N002 note at the body site.
+        if ret == "void"
+            && !explicit_ret
+            && let Some(fv) = decl
+                .children(&mut decl.walk())
+                .find(|c| c.kind() == "function_body")
+        {
+            let is_expr_body = fv.children(&mut fv.walk()).any(|c| c.kind() == "=");
+            if is_expr_body {
+                let body_expr = fv
+                    .children(&mut fv.walk())
+                    .find(|c| c.is_named() && c.kind() != "=");
+                let inferred = body_expr.map(|be| {
+                    match be.kind() {
+                        "number_literal" => Some("int"),
+                        "string_literal" | "interpolated_string" => Some("String"),
+                        "true" | "false" => Some("boolean"),
+                        // when/if over numbers: pick the arm literal kinds
+                        "when_expression" | "if_expression" | "binay" => {
+                            let mut has_num = false;
+                            let mut has_str = false;
+                            let mut stack = vec![be];
+                            while let Some(n) = stack.pop() {
+                                match n.kind() {
+                                    "number_literal" => has_num = true,
+                                    "string_literal" | "interpolated_string" => has_str = true,
+                                    _ => {}
+                                }
+                                let mut wc = n.walk();
+                                for c in n.children(&mut wc) {
+                                    stack.push(c);
+                                }
+                            }
+                            if has_num && !has_str {
+                                Some("int")
+                            } else if has_str && !has_num {
+                                Some("String")
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                    .map(|s| s.to_string())
+                });
+                if let Some(t) = inferred.flatten() {
+                    ret = t;
+                }
+            }
+        }
         self.fn_rets.insert(fname_raw.clone(), ret.clone());
 
         // parameters
