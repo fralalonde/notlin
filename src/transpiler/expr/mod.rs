@@ -170,10 +170,18 @@ impl<'a, 'u> Expr<'a, 'u> {
         // when (subject) { branch -> expr, ... }  =>  ternary chain (single branch for now)
         let mut cursor = node.walk();
         let kids: Vec<_> = node.children(&mut cursor).collect();
+        // The subject is inside a when_subject wrapper (with paren tokens):
+        // find its first named expression child so `xs.size` TRANSPILES (its
+        // property access -> xs.size()) instead of raw text pass-through.
         let subject = kids
             .iter()
-            .find(|c| c.is_named() && c.kind() != "when_entry")
-            .copied();
+            .find(|c| c.kind() == "when_subject")
+            .and_then(|ws| ws.children(&mut ws.walk()).find(|c| c.is_named()))
+            .or_else(|| {
+                kids.iter()
+                    .find(|c| c.is_named() && c.kind() != "when_entry")
+                    .copied()
+            });
         let entries: Vec<_> = kids
             .iter()
             .filter(|c| c.kind() == "when_entry")
@@ -226,6 +234,15 @@ impl<'a, 'u> Expr<'a, 'u> {
         }
         if ternary.is_empty() {
             "null".to_string()
+        } else if ternary.contains("System.out.println") && ternary.contains(" : ") {
+            // when-as-statement with void arms: a ternary over void calls is
+            // illegal Java — real if/else chain preserves the logic.
+            if let Some((c, rest)) = ternary.split_once(" ? ")
+                && let Some((a, b)) = rest.split_once(" : ")
+            {
+                return format!("if ({}) {}; else {};", c, a, b);
+            }
+            ternary
         } else {
             ternary
         }
@@ -285,18 +302,31 @@ impl<'a, 'u> Expr<'a, 'u> {
             "if-expression approximated as ternary",
         );
         let mut cursor = node.walk();
-        let kids: Vec<_> = node.children(&mut cursor).collect();
-        // Condition: the `condition` field if present, else the first is/binary
-        // expression child before `else`.
-        let cond_node = kids
-            .iter()
-            .find(|c| {
-                cursor.field_name() == Some("condition")
-                    || c.kind() == "is_expression"
-                    || c.kind() == "binary_expression"
-                    || c.kind() == "parenthesized"
-            })
-            .copied();
+        let kids: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+        // Condition: first named child between the `(` and `)` tokens —
+        // the if-condition can be ANY expression kind (call, binary, is,
+        // paren). Field-based detection misses call conditions.
+        let cond_node: Option<tree_sitter::Node> = {
+            let mut c2 = node.walk();
+            let all: Vec<_> = node.children(&mut c2).collect();
+            let mut inner = Vec::new();
+            let mut depth = 0;
+            for c in all {
+                if c.kind() == "(" {
+                    depth = 1;
+                    continue;
+                }
+                if depth == 1 {
+                    if c.kind() == ")" {
+                        break;
+                    }
+                    if c.is_named() {
+                        inner.push(c);
+                    }
+                }
+            }
+            inner.first().copied()
+        };
         let cond = cond_node.map(|c| {
             let inner = unwrap_paren_node(c);
             self.transpile(inner)
@@ -330,6 +360,18 @@ impl<'a, 'u> Expr<'a, 'u> {
                     (Some(ty), "identifier") => format!("(({}) {})", ty, a),
                     _ => a,
                 };
+                // Both arms are void calls (println etc.)? A statement-level
+                // ternary over void calls is illegal Java — emit real if/else.
+                let arms_void =
+                    a.contains("System.out.println") || b.contains("System.out.println");
+                if arms_void {
+                    return format!(
+                        "if ({}) {{\n{};\n}} else {{\n{};\n}}",
+                        c,
+                        a.trim_matches('(').trim_matches(')'),
+                        b
+                    );
+                }
                 format!("({} ? {} : {})", c, a, b)
             }
             _ => {

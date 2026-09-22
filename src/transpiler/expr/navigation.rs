@@ -2,6 +2,7 @@
 //! calls, stdlib-member mapping table, subscript -> get().
 
 use super::Expr;
+use crate::transpiler::kt;
 
 impl<'a, 'u> Expr<'a, 'u> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
@@ -181,6 +182,53 @@ impl<'a, 'u> Expr<'a, 'u> {
                 );
                 return format!("{}.get(0)", self.transpile(b));
             }
+            // joinToString(sep) -> stream().collect(joining(sep)): need the
+            // call's args from the AST — the raw path runs inside call.rs
+            // AFTER callee translation, so handle it there via a marker or
+            // here by re-reading args from the node tree.
+            if member == "joinToString" {
+                // extract args from this navigation's enclosing call — walk
+                // the tree here instead: the call_expression's value_arguments
+                if let Some(call) = node
+                    .parent()
+                    .filter(|p| p.kind() == "call_expression")
+                    .and_then(|p| kt::child(p, "value_arguments"))
+                {
+                    let mut acur = call.walk();
+                    let args: Vec<String> = call
+                        .children(&mut acur)
+                        .filter(|a| a.kind() == "value_argument")
+                        .filter_map(|a| a.children(&mut a.walk()).find(|x| x.is_named()))
+                        .map(|e| self.transpile(e))
+                        .collect();
+                    if !args.is_empty() {
+                        self.unit.diags.warn_approx(
+                            node,
+                            self.unit.file,
+                            if args.len() == 1 {
+                                "Kotlin `joinToString(sep)` mapped to `stream().collect(joining(sep))`; element toString used"
+                            } else {
+                                "joinToString with >1 arg (prefix/postfix/limit/transform) approximated as joining(sep); extra args dropped"
+                            },
+                        );
+                        let base_java = self
+                            .unit
+                            .text(node)
+                            .split('.')
+                            .next()
+                            .unwrap_or("xs")
+                            .to_string();
+                        // base may itself be compound; use node text minus suffix
+                        let _ = base_java;
+                        self.unit.pending_full_call = true;
+                        return format!(
+                            "{}.stream().map(Object::toString).collect(java.util.stream.Collectors.joining({}))",
+                            &raw_trimmed[..dot],
+                            args[0]
+                        );
+                    }
+                }
+            }
             if let Some(java_member) = kotlin_member_to_java(member) {
                 if java_member != member {
                     if java_member.contains('(') {
@@ -257,6 +305,8 @@ fn kotlin_member_to_java(member: &str) -> Option<String> {
         "lastOrNull" => Some("stream().reduce((__left, __right) -> __right).orElse(null)"),
         "reversed" => Some("reversed()"),
         "count" => Some("size()"),
+        // joinToString(sep) needs the sep argument — handled upstream in the
+        // call path where args are available, not by this name table.
         _ => None,
     };
     if let Some(m) = mapped {

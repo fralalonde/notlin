@@ -179,10 +179,35 @@ impl<'a, 'u> Expr<'a, 'u> {
                 node,
                 self.unit.file,
                 format!(
-                    "collection op `.{} {{...}}` approximated with Stream",
-                    member
+                    "collection op `.{member} {{...}}` approximated with Stream",
+                    member = member
                 ),
             );
+            // joinToString(sep) -> collect(joining(sep)): the separator is
+            // the first positional arg; other overloads (prefix/postfix/
+            // limit/transform) degrade to joinToString-less collection with
+            // a warn via the generic stream path below only when args exist
+            if member == "joinToString" && !args.is_empty() {
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    if args.len() == 1 {
+                        "Kotlin `joinToString(sep)` mapped to `stream().collect(joining(sep))`"
+                    } else {
+                        "joinToString with >1 arg (prefix/postfix/limit/transform) approximated as joining(sep); extra args dropped"
+                    },
+                );
+                return format!(
+                    "{}.stream().map(Object::toString).collect(java.util.stream.Collectors.joining({}))",
+                    base, args[0]
+                );
+            }
+            // forEach terminates the stream: it returns void, so no
+            // `.collect(...)` tail (chaining collect after forEach is a
+            // compile error and would drop the loop's effect entirely).
+            if member == "forEach" {
+                return format!("{}.stream().forEach({});", base, self.transpile(lambda));
+            }
             return format!(
                 "{}.stream().{}({}).collect(java.util.stream.Collectors.toList())",
                 base,
@@ -245,6 +270,10 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // (`xs.get(0)`, `xs.stream().findFirst().orElse(null)`):
                     // it IS the call — no `()` wrapper to add.
                     callee_java
+                } else if std::mem::replace(&mut self.unit.pending_full_call, false) {
+                    // joinToString style: callee mapping already emitted the
+                    // full call with args — nothing to append.
+                    callee_java
                 } else {
                     format!("{}({})", callee_java, args.join(", "))
                 }
@@ -265,25 +294,57 @@ impl<'a, 'u> Expr<'a, 'u> {
     }
 
     pub(crate) fn lambda(&mut self, node: tree_sitter::Node) -> String {
-        // lambda_literal: { params -> body }
-        let raw = self.unit.text(node);
-        // strip braces
-        let inner = raw.trim().trim_start_matches('{').trim_end_matches('}');
-        let (params, body) = match inner.split_once("->") {
-            Some((p, b)) => (p.trim(), b.trim()),
-            None => ("", inner.trim()),
-        };
-        // params like `a, b` or typed `a: Int`
-        let params_java = params
-            .split(',')
-            .map(|p| p.split(':').next().unwrap_or(p).trim().to_string())
-            .filter(|p| !p.is_empty() && p != "it")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let body_java = self.transpile_body_text(node, body);
+        // lambda_literal: { params -> body }. The body is real AST (named
+        // children after `->`) — transpiling it keeps println and other
+        // top-level rewrites intact; raw text pass-through loses them.
+        let mut cursor = node.walk();
+        let kids: Vec<_> = node.children(&mut cursor).collect();
+        // params
+        let mut params_java = String::new();
+        let mut body_nodes: Vec<tree_sitter::Node> = Vec::new();
+        let mut after_arrow = !kids.iter().any(|c| c.kind() == "->");
+        for c in kids {
+            match c.kind() {
+                "lambda_parameters" => {
+                    let mut pcur = c.walk();
+                    let names: Vec<String> = c
+                        .children(&mut pcur)
+                        .filter(|vc| vc.kind() == "variable_declaration")
+                        .filter_map(|vd| kt::child(vd, "identifier"))
+                        .map(|n| self.unit.text(n).to_string())
+                        .collect();
+                    params_java = names.join(", ");
+                }
+                "->" => after_arrow = true,
+                k if after_arrow && c.is_named() && k != "{" && k != "}" => {
+                    body_nodes.push(c);
+                }
+                _ => {}
+            }
+        }
+        // body statements -> `\n`-joined expressions (Kotlin lambda bodies
+        // here are single expressions in practice)
+        let mut body_java = String::new();
+        for (i, bn) in body_nodes.iter().enumerate() {
+            if i > 0 {
+                body_java.push_str("; ");
+            }
+            body_java.push_str(&self.transpile(*bn));
+        }
+        if body_java.is_empty() {
+            body_java = "{}".to_string();
+            self.unit.diags.warn_approx(
+                node,
+                self.unit.file,
+                "empty lambda body emitted as a no-op block",
+            );
+        }
         if params_java.is_empty() {
             // `{ it * 2 }`: implicit `it` parameter — the body references it.
-            if body_java.contains("it") {
+            let uses_it = body_nodes
+                .iter()
+                .any(|bn| Self::body_uses_it(*bn, self.unit.source));
+            if uses_it {
                 format!("it -> {}", body_java)
             } else {
                 format!("() -> {}", body_java)
@@ -293,22 +354,21 @@ impl<'a, 'u> Expr<'a, 'u> {
         }
     }
 
-    fn transpile_body_text(&mut self, node: tree_sitter::Node, body: &str) -> String {
-        // For now: pass through simple expressions, warn otherwise.
-        if body
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._()<>[]\" ',:+-*/%=!&|?".contains(c))
-            && !body.contains("val ")
-            && !body.contains("var ")
-        {
-            body.replace("?.", ".").replace('$', "")
-        } else {
-            self.unit.diags.warn_approx(
-                node,
-                self.unit.file,
-                format!("complex lambda body passed through raw: {}", body),
-            );
-            body.replace("?.", ".").replace('$', "")
+    /// Does this lambda-body tree reference the implicit `it` parameter?
+    fn body_uses_it<'t>(node: tree_sitter::Node<'t>, source: &'t str) -> bool {
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "identifier"
+                && n.parent().map(|p| p.kind()) != Some("lambda_parameters")
+                && kt::text(n, source) == "it"
+            {
+                return true;
+            }
+            let mut cur = n.walk();
+            for c in n.children(&mut cur) {
+                stack.push(c);
+            }
         }
+        false
     }
 }

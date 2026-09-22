@@ -72,6 +72,9 @@ pub struct Unit<'a> {
     /// Set by transpile_target when the LHS was rewritten to a setter call —
     /// the assignment emitter then closes the call instead of emitting `=`.
     pub(crate) pending_setter: bool,
+    /// Set by navigation_call when the member mapping already consumed the
+    /// call args (joinToString) — call.rs must not append its own `(args)`.
+    pub(crate) pending_full_call: bool,
     /// data class name -> record component list `(type, name)` in declaration
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
@@ -107,6 +110,7 @@ impl<'a> Unit<'a> {
             current_object: None,
             static_member_types: std::collections::HashMap::new(),
             pending_setter: false,
+            pending_full_call: false,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
         }
