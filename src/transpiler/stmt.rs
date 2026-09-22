@@ -37,7 +37,27 @@ impl<'a, 'u> Stmt<'a, 'u> {
                 // Fall back to expression statement
                 let mut e = Expr { unit: self.unit };
                 let java = e.transpile(stmt);
-                if !java.is_empty() {
+                // Statement-level elvis with void arms: `x?.let{...} ?: y`
+                // transpiles to a (null-check ? void : void) ternary which
+                // javac rejects as a statement — lift to a real if/else.
+                let t = java.trim();
+                if t.starts_with('(')
+                    && t.ends_with(')')
+                    && let Some((cond, rest)) = t[1..t.len() - 1].split_once(" ? ")
+                    && let Some((a, b)) = rest.split_once(" : ")
+                    && java.contains("System.out.println")
+                {
+                    // A null-tainted (scope-fn) arm emitted the literal
+                    // `null` — javac rejects `if (c) null`; use the other
+                    // arm's shape and drop the dead branch.
+                    if a.trim() == "null" {
+                        out.line(format!("if (!({})) {};", cond, b));
+                    } else if b.trim() == "null" {
+                        out.line(format!("if ({}) {};", cond, a));
+                    } else {
+                        out.line(format!("if ({}) {} else {};", cond, a, b));
+                    }
+                } else if !java.is_empty() {
                     out.line(format!("{};", java));
                 } else {
                     self.unit.diags.warn_approx(

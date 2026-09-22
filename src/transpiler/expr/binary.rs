@@ -32,6 +32,13 @@ impl<'a, 'u> Expr<'a, 'u> {
                     );
                     let l_java = self.transpile(l);
                     let r_java = self.transpile(r);
+                    // `lhs ?: println(...)`-style void arms: orElse(void) is
+                    // illegal Java — fall back to a null-check ternary.
+                    if r_java.starts_with("System.out.println")
+                        || l_java.starts_with("System.out.println")
+                    {
+                        return format!("({} != null ? {} : {})", l_java, l_java, r_java);
+                    }
                     return format!(
                         "java.util.Optional.ofNullable({}).orElse({})",
                         l_java, r_java
@@ -127,7 +134,20 @@ impl<'a, 'u> Expr<'a, 'u> {
         if kids.len() >= 2 {
             let lhs = self.transpile(kids[0]);
             let rhs = self.transpile(kids[1]);
-            format!("java.util.Optional.ofNullable({}).orElse({})", lhs, rhs)
+            // orElse of a void/println arm is illegal Java. A ternary is
+            // always valid (works for void-as-statement contexts too when
+            // emitted inside an expression-only parent? no — statement
+            // parents get it via when/if rules). The correct semantics for
+            // `x ?: y` is a ternary on truthy-only-for-refs: use the plain
+            // null-check ternary for string/nullable shapes.
+            if rhs.contains("void")
+                || rhs.starts_with("System.out.println")
+                || lhs.starts_with("System.out.println")
+            {
+                format!("({} != null ? {} : {})", lhs.trim_end(), lhs, rhs)
+            } else {
+                format!("java.util.Optional.ofNullable({}).orElse({})", lhs, rhs)
+            }
         } else {
             "null".to_string()
         }

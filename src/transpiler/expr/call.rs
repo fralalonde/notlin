@@ -162,6 +162,26 @@ impl<'a, 'u> Expr<'a, 'u> {
                 )
             })
             .unwrap_or(false);
+        // Scope function with receiver: `x.apply { ... }` / `x.also { ... }`
+        // -> IIFE-style static helper? No: Java 25 has no scope functions;
+        // nearest logic-preserving form is a nested block with a typed
+        // local. Left as an explicit N001 when the callee is a receiver-scope
+        // function to avoid silently emitting a method that does not exist.
+        if let Some(lambda) = lambda_arg {
+            let member = callee_java.rsplit('.').next().unwrap_or("");
+            if matches!(member, "apply" | "also" | "run" | "with" | "let") {
+                self.unit.diag_untranslatable(
+                    node,
+                    format!(
+                        "scope function `.{}` not reproduced: Java has no equivalent; logic must be hand-migrated",
+                        member
+                    ),
+                );
+                // Inline comment breaks surrounding expressions; the
+                // diagnostic listing carries the message.
+                return "null".to_string();
+            }
+        }
         if let (true, Some(lambda)) = (is_stream_op, lambda_arg) {
             let member = callee_java
                 .rfind('.')
