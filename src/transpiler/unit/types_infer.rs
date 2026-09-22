@@ -129,6 +129,11 @@ impl<'a> Unit<'a> {
                         return t;
                     }
                 }
+                // `+` with a String operand (or a quoted-literal piece) is
+                // Java/Kotlin string concat -> String result, not int.
+                if is_arith && self.text(expr).contains('"') {
+                    return "String".to_string();
+                }
                 if is_arith {
                     // widen when either operand is a floating literal
                     let has_dot = self
@@ -274,6 +279,23 @@ impl<'a> Unit<'a> {
         // Object/companion member datums recorded at emission: the member
         // name's registered type wins over the unknown path.
         let static_ty = self.static_member_types.get(member).cloned();
+        if let Some(ty) = static_ty {
+            return ty;
+        }
+        // data-class `copy` is rebuilt as `new T(...)` — inferred type is T.
+        if member == "copy" {
+            let t = self.text(base).trim().to_string();
+            let ctor_name = t.split('(').next().unwrap_or("").trim().to_string();
+            // `new P5(...)` or call sites that stripped to receiver text.
+            let cand = ctor_name.trim_start_matches("new ").trim();
+            if self.data_components.contains_key(cand) {
+                return cand.to_string();
+            }
+        }
+        // `Regex.matches(s)` -> boolean.
+        if member == "matches" {
+            return "boolean".to_string();
+        }
         let unknown = |u: &mut Self| {
             u.diag_approx(
                 node,

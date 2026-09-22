@@ -68,6 +68,14 @@ impl<'a, 'u> Expr<'a, 'u> {
                         parts.push(format!("({})", java));
                     }
                 }
+                "escape_sequence" => {
+                    dollar_pending = false;
+                    // The node text IS the source escape (e.g. `\n`, `\\`)
+                    // and Java honours the same escapes — quote it, no
+                    // re-escaping (Rust {:?} would double every slash).
+                    let t = self.unit.text(child);
+                    parts.push(format!("\"{}\"", t));
+                }
                 _ => {}
             }
         }

@@ -30,12 +30,34 @@ impl<'a, 'u> Expr<'a, 'u> {
             for arg in an.children(&mut inner) {
                 if arg.kind() == "value_argument" {
                     let mut ac = arg.walk();
-                    let expr = arg
+                    let namedkids: Vec<_> = arg
                         .children(&mut ac)
-                        .find(|c| c.is_named())
-                        .map(|e| self.transpile(e))
+                        .filter(|c| c.is_named())
+                        .collect::<Vec<_>>();
+                    // `y = 9`: two named kids (identifier + value) and the
+                    // raw text carries `=`. Emit `y = 9` so data-class copy
+                    // reassembly can substitute by component name.
+                    if namedkids.len() == 2 && self.unit.text(arg).contains('=') {
+                        let name = self.unit.text(namedkids[0]).trim().to_string();
+                        args.push(format!("{} = {}", name, self.transpile(namedkids[1])));
+                        continue;
+                    }
+                    let expr = namedkids
+                        .first()
+                        .map(|e| self.transpile(*e))
                         .unwrap_or_default();
                     args.push(expr);
+                } else if arg.kind() == "named_argument" {
+                    // `y = 9` — keep as `y = 9` text so downstream maps
+                    // (data-class copy reassembly) see both halves.
+                    let mut ac = arg.walk();
+                    let pair: Vec<_> = arg.children(&mut ac).collect::<Vec<_>>();
+                    if pair.len() >= 2 {
+                        // identifier, then value
+                        let name = self.unit.text(pair[0]).trim().to_string();
+                        let vexpr = pair[pair.len() - 1];
+                        args.push(format!("{} = {}", name, self.transpile(vexpr)));
+                    }
                 }
             }
         }
@@ -182,6 +204,107 @@ impl<'a, 'u> Expr<'a, 'u> {
         }
         if callee_java == "print" {
             return format!("System.out.print({})", args.join(", "));
+        }
+
+        // `Receiver.copy(x = 1, z = 2)` on a data-class/record receiver:
+        // Java records have no copy() — rebuild: `new Receiver(k, v, …)`
+        // with named args substituted in declared component order.
+        if let Some(cpos) = callee_java.rfind(".copy")
+            && callee_java.ends_with(".copy")
+        {
+            let recv = callee_java[..cpos].to_string();
+            if let Some(ctor) = recv.strip_prefix("new ") {
+                let tname = ctor.split('(').next().unwrap_or("").trim().to_string();
+                eprintln!(
+                    "[dbg16c] tname={tname}? {}",
+                    self.unit.data_components.contains_key(&tname)
+                );
+                if let Some(comps) = self.unit.data_components.get(&tname).cloned() {
+                    // ctor args, in order
+                    if let (Some(op), Some(cp)) = (ctor.find('('), ctor.rfind(')')) {
+                        let inner = &ctor[op + 1..cp];
+                        let mut cargs: Vec<String> = if inner.trim().is_empty() {
+                            Vec::new()
+                        } else {
+                            inner.split(',').map(|s| s.trim().to_string()).collect()
+                        };
+                        // Named args (`y = 9`) keep their `name = value`
+                        // text through `args`; parse it back here.
+                        let mut arg_pairs: Vec<(String, String)> = Vec::new();
+                        for arg in &args {
+                            if let Some(eq) = arg.find(" = ") {
+                                arg_pairs.push((
+                                    arg[..eq].trim().to_string(),
+                                    arg[eq + 3..].trim().to_string(),
+                                ));
+                            }
+                        }
+                        for (n, v) in &arg_pairs {
+                            if let Some(idx) =
+                                comps.iter().position(|(_ct, cn)| cn.trim() == n.trim())
+                            {
+                                while cargs.len() < comps.len() {
+                                    cargs.push(String::new());
+                                }
+                                cargs[idx] = v.clone();
+                            }
+                        }
+                        let _ = &mut cargs;
+                        let full: Vec<String> = comps
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| cargs.get(i).cloned().unwrap_or_default())
+                            .collect();
+                        let full = if full.iter().any(|s| s.is_empty()) {
+                            // cannot fill every component positionally —
+                            // mark instead of emitting broken Java.
+                            self.unit.diags.warn_approx(
+                                node,
+                                self.unit.file,
+                                "data-class `copy` with gaps: component defaults unavailable, entity marked for manual review",
+                            );
+                            comps
+                                .iter()
+                                .enumerate()
+                                .map(|(i, _)| {
+                                    cargs.get(i).cloned().unwrap_or_else(|| "0".to_string())
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            full
+                        };
+                        return format!("new {}({})", tname, full.join(", "));
+                    }
+                }
+            }
+        }
+        // `Regex.matches(str)` -> Kotlin Regex ≈ java.util.regex.Pattern:
+        // `new Regex(p)` -> `Pattern.compile(p)`; matches(input) ->
+        // `Pattern.compile(p).matcher(input).matches()`.
+        if callee_java == "Regex" && !args.is_empty() {
+            return format!("java.util.regex.Pattern.compile({})", args.join(", "));
+        }
+        if let Some(rpos) = callee_java.rfind(".matches")
+            && callee_java.ends_with(".matches")
+        {
+            let recv = callee_java[..rpos].trim().to_string();
+            if recv.starts_with("new Regex(") {
+                let inner = recv.trim_start_matches("new Regex(").trim_end_matches(')');
+                return format!(
+                    "java.util.regex.Pattern.compile({}).matcher({}).matches()",
+                    inner, args[0]
+                );
+            }
+            if let Some(inner) = recv
+                .strip_prefix("java.util.regex.Pattern.compile(")
+                .filter(|_| recv.ends_with(')'))
+                .map(|t| &t[..t.len() - 1])
+            {
+                return format!(
+                    "java.util.regex.Pattern.compile({}).matcher({}).matches()",
+                    inner, args[0]
+                );
+            }
         }
 
         // Kotlin collection operations with a trailing lambda -> Stream API

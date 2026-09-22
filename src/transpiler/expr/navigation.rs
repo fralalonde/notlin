@@ -397,6 +397,18 @@ impl<'a, 'u> Expr<'a, 'u> {
                     return match kotlin_member_to_java(&member) {
                         Some(jm) if jm != member => format!("{}.{}", base_java, jm),
                         Some(_) => format!("{}.{}", base_java, member),
+                        None if member == "copy" => {
+                            // Hand the FULL callee text (receiver + `.copy`)
+                            // to call.rs — its copy arm rebuilds the ctor
+                            // with named-arg substitution using
+                            // data_components.
+                            self.unit.diags.warn_approx(
+                                node,
+                                self.unit.file,
+                                "data-class `copy` -> record ctor reassembly with named args",
+                            );
+                            format!("{}.{}", base_java, member)
+                        }
                         None => {
                             self.unit.diags.warn_approx(
                                 node,
