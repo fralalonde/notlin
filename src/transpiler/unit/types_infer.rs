@@ -4,6 +4,12 @@ use super::Unit;
 use crate::transpiler::kt;
 
 impl<'a> Unit<'a> {
+    /// Element type of a collection/array Java type (`List<X>` -> X, `X[]` ->
+    /// X); exposed for destructuring-site extraction in stmt.rs.
+    pub(crate) fn elem_type_of(&self, java_ty: &str) -> String {
+        elem_type_of(java_ty)
+    }
+
     pub fn infer_type(&mut self, expr: tree_sitter::Node) -> String {
         match expr.kind() {
             "identifier" => self

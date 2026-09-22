@@ -354,6 +354,41 @@ impl<'a, 'u> Stmt<'a, 'u> {
             .or_else(|| kt::child(stmt, "control_structure_body"))
             .or_else(|| single_stmt_body(stmt, iterable));
         let names: Vec<&str> = comps.iter().map(|(n, _)| n.as_str()).collect();
+        // Known data-class iterable (`for ((x, y) in points)`) where every
+        // component is covered by the shape: emit `for (var item : xs)` with
+        // real accessor extraction at the top of the body — bytecode-shaped,
+        // no N002 needed. Unknown shapes keep the degrade path.
+        let elem_ty = iterable
+            .map(|i| {
+                let it = self.unit.infer_type(i);
+                self.unit.elem_type_of(&it)
+            })
+            .unwrap_or_default();
+        if let Some(iter) = iterable
+            && self
+                .unit
+                .data_components
+                .get(&elem_ty)
+                .is_some_and(|shape| shape.len() >= comps.len())
+        {
+            let shape = self
+                .unit
+                .data_components
+                .get(&elem_ty)
+                .cloned()
+                .unwrap_or_default();
+            let iter_java = self.translate_iterable(iter, "__notlin_item");
+            out.open(format!("for ({}", iter_java));
+            if let Some(b) = body {
+                for (i, (name, _ty)) in comps.iter().enumerate() {
+                    let (sty, accessor) = &shape[i];
+                    out.line(format!("{} {} = __notlin_item.{}();", sty, name, accessor));
+                }
+                self.transpile_body(b, out);
+            }
+            out.close();
+            return;
+        }
         self.unit.diags.warn_approx(
             stmt,
             self.unit.file,
