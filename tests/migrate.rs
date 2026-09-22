@@ -124,6 +124,45 @@ fn blocker_keeps_elements_indentation() {
 }
 
 #[test]
+fn blockers_in_reverse_offset_order_do_not_panic() {
+    // Real-world traversal pushes blockers in AST order, which is NOT byte
+    // order (e.g. a later-visited sibling with a lower start_byte). This
+    // panicked at migrate.rs "byte range starts at X but ends at Y" before
+    // strip_translated began sorting blockers by offset.
+    let source = "class Alpha {\n    fun old(): Alpha = Alpha()\n}\n\nclass Beta {\n    fun older(): Beta = Beta()\n}\n";
+    let mut cov = FileCoverage::default();
+    cov.translated_spans.push((0, 13)); // "class Alpha {\n"
+    let beta_anchor = source.find("fun older").unwrap();
+    let alpha_anchor = source.find("fun old():").unwrap();
+    // Pushed in REVERSE offset order: Beta's blocker first.
+    cov.blockers
+        .push((beta_anchor, "// NOTLIN: N001 beta blocker\n".to_string()));
+    cov.blockers
+        .push((alpha_anchor, "// NOTLIN: N001 alpha blocker\n".to_string()));
+    let out = migrate::strip_translated(source, &cov);
+    let fun_lines: Vec<usize> = out
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.trim().starts_with("fun "))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(fun_lines.len(), 2);
+    for (line_idx, marker) in fun_lines.iter().zip(["alpha blocker", "beta blocker"]) {
+        let above = out.lines().nth(line_idx - 1).unwrap();
+        assert_eq!(
+            above.trim(),
+            format!("// NOTLIN: N001 {}", marker),
+            "blocker not directly above its element"
+        );
+        assert!(
+            above.starts_with("    "),
+            "comment lost indent: {:?}",
+            above
+        );
+    }
+}
+
+#[test]
 fn migration_on_tmpdir_trim_and_delete() {
     let dir = std::env::temp_dir().join(format!("notlin-mig-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
