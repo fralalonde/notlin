@@ -198,8 +198,56 @@ impl<'a, 'u> Expr<'a, 'u> {
         // nearest logic-preserving form is a nested block with a typed
         // local. Left as an explicit N001 when the callee is a receiver-scope
         // function to avoid silently emitting a method that does not exist.
+        // No-lambda collection terminators (sum) must fire before the
+        // lambda-gated block.
+        let member0 = callee_java.rsplit('.').next().unwrap_or("");
+        if member0 == "sum" && lambda_arg.is_none() {
+            self.unit.diags.warn_approx(
+                node,
+                self.unit.file,
+                "`sum()` approximated with mapToInt(...).sum()",
+            );
+            return format!(
+                "{}.stream().mapToInt(Integer::intValue).sum()",
+                callee_java[..callee_java.len() - member0.len()].trim_end_matches('.')
+            );
+        }
+
         if lambda_arg.is_some() {
             let member = callee_java.rsplit('.').next().unwrap_or("");
+            // Stream-terminator predicates: rewrite to filter(...) before
+            // the generic stream path (its full-expression mappings drop
+            // the predicate).
+            if member == "firstOrNull" {
+                let base = callee_java[..callee_java.len() - member.len()]
+                    .trim_end_matches('.')
+                    .to_string();
+                let Some(lnode_fo) = lambda_arg else {
+                    return callee_java.clone();
+                };
+                let pred = self.transpile(lnode_fo);
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "firstOrNull { pred } approximated with filter(...).findFirst().orElse(null)",
+                );
+                return format!(
+                    "{}.stream().filter({}).findFirst().orElse(null)",
+                    base,
+                    it_subst(&pred)
+                );
+            }
+            if member == "sum" {
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "`sum()` approximated with mapToInt(...).sum()",
+                );
+                return format!(
+                    "{}.stream().mapToInt(Integer::intValue).sum()",
+                    callee_java[..callee_java.len() - member.len()].trim_end_matches('.')
+                );
+            }
             if matches!(member, "apply" | "also" | "run" | "with" | "let") {
                 self.unit.diag_untranslatable(
                     node,
@@ -258,6 +306,38 @@ impl<'a, 'u> Expr<'a, 'u> {
             // compile error and would drop the loop's effect entirely).
             if member == "forEach" {
                 return format!("{}.stream().forEach({});", base, self.transpile(lambda));
+            }
+            // Collectors-backed ops with distinct Java shapes:
+            let mapped_lambda = self.transpile(lambda);
+            match member {
+                "groupBy" => {
+                    // `xs.groupBy { it % 2 }` -> groupingBy(keyFn)
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "groupBy approximated with Collectors.groupingBy (value lists, LinkedHashMap default ordering differs)",
+                    );
+                    return format!(
+                        "{}.stream().collect(java.util.stream.Collectors.groupingBy({}))",
+                        base, mapped_lambda
+                    );
+                }
+                "associate" => {
+                    // `xs.associate { it to it * 2 }`: the lambda was mapped
+                    // to `new SimpleImmutableEntry<>(k, v)` by infix `to` —
+                    // convert to toMap(kFn, vFn).
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "associate approximated with Collectors.toMap",
+                    );
+                    let kv = entry_lambda_to_kv(&mapped_lambda);
+                    return format!(
+                        "{}.stream().collect(java.util.stream.Collectors.toMap({}, {}))",
+                        base, kv.0, kv.1
+                    );
+                }
+                _ => {}
             }
             return format!(
                 "{}.stream().{}({}).collect(java.util.stream.Collectors.toList())",
@@ -448,4 +528,45 @@ impl<'a, 'u> Expr<'a, 'u> {
         }
         false
     }
+}
+
+/// Replace bare `it` identifier in a transpiled lambda body with the
+/// element lambda name (used when hoisting a lambda body into filter()).
+fn it_subst(pred: &str) -> String {
+    pred.replace("it", "__e")
+}
+
+/// Split an `associate` lambda mapped to `new SimpleImmutableEntry<>(K, V)`
+/// into (keyFn, valueFn) strings for Collectors.toMap.
+fn entry_lambda_to_kv(mapped: &str) -> (String, String) {
+    if let Some(start) = mapped.find("SimpleImmutableEntry<>(") {
+        let inner_start = start + "SimpleImmutableEntry<>(".len();
+        if let Some(end) = mapped.rfind(')') {
+            let inner = &mapped[inner_start..end];
+            if let Some(comma) = split_top_comma(inner) {
+                // The `to` lambda's body referenced the element as `it` —
+                // toMap's key/value fns also see the element, so keep the
+                // original lambda param name.
+                return (
+                    format!("__e -> {}", inner[..comma].trim().replace("it", "__e")),
+                    format!("__e -> {}", inner[comma + 1..].trim().replace("it", "__e")),
+                );
+            }
+        }
+    }
+    (mapped.trim().to_string(), "__e -> __e".to_string())
+}
+
+/// Find the first top-level comma (not inside parens/angles).
+fn split_top_comma(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' | '<' => depth += 1,
+            ')' | '>' => depth -= 1,
+            ',' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }

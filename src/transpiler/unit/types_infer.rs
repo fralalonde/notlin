@@ -250,7 +250,7 @@ impl<'a> Unit<'a> {
             },
             // Stream-approximated collection ops keep the element type
             "map" | "filter" | "flatMap" | "sorted" | "distinct" | "mapNotNull" | "mapIndexed"
-            | "filterIndexed" | "associateBy" | "groupBy" => match recv_ty.as_deref() {
+            | "filterIndexed" => match recv_ty.as_deref() {
                 Some(t) if is_collection_ty(t) => format!("List<{}>", elem_type_of(t)),
                 _ => unknown(self),
             },
@@ -259,6 +259,23 @@ impl<'a> Unit<'a> {
                 _ => unknown(self),
             },
             "joinToString" => "String".to_string(),
+            // Collectors-backed grouping ops return a Map, not a List —
+            // groupingBy: Map<K, List<T>>; associate/toMap: Map<K, V> with
+            // the lambda-entry shape inferred as entries.
+            "groupBy" => match recv_ty.as_deref() {
+                Some(t) if is_collection_ty(t) => {
+                    format!("Map<Object, List<{}>>", elem_type_of(t))
+                }
+                _ => unknown(self),
+            },
+            "associate" | "associateBy" | "toMap" => match recv_ty.as_deref() {
+                Some(t) if is_collection_ty(t) => "Map<Object, Object>".to_string(),
+                _ => unknown(self),
+            },
+            "sum" => match recv_ty.as_deref() {
+                Some(t) if is_collection_ty(t) => "int".to_string(),
+                _ => unknown(self),
+            },
             "fold" | "reduce" => match recv_ty.as_deref() {
                 Some(t) if is_collection_ty(t) => elem_type_of(t),
                 _ => unknown(self),

@@ -84,6 +84,19 @@ impl<'a, 'u> Expr<'a, 'u> {
                         // user-defined property read -> getter call; Pair/
                         // Entry receivers map first/second to the JDK
                         // SimpleImmutableEntry accessors emitted by `to`.
+                        // JDK package paths (java.util.List.of) are NOT
+                        // property reads — pass the segment verbatim.
+                        let base_text0 = base
+                            .map(|b| self.unit.text(b).trim().to_string())
+                            .unwrap_or_default();
+                        if base_text0 == "java"
+                            || base_text0.starts_with("java.")
+                            || base_text0 == "javax"
+                            || base_text0.starts_with("javax.")
+                        {
+                            result.push_str(&format!(".{}", member_name));
+                            continue;
+                        }
                         let recv_ty = base
                             .and_then(|b| {
                                 self.unit.var_types.get(self.unit.text(b).trim()).cloned()
@@ -366,7 +379,9 @@ fn kotlin_member_to_java(member: &str) -> Option<String> {
         // Lambda params `__left`/`__right` can never collide with Kotlin
         // identifiers (Kotlin forbids leading underscores), so `(a, b) -> b`
         // can't shadow user locals named a/b.
-        "firstOrNull" => Some("stream().findFirst().orElse(null)"),
+        // NOTE: firstOrNull NOT mapped here — with a lambda pred it must
+        // route through call.rs's filter(...) form; bare calls hit the
+        // fallback passthrough (find symbol error is the least-broken).
         "last" => Some("stream().reduce((__left, __right) -> __right).orElse(null)"),
         "lastOrNull" => Some("stream().reduce((__left, __right) -> __right).orElse(null)"),
         "reversed" => Some("reversed()"),
