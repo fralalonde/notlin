@@ -57,7 +57,10 @@ pub fn strip_translated(source: &str, coverage: &FileCoverage) -> String {
     // never drift to the head of the file or the top of a kept segment.
     let mut out = String::with_capacity(source.len());
     let mut cursor = 0usize;
+    // Blockers arrive in AST-traversal order, not byte-offset order;
+    // copy_kept/flush_blockers both rely on ascending offsets.
     let mut blockers: Vec<(usize, String)> = coverage.blockers.to_vec();
+    blockers.sort_by_key(|(offset, _)| *offset);
     for (start, end) in merged {
         copy_kept(&mut blockers, source, cursor, start, &mut out);
         // Blockers anchored inside the stripped span: emit at its start,
