@@ -26,7 +26,12 @@ impl<'a> Unit<'a> {
         // Each declaration is its own translation scope: params and locals
         // must not leak from a previously emitted function (var_types
         // persists on Unit across top-level and member declarations).
+        // Exceptions re-seeded below: enum ctor params (fields visible to
+        // every enum body method) and the current extension receiver.
         self.var_types.clear();
+        for (fname, fty) in std::mem::take(&mut self.pending_field_types) {
+            self.var_types.insert(fname, fty);
+        }
         let name = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_else(|| "anon".to_string());

@@ -50,6 +50,13 @@ pub struct Unit<'a> {
     pub(crate) subclass_map: std::collections::HashMap<String, Vec<String>>,
     /// names of sealed class declarations in this file.
     pub(crate) sealed_types: std::collections::HashSet<String>,
+    /// companion-object members across the file: member name -> Java access
+    /// expression on the outer class (getter call or function ref). Static
+    /// call-site rewrite `Outer.MAX` -> `Use.getMAX()`.
+    pub(crate) companion_members: std::collections::HashMap<String, String>,
+    /// Field types to re-seed into every enclosing declaration scope: enum
+    /// ctor params are instance fields visible to all enum body methods.
+    pub(crate) pending_field_types: Vec<(String, String)>,
     /// data class name -> record component list `(type, name)` in declaration
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
@@ -80,6 +87,8 @@ impl<'a> Unit<'a> {
             ext_receiver_name: None,
             subclass_map: std::collections::HashMap::new(),
             sealed_types: std::collections::HashSet::new(),
+            companion_members: std::collections::HashMap::new(),
+            pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
         }
     }

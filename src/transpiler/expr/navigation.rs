@@ -64,8 +64,21 @@ impl<'a, 'u> Expr<'a, 'u> {
                         .next()
                         .is_some_and(|c| c.is_ascii_uppercase())
                     {
-                        // Uppercase member: class ref / static member (Registry.INSTANCE)
-                        result.push_str(&format!(".{}", member_name));
+                        // Uppercase member: class ref / static member
+                        // (Registry.INSTANCE), or a companion-object member
+                        // read through the outer class: `Use.MAX` ->
+                        // `Use.getMAX()` because companion vals became static
+                        // fields with accessors.
+                        let base_text = base
+                            .map(|b| self.unit.text(b).trim().to_string())
+                            .unwrap_or_default();
+                        if let Some(accessor) = self.unit.companion_members.get(&member_name) {
+                            // known companion member name: getter call
+                            let _ = &base_text;
+                            result.push_str(&format!(".{}", accessor));
+                        } else {
+                            result.push_str(&format!(".{}", member_name));
+                        }
                     } else {
                         // user-defined property read -> getter call
                         let cap: String = member_name

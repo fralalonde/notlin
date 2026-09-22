@@ -765,6 +765,14 @@ impl<'a> Unit<'a> {
         }
 
         let params = self.class_params(decl);
+        // Register ctor-param names/types so bodies (`rgb.toString(16)`) get
+        // primitive-receiver rewrites and type inference like class fields do.
+        // `pending_field_types` re-seeds them inside each member's scope
+        // (transpile_function clears var_types per declaration).
+        self.pending_field_types = params
+            .iter()
+            .map(|(_, fname, ftype)| (fname.clone(), ftype.clone()))
+            .collect();
         let body = kt::child(decl, "enum_class_body").or_else(|| kt::child(decl, "class_body"));
 
         // Split the body: constants first (Java requires them before any
@@ -922,6 +930,7 @@ impl<'a> Unit<'a> {
                 }
             }
         }
+        self.pending_field_types.clear();
         out.close();
     }
 
@@ -964,6 +973,14 @@ impl<'a> Unit<'a> {
                 "property_declaration" => {
                     if kt::child(member, "var").is_some() {
                         mutable_state = true;
+                    }
+                    if let Some(vd) = kt::child(member, "variable_declaration")
+                        && let Some(n) = kt::child(vd, "identifier")
+                    {
+                        let pname = self.text(n).to_string();
+                        let cap: String = capitalize(&pname);
+                        self.companion_members
+                            .insert(pname, format!("get{}()", cap));
                     }
                     self.transpile_property_opts(member, out, true, Some(owner));
                     out.blank();

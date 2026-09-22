@@ -116,10 +116,25 @@ impl<'a> Unit<'a> {
     }
 
     fn infer_navigation(&mut self, expr: tree_sitter::Node) -> String {
-        match self.nav_base_member(expr) {
-            Some((base, member)) => self.infer_member_type(base, &member, expr),
-            None => "Object".to_string(),
+        if let Some((base, member)) = self.nav_base_member(expr) {
+            // `Color.RED` / `Registry.CONSTANT`: uppercase base + uppercase
+            // member is a static/enum constant whose type IS the base class.
+            let base_text = self.text(base).trim().to_string();
+            if base.kind() == "identifier"
+                && base_text
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+                && member
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+            {
+                return base_text;
+            }
+            return self.infer_member_type(base, &member, expr);
         }
+        "Object".to_string()
     }
 
     fn infer_member_type(

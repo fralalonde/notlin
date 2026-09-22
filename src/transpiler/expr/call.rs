@@ -56,6 +56,47 @@ impl<'a, 'u> Expr<'a, 'u> {
                 // Kotlin `arr.size()`/`arr.size` -> Java `arr.length`.
                 return format!("{}.length", self.transpile(base));
             }
+            // Primitive receivers cannot be dereferenced in Java: Kotlin
+            // `x.toString(radix)` -> `Integer.toString(x, radix)`,
+            // `x.toString()` -> `String.valueOf(x)`, other primitive member
+            // calls -> static wrapper when the boxed type has one.
+            if base.kind() == "identifier"
+                && let Some(bty) = self.unit.var_types.get(self.unit.text(base).trim())
+                && matches!(
+                    bty.as_str(),
+                    "int" | "long" | "short" | "byte" | "double" | "float" | "boolean" | "char"
+                )
+            {
+                let recv = self.transpile(base);
+                match member.as_str() {
+                    "toString" => {
+                        self.unit.diags.warn_approx(
+                            nav,
+                            self.unit.file,
+                            "Kotlin primitive `toString(...)` mapped to the boxed static wrapper (`Integer.toString`/`String.valueOf`)",
+                        );
+                        return if args.len() == 1 {
+                            format!("Integer.toString({}, {})", recv, args[0])
+                        } else {
+                            format!("String.valueOf({})", recv)
+                        };
+                    }
+                    "toInt" => return recv,
+                    "toLong" => return format!("((long) {})", recv),
+                    "toDouble" => return format!("((double) {})", recv),
+                    "toFloat" => return format!("((float) {})", recv),
+                    "and" | "or" | "xor" if args.len() == 1 => {
+                        let op = member.as_str();
+                        self.unit.diags.warn_approx(
+                            nav,
+                            self.unit.file,
+                            format!("Kotlin infix `{}` mapped to Java `{}` operator", op, op),
+                        );
+                        return format!("{} {} {}", recv, op, args[0]);
+                    }
+                    _ => {}
+                }
+            }
             if let Some(_recv_ty) = self.unit.extension_fns.get(member.as_str()) {
                 // `x.f(...)` for a same-file extension -> static `f(x, ...)`.
                 let recv_java = self.transpile(base);
