@@ -87,7 +87,7 @@ impl<'a> Unit<'a> {
                 let targs = kt::child(expr, "type_arguments").map(|t| {
                     // Box Kotlin primitives inside generic args:
                     // `Map<Op, Int>` -> `Map<Op, Integer>`.
-                    crate::transpiler::types::box_primitive_generics(&self.text(t).to_string())
+                    crate::transpiler::types::box_primitive_generics(self.text(t))
                 });
                 // primitive array factories: intArrayOf(...) -> int[]
                 if !callee.is_empty()
