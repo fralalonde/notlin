@@ -154,6 +154,9 @@ impl<'a> Unit<'a> {
             "string_literal" => Some("String".to_string()),
             _ => None,
         };
+        // Object/companion member datums recorded at emission: the member
+        // name's registered type wins over the unknown path.
+        let static_ty = self.static_member_types.get(member).cloned();
         let unknown = |u: &mut Self| {
             u.diag_approx(
                 node,
@@ -212,7 +215,10 @@ impl<'a> Unit<'a> {
                 Some(t) if is_collection_ty(t) => elem_type_of(t),
                 _ => unknown(self),
             },
-            _ => unknown(self),
+            _ => match static_ty {
+                Some(st) => st,
+                None => unknown(self),
+            },
         }
     }
 

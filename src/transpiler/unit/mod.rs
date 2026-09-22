@@ -66,6 +66,9 @@ pub struct Unit<'a> {
     /// inside an object body (`val self = Registry`) must map to
     /// `Registry.INSTANCE` — a plain `Registry` is an unresolved symbol.
     pub(crate) current_object: Option<String>,
+    /// object/companion member return types: member name -> Java type, so
+    /// `Registry.instance` infers instead of degrading to Object.
+    pub(crate) static_member_types: std::collections::HashMap<String, String>,
     /// Set by transpile_target when the LHS was rewritten to a setter call —
     /// the assignment emitter then closes the call instead of emitting `=`.
     pub(crate) pending_setter: bool,
@@ -102,6 +105,7 @@ impl<'a> Unit<'a> {
             companion_members: std::collections::HashMap::new(),
             class_props: std::collections::HashMap::new(),
             current_object: None,
+            static_member_types: std::collections::HashMap::new(),
             pending_setter: false,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),

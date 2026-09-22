@@ -146,6 +146,12 @@ impl<'a> Unit<'a> {
                 }
             }
         };
+        // Static members (object/companion props) record their types so
+        // call sites `Registry.instance` infer instead of degrading to
+        // Object.
+        if make_static {
+            self.static_member_types.insert(name.clone(), ty.clone());
+        }
 
         // Custom getter/setter bodies
         let getter_body: Option<tree_sitter::Node> =

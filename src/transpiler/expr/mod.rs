@@ -145,7 +145,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                             self.unit.diag_untranslatable(
                                 node,
                                 format!(
-                                    "assignment to `val {}` — Kotlin rejects this too (no setter); declaration taints, emitted Java mirrors the Kotlin error",
+                                    "assignment to `{}` is rejected in Kotlin (val or `private set`); declaration taints",
                                     member
                                 ),
                             );
