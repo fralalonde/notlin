@@ -88,6 +88,9 @@ pub struct Unit<'a> {
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
     pub(crate) data_components: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// enum declarations in this file (simple names) — `Enum#name` is
+    /// public so `.name` on an enum-typed receiver stays a field read.
+    pub(crate) enum_types: std::collections::HashSet<String>,
 }
 
 impl<'a> Unit<'a> {
@@ -124,6 +127,7 @@ impl<'a> Unit<'a> {
             pending_nav_text: None,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
+            enum_types: std::collections::HashSet::new(),
         }
     }
 

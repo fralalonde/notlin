@@ -735,6 +735,7 @@ impl<'a> Unit<'a> {
         is_sealed: bool,
         out: &mut JavaOut,
     ) {
+        self.enum_types.insert(name.to_string());
         // Only visibility + (implicitly final) enum is legal Java. Any other
         // class modifier (sealed/abstract/open) on an enum taints.
         let extra = modifiers.trim();

@@ -115,6 +115,40 @@ impl<'a, 'u> Expr<'a, 'u> {
                                 continue;
                             }
                         }
+                        // `name` on an enum constant: Enum#name is public,
+                        // BUT data-class records define `id` style accessors;
+                        // Kotlin `val name` on a user type maps to getName()
+                        // while java.lang.Enum constants expose `name` —
+                        // so route enum-typed receivers to .name only when
+                        // the base is a known enum type.
+                        if member_name == "name"
+                            && base
+                                .map(|b| {
+                                    let raw = self.unit.text(b).trim().to_string();
+                                    let first = raw.split('.').next().unwrap_or("").to_string();
+                                    self.unit.enum_types.contains(first.as_str())
+                                })
+                                .unwrap_or(false)
+                        {
+                            // JDK 25: Enum#name is a private field; the
+                            // public accessor is the method `name()`.
+                            result.push_str(".name()");
+                            continue;
+                        }
+                        // Data-class record receivers: `q.id` -> `q.id()`
+                        // (Java record accessor style, not getter).
+                        if base
+                            .map(|b| {
+                                let t0 = self.unit.text(b).trim().to_string();
+                                let ct = self.unit.var_types.get(&t0).cloned();
+                                ct.map(|c| self.unit.data_components.contains_key(&c))
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false)
+                        {
+                            result.push_str(&format!(".{}()", member_name));
+                            continue;
+                        }
                         let cap: String = member_name
                             .chars()
                             .next()
