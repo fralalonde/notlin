@@ -47,35 +47,25 @@ impl<'a> Unit<'a> {
                     let word = self.text(f).trim().to_string();
                     match word.as_str() {
                         "suspend" => {
-                            self.diags.warn_approx(
+                            self.diag_approx(
                                 f,
-                                self.file,
                                 "Kotlin `suspend` compiled to a plain blocking method; coroutine semantics lost",
                             );
                         }
                         "external" => {
                             // JNI-shaped; bodyless native method is closest
-                            self.diags.warn_approx(
-                                f,
-                                self.file,
-                                "Kotlin `external` emitted as JNI `native` method",
-                            );
+                            self.diag_approx(f, "Kotlin `external` emitted as JNI `native` method");
                             is_external = true;
                         }
                         "operator" | "infix" | "tailrec" => {
-                            self.diags.warn_approx(
+                            self.diag_approx(
                                 f,
-                                self.file,
                                 format!("Kotlin function modifier `{}` has no Java counterpart; emitted as a plain method", word),
                             );
                         }
                         "inline" => {
                             // Java can't inline functions; harmless no-op
-                            self.diags.warn_approx(
-                                f,
-                                self.file,
-                                "Kotlin `inline` dropped (JIT inlines anyway)",
-                            );
+                            self.diag_approx(f, "Kotlin `inline` dropped (JIT inlines anyway)");
                         }
                         _ => {
                             self.diag_untranslatable(
@@ -123,9 +113,8 @@ impl<'a> Unit<'a> {
                     if m.kind() == "type_parameter_modifiers" {
                         let txt = self.text(m).trim().to_string();
                         if txt.contains("reified") {
-                            self.diags.warn_approx(
+                            self.diag_approx(
                                 m,
-                                self.file,
                                 "reified type parameter has no Java counterpart; emitted without it",
                             );
                         } else if !txt.is_empty() {
@@ -274,9 +263,8 @@ impl<'a> Unit<'a> {
                     self.extension_fns.insert(name.clone(), recv_java);
                 }
                 prev_receiver = self.ext_receiver_name.replace("__receiver__".to_string());
-                self.diags.warn_approx(
+                self.diag_approx(
                     decl,
-                    self.file,
                     "extension function: receiver emitted as first parameter; call sites `x.f()` become `f(x)` in the same file",
                 );
             }
@@ -361,9 +349,8 @@ impl<'a> Unit<'a> {
             if !defaulted.is_empty() && trailing_defaults.is_empty() {
                 // Defaults exist but none form a trailing suffix: no overload
                 // can stand in — callers must pass these explicitly.
-                self.diags.warn_approx(
+                self.diag_approx(
                     decl,
-                    self.file,
                     format!(
                         "default parameter value(s) on '{}' (params: {}) have no Java counterpart — callers must pass them explicitly",
                         name,
@@ -372,9 +359,8 @@ impl<'a> Unit<'a> {
                 );
             } else if !trailing_defaults.is_empty() {
                 // One N002 per function (not per param), as user policy.
-                self.diags.warn_approx(
+                self.diag_approx(
                     decl,
-                    self.file,
                     format!(
                         "default parameter values on '{}' approximated by synthesizing {} Java overload(s); named-argument and mid-parameter skipping semantics not reproduced",
                         name,

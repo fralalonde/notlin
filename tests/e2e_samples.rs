@@ -93,7 +93,7 @@ fn basic_class_produces_expected_types() {
     // Registry is a final class with a static INSTANCE
     let registry = &files.iter().find(|(n, _)| n == "Registry.java").unwrap().1;
     assert!(registry.contains("public static final Registry INSTANCE"));
-    assert!(registry.contains("static List<String> items"));
+    assert!(registry.contains("static final List<String> items"));
 }
 
 #[test]
@@ -260,4 +260,151 @@ fn lombok_flag_emits_mutable_data_class() {
         !all2.contains("record Point"),
         "plain mode must not emit an immutable record for a var data class"
     );
+}
+
+#[test]
+fn enum_classes_emit_java_enums() {
+    let source = r#"enum class Direction { A, B, C }
+
+enum class Color(val rgb: Int) {
+    RED(0xFF0000),
+    GREEN(0x00FF00)
+}"#;
+    let (files, errors, warnings, _cov) = {
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Enums.kt"]);
+        let path = PathBuf::from("Enums.kt");
+        notlin::transpiler::transpile(source, &path, &cli)
+    };
+    assert_eq!(errors, 0);
+    assert_eq!(warnings, 0);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"Direction.java"));
+    assert!(names.contains(&"Color.java"));
+    let dir = &files.iter().find(|(n, _)| n == "Direction.java").unwrap().1;
+    assert!(dir.contains("public enum Direction"));
+    assert!(dir.contains("A,") && dir.contains("B,") && dir.contains("C"));
+    let col = &files.iter().find(|(n, _)| n == "Color.java").unwrap().1;
+    // constants with ctor args, private final field, accessor, private ctor
+    assert!(col.contains("RED(0xFF0000)"));
+    assert!(col.contains("GREEN(0x00FF00)"));
+    assert!(col.contains("private final int rgb;"));
+    assert!(col.contains("public int getRgb()"));
+    assert!(col.contains("private Color(int rgb)"));
+}
+
+#[test]
+fn complex_enum_taints_instead_of_emitting_broken_java() {
+    // sealed modifiers, generic enums, and abstract members are beyond javac
+    // enums — the declaration must NOT be emitted at all.
+    let source = "sealed enum class State { ON, OFF }\n";
+    let (files, errors, warnings, _cov) = {
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "State.kt"]);
+        let path = PathBuf::from("State.kt");
+        notlin::transpiler::transpile(source, &path, &cli)
+    };
+    assert_eq!(errors, 0);
+    assert!(warnings > 0, "sealed enum must warn");
+    assert!(
+        files.iter().all(|(n, _)| n != "State.java"),
+        "tainted enum must not emit Java"
+    );
+}
+
+#[test]
+fn companion_object_members_become_statics() {
+    let source = r#"class Counter {
+    companion object {
+        val MAX = 100
+        fun create(): Counter = Counter()
+        private var instances = 0
+    }
+}"#;
+    let (files, errors, warnings, _cov) = {
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Counter.kt"]);
+        let path = PathBuf::from("Counter.kt");
+        notlin::transpiler::transpile(source, &path, &cli)
+    };
+    assert_eq!(errors, 0);
+    // N002 for the mutable companion state
+    assert!(warnings > 0);
+    let counter = &files
+        .iter()
+        .find(|(n, _)| n == "Counter.java")
+        .expect("Counter.java emitted")
+        .1;
+    assert!(counter.contains("private static final int MAX = 100;"));
+    assert!(counter.contains("public static int getMAX()"));
+    assert!(counter.contains("public static Counter create()"));
+    // private companion var -> private static field + private static accessors
+    assert!(counter.contains("private static int instances = 0;"));
+    assert!(counter.contains("private static int getInstances()"));
+    assert!(counter.contains("private static void setInstances(int instances)"));
+    assert!(counter.contains("Counter.instances = instances;"));
+    assert!(
+        !counter.contains("this.instances"),
+        "static setter must not use this"
+    );
+}
+
+#[test]
+fn named_companion_taints() {
+    let source =
+        "class C {\n    companion object Factory {\n        fun make(): C = C()\n    }\n}\n";
+    let (files, errors, warnings, _cov) = {
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "C.kt"]);
+        let path = PathBuf::from("C.kt");
+        notlin::transpiler::transpile(source, &path, &cli)
+    };
+    assert_eq!(errors, 0);
+    assert!(warnings > 0);
+    assert!(
+        files.iter().all(|(n, _)| n != "C.java"),
+        "named companion must taint the class"
+    );
+}
+
+#[test]
+fn class_body_properties_emit_accessors_not_records() {
+    // property_declaration members (incl. `get() =` shapes) inside a data
+    // class body must be emitted as record members, not taint the record.
+    let source = r#"data class Vec2(val x: Int, val y: Int) {
+    val length: Double
+        get() = 0.0
+    fun dot(o: Vec2): Int = x * o.x + y * o.y
+}"#;
+    let (files, errors, _warnings, _cov) = {
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Vec2.kt"]);
+        let path = PathBuf::from("Vec2.kt");
+        notlin::transpiler::transpile(source, &path, &cli)
+    };
+    assert_eq!(errors, 0);
+    let vec = &files
+        .iter()
+        .find(|(n, _)| n == "Vec2.java")
+        .expect("record emitted")
+        .1;
+    assert!(vec.contains("public record Vec2(int x, int y)"));
+    assert!(vec.contains("public double getLength()"));
+    assert!(vec.contains("public int dot(Vec2 o)"));
+}
+
+#[test]
+fn property_visibility_matches_kotlin() {
+    // private/protected properties must not leak public accessors
+    let source = r#"class Vault {
+    private val secret = 42
+    protected var name: String = "x"
+        private set
+}"#;
+    let (files, errors, _warnings, _cov) = {
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Vault.kt"]);
+        let path = PathBuf::from("Vault.kt");
+        notlin::transpiler::transpile(source, &path, &cli)
+    };
+    assert_eq!(errors, 0);
+    let vault = &files.iter().find(|(n, _)| n == "Vault.java").unwrap().1;
+    assert!(vault.contains("private int getSecret()"));
+    assert!(vault.contains("protected String getName()"));
+    assert!(vault.contains("private void setName(String name)"));
+    assert!(!vault.contains("public int getSecret()"));
 }

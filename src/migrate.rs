@@ -50,21 +50,62 @@ pub fn strip_translated(source: &str, coverage: &FileCoverage) -> String {
     }
 
     // Build the result by skipping merged spans. Blockers are keyed by byte
-    // offset in SOURCE coordinates and flushed in order before the source
-    // segment that contains them — so a blocker inside stripped code lands
-    // right where the code used to start, and one in untranslated residue
-    // lands immediately above the residue.
+    // offset in SOURCE coordinates. A blocker whose anchor falls inside a
+    // stripped span lands right where that code used to start; a blocker
+    // anchored inside kept (untranslated) residue is inserted at its exact
+    // offset — immediately above the offending element — so residue comments
+    // never drift to the head of the file or the top of a kept segment.
     let mut out = String::with_capacity(source.len());
     let mut cursor = 0usize;
     let mut blockers: Vec<(usize, String)> = coverage.blockers.to_vec();
     for (start, end) in merged {
-        flush_blockers(&mut blockers, cursor, start, &mut out);
-        out.push_str(&source[cursor..start]);
+        copy_kept(&mut blockers, source, cursor, start, &mut out);
+        // Blockers anchored inside the stripped span: emit at its start,
+        // where the removed code used to be.
+        flush_blockers(&mut blockers, start, end, &mut out);
         cursor = end;
     }
-    flush_blockers(&mut blockers, cursor, source.len(), &mut out);
-    out.push_str(&source[cursor..]);
+    copy_kept(&mut blockers, source, cursor, source.len(), &mut out);
     out
+}
+
+/// Copy `source[from..to]` verbatim, inserting each blocker whose anchor
+/// offset falls inside the kept region as a comment line directly above the
+/// line that contains its element (exact line insertion, in offset order —
+/// the element's own indentation is preserved because the full line is
+/// re-copied after the comment).
+fn copy_kept(
+    blockers: &mut Vec<(usize, String)>,
+    source: &str,
+    from: usize,
+    to: usize,
+    out: &mut String,
+) {
+    let mut p = from;
+    for (offset, text) in blockers.iter() {
+        if *offset < from || *offset >= to {
+            continue;
+        }
+        // Back up to the start of the line holding the element, then insert
+        // the comment AFTER that line's leading whitespace so the comment
+        // shares the element's indentation; re-copy the whitespace + content
+        // after it (p rewinds to the line start).
+        let line_start = source[..*offset]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0)
+            .max(from);
+        let indent_end = source[line_start..*offset]
+            .bytes()
+            .take_while(|b| *b == b' ' || *b == b'\t')
+            .count()
+            + line_start;
+        out.push_str(&source[p..indent_end]);
+        out.push_str(text);
+        p = line_start;
+    }
+    out.push_str(&source[p..to]);
+    blockers.retain(|(o, _)| !(*o >= from && *o < to));
 }
 
 /// Emit (and remove) blockers with `from <= offset < to`, in offset order.

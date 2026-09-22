@@ -8,6 +8,21 @@ use crate::transpiler::kt;
 
 impl<'a> Unit<'a> {
     pub(crate) fn transpile_property(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
+        self.transpile_property_opts(decl, out, false, None)
+    }
+
+    /// Emit a property as instance members (`make_static=false`) or as static
+    /// members of the enclosing class (`make_static=true`, used for companion
+    /// objects, top-level properties and object singletons). `owner` is the
+    /// enclosing Java class name, needed by static setters (`this.x = x` is
+    /// illegal in a static method).
+    pub(crate) fn transpile_property_opts(
+        &mut self,
+        decl: tree_sitter::Node,
+        out: &mut JavaOut,
+        make_static: bool,
+        owner: Option<&str>,
+    ) {
         // Fresh scope per property: getter/setter bodies must not see locals
         // declared while a previous property was translated.
         self.var_types.clear();
@@ -20,7 +35,7 @@ impl<'a> Unit<'a> {
         let ty = vd
             .and_then(|v| kt::child(v, "user_type").or_else(|| kt::child(v, "nullable_type")))
             .map(|t| kt::java_type_ann(t, self.source, self.annots));
-        let _visibility = self.visibility_of(decl);
+        let visibility = self.visibility_of(decl);
 
         // Destructuring class property `val (a, b) = expr`: field + accessor
         // shapes don't apply; flag it instead of emitting a junk `prop` field.
@@ -78,9 +93,8 @@ impl<'a> Unit<'a> {
                         let tyy = ty.clone().unwrap_or_else(|| "Object".to_string());
                         if java.contains("LAMBDA") || body.kind() == "lambda_literal" {
                             out.line(format!("private {} {} = null;", tyy, name));
-                            self.diags.warn_approx(
+                            self.diag_approx(
                                 delim,
-                                self.file,
                                 format!(
                                     "`by lazy {{ ... }}` for '{}' emitted as `= null` + warning (lambda body not representable in field initializer); body reads: {}",
                                     name, self.text(body).trim()
@@ -88,9 +102,8 @@ impl<'a> Unit<'a> {
                             );
                         } else {
                             out.line(format!("private {} {} = {};", tyy, name, java));
-                            self.diags.warn_approx(
+                            self.diag_approx(
                                 delim,
-                                self.file,
                                 format!(
                                     "`by lazy` for '{}' emitted as eager initializer (memoization not reproduced)",
                                     name
@@ -144,11 +157,19 @@ impl<'a> Unit<'a> {
         // we can't tell yet, so emit backing field unless there's no initializer
         // and no setter and a custom getter — heuristic).
         let backing = initializer.is_some() || setter_body.is_some() || getter.is_none();
-        let static_kw = if kt::child(decl, "modifiers")
+        // `const val` -> static final; otherwise static only when requested
+        // (companion/top-level/object properties).
+        let is_const = kt::child(decl, "modifiers")
             .map(|m| self.text(m).contains("const"))
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let static_kw = if is_const {
             "static final "
+        } else if make_static && is_val {
+            // Kotlin `val` is final; keep the field final in the static
+            // mirror so bytecode-level immutability semantics match.
+            "static final "
+        } else if make_static {
+            "static "
         } else {
             ""
         };
@@ -183,7 +204,13 @@ impl<'a> Unit<'a> {
         let has_setter_method = conflicts.contains(&setter_name);
 
         if !has_getter_method {
-            out.open(format!("public {} get{}()", ty, cap));
+            out.open(format!(
+                "{}{}{} get{}()",
+                visibility,
+                if make_static { "static " } else { "" },
+                ty,
+                cap
+            ));
             match getter_body {
                 Some(gb) => {
                     // body: `= expr` or `{ ... }`
@@ -203,25 +230,33 @@ impl<'a> Unit<'a> {
                         }
                     }
                 }
-                None => out.line(format!("return this.{};", name)),
+                None => out.line(format!("return {};", name)),
             }
             out.close();
         }
 
         if !is_val && !has_setter_method {
-            // Kotlin `private set`: the setter exists but is private.
+            // Kotlin `private set`: the setter exists but is private;
+            // otherwise its visibility matches the property's.
             let set_vis = if setter
                 .as_ref()
                 .and_then(|s| kt::child(*s, "modifiers"))
                 .map(|m| self.text(m).contains("private"))
                 .unwrap_or(false)
             {
-                "private "
+                "private ".to_string()
             } else {
-                "public "
+                visibility.clone()
             };
             out.blank();
-            out.open(format!("{}void set{}({} {})", set_vis, cap, ty, name));
+            out.open(format!(
+                "{}{}void set{}({} {})",
+                set_vis,
+                if make_static { "static " } else { "" },
+                cap,
+                ty,
+                name
+            ));
             match setter_body {
                 Some(sb) => {
                     let mut cursor = sb.walk();
@@ -238,7 +273,14 @@ impl<'a> Unit<'a> {
                         }
                     }
                 }
-                None => out.line(format!("this.{} = {};", name, name)),
+                None => {
+                    // `this.x = x` is illegal in a static method; qualify the
+                    // field with the owner class name instead.
+                    match owner {
+                        Some(o) if make_static => out.line(format!("{}.{} = {};", o, name, name)),
+                        _ => out.line(format!("this.{} = {};", name, name)),
+                    }
+                }
             }
             out.close();
         }
@@ -262,19 +304,10 @@ impl<'a> Unit<'a> {
         &mut self,
         decl: tree_sitter::Node,
         out: &mut JavaOut,
+        owner: &str,
     ) {
-        // same as transpile_property but static
-        let mut inner_out = JavaOut::new();
-        self.transpile_property(decl, &mut inner_out);
-        for line in inner_out.buf.lines() {
-            if line.trim_start().starts_with("private ") {
-                out.line(line.replacen("private ", "private static ", 1));
-            } else {
-                out.line(
-                    line.replacen("public ", "public static ", 1)
-                        .replace("return this.", "return "),
-                );
-            }
-        }
+        // same as transpile_property but static, owned by the file-level
+        // utility class (`owner` qualifies static setter bodies).
+        self.transpile_property_opts(decl, out, true, Some(owner));
     }
 }

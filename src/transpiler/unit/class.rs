@@ -3,6 +3,7 @@
 use super::Unit;
 use super::capitalize;
 use crate::diagnostics::DiagnosticKind;
+use crate::transpiler::expr::Expr;
 use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
@@ -25,6 +26,47 @@ impl<'a> Unit<'a> {
                 .unwrap_or(false);
             if is_sealed {
                 self.sealed_types.insert(tname.clone());
+            }
+            // Data classes: capture primary-constructor params as record
+            // components for destructuring-site extraction (`val (a, b) = p`).
+            let is_data = kt::child(n, "modifiers")
+                .map(|m| self.text(m).contains("data"))
+                .unwrap_or(false);
+            if is_data && let Some(pvs) = kt::child(n, "primary_constructor") {
+                let mut comps: Vec<(String, String)> = Vec::new();
+                // Structure: primary_constructor > class_parameters > class_parameter
+                let mut pvs_cur = pvs.walk();
+                let cparams = pvs
+                    .children(&mut pvs_cur)
+                    .find(|c| c.kind() == "class_parameters");
+                let params: Vec<tree_sitter::Node> = cparams
+                    .map(|cp| {
+                        cp.children(&mut cp.walk())
+                            .filter(|c| c.is_named() && c.kind() == "class_parameter")
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for pm in params {
+                    let mut pm_cur = pm.walk();
+                    let named: Vec<tree_sitter::Node> =
+                        pm.children(&mut pm_cur).filter(|c| c.is_named()).collect();
+                    let pname = named
+                        .iter()
+                        .find(|c| c.kind() == "identifier")
+                        .map(|x| self.text(*x).to_string())
+                        .unwrap_or_default();
+                    let ptype = named
+                        .iter()
+                        .find(|c| c.kind() == "user_type" || c.kind().ends_with("_type"))
+                        .map(|t| kt::java_type(*t, self.source))
+                        .unwrap_or_else(|| "Object".to_string());
+                    if !pname.is_empty() {
+                        comps.push((ptype, pname));
+                    }
+                }
+                if !comps.is_empty() {
+                    self.data_components.insert(tname.clone(), comps);
+                }
             }
             if let Some(sup) = self.superclass_name(n) {
                 self.subclass_map.entry(sup).or_default().push(tname);
@@ -116,6 +158,7 @@ impl<'a> Unit<'a> {
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
         let mut is_data = false;
         let mut is_sealed = false;
+        let mut is_enum = false;
         // Kotlin `interface` parses as class_declaration with an unnamed
         // `interface` keyword child.
         let is_interface = decl
@@ -139,8 +182,9 @@ impl<'a> Unit<'a> {
                                     modifiers.push_str(word);
                                     modifiers.push(' ');
                                 }
-                                "annotation" | "companion" | "enum" | "inline" | "value"
-                                | "expect" | "actual" | "external" | "inner" | "fun" => {
+                                "enum" => is_enum = true,
+                                "annotation" | "companion" | "inline" | "value" | "expect"
+                                | "actual" | "external" | "inner" | "fun" => {
                                     self.diag_untranslatable(
                                         cm,
                                         format!("class modifier not supported: {}", self.text(cm)),
@@ -167,6 +211,10 @@ impl<'a> Unit<'a> {
 
         if decl.kind() == "object_declaration" {
             self.transpile_object(decl, &name, &visibility, out);
+            return;
+        }
+        if is_enum {
+            self.transpile_enum(decl, &name, &visibility, &modifiers, is_sealed, out);
             return;
         }
 
@@ -212,58 +260,7 @@ impl<'a> Unit<'a> {
                 type_params = format!("<{}> ", parts.join(", "));
             }
         }
-        let params: Vec<(bool, String, String)> = kt::child(decl, "primary_constructor")
-            .and_then(|pc| kt::child(pc, "class_parameters"))
-            .map(|cps| {
-                let mut cursor = cps.walk();
-                cps.children(&mut cursor)
-                    .filter(|c| c.kind() == "class_parameter")
-                    .filter_map(|cp| {
-                        let is_val = kt::child(cp, "val").is_some();
-                        let ident = kt::child(cp, "identifier")?;
-                        let ty = kt::child(cp, "user_type")
-                            .or_else(|| kt::child(cp, "nullable_type"))
-                            .or_else(|| kt::child(cp, "function_type"))
-                            .or_else(|| kt::child(cp, "parenthesized_type"));
-                        let ty_java = match ty {
-                            Some(t) => {
-                                let t_java = kt::java_type_ann(t, self.source, self.annots);
-                                if t_java == crate::transpiler::types::FUNCTION_TYPE_PLACEHOLDER {
-                                    self.diag_untranslatable(
-                                        t,
-                                        format!(
-                                            "function type on param '{}' has no Java counterpart (functional-interface mapping not implemented)",
-                                            self.text(ident)
-                                        ),
-                                    );
-                                    "Object".to_string()
-                                } else {
-                                    t_java
-                                }
-                            }
-                            None => {
-                                // Param with unrecognized type shape: flag it
-                                // instead of silently dropping the field.
-                                self.diags.push(crate::diagnostics::Diagnostic {
-                                    severity: crate::diagnostics::Severity::Warning,
-                                    kind: DiagnosticKind::Approximated,
-                                    message: format!(
-                                        "primary-ctor param '{}' has unsupported type shape ({}); emitted as Object",
-                                        self.text(ident),
-                                        cp.kind()
-                                    ),
-                                    file: self.file.to_path_buf(),
-                                    line: cp.start_position().row + 1,
-                                    col: cp.start_position().column + 1,
-                                });
-                                "Object".to_string()
-                            }
-                        };
-                        Some((is_val, self.text(ident).to_string(), ty_java))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let params = self.class_params(decl);
 
         // superclass / interfaces
         // The grammar wraps each supertype in `delegation_specifier`
@@ -301,9 +298,8 @@ impl<'a> Unit<'a> {
                         {
                             parts.push(format!("iface:{}", self.text(ut).replace(" ", "")));
                         }
-                        self.diags.warn_approx(
+                        self.diag_approx(
                             inner,
-                            self.file,
                             "interface delegation `by` has no Java counterpart; emitted as plain implements",
                         );
                     }
@@ -528,6 +524,12 @@ impl<'a> Unit<'a> {
                     if member.kind() == "function_declaration" {
                         out.blank();
                         self.transpile_function(member, false, out);
+                    } else if member.kind() == "property_declaration" {
+                        // Custom properties inside a data class: backing
+                        // field + accessors are legal record members — do
+                        // NOT taint the record for these.
+                        out.blank();
+                        self.transpile_property(member, out);
                     } else if member.is_named() && !matches!(member.kind(), ";" | "{" | "}") {
                         self.diag_untranslatable(
                             member,
@@ -610,6 +612,387 @@ impl<'a> Unit<'a> {
         }
     }
 
+    /// Primary constructor parameters -> (is_val, name, java_type). Shared by
+    /// the class/enum/record paths so ctor-param handling stays in one place.
+    fn class_params(&mut self, decl: tree_sitter::Node) -> Vec<(bool, String, String)> {
+        kt::child(decl, "primary_constructor")
+            .and_then(|pc| kt::child(pc, "class_parameters"))
+            .map(|cps| {
+                let mut cursor = cps.walk();
+                cps.children(&mut cursor)
+                    .filter(|c| c.kind() == "class_parameter")
+                    .filter_map(|cp| {
+                        let is_val = kt::child(cp, "val").is_some();
+                        let ident = kt::child(cp, "identifier")?;
+                        let ty = kt::child(cp, "user_type")
+                            .or_else(|| kt::child(cp, "nullable_type"))
+                            .or_else(|| kt::child(cp, "function_type"))
+                            .or_else(|| kt::child(cp, "parenthesized_type"));
+                        let ty_java = match ty {
+                            Some(t) => {
+                                let t_java = kt::java_type_ann(t, self.source, self.annots);
+                                if t_java == crate::transpiler::types::FUNCTION_TYPE_PLACEHOLDER {
+                                    self.diag_untranslatable(
+                                        t,
+                                        format!(
+                                            "function type on param '{}' has no Java counterpart (functional-interface mapping not implemented)",
+                                            self.text(ident)
+                                        ),
+                                    );
+                                    "Object".to_string()
+                                } else {
+                                    t_java
+                                }
+                            }
+                            None => {
+                                // Param with unrecognized type shape: flag it
+                                // instead of silently dropping the field.
+                                self.diags.push(crate::diagnostics::Diagnostic {
+                                    severity: crate::diagnostics::Severity::Warning,
+                                    kind: DiagnosticKind::Approximated,
+                                    message: format!(
+                                        "primary-ctor param '{}' has unsupported type shape ({}); emitted as Object",
+                                        self.text(ident),
+                                        cp.kind()
+                                    ),
+                                    file: self.file.to_path_buf(),
+                                    line: cp.start_position().row + 1,
+                                    col: cp.start_position().column + 1,
+                                });
+                                "Object".to_string()
+                            }
+                        };
+                        Some((is_val, self.text(ident).to_string(), ty_java))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `enum class` -> native Java enum. Constants become enum constants;
+    /// primary-ctor params (`val rgb: Int`) become private final fields +
+    /// accessors + a private constructor; body members (functions, properties
+    /// incl. `get() =` accessor shapes) become enum members.
+    ///
+    /// Shapes beyond javac's capability TAINT with N001 instead of emitting
+    /// broken Java: generic enums, enum superclass delegation (Java enums
+    /// implicitly extend Enum), abstract/bodyless enum methods (they require
+    /// per-constant bodies the grammar can't even parse), and class modifiers
+    /// like `sealed`. Plain supertypes are fine — Java enums may implement
+    /// interfaces.
+    fn transpile_enum(
+        &mut self,
+        decl: tree_sitter::Node,
+        name: &str,
+        visibility: &str,
+        modifiers: &str,
+        is_sealed: bool,
+        out: &mut JavaOut,
+    ) {
+        // Only visibility + (implicitly final) enum is legal Java. Any other
+        // class modifier (sealed/abstract/open) on an enum taints.
+        let extra = modifiers.trim();
+        if !extra.is_empty() || is_sealed {
+            self.diag_untranslatable(
+                decl,
+                format!(
+                    "enum '{}' has class modifier(s) '{}' that Java enums cannot express",
+                    name, extra
+                ),
+            );
+            return;
+        }
+        // Java enums cannot be generic.
+        if let Some(tp) = kt::child(decl, "type_parameters") {
+            self.diag_untranslatable(
+                tp,
+                format!(
+                    "enum '{}' declares type parameters; Java enums cannot be generic",
+                    name
+                ),
+            );
+            return;
+        }
+        // Supertypes: constructor_invocation would mean `extends` — illegal
+        // for a Java enum (implicit Enum). Bare/`by` supertypes are
+        // interfaces and can be `implements`.
+        let mut implements = String::new();
+        if let Some(dc) = kt::child(decl, "delegation_specifiers") {
+            let mut ifaces: Vec<String> = Vec::new();
+            let mut cursor = dc.walk();
+            for spec in dc.children(&mut cursor) {
+                if spec.kind() != "delegation_specifier" {
+                    continue;
+                }
+                let inner = spec.children(&mut spec.walk()).find(|c| c.is_named());
+                match inner.map(|n| n.kind()) {
+                    Some("constructor_invocation") => {
+                        self.diag_untranslatable(
+                            spec,
+                            format!(
+                                "enum '{}' extends a superclass; Java enums implicitly extend java.lang.Enum and cannot extend another class",
+                                name
+                            ),
+                        );
+                        return;
+                    }
+                    Some("user_type") | Some("nullable_type") | Some("explicit_delegation") => {
+                        let t = self
+                            .text(inner.unwrap())
+                            .replace(" ", "")
+                            .trim_start_matches('@')
+                            .to_string();
+                        if !t.is_empty() {
+                            ifaces.push(t);
+                        }
+                    }
+                    other => {
+                        self.diag_untranslatable(
+                            spec,
+                            format!(
+                                "enum '{}' supertype form not supported: {}",
+                                name,
+                                other.unwrap_or("?")
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
+            if !ifaces.is_empty() {
+                implements = format!(" implements {}", ifaces.join(", "));
+            }
+        }
+
+        let params = self.class_params(decl);
+        let body = kt::child(decl, "enum_class_body").or_else(|| kt::child(decl, "class_body"));
+
+        // Split the body: constants first (Java requires them before any
+        // member), then `;`, then members in declaration order.
+        let mut entries: Vec<String> = Vec::new();
+        let mut members: Vec<tree_sitter::Node> = Vec::new();
+        if let Some(body) = body {
+            let mut cursor = body.walk();
+            for member in body.children(&mut cursor) {
+                match member.kind() {
+                    "enum_entry" => {
+                        let mut e = String::new();
+                        let mut ec = member.walk();
+                        for c in member.children(&mut ec) {
+                            match c.kind() {
+                                "identifier" => e.push_str(self.text(c)),
+                                "value_arguments" => {
+                                    let mut args: Vec<String> = Vec::new();
+                                    let mut ac = c.walk();
+                                    for arg in c.children(&mut ac) {
+                                        if arg.kind() != "value_argument" {
+                                            continue;
+                                        }
+                                        if let Some(ex) =
+                                            arg.children(&mut arg.walk()).find(|x| x.is_named())
+                                        {
+                                            let mut e2 = Expr { unit: self };
+                                            args.push(e2.transpile(ex));
+                                        }
+                                    }
+                                    e.push_str(&format!("({})", args.join(", ")));
+                                }
+                                _ => {}
+                            }
+                        }
+                        entries.push(e);
+                    }
+                    ";" => {}
+                    "function_declaration"
+                    | "property_declaration"
+                    | "class_declaration"
+                    | "object_declaration"
+                    | "anonymous_initializer"
+                    | "secondary_constructor"
+                    | "companion_object" => {
+                        if member.is_named() {
+                            members.push(member);
+                        }
+                    }
+                    _ => {
+                        if member.is_named() {
+                            self.diag_untranslatable(
+                                member,
+                                format!("enum member not supported: {}", member.kind()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if entries.is_empty() {
+            self.diag_untranslatable(
+                decl,
+                format!(
+                    "enum '{}' declares no constants; Java enums require at least one",
+                    name
+                ),
+            );
+            return;
+        }
+
+        // Bodyless (abstract) enum methods need per-constant bodies the
+        // grammar cannot parse — javac would reject the emitted enum, so
+        // taint instead of emitting broken Java.
+        for m in &members {
+            if m.kind() == "function_declaration" && kt::child(*m, "function_body").is_none() {
+                self.diag_untranslatable(
+                    *m,
+                    format!(
+                        "enum method '{}' is abstract; per-constant bodies are not supported — Java requires every constant to implement it",
+                        kt::field(*m, "name")
+                            .map(|n| self.text(n).to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    ),
+                );
+                return;
+            }
+        }
+
+        out.open(format!("{}enum {}{}", visibility, name, implements));
+        // constants
+        out.line(entries.join(",\n"));
+        if !members.is_empty() || !params.is_empty() {
+            out.line(";");
+        }
+        // ctor params -> fields + accessors + private ctor
+        if !params.is_empty() {
+            out.blank();
+            for (is_val, fname, ftype) in &params {
+                let final_kw = if *is_val { "final " } else { "" };
+                out.line(format!("private {}{} {};", final_kw, ftype, fname));
+            }
+            out.blank();
+            for (is_val, fname, ftype) in &params {
+                let cap = capitalize(fname);
+                out.open(format!("public {} get{}()", ftype, cap));
+                out.line(format!("return {};", fname));
+                out.close();
+                if !*is_val {
+                    out.blank();
+                    out.open(format!("public void set{}({} {})", cap, ftype, fname));
+                    out.line(format!("this.{} = {};", fname, fname));
+                    out.close();
+                }
+                out.blank();
+            }
+            // Kotlin enum constructors are private; Java requires the same.
+            out.open(format!(
+                "private {}({})",
+                name,
+                params
+                    .iter()
+                    .map(|(_, n, t)| format!("{} {}", t, n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            for (_, fname, _) in &params {
+                out.line(format!("this.{} = {};", fname, fname));
+            }
+            out.close();
+            out.blank();
+        }
+        // body members
+        for m in members {
+            match m.kind() {
+                "function_declaration" => {
+                    self.transpile_function(m, true, out);
+                    out.blank();
+                }
+                "property_declaration" => {
+                    self.transpile_property(m, out);
+                    out.blank();
+                }
+                "class_declaration" | "object_declaration" => {
+                    self.transpile_type_decl(m, out);
+                    out.blank();
+                }
+                _ => {
+                    if m.is_named() {
+                        self.diag_untranslatable(
+                            m,
+                            format!("enum member not supported: {}", m.kind()),
+                        );
+                    }
+                }
+            }
+        }
+        out.close();
+    }
+
+    /// `companion object { ... }` -> static members of the enclosing class.
+    ///
+    /// Kotlin companion member call sites (`Outer.member`) resolve the same
+    /// way as Java statics, so functions become `static` methods, `val`
+    /// properties become `static final` fields (with accessors), and `var`
+    /// properties become static fields + accessors with an N002 approximation
+    /// warning (Kotlin keeps companion state on the Companion singleton, not
+    /// as class statics). Named companions and companions holding init logic
+    /// or other non-member constructs TAINT with N001 — there is no Java
+    /// shape that preserves reachability (`Outer.Factory` vs statics).
+    fn transpile_companion(
+        &mut self,
+        companion: tree_sitter::Node,
+        owner: &str,
+        out: &mut JavaOut,
+    ) {
+        // Named companion: `companion object Foo { ... }` — Kotlin reaches
+        // members via `Outer.Foo.member`; statics on Outer would change the
+        // call path. Taint rather than silently rename.
+        let named = companion
+            .children(&mut companion.walk())
+            .any(|c| c.kind() == "identifier");
+        if named {
+            self.diag_untranslatable(
+                companion,
+                "named companion object has no Java counterpart (callers use Outer.CompanionName.member; cannot be redirected to Outer statics)",
+            );
+            return;
+        }
+        let Some(body) = kt::child(companion, "class_body") else {
+            return;
+        };
+        let mut mutable_state = false;
+        let mut cursor = body.walk();
+        for member in body.children(&mut cursor) {
+            match member.kind() {
+                "property_declaration" => {
+                    if kt::child(member, "var").is_some() {
+                        mutable_state = true;
+                    }
+                    self.transpile_property_opts(member, out, true, Some(owner));
+                    out.blank();
+                }
+                "function_declaration" => {
+                    self.transpile_function_opts(
+                        member, true, /*make_static=*/ true, false, out,
+                    );
+                    out.blank();
+                }
+                ";" | "{" | "}" => {}
+                _ => {
+                    if member.is_named() {
+                        self.diag_untranslatable(
+                            member,
+                            format!("companion object member not supported: {}", member.kind()),
+                        );
+                    }
+                }
+            }
+        }
+        if mutable_state {
+            self.diag_approx(
+                companion,
+                "companion object state (var members) approximated as static fields of the enclosing class — Kotlin stores companion state on the Companion singleton instance; API shape preserved, storage location approximated",
+            );
+        }
+    }
+
     fn transpile_object(
         &mut self,
         decl: tree_sitter::Node,
@@ -634,8 +1017,18 @@ impl<'a> Unit<'a> {
                     }
                     "property_declaration" => {
                         // object properties behave like static fields
-                        self.transpile_toplevel_property(member, out);
+                        self.transpile_property_opts(member, out, true, Some(name));
                         out.blank();
+                    }
+                    "companion_object" => {
+                        self.transpile_companion(member, name, out);
+                        out.blank();
+                    }
+                    "secondary_constructor" => {
+                        self.diag_untranslatable(
+                            member,
+                            "secondary constructors not yet supported",
+                        );
                     }
                     ";" | "{" | "}" => {}
                     _ => {
@@ -662,6 +1055,14 @@ impl<'a> Unit<'a> {
                 }
                 "property_declaration" => {
                     self.transpile_property(member, out);
+                    out.blank();
+                }
+                "companion_object" => {
+                    if let Some(cls) = kt::parent_of(body)
+                        && let Some(name) = kt::field(cls, "name")
+                    {
+                        self.transpile_companion(member, self.text(name), out);
+                    }
                     out.blank();
                 }
                 "secondary_constructor" => {

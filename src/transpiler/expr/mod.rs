@@ -131,28 +131,41 @@ impl<'a, 'u> Expr<'a, 'u> {
             .filter(|c| c.kind() == "when_entry")
             .copied()
             .collect();
-        let subject_java = subject.map(|s| self.transpile(s)).unwrap_or_default();
-
+        let subject_java = subject.as_ref().map(|s| self.transpile(*s));
+        let subject_java = subject_java.unwrap_or_default();
         let mut ternary = String::new();
         for entry in entries.iter().rev() {
             let mut ec = entry.walk();
             let e_kids: Vec<_> = entry.children(&mut ec).collect();
-            let condition = e_kids.iter().find(|c| c.is_named()).copied();
-            let result = e_kids.iter().filter(|c| c.is_named()).nth(1).copied();
+            let e_named: Vec<_> = e_kids.iter().filter(|c| c.is_named()).copied().collect();
+            let result = e_named.last().copied();
+            let conditions: Vec<_> = e_named[..e_named.len().saturating_sub(1)].to_vec();
             let result_java = result
                 .map(|r| self.transpile(r))
                 .unwrap_or_else(|| "null".to_string());
-            let cond_java = match condition {
-                Some(c) if self.unit.text(c) == "else" => "true".to_string(),
-                Some(c) => {
-                    let cj = self.transpile(c);
+            // Conditions joined with OR: `0, 1 ->` means `x==0 || x==1`;
+            // `in 2..9 ->` is a range test over the when subject; `else`
+            // is the fallthrough arm.
+            let mut cond_parts: Vec<String> = Vec::new();
+            for c in &conditions {
+                let text = self.unit.text(*c);
+                if text == "else" {
+                    cond_parts.push("true".to_string());
+                } else if c.kind() == "range_test" {
+                    cond_parts.push(self.range_test_cond(*c, &subject_java));
+                } else {
+                    let cj = self.transpile(*c);
                     if subject.is_some() && cj != "true" {
-                        format!("Objects.equals({}, {})", subject_java, cj)
+                        cond_parts.push(format!("Objects.equals({}, {})", subject_java, cj));
                     } else {
-                        cj
+                        cond_parts.push(cj);
                     }
                 }
-                None => "true".to_string(),
+            }
+            let cond_java = if cond_parts.is_empty() {
+                "true".to_string()
+            } else {
+                cond_parts.join(" || ")
             };
             ternary = if ternary.is_empty() {
                 result_java.clone()
@@ -167,6 +180,35 @@ impl<'a, 'u> Expr<'a, 'u> {
             "null".to_string()
         } else {
             ternary
+        }
+    }
+
+    /// `x in lo..hi` when-condition -> `x >= lo && x <= hi` (`!in` negated).
+    /// The subject is the when-expression's subject, not part of the node.
+    fn range_test_cond(&mut self, cond: tree_sitter::Node, subject: &str) -> String {
+        let mut cursor = cond.walk();
+        let kids: Vec<_> = cond.children(&mut cursor).collect();
+        let negate = kids.iter().any(|c| self.unit.text(*c).trim() == "!in");
+        let range = kids.iter().find(|c| c.is_named()).copied();
+        let Some(range) = range else {
+            return "true".to_string();
+        };
+        let mut rc = range.walk();
+        let rkids: Vec<_> = range.children(&mut rc).filter(|c| c.is_named()).collect();
+        if rkids.len() != 2 {
+            // not a plain a..b range — degrade to a true condition
+            return "true".to_string();
+        }
+        let lo = self.transpile(rkids[0]);
+        let hi = self.transpile(rkids[1]);
+        if subject.is_empty() {
+            return "true".to_string();
+        }
+        let in_range = format!("{} >= {} && {} <= {}", subject, lo, subject, hi);
+        if negate {
+            format!("!({})", in_range)
+        } else {
+            in_range
         }
     }
 

@@ -99,9 +99,8 @@ impl<'a> Unit<'a> {
                         {
                             callee
                         } else {
-                            self.diags.warn_approx(
+                            self.diag_approx(
                                 expr,
-                                self.file,
                                 format!(
                                     "cannot infer type of call `{}`; local emitted as Object",
                                     self.text(expr).trim()
@@ -135,9 +134,8 @@ impl<'a> Unit<'a> {
             _ => None,
         };
         let unknown = |u: &mut Self| {
-            u.diags.warn_approx(
+            u.diag_approx(
                 node,
-                u.file,
                 format!(
                     "cannot infer type of `{}` (member not in known-mapping table); local emitted as Object",
                     member

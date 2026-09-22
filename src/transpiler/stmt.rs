@@ -141,6 +141,34 @@ impl<'a, 'u> Stmt<'a, 'u> {
             .map(|i| e.transpile(i))
             .unwrap_or_else(|| "null".to_string());
         let names: Vec<&str> = comps.iter().map(|(n, _)| n.as_str()).collect();
+        // Known data-class receiver? Emit real componentN() extraction via
+        // record accessors (bytecode-compatible: records generate accessors,
+        // javac compiles them even when accessor names differ from fields).
+        // Receivers without a known shape keep the degraded fallback below.
+        let init_ty = init.map(|i| self.unit.infer_type(i)).unwrap_or_default();
+        let comp_ty = init_ty
+            .split('<')
+            .next()
+            .unwrap_or(&init_ty)
+            .trim()
+            .to_string();
+        if let Some(shape) = self.unit.data_components.get(&comp_ty)
+            && shape.len() >= comps.len()
+        {
+            for (i, (name, _ty)) in comps.iter().enumerate() {
+                // Component type comes from the data class's recorded shape,
+                // not the destructuring site (which has no type ascription).
+                // Records expose components via accessor `name()` directly —
+                // `p.comp1()` isn't real Java, so call the component accessor.
+                let shape_ty = &shape[i].0;
+                let accessor = &shape[i].1;
+                out.line(format!(
+                    "{} {} = {}.{}();",
+                    shape_ty, name, init_java, accessor
+                ));
+            }
+            return;
+        }
         self.unit.diags.warn_approx(
             decl,
             self.unit.file,

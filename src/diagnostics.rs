@@ -191,6 +191,10 @@ pub struct FileCoverage {
     pub translated_spans: Vec<(usize, usize)>,
     /// Byte ranges of comments attached to translated declarations, so the
     /// doc-comment travels with the code into the Java file conceptually.
+    /// N002 approximations recorded during translation: (byte anchor, message,
+    /// line, col). Flushed to console diagnostics by the caller after
+    /// translation so ordering matches source position.
+    pub diags_approx: Vec<(usize, String, usize, usize)>,
     pub attached_comment_spans: Vec<(usize, usize)>,
     /// Blocking diagnostics attached to untranslated deletions, mapped by
     /// insertion byte offset (start of the untranslated span): rendered

@@ -50,6 +50,10 @@ pub struct Unit<'a> {
     pub(crate) subclass_map: std::collections::HashMap<String, Vec<String>>,
     /// names of sealed class declarations in this file.
     pub(crate) sealed_types: std::collections::HashSet<String>,
+    /// data class name -> record component list `(type, name)` in declaration
+    /// order. Filled by a pre-pass so destructuring sites can emit real
+    /// `componentN()` extraction instead of `Object x = value; y = null;`.
+    pub(crate) data_components: std::collections::HashMap<String, Vec<(String, String)>>,
 }
 
 impl<'a> Unit<'a> {
@@ -76,6 +80,7 @@ impl<'a> Unit<'a> {
             ext_receiver_name: None,
             subclass_map: std::collections::HashMap::new(),
             sealed_types: std::collections::HashSet::new(),
+            data_components: std::collections::HashMap::new(),
         }
     }
 
@@ -130,10 +135,12 @@ impl<'a> Unit<'a> {
         // Taint the enclosing declaration (if any) so --in-place migration
         // knows this declaration must stay in the .kt file.
         {
-            // Walk up through the AST: the nearest enclosing declaration node
-            // that began via begin_decl (tracked by decl_labels). Handles both
-            // top-level decls and members nested in class bodies.
-            let mut ancestor = node.parent();
+            // The diagnostic node itself, then walk up through the AST: the
+            // nearest enclosing declaration node that began via begin_decl
+            // (tracked by decl_labels). Handles both top-level decls (diag
+            // anchored on the decl or a member of it) and members nested in
+            // class bodies.
+            let mut ancestor = Some(node);
             while let Some(n) = ancestor {
                 if self.decl_labels.contains_key(&n.id()) {
                     let label = self.decl_labels.get(&n.id()).cloned().unwrap_or_default();
@@ -167,14 +174,26 @@ impl<'a> Unit<'a> {
     }
 
     pub(crate) fn diag_approx(&mut self, node: tree_sitter::Node, msg: impl Into<String>) {
-        self.diags.push(crate::diagnostics::Diagnostic {
-            severity: crate::diagnostics::Severity::Warning,
-            kind: DiagnosticKind::Approximated,
-            message: msg.into(),
-            file: self.file.to_path_buf(),
-            line: node.start_position().row + 1,
-            col: node.start_position().column + 1,
-        });
+        // Console diagnostic (compiler-style listing)…
+        let message = msg.into();
+        self.coverage.diags_approx.push((
+            node.start_byte(),
+            message.clone(),
+            node.start_position().row + 1,
+            node.start_position().column + 1,
+        ));
+        // …and an in-place residue `// NOTLIN: N002 …` comment anchored
+        // directly above the element (same mechanism as N001 blockers) —
+        // every translated-but-lossy construct is marked at its site, not
+        // just hard blockers.
+        self.coverage.blockers.push((
+            node.start_byte(),
+            format!(
+                "// NOTLIN: {} {}\n",
+                DiagnosticKind::Approximated.code(),
+                message
+            ),
+        ));
     }
 
     pub fn run(&mut self, root: tree_sitter::Node<'a>) -> Vec<(String, String)> {
@@ -291,7 +310,7 @@ impl<'a> Unit<'a> {
                             out.blank();
                         }
                         "property_declaration" => {
-                            unit.transpile_toplevel_property(**decl, out);
+                            unit.transpile_toplevel_property(**decl, out, &file_class_name);
                             out.blank();
                         }
                         _ => {}

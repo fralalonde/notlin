@@ -75,7 +75,7 @@ pub fn transpile(
     };
     let untranslatable_as_error = matches!(cli.untranslatable, UntranslatableMode::Error);
 
-    let (java_files, unit) = {
+    let (java_files, approx_diags, coverage) = {
         let mut unit = Unit::new(
             source,
             file,
@@ -85,9 +85,25 @@ pub fn transpile(
             cli.lombok,
         );
         let java_files = unit.run(tree.root_node());
-        let coverage = std::mem::take(&mut unit.coverage);
-        (java_files, coverage)
+        let mut coverage = std::mem::take(&mut unit.coverage);
+        let approx = std::mem::take(&mut coverage.diags_approx);
+        (java_files, approx, coverage)
     };
+
+    // N002 approximations were recorded on Unit.coverage (byte-anchored);
+    // flush them into the console diagnostic listing in source order.
+    let mut approx_diags = approx_diags;
+    approx_diags.sort_by_key(|(off, _, _, _)| *off);
+    for (_, msg, line, col) in approx_diags {
+        diags.push(crate::diagnostics::Diagnostic {
+            severity: crate::diagnostics::Severity::Warning,
+            kind: crate::diagnostics::DiagnosticKind::Approximated,
+            message: msg,
+            file: file.to_path_buf(),
+            line,
+            col,
+        });
+    }
 
     if tree.root_node().has_error() {
         diags.warn_parse(
@@ -99,5 +115,5 @@ pub fn transpile(
 
     let (errors, warnings) = (diags.error_count(), diags.warning_count());
     diags.print();
-    (java_files, errors, warnings, unit)
+    (java_files, errors, warnings, coverage)
 }
