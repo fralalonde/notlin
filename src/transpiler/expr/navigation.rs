@@ -139,13 +139,19 @@ impl<'a, 'u> Expr<'a, 'u> {
                             continue;
                         }
                         // Data-class record receivers: `q.id` -> `q.id()`
-                        // (Java record accessor style, not getter).
+                        // (Java record accessor style, not getter). Nullable
+                        // receivers carry the annotation prefix in var_types
+                        // (`@Nullable Currency`) — strip it so the record
+                        // accessor still fires under `?.`.
                         if base
                             .map(|b| {
                                 let t0 = self.unit.text(b).trim().to_string();
                                 let ct = self.unit.var_types.get(&t0).cloned();
-                                ct.map(|c| self.unit.data_components.contains_key(&c))
-                                    .unwrap_or(false)
+                                ct.map(|c| {
+                                    let bare = c.strip_prefix("@Nullable ").unwrap_or(&c).trim();
+                                    self.unit.data_components.contains_key(bare)
+                                })
+                                .unwrap_or(false)
                             })
                             .unwrap_or(false)
                         {
@@ -157,8 +163,16 @@ impl<'a, 'u> Expr<'a, 'u> {
                         // enum accessor). Strings don't have `name`, but a
                         // Kotlin `val name` user prop would have been a
                         // getter — this context is the LIMITED-subset case
-                        // (N002 recorded at the stream-op site).
-                        if member_name == "name" {
+                        // (N002 recorded at the stream-op site). The guard is
+                        // `it` specifically: any OTHER named receiver with a
+                        // known type must take the platform accessor below
+                        // (`p.name` on a plain class -> `p.getName()`), never
+                        // the record-style `name()`.
+                        if member_name == "name"
+                            && base
+                                .map(|b| self.unit.text(b).trim() == "it")
+                                .unwrap_or(false)
+                        {
                             result.push_str(".name()");
                             continue;
                         }
