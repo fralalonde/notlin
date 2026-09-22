@@ -1111,7 +1111,17 @@ impl<'a> Unit<'a> {
                         out.blank();
                     }
                     "property_declaration" => {
-                        // object properties behave like static fields
+                        // object properties behave like static fields; record
+                        // the accessor so `Cfg.TAG` call sites read via the
+                        // generated getter (fields are private).
+                        if let Some(vd) = kt::child(member, "variable_declaration")
+                            && let Some(n) = kt::child(vd, "identifier")
+                        {
+                            let pname = self.text(n).to_string();
+                            let cap: String = capitalize(&pname);
+                            self.companion_members
+                                .insert(pname, format!("get{}()", cap));
+                        }
                         self.transpile_property_opts(member, out, true, Some(name));
                         out.blank();
                     }

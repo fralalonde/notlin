@@ -12,11 +12,17 @@ impl<'a> Unit<'a> {
 
     pub fn infer_type(&mut self, expr: tree_sitter::Node) -> String {
         match expr.kind() {
-            "identifier" => self
-                .var_types
-                .get(self.text(expr).trim())
-                .cloned()
-                .unwrap_or_else(|| "Object".to_string()),
+            "identifier" => {
+                // Grammar quirk: bare `false`/`true` parses as identifier,
+                // not boolean_literal — recognize them here.
+                if matches!(self.text(expr).trim(), "true" | "false") {
+                    return "boolean".to_string();
+                }
+                self.var_types
+                    .get(self.text(expr).trim())
+                    .cloned()
+                    .unwrap_or_else(|| "Object".to_string())
+            }
             "navigation_expression" => self.infer_navigation(expr),
             "string_literal" => "String".to_string(),
             "number_literal" => {
