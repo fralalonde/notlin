@@ -84,6 +84,10 @@ pub struct Unit<'a> {
     /// Fully-assembled stream text from navigation_call's curried fold —
     /// the call.rs frame holding the lambda must return it verbatim.
     pub(crate) pending_nav_text: Option<String>,
+    /// A trailing `joinToString(sep)` seen on the callee nav — the map/filter
+    /// stream arm should collect with joining(sep) (not toList()) and the
+    /// member's joinToString tail is stripped.
+    pub(crate) pending_join_to_string: Option<String>,
     /// data class name -> record component list `(type, name)` in declaration
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
@@ -125,6 +129,7 @@ impl<'a> Unit<'a> {
             pending_full_call: false,
             fn_rets: std::collections::HashMap::new(),
             pending_nav_text: None,
+            pending_join_to_string: None,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
             enum_types: std::collections::HashSet::new(),

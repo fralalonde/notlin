@@ -21,6 +21,11 @@ impl<'a, 'u> Stmt<'a, 'u> {
             "call_expression" => {
                 let mut e = Expr { unit: self.unit };
                 let java = e.transpile(stmt);
+                // Post-rewrite: `…collect(toList()).joinToString(sep)` — the
+                // map arm collected before a trailing joinToString member;
+                // List.joinToString doesn't exist in Java, so swap the pair
+                // for a single joining(sep) collect.
+                let java = fix_join_tail(&java);
                 out.line(format!("{};", java));
             }
             "block" => {
@@ -268,7 +273,7 @@ impl<'a, 'u> Stmt<'a, 'u> {
             out.line("return;");
         } else {
             let java = e.transpile(exprs[0]);
-            out.line(format!("return {};", java));
+            out.line(format!("return {};", fix_join_tail(&java)));
         }
     }
 
@@ -679,4 +684,67 @@ fn unwrap_parens(node: tree_sitter::Node) -> tree_sitter::Node {
         return inner;
     }
     node
+}
+
+/// Rewrite `…collect(Collectors.toList()).joinToString(sep)` — the stream
+/// arm collected with toList before a trailing joinToString member; the
+/// Java List has no joinToString. Merge into one joining(sep) collect.
+pub(crate) fn fix_join_tail(java: &str) -> String {
+    let marker = ".collect(java.util.stream.Collectors.toList()).joinToString(";
+    if let Some(p) = java.find(marker) {
+        let close = java[p + marker.len()..]
+            .rfind(')')
+            .map(|i| i + p + marker.len());
+        if let Some(close) = close {
+            let sep = java[p + marker.len()..close].trim();
+            let mut out = java[..p].to_string();
+            if sep.is_empty() {
+                out.push_str(".collect(java.util.stream.Collectors.joining())");
+            } else {
+                out.push_str(&format!(
+                    ".collect(java.util.stream.Collectors.joining({}))",
+                    sep
+                ));
+            }
+            out.push_str(&java[close + 1..]);
+            return out;
+        }
+    }
+    // (b) residual `.joinToString(sep)` tail (collector already joined):
+    // strip that member and merge the sep into the upstream join, which is
+    // the joinToString emitter's own arg.
+    if let Some(j) = java.find(".joinToString(") {
+        let close = java[j + ".joinToString(".len()..]
+            .rfind(')')
+            .map(|i| i + j + ".joinToString(".len());
+        if let Some(close) = close {
+            let sep = java[j + ".joinToString(".len()..close].trim();
+            let mut out = java[..j].to_string();
+            // merge the join tail's sep into the upstream joining(...) arg
+            if let Some(u) = out.rfind(".collect(java.util.stream.Collectors.joining(") {
+                let usep_start = u + ".collect(java.util.stream.Collectors.joining(".len();
+                let usep_end = out[usep_start..].rfind("))").map(|i| i + usep_start);
+                if let Some(ue) = usep_end {
+                    let upstream = out[usep_start..ue].trim();
+                    // The joinToString tail's sep equals the upstream
+                    // arg in Kotlin source; trust the upstream join.
+                    let merged = if upstream.is_empty() {
+                        sep.to_string()
+                    } else {
+                        upstream.to_string()
+                    };
+                    out.truncate(u);
+                    out.push_str(&format!(
+                        ".collect(java.util.stream.Collectors.joining({}))",
+                        merged
+                    ));
+                }
+            }
+            out.push_str(");");
+            out.push_str(&java[close + 1..]);
+            let cleaned = out.replace(";;", ";");
+            return cleaned.trim().to_string();
+        }
+    }
+    java.to_string()
 }

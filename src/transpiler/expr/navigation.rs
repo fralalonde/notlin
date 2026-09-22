@@ -176,6 +176,34 @@ impl<'a, 'u> Expr<'a, 'u> {
         if result.is_empty() {
             result = self.unit.text(node).replace("?.", ".");
         }
+        // Mid-chain joinToString: the stream arm terminated with
+        // `collect(toList())`; swap the tail for joining(sep) so the chain
+        // compiles (Kotlin List has no joinToString; this is the
+        // collector-level rewrite).
+        if result.rfind(".joinToString(").is_some()
+            && let Some(j) = result.rfind(".joinToString(")
+        {
+            let head = result[..j].to_string();
+            let _ = head;
+            let raw = self.unit.text(node);
+            let tail = raw[raw.rfind(".joinToString").unwrap_or(0)..]
+                .trim()
+                .trim_start_matches(".joinToString")
+                .trim();
+            let inner = tail.trim_start_matches('(').trim_end_matches(')').trim();
+            self.unit.diags.warn_approx(
+                node,
+                self.unit.file,
+                "joinToString after collect -> collect(joining())",
+            );
+            if inner.is_empty() {
+                return format!("{}.collect(java.util.stream.Collectors.joining())", head);
+            }
+            return format!(
+                "{}.collect(java.util.stream.Collectors.joining({}))",
+                head, inner
+            );
+        }
         result
     }
 
@@ -187,6 +215,50 @@ impl<'a, 'u> Expr<'a, 'u> {
             // `this.x` inside an extension body refers to the receiver param.
             if raw_trimmed.starts_with("this.") {
                 raw_trimmed = format!("{}{}", r, &raw_trimmed[4..]);
+            }
+        }
+        // `…collect(toList()).joinToString(sep)` — the map arm terminated
+        // the stream early; swap the tail for joining(sep) over the same
+        // base (List.joinToString does not exist in Java).
+        // `…map { … }.joinToString(sep)`: the sibling call is the terminal
+        // joinToString — tell call.rs's map arm to choose joining(sep)
+        // instead of its default toList() collect.
+        if let Some(j) = raw_trimmed.rfind(".joinToString") {
+            let _tail = raw_trimmed[j..].trim();
+            if base_text(raw_trimmed[..j].to_string().as_str())
+                || raw_trimmed.contains(".map ")
+                || raw_trimmed.contains(".map {")
+            {
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "terminal joinToString after map{…} -> collect(joining(sep))",
+                );
+                // args live on the sibling call node, like curried fold
+                let args = node
+                    .parent()
+                    .filter(|p| p.kind() == "call_expression")
+                    .and_then(|p| kt::child(p, "value_arguments"))
+                    .map(|va| {
+                        let mut ac = va.walk();
+                        va.children(&mut ac)
+                            .filter(|c| c.kind() == "value_argument")
+                            .filter_map(|a| a.children(&mut a.walk()).find(|c| c.is_named()))
+                            .map(|e| {
+                                let mut ee = Expr { unit: self.unit };
+                                ee.transpile(e)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|a| !a.is_empty())
+                    .map(|a| a.join(", "))
+                    .unwrap_or_default();
+                let inner = args;
+                self.unit.pending_join_to_string = (!inner.is_empty()).then_some(inner.to_string());
+                // strip the joinToString suffix from the callee we return
+                // and swallow its (args) — call.rs must not re-emit them.
+                raw_trimmed = raw_trimmed[..j].to_string();
+                self.unit.pending_full_call = true;
             }
         }
         // Compound receiver (itself a call/index/nav chain): the base must be
@@ -384,6 +456,48 @@ impl<'a, 'u> Expr<'a, 'u> {
                 );
                 return format!("{}.charAt(0)", self.transpile(b));
             }
+            // `x.joinToString("")` / no-arg: stream().collect(joining()).
+            // The generic member machinery has no lambda-less branch.
+            if member == "joinToString" {
+                let base = &raw_trimmed[..dot];
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "joinToString -> stream().map(toString).collect(joining())",
+                );
+                return format!(
+                    "{}.stream().map(Object::toString).collect(java.util.stream.Collectors.joining())",
+                    base
+                );
+            }
+            // `…collect(toList()).joinToString(sep)` — the map arm
+            // terminated early with toList; swap the tail for
+            // joining(sep) over the still-open stream.
+            if member == "joinToString"
+                && let Some(t) = raw_trimmed[..dot]
+                    .strip_suffix(".collect(java.util.stream.Collectors.toList())")
+            {
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "joinToString after collect(toList()) -> collect(joining())",
+                );
+                let raw_args = raw_trimmed[dot..]
+                    .trim_start_matches(".joinToString")
+                    .trim();
+                let sep = raw_args
+                    .strip_prefix('(')
+                    .map(|a| a.strip_suffix(')').unwrap_or(a).trim().to_string())
+                    .unwrap_or_default();
+                return if sep.is_empty() {
+                    format!("{}.collect(java.util.stream.Collectors.joining())", t)
+                } else {
+                    format!(
+                        "{}.collect(java.util.stream.Collectors.joining({}))",
+                        t, sep
+                    )
+                };
+            }
             // `it.<prop>` inside a lambda (param type unknown): `.name()`
             // covers the common enum-names mapping case (String.tname has
             // none); N002-note rather than guessing a getter.
@@ -570,6 +684,14 @@ impl<'a, 'u> Expr<'a, 'u> {
 
 /// Kotlin stdlib member -> Java counterpart. None = not recognized as
 /// stdlib (user-defined methods pass through unmapped).
+fn base_text(s: &str) -> bool {
+    // the nav ends with `.map`/`.filter`/… operator that owns the lambda
+    s.contains(".map ")
+        || s.contains(".map{")
+        || s.rfind(".map").is_some()
+        || s.rfind(".filter").is_some()
+}
+
 fn kotlin_member_to_java(member: &str) -> Option<String> {
     let mapped: Option<&str> = match member {
         "uppercase" => Some("toUpperCase"),

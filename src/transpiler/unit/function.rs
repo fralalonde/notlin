@@ -475,7 +475,10 @@ impl<'a> Unit<'a> {
                 // expression body: `= expr` -> `return expr;`
                 let mut e = Expr { unit: self };
                 let java = e.transpile(child);
-                out.line(format!("return {};", java));
+                out.line(format!(
+                    "return {};",
+                    crate::transpiler::stmt::fix_join_tail(&java)
+                ));
             }
         }
     }

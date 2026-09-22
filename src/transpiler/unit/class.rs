@@ -832,10 +832,21 @@ impl<'a> Unit<'a> {
                 match member.kind() {
                     "enum_entry" => {
                         let mut e = String::new();
+                        let mut has_class_body = false;
                         let mut ec = member.walk();
                         for c in member.children(&mut ec) {
                             match c.kind() {
                                 "identifier" => e.push_str(self.text(c)),
+                                "class_body" => {
+                                    // Per-constant override body: Java enum
+                                    // constants accept `NAME { ... }`.
+                                    has_class_body = true;
+                                    let mut bc = JavaOut::new();
+                                    bc.open("");
+                                    self.transpile_class_body(c, &mut bc);
+                                    bc.close();
+                                    e.push_str(&format!(" {}", bc.finish().trim()));
+                                }
                                 "value_arguments" => {
                                     let mut args: Vec<String> = Vec::new();
                                     let mut ac = c.walk();
@@ -855,6 +866,7 @@ impl<'a> Unit<'a> {
                                 _ => {}
                             }
                         }
+                        let _ = has_class_body;
                         entries.push(e);
                     }
                     ";" => {}
@@ -891,18 +903,29 @@ impl<'a> Unit<'a> {
             return;
         }
 
-        // Bodyless (abstract) enum methods need per-constant bodies the
-        // grammar cannot parse — javac would reject the emitted enum, so
-        // taint instead of emitting broken Java.
-        for m in &members {
-            if m.kind() == "function_declaration" && kt::child(*m, "function_body").is_none() {
+        // Bodyless (abstract) enum methods are fine ONLY when every entry
+        // carries an override body (checked after entries are built).
+        let abstract_fns: Vec<String> = members
+            .iter()
+            .filter(|m| {
+                m.kind() == "function_declaration" && kt::child(**m, "function_body").is_none()
+            })
+            .map(|m| {
+                kt::field(*m, "name")
+                    .map(|n| self.text(n).to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            })
+            .collect();
+        if !abstract_fns.is_empty() {
+            // Every constant must implement each abstract method.
+            let bodies_ok = entries.iter().all(|e| e.contains("{"));
+            if !bodies_ok {
                 self.diag_untranslatable(
-                    *m,
+                    decl,
                     format!(
-                        "enum method '{}' is abstract; per-constant bodies are not supported — Java requires every constant to implement it",
-                        kt::field(*m, "name")
-                            .map(|n| self.text(n).to_string())
-                            .unwrap_or_else(|| "?".to_string())
+                        "enum '{}' declares abstract method(s) {} but not every constant has an override body",
+                        name,
+                        abstract_fns.join(", ")
                     ),
                 );
                 return;

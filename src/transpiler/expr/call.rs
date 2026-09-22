@@ -264,10 +264,6 @@ impl<'a, 'u> Expr<'a, 'u> {
                 return "null".to_string();
             }
         }
-        // Any stream arm below emits its own text — clear any stale
-        // curried-callee flag set by navigation_call, or the next call
-        // statement silently drops its arguments.
-        self.unit.pending_full_call = false;
         // A curried fold already assembled its full `stream().reduce(...)`
         // text in navigation_call — take it verbatim and clear it.
         let nav_text = self.unit.pending_nav_text.take();
@@ -427,12 +423,22 @@ impl<'a, 'u> Expr<'a, 'u> {
                 }
                 _ => {}
             }
-            return format!(
-                "{}.{}({}).collect(java.util.stream.Collectors.toList())",
-                base,
-                stream_fn,
-                self.transpile(lambda)
-            );
+            return if let Some(sep) = self.unit.pending_join_to_string.take() {
+                format!(
+                    "{}.{}({}).collect(java.util.stream.Collectors.joining({}))",
+                    stream_base,
+                    stream_fn,
+                    self.transpile(lambda),
+                    sep
+                )
+            } else {
+                format!(
+                    "{}.{}({}).collect(java.util.stream.Collectors.toList())",
+                    stream_base,
+                    stream_fn,
+                    self.transpile(lambda)
+                )
+            };
         }
 
         // mutableListOf<String>(...) etc. -> new ArrayList<>()
@@ -489,6 +495,12 @@ impl<'a, 'u> Expr<'a, 'u> {
                 format!("new {}[]{{{}}}", elem, args.join(", "))
             }
             _ => {
+                eprintln!(
+                    "[dbgF] callee={} args={} pend={}",
+                    callee_java,
+                    args.is_empty(),
+                    self.unit.pending_full_call
+                );
                 // Uppercase callee = constructor call — bare `Foo` or nested
                 // `Outer.Inner` both need `new` (data subclasses of a sealed
                 // nesting parent are the common case).
@@ -527,6 +539,15 @@ impl<'a, 'u> Expr<'a, 'u> {
                     } else {
                         callee_java
                     }
+                } else if callee_java.rfind(".joinToString(").is_some() {
+                    // trailing joinToString(sep) was re-collected with
+                    // joining(sep) upstream; drop the tail entirely.
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "trailing joinToString(sep) dropped: already collected with joining(sep)",
+                    );
+                    callee_java
                 } else if std::mem::replace(&mut self.unit.pending_full_call, false) {
                     // joinToString style: callee mapping already emitted the
                     // full call with args — nothing to append.
