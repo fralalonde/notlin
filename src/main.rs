@@ -1,7 +1,7 @@
 use clap::Parser as _;
 use colored::Colorize;
 use notlin::cli::{Cli, UntranslatableMode};
-use notlin::migrate;
+use notlin::migrate::{self, MigrateOutcome};
 use notlin::transpiler;
 use notlin::workspace::SourceIndex;
 use std::collections::HashSet;
@@ -63,6 +63,8 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
 
     let mut total_errors = 0usize;
     let mut total_warnings = 0usize;
+    let mut java_written = 0usize;
+    let mut outcomes: Vec<(PathBuf, MigrateOutcome)> = Vec::new();
 
     for file in &files {
         log::info!("transpiling {}", file.display());
@@ -103,6 +105,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                         .map_err(|e| format!("{}: {e}", target.display()))?;
                     log::info!("wrote {}", target.display());
                 }
+                java_written += java_files.len();
             }
             None => {
                 for (name, content) in &java_files {
@@ -125,7 +128,8 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             let strict_block = matches!(cli.untranslatable, UntranslatableMode::Error)
                 && (errors > 0 || warnings > 0);
             if !strict_block {
-                match migrate::migrate(file, &source, &coverage)? {
+                let outcome = migrate::migrate(file, &source, &coverage)?;
+                match &outcome {
                     migrate::MigrateOutcome::Deleted => {
                         println!("{}: {}", "deleted".green(), file.display());
                     }
@@ -141,23 +145,46 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                         log::info!("{}: no translated content; untouched", file.display());
                     }
                 }
+                outcomes.push((file.clone(), outcome));
             } else {
                 log::info!(
                     "{}: kept — run had errors/warnings in --untranslatable=error mode",
                     file.display()
                 );
+                outcomes.push((file.clone(), MigrateOutcome::Untouched));
             }
         }
-    }
-
-    if cli.dump_ast {
-        return Ok(ExitCode::SUCCESS);
     }
 
     let untranslatable_strict = matches!(cli.untranslatable, UntranslatableMode::Error);
     let failed = total_errors > 0
         || (untranslatable_strict && total_warnings > 0)
         || (cli.deny_warnings && total_warnings > 0);
+
+    // Pre-exit operation summary (stderr): per-file disposition plus the
+    // tallies that decide the exit code.
+    eprintln!("summary:");
+    for (path, outcome) in &outcomes {
+        let action = match outcome {
+            MigrateOutcome::Deleted => "deleted".green(),
+            MigrateOutcome::Trimmed { .. } => "trimmed".yellow(),
+            MigrateOutcome::Untouched => "untouched".normal(),
+        };
+        eprintln!("  {}: {}", path.display(), action);
+    }
+    eprintln!(
+        "notlin: {} file(s) processed, {} java file(s) written, {} error(s), {} warning(s) — {}",
+        files.len(),
+        java_written,
+        total_errors,
+        total_warnings,
+        if failed {
+            "failed".red()
+        } else {
+            "success".green()
+        }
+    );
+
     Ok(if failed {
         ExitCode::FAILURE
     } else {
