@@ -8,6 +8,11 @@ pub struct Cli {
     /// .kt files or directories to transpile
     pub input: Vec<PathBuf>,
 
+    /// Workspace root whose Kotlin and Java sources provide compatibility context.
+    /// Defaults to the current directory.
+    #[arg(long = "root", alias = "workspace-root")]
+    pub workspace_root: Option<PathBuf>,
+
     /// Output directory for generated .java files (default: alongside input)
     #[arg(short, long)]
     pub out_dir: Option<PathBuf>,

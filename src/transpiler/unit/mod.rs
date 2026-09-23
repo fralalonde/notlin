@@ -4,12 +4,13 @@
 //! submodules hold emission/inference; this file keeps the `Unit` state,
 //! the coverage/taint machinery and top-level orchestration.
 
-use crate::diagnostics::{DiagnosticKind, Diagnostics, FileCoverage};
+use crate::diagnostics::{DiagnosticKind, Diagnostics, FileCoverage, warning_code};
 use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 use crate::transpiler::stmt::Stmt;
 use crate::transpiler::types::AnnotationSet;
-use std::path::Path;
+use crate::workspace::SourceIndex;
+use std::path::{Path, PathBuf};
 
 mod class;
 mod function;
@@ -27,6 +28,7 @@ pub struct Unit<'a> {
     /// Assume Lombok on target classpath (--lombok): data classes emit as
     /// @Data classes (mutable), hand-rolled accessors become annotations.
     pub lombok: bool,
+    pub in_place: bool,
     /// Per-file coverage: which declarations translated, which didn't.
     pub coverage: FileCoverage,
     /// Name of the declaration currently being translated; diagnostics raised
@@ -95,6 +97,9 @@ pub struct Unit<'a> {
     /// enum declarations in this file (simple names) — `Enum#name` is
     /// public so `.name` on an enum-typed receiver stays a field read.
     pub(crate) enum_types: std::collections::HashSet<String>,
+    pub(crate) workspace: Option<&'a SourceIndex>,
+    pub(crate) workspace_file: Option<PathBuf>,
+    pub(crate) translation_roots: &'a [PathBuf],
 }
 
 impl<'a> Unit<'a> {
@@ -105,6 +110,7 @@ impl<'a> Unit<'a> {
         annots: AnnotationSet,
         untranslatable_as_error: bool,
         lombok: bool,
+        in_place: bool,
     ) -> Self {
         Self {
             source,
@@ -113,6 +119,7 @@ impl<'a> Unit<'a> {
             annots,
             untranslatable_as_error,
             lombok,
+            in_place,
             coverage: FileCoverage::default(),
             current_decl: None,
             decl_labels: std::collections::HashMap::new(),
@@ -133,7 +140,38 @@ impl<'a> Unit<'a> {
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
             enum_types: std::collections::HashSet::new(),
+            workspace: None,
+            workspace_file: None,
+            translation_roots: &[],
         }
+    }
+
+    pub fn with_workspace(
+        mut self,
+        workspace: Option<&'a SourceIndex>,
+        translation_roots: &'a [PathBuf],
+    ) -> Self {
+        self.workspace = workspace;
+        self.workspace_file = std::fs::canonicalize(self.file).ok();
+        self.translation_roots = translation_roots;
+        self
+    }
+
+    fn top_level_name(&self, decl: tree_sitter::Node<'_>) -> Option<String> {
+        kt::field(decl, "name")
+            .or_else(|| {
+                kt::child(decl, "variable_declaration")
+                    .and_then(|variable| kt::child(variable, "identifier"))
+            })
+            .map(|name| self.text(name).to_string())
+    }
+
+    fn workspace_requires_top_level_retention(&self, name: &str) -> bool {
+        let Some(workspace) = self.workspace else {
+            return false;
+        };
+        let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
+        workspace.has_kotlin_reference(indexed_path, name)
     }
 
     fn begin_decl(&mut self, node: tree_sitter::Node<'a>, label: String) {
@@ -208,11 +246,7 @@ impl<'a> Unit<'a> {
         let message: String = msg.into();
         self.coverage.blockers.push((
             node.start_byte(),
-            format!(
-                "// NOTLIN: {} {}\n",
-                DiagnosticKind::Untranslatable.code(),
-                message
-            ),
+            format!("// NOTLIN: {} {}\n", warning_code(&message), message),
         ));
 
         self.diags.push(crate::diagnostics::Diagnostic {
@@ -242,17 +276,41 @@ impl<'a> Unit<'a> {
             node.start_byte(),
             format!(
                 "// NOTLIN: {} {}\n",
-                DiagnosticKind::Approximated.code(),
+                crate::diagnostics::warning_code(&message),
                 message
             ),
         ));
     }
 
+    fn kotlin_import_to_java(&self, node: tree_sitter::Node<'a>) -> String {
+        let raw = self.text(node).trim();
+        let path = raw
+            .strip_prefix("import")
+            .map(str::trim)
+            .unwrap_or(raw)
+            .trim_end_matches(';')
+            .trim();
+        if path.ends_with(".*") || path.contains(" as ") {
+            return path.to_string();
+        }
+        let last = path.rsplit('.').next().unwrap_or(path);
+        let is_package_name = !last.is_empty()
+            && last
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_');
+        if is_package_name {
+            format!("{path}.*")
+        } else {
+            path.to_string()
+        }
+    }
     pub fn run(&mut self, root: tree_sitter::Node<'a>) -> Vec<(String, String)> {
         // Collect top-level structure
         let mut package = String::new();
         let mut imports: Vec<String> = Vec::new();
         let mut decls: Vec<tree_sitter::Node> = Vec::new();
+        let mut standalone_annotation_targets = std::collections::HashSet::new();
+        let mut retain_next_declaration = false;
 
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
@@ -263,17 +321,35 @@ impl<'a> Unit<'a> {
                     }
                 }
                 "import" => {
-                    if let Some(qi) = kt::child(child, "qualified_identifier") {
-                        imports.push(self.text(qi).replace(" ", ""));
-                    }
+                    imports.push(self.kotlin_import_to_java(child));
                 }
                 "shebang_line" | ";" | "line_comment" | "multiline_comment" => {}
+                "annotated_expression" => {
+                    // An annotation wrapper may contain a declaration whose
+                    // annotation semantics are not representable in Java.
+                    // Retain the complete Kotlin construct rather than
+                    // dropping the declaration while translating siblings.
+                    self.diag_untranslatable(
+                        child,
+                        "annotated top-level declaration is retained in Kotlin",
+                    );
+                    if self.current_decl.is_none() {
+                        self.coverage
+                            .untranslated
+                            .push(format!("top-level@{}", child.start_byte()));
+                    }
+                    retain_next_declaration = true;
+                }
                 k if k.contains("declaration")
                     || k == "object_declaration"
                     || k == "class_declaration"
                     || k == "function_declaration"
                     || k == "property_declaration" =>
                 {
+                    if retain_next_declaration {
+                        standalone_annotation_targets.insert(child.id());
+                        retain_next_declaration = false;
+                    }
                     decls.push(child);
                 }
                 _ => {
@@ -303,6 +379,14 @@ impl<'a> Unit<'a> {
                     let imports2 = imports.clone();
                     let package2 = package.clone();
                     self.begin_decl(*decl, type_name.clone());
+                    if standalone_annotation_targets.contains(&decl.id()) {
+                        self.diag_untranslatable(
+                            *decl,
+                            "standalone annotation requires the following declaration to remain Kotlin",
+                        );
+                        self.end_decl();
+                        continue;
+                    }
                     self.transpile_type_decl_set(&mut out, &package2, &imports2, |unit, out| {
                         unit.transpile_type_decl(*decl, out);
                     });
@@ -349,23 +433,30 @@ impl<'a> Unit<'a> {
                 out.line(format!("private {}() {{}}", file_class_name));
                 out.blank();
                 for decl in &loose {
-                    let label = kt::field(**decl, "name")
-                        .map(|n| unit.text(n).to_string())
+                    let label = unit
+                        .top_level_name(**decl)
                         .unwrap_or_else(|| "<anonymous>".to_string());
                     unit.begin_decl(**decl, label.clone());
-                    match decl.kind() {
-                        "function_declaration" => {
-                            let is_main = kt::field(**decl, "name")
-                                .map(|n| unit.text(n) == "main")
-                                .unwrap_or(false);
-                            unit.transpile_function_opts(**decl, true, true, is_main, out);
-                            out.blank();
+                    if unit.workspace_requires_top_level_retention(&label) {
+                        unit.diag_untranslatable(
+                            **decl,
+                            "top-level declaration is referenced by retained Kotlin source",
+                        );
+                    } else {
+                        match decl.kind() {
+                            "function_declaration" => {
+                                let is_main = kt::field(**decl, "name")
+                                    .map(|n| unit.text(n) == "main")
+                                    .unwrap_or(false);
+                                unit.transpile_function_opts(**decl, true, true, is_main, out);
+                                out.blank();
+                            }
+                            "property_declaration" => {
+                                unit.transpile_toplevel_property(**decl, out, &file_class_name);
+                                out.blank();
+                            }
+                            _ => {}
                         }
-                        "property_declaration" => {
-                            unit.transpile_toplevel_property(**decl, out, &file_class_name);
-                            out.blank();
-                        }
-                        _ => {}
                     }
                     unit.end_decl();
                 }
@@ -376,8 +467,8 @@ impl<'a> Unit<'a> {
             let clean_count = loose
                 .iter()
                 .filter(|d| {
-                    let label = kt::field(***d, "name")
-                        .map(|n| self.text(n).to_string())
+                    let label = self
+                        .top_level_name(***d)
                         .unwrap_or_else(|| "<anonymous>".to_string());
                     !self.coverage.untranslated.iter().any(|l| l == &label)
                 })

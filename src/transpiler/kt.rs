@@ -62,6 +62,32 @@ pub fn java_type_ann(node: tree_sitter::Node, source: &str, annots: AnnotationSe
     java
 }
 
+fn java_type_projection(node: tree_sitter::Node, source: &str) -> String {
+    if text(node, source).trim() == "*" {
+        return "?".to_string();
+    }
+    let mut variance = None;
+    let mut projected = None;
+    for child in node.named_children(&mut node.walk()) {
+        if child.kind() == "variance_modifier" {
+            variance = Some(text(child, source).trim());
+        } else {
+            projected = Some(child);
+        }
+    }
+    let java = projected
+        .map(|child| java_type(child, source))
+        .unwrap_or_else(|| "Object".to_string());
+    let java = crate::transpiler::types::boxed_name(&java)
+        .unwrap_or(&java)
+        .to_string();
+    match variance {
+        Some("out") => format!("? extends {java}"),
+        Some("in") => format!("? super {java}"),
+        _ => java,
+    }
+}
+
 pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
     match node.kind() {
         "user_type" => {
@@ -80,12 +106,10 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                             // punctuation: keep verbatim
                             args.push_str(text(arg, source));
                         } else {
-                            // type_projection wraps the actual type; find the
-                            // nested type node
-                            let inner = arg.children(&mut arg.walk()).find(|c| c.is_named());
-                            let jt = match inner {
-                                Some(n) => java_type(n, source),
-                                None => java_type(arg, source),
+                            let jt = if arg.kind() == "type_projection" {
+                                java_type_projection(arg, source)
+                            } else {
+                                java_type(arg, source)
                             };
                             let boxed = crate::transpiler::types::boxed_name(&jt).unwrap_or(&jt);
                             args.push_str(boxed);

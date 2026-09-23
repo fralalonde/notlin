@@ -3,6 +3,8 @@ use colored::Colorize;
 use notlin::cli::{Cli, UntranslatableMode};
 use notlin::migrate;
 use notlin::transpiler;
+use notlin::workspace::SourceIndex;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -27,6 +29,33 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<ExitCode, String> {
+    let workspace_root = cli
+        .workspace_root
+        .clone()
+        .unwrap_or(std::env::current_dir().map_err(|e| format!("current directory: {e}"))?);
+    let workspace_root = std::fs::canonicalize(&workspace_root)
+        .map_err(|e| format!("workspace root {}: {e}", workspace_root.display()))?;
+    let index = SourceIndex::discover(&workspace_root)?;
+    log::info!(
+        "indexed {} Kotlin and {} Java files from {}",
+        index.kotlin_files().count(),
+        index.java_files().count(),
+        workspace_root.display()
+    );
+
+    let translation_roots = if cli.input.is_empty() {
+        vec![workspace_root.clone()]
+    } else {
+        cli.input
+            .iter()
+            .filter(|input| input.as_os_str() != "-")
+            .map(|input| {
+                log::info!("source root {}", input.to_string_lossy());
+                std::fs::canonicalize(input)
+                    .map_err(|e| format!("translation root {}: {e}", input.display()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let files = collect_inputs(&cli.input)?;
     if files.is_empty() {
         return Err("no input files given (positional <INPUT>..., or use - for stdin)".into());
@@ -44,7 +73,13 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             continue;
         }
 
-        let (java_files, errors, warnings, coverage) = transpiler::transpile(&source, file, cli);
+        let (java_files, errors, warnings, coverage) = transpiler::transpile_with_workspace(
+            &source,
+            file,
+            cli,
+            Some(&index),
+            &translation_roots,
+        );
         total_errors += errors;
         total_warnings += warnings;
 
@@ -161,6 +196,21 @@ fn collect_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
             files.push(input.clone());
         }
     }
+    let mut seen = HashSet::new();
+    files.retain(|file| {
+        if file.as_os_str() == "-" {
+            return seen.insert("-".to_string());
+        }
+        let identity = std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
+        let identity = identity.to_string_lossy().replace('\\', "/");
+        let identity = if cfg!(windows) {
+            identity.to_ascii_lowercase()
+        } else {
+            identity
+        };
+        seen.insert(identity)
+    });
+    log::info!("collected {} .kt files", files.len());
     Ok(files)
 }
 
@@ -180,4 +230,23 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_inputs;
+    use std::fs;
+
+    #[test]
+    fn duplicate_input_paths_are_processed_once() {
+        let root = std::env::temp_dir().join(format!("notlin-input-dedupe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("Sample.kt");
+        fs::write(&source, "class Sample\n").unwrap();
+
+        let files = collect_inputs(&[source.clone(), source.clone()]).unwrap();
+        assert_eq!(files, vec![source]);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

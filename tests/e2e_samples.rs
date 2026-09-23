@@ -5,6 +5,7 @@
 //! `tools/e2e.sh` additionally compile-checks with javac when available.
 
 use clap::Parser;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Run the transpiler on a string, returning (files, error count).
@@ -60,6 +61,91 @@ fn all_samples_parse_without_errors() {
         }
     }
     assert!(count >= 1, "no samples found — corpus is empty");
+}
+
+#[test]
+fn generic_variance_becomes_java_wildcards() {
+    let source = "interface Event\ninterface Registry { val eventType: KClass<out Event> }\n";
+    let (files, errors) = transpile_src(source, "Variance.kt");
+    assert_eq!(errors, 0);
+    let registry = files
+        .iter()
+        .find(|(name, _)| name == "Registry.java")
+        .map(|(_, content)| content)
+        .expect("Registry.java");
+    assert!(
+        registry.contains("KClass<? extends Event> getEventType()"),
+        "{registry}"
+    );
+    assert!(!registry.contains("KClass<out>"), "{registry}");
+}
+
+#[test]
+fn standalone_annotation_retains_following_object() {
+    let (files, errors) = transpile_src(
+        "@Marker(\"x\")\nobject First\n@Marker(\"y\")\nobject Second\n",
+        "AnnotatedObjects.kt",
+    );
+    assert_eq!(errors, 0);
+    assert!(!files.iter().any(|(name, _)| name == "First.java"));
+    assert!(!files.iter().any(|(name, _)| name == "Second.java"));
+}
+
+#[test]
+fn annotated_interface_is_retained_in_kotlin() {
+    let (files, errors) = transpile_src(
+        "@Marker(value = \"x\")\ninterface Parent\ninterface Child : Parent\n",
+        "AnnotatedInheritance.kt",
+    );
+    assert_eq!(errors, 0);
+    assert!(!files.iter().any(|(name, _)| name == "Parent.java"));
+    assert!(files.iter().any(|(name, _)| name == "Child.java"));
+}
+#[test]
+fn in_place_migration_keeps_annotated_declaration_source() {
+    let root = std::env::temp_dir().join(format!("notlin-annotated-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("Definitions.kt");
+    let source = "package sample\n/* note */\n@Marker(value = \"x\")\ninterface Parent\ninterface Child : Parent\n";
+    fs::write(&path, source).unwrap();
+
+    let index = notlin::workspace::SourceIndex::discover(&root).unwrap();
+    let cli = notlin::cli::Cli::parse_from(["notlin", "--in-place", path.to_str().unwrap()]);
+    let (files, errors, _warnings, coverage) = notlin::transpiler::transpile_with_workspace(
+        source,
+        &path,
+        &cli,
+        Some(&index),
+        std::slice::from_ref(&root),
+    );
+    assert_eq!(errors, 0);
+    assert!(coverage.untranslated.iter().any(|name| name == "Parent"));
+    assert!(files.iter().any(|(name, _)| name == "Child.java"));
+
+    notlin::migrate::migrate(&path, source, &coverage).unwrap();
+    let remaining = fs::read_to_string(&path).unwrap();
+    assert!(remaining.contains("interface Parent"), "{remaining}");
+    assert!(!remaining.contains("interface Child"), "{remaining}");
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn interface_inheritance_uses_java_extends() {
+    let (files, errors) = transpile_src(
+        "interface Parent\ninterface Child : Parent\n",
+        "InterfaceInheritance.kt",
+    );
+    assert_eq!(errors, 0);
+    let child = files
+        .iter()
+        .find(|(name, _)| name == "Child.java")
+        .map(|(_, source)| source)
+        .expect("Child.java");
+    assert!(child.contains("interface Child extends Parent"), "{child}");
+    assert!(
+        !child.contains("interface Child implements Parent"),
+        "{child}"
+    );
 }
 
 #[test]
@@ -122,15 +208,56 @@ fn elvis_becomes_optional() {
 }
 
 #[test]
-fn when_becomes_ternary_chain() {
+fn when_becomes_switch_or_if_else() {
     let source = r#"fun w(x: Int): String {
     return when (x) {
         0 -> "zero"
         else -> "many"
     }
 }"#;
-    let (_, errors) = transpile_src(source, "W.kt");
+    let (files, errors) = transpile_src(source, "W.kt");
     assert_eq!(errors, 0);
+    let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
+    assert!(all.contains("switch (") || all.contains("if ("), "{all}");
+    assert!(!all.contains(" ? "), "{all}");
+}
+
+#[test]
+fn untranslatable_reasons_get_distinct_codes() {
+    let source = "value class Bad(val raw: Int)\nclass Holder {\n    constructor()\n}\n";
+    let cli = notlin::cli::Cli::parse_from(["notlin", "Bad.kt"]);
+    let (_, errors, warnings, coverage) =
+        notlin::transpiler::transpile(source, Path::new("Bad.kt"), &cli);
+    assert_eq!(errors, 0);
+    assert!(warnings >= 2);
+    let codes: Vec<_> = coverage
+        .blockers
+        .iter()
+        .filter_map(|(_, text)| text.split_whitespace().nth(2))
+        .collect();
+    assert!(codes.len() >= 2, "{codes:?}");
+    assert_ne!(codes[0], codes[1], "{codes:?}");
+    assert!(codes.iter().all(|code| *code != "N001"), "{codes:?}");
+}
+
+#[test]
+fn when_throw_else_is_valid_java() {
+    let source = r#"fun createId(kind: Kind): String {
+    return when (kind) {
+        Kind.A -> newA()
+        Kind.B -> newB()
+        else -> throw IllegalArgumentException()
+    }
+}"#;
+    let (files, errors) = transpile_src(source, "CreateId.kt");
+    assert_eq!(errors, 0);
+    let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
+    assert!(
+        all.contains("throw new IllegalArgumentException()"),
+        "{all}"
+    );
+    assert!(!all.contains("? "), "{all}");
+    assert!(all.contains("switch (") || all.contains("if ("), "{all}");
 }
 
 #[test]
@@ -144,6 +271,21 @@ fn untranslatable_mode_error_fails_the_run() {
     assert!(errors > 0 || warnings > 0);
 }
 
+#[test]
+fn package_imports_become_java_wildcard_imports() {
+    let source = r#"package sample
+import com.example.base
+
+class Example"#;
+    let (files, errors) = transpile_src(source, "Example.kt");
+    assert_eq!(errors, 0);
+    let all = files
+        .iter()
+        .map(|(_, content)| content.as_str())
+        .collect::<String>();
+    assert!(all.contains("import com.example.base.*;"), "{all}");
+    assert!(!all.contains("import com.example.base;"), "{all}");
+}
 #[test]
 fn annotations_option_controls_import() {
     let source = r#"val x: Int = 1"#;

@@ -1,7 +1,8 @@
 use crate::cli::{Annotations, Cli, UntranslatableMode};
 use crate::diagnostics::{Diagnostics, FileCoverage};
 use crate::transpiler::unit::Unit;
-use std::path::Path;
+use crate::workspace::SourceIndex;
+use std::path::{Path, PathBuf};
 
 pub mod expr;
 pub mod java;
@@ -58,15 +59,24 @@ fn render_node(node: tree_sitter::Node, source: &str, depth: usize, out: &mut St
     }
 }
 
-/// Transpile one file.
-/// Returns (java files, error count, warning count, coverage).
+/// Transpile one file without workspace compatibility context.
 pub fn transpile(
     source: &str,
     file: &Path,
     cli: &Cli,
 ) -> (Vec<(String, String)>, usize, usize, FileCoverage) {
-    let tree = parse(source);
+    transpile_with_workspace(source, file, cli, None, &[])
+}
 
+/// Transpile one file with a source-level workspace index and selected roots.
+pub fn transpile_with_workspace(
+    source: &str,
+    file: &Path,
+    cli: &Cli,
+    workspace: Option<&SourceIndex>,
+    translation_roots: &[PathBuf],
+) -> (Vec<(String, String)>, usize, usize, FileCoverage) {
+    let tree = parse(source);
     let mut diags = Diagnostics::new();
     let annots = match cli.annotations {
         Annotations::Jetbrains => types::AnnotationSet::Jetbrains,
@@ -83,15 +93,15 @@ pub fn transpile(
             annots,
             untranslatable_as_error,
             cli.lombok,
-        );
+            cli.in_place,
+        )
+        .with_workspace(workspace, translation_roots);
         let java_files = unit.run(tree.root_node());
         let mut coverage = std::mem::take(&mut unit.coverage);
         let approx = std::mem::take(&mut coverage.diags_approx);
         (java_files, approx, coverage)
     };
 
-    // N002 approximations were recorded on Unit.coverage (byte-anchored);
-    // flush them into the console diagnostic listing in source order.
     let mut approx_diags = approx_diags;
     approx_diags.sort_by_key(|(off, _, _, _)| *off);
     for (_, msg, line, col) in approx_diags {
@@ -104,7 +114,6 @@ pub fn transpile(
             col,
         });
     }
-
     if tree.root_node().has_error() {
         diags.warn_parse(
             tree.root_node(),
@@ -112,7 +121,6 @@ pub fn transpile(
             "source contains syntax errors; output is best-effort",
         );
     }
-
     let (errors, warnings) = (diags.error_count(), diags.warning_count());
     diags.print();
     (java_files, errors, warnings, coverage)

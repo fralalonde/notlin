@@ -39,6 +39,17 @@ impl DiagnosticKind {
     }
 }
 
+/// Stable code for one warning reason. Identical messages share a code;
+/// different messages do not share the coarse N001/N002/N003 bucket.
+pub fn warning_code(message: &str) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in message.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("N{:04X}", hash & 0xFFFF)
+}
+
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub severity: Severity,
@@ -55,11 +66,15 @@ impl Diagnostic {
             "{}: {} [{}]\n  --> {}:{}:{}",
             self.severity,
             self.message,
-            self.kind.code(),
+            self.warning_code(),
             self.file.display(),
             self.line,
             self.col,
         )
+    }
+
+    pub fn warning_code(&self) -> String {
+        warning_code(&self.message)
     }
 }
 

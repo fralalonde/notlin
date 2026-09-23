@@ -156,6 +156,29 @@ impl<'a> Unit<'a> {
         f(self, out);
     }
 
+    fn workspace_requires_kotlin_retention(&self, name: &str) -> bool {
+        let Some(workspace) = self.workspace else {
+            return false;
+        };
+        let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
+        let Some(source_file) = workspace.source_file(indexed_path) else {
+            return false;
+        };
+        let Some(target) = source_file
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+        else {
+            return false;
+        };
+        workspace.has_unselected_kotlin_subtype(target, self.translation_roots)
+            || (target.kind == crate::workspace::DeclarationKind::Interface
+                && workspace.has_kotlin_subtype(target))
+            || (target.has_default_constructor_parameter
+                && workspace.has_kotlin_reference(indexed_path, name))
+            || workspace.narrows_nullable_kotlin_property(source_file, target)
+            || workspace.property_smart_cast_used_by_kotlin(indexed_path, target)
+    }
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
         let mut is_data = false;
         let mut is_sealed = false;
@@ -170,6 +193,9 @@ impl<'a> Unit<'a> {
             let mut cursor = mods.walk();
             for m in mods.children(&mut cursor) {
                 match m.kind() {
+                    "annotation" => {
+                        self.diag_untranslatable(m, "declaration annotation is retained in Kotlin");
+                    }
                     "class_modifier" => {
                         let mut inner = m.walk();
                         for cm in m.children(&mut inner) {
@@ -209,6 +235,13 @@ impl<'a> Unit<'a> {
         let name = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_else(|| "Anonymous".to_string());
+        if self.workspace_requires_kotlin_retention(&name) {
+            self.diag_untranslatable(
+                decl,
+                "workspace Kotlin implementation requires this declaration to remain Kotlin",
+            );
+            return;
+        }
 
         if decl.kind() == "object_declaration" {
             self.transpile_object(decl, &name, &visibility, out);
@@ -340,7 +373,11 @@ impl<'a> Unit<'a> {
                     j.push_str(&format!(" extends {c}"));
                 }
                 if !ifaces.is_empty() {
-                    j.push_str(&format!(" implements {}", ifaces.join(", ")));
+                    if is_interface {
+                        j.push_str(&format!(" extends {}", ifaces.join(", ")));
+                    } else {
+                        j.push_str(&format!(" implements {}", ifaces.join(", ")));
+                    }
                 }
                 if !j.is_empty() {
                     extends = j;

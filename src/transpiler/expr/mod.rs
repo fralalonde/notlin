@@ -104,6 +104,7 @@ impl<'a, 'u> Expr<'a, 'u> {
             }
             "indexing_expression" | "index_expression" => self.indexing(node),
             "jump_expression" => self.jump(node),
+            "throw_expression" => self.throw_expr(node),
             "if_expression" => self.if_expr(node),
             _ => {
                 // Last resort: try to copy verbatim text if it's plausible Java,
@@ -183,14 +184,10 @@ impl<'a, 'u> Expr<'a, 'u> {
         self.unit.diags.warn_approx(
             node,
             self.unit.file,
-            "when-expression approximated; check ternary output",
+            "when-expression lowered to switch or if/else",
         );
-        // when (subject) { branch -> expr, ... }  =>  ternary chain (single branch for now)
         let mut cursor = node.walk();
         let kids: Vec<_> = node.children(&mut cursor).collect();
-        // The subject is inside a when_subject wrapper (with paren tokens):
-        // find its first named expression child so `xs.size` TRANSPILES (its
-        // property access -> xs.size()) instead of raw text pass-through.
         let subject = kids
             .iter()
             .find(|c| c.kind() == "when_subject")
@@ -205,149 +202,190 @@ impl<'a, 'u> Expr<'a, 'u> {
             .filter(|c| c.kind() == "when_entry")
             .copied()
             .collect();
-        let subject_java = subject.as_ref().map(|s| self.transpile(*s));
-        let subject_java = subject_java.unwrap_or_default();
-        let mut ternary = String::new();
-        for entry in entries.iter().rev() {
-            let mut ec = entry.walk();
-            let e_kids: Vec<_> = entry.children(&mut ec).collect();
-            let e_named: Vec<_> = e_kids.iter().filter(|c| c.is_named()).copied().collect();
-            let result = e_named.last().copied();
-            let conditions: Vec<_> = e_named[..e_named.len().saturating_sub(1)].to_vec();
-            let result_java = result
-                .map(|r| self.transpile(r))
-                .unwrap_or_else(|| "null".to_string());
-            // Conditions joined with OR: `0, 1 ->` means `x==0 || x==1`;
-            // `in 2..9 ->` is a range test over the when subject; `else`
-            // is the fallthrough arm.
-            let mut cond_parts: Vec<String> = Vec::new();
-            // Smart-cast type when any condition is a `is T` test:
-            // member accesses on the subject in this arm need (T) subject.
-            let mut cast_type: Option<String> = None;
-            for c in &conditions {
-                let text = self.unit.text(*c);
-                if text == "else" {
-                    cond_parts.push("true".to_string());
-                } else if c.kind() == "range_test" {
-                    cond_parts.push(self.range_test_cond(*c, &subject_java));
-                } else if c.kind() == "type_test" {
-                    // `is State.Running` -> subject instanceof State.Running.
-                    // Kotlin smart-casts the subject to the tested type, so
-                    // member accesses on the subject in the arm must see a
-                    // narrowed receiver: force a cast in the emitted arm.
-                    let mut tcur = c.walk();
-                    let ty = c
-                        .children(&mut tcur)
-                        .find(|t| t.is_named())
-                        .map(|t| self.unit.text(t).trim().replace(" ", ""))
-                        .unwrap_or_default();
-                    cond_parts.push(format!("{} instanceof {}", subject_java, ty));
-                    cast_type = Some(ty.clone());
-                } else {
-                    let cj = self.transpile(*c);
-                    if subject.is_some() && cj != "true" {
-                        cond_parts.push(format!("Objects.equals({}, {})", subject_java, cj));
-                    } else {
-                        cond_parts.push(cj);
-                    }
-                }
-            }
-            let cond_java = if cond_parts.is_empty() {
-                "true".to_string()
-            } else {
-                cond_parts.join(" || ")
-            };
-            // Apply the smart cast AFTER conditions loop filled cast_type:
-            // member reads on the subject in this arm need the narrowed type
-            // (Kotlin smart-cast semantics).
-            let result_java = match (&cast_type, subject) {
-                (Some(ty), Some(_)) => {
-                    // wrap the cast around the RECEIVER: ((T) s).getPid(),
-                    // not (T) s.getPid() which casts the whole call result.
-                    result_java.replace(
-                        &format!("{}.", subject_java),
-                        &format!("(({}) {}).", ty, subject_java),
-                    )
-                }
-                _ => result_java,
-            };
-            ternary = if ternary.is_empty() {
-                result_java.clone()
-            } else {
-                format!("{} ? {} : {}", cond_java, result_java, ternary)
-            };
-            if entries.len() == 1 {
-                ternary = result_java;
-            }
-        }
-        if ternary.is_empty() {
-            "null".to_string()
-        } else if ternary.contains("System.out.println") && ternary.contains(" : ") {
-            // when-as-statement with void arms: build the if/else chain
-            // structurally from entries (fwd order) rather than re-parsing
-            // ternary text (which mis-splits on `:` inside strings).
-            let mut out = String::new();
-            for entry in entries.iter().rev() {
-                let mut ec = entry.walk();
-                let e_kids: Vec<_> = entry.children(&mut ec).collect();
-                let e_named: Vec<_> = e_kids.iter().filter(|c| c.is_named()).copied().collect();
+        let subject_java = subject
+            .as_ref()
+            .map(|s| self.transpile(*s))
+            .unwrap_or_default();
+        let arms: Vec<(Vec<tree_sitter::Node>, Option<tree_sitter::Node>)> = entries
+            .iter()
+            .map(|entry| {
+                let e_named: Vec<_> = entry
+                    .children(&mut entry.walk())
+                    .filter(|c| c.is_named())
+                    .collect();
                 let result = e_named.last().copied();
-                let conditions: Vec<_> = e_named[..e_named.len().saturating_sub(1)].to_vec();
-                let mut cond_parts: Vec<String> = Vec::new();
-                for c in &conditions {
-                    let text = self.unit.text(*c);
-                    if text == "else" {
-                        cond_parts.push("true".to_string());
-                    } else if c.kind() == "type_test" {
-                        let mut tcur = c.walk();
-                        let ty = c
-                            .children(&mut tcur)
-                            .find(|t| t.is_named())
-                            .map(|t| self.unit.text(t).trim().replace(" ", ""))
-                            .unwrap_or_default();
-                        cond_parts.push(format!("{} instanceof {}", subject_java, ty));
-                    } else {
-                        let cj = self.transpile(*c);
-                        if subject.is_some() && cj != "true" {
-                            cond_parts.push(format!("Objects.equals({}, {})", subject_java, cj));
-                        } else {
-                            cond_parts.push(cj);
-                        }
-                    }
-                }
-                let arm = result
-                    .map(|r| self.transpile(r))
-                    .unwrap_or_else(|| "null".to_string());
-                let ender = if out.is_empty() { ";" } else { "" };
-                let _ = ender;
-                if out.is_empty() {
-                    // last entry (reversed) = else arm; do NOT prefix `else`
-                    // — the wrapping statement builder adds it.
-                    out = format!("{};", arm);
-                } else {
-                    let cj = if cond_parts.iter().all(|c| c == "true") {
-                        "true".to_string()
-                    } else {
-                        cond_parts.join(" || ")
-                    };
-                    out = format!(
-                        "if ({}) {} else {}",
-                        cj,
-                        if arm.ends_with(';') {
-                            arm.clone()
-                        } else {
-                            format!("{};", arm)
-                        },
-                        out
-                    );
-                }
+                let conditions = e_named[..e_named.len().saturating_sub(1)].to_vec();
+                (conditions, result)
+            })
+            .collect();
+        if let Some(lowered) = self.when_switch(subject, &subject_java, &arms) {
+            return lowered;
+        }
+        self.when_if_else(node, subject, &subject_java, &arms)
+    }
+
+    fn when_switch(
+        &mut self,
+        subject: Option<tree_sitter::Node>,
+        subject_java: &str,
+        arms: &[(Vec<tree_sitter::Node>, Option<tree_sitter::Node>)],
+    ) -> Option<String> {
+        if subject.is_none() || subject_java.is_empty() || arms.is_empty() {
+            return None;
+        }
+        let mut cases = Vec::new();
+        let mut default_arm = None;
+        for (conditions, result) in arms {
+            let is_else = conditions.is_empty()
+                || conditions
+                    .iter()
+                    .all(|c| self.unit.text(*c).trim() == "else");
+            if is_else {
+                default_arm = Some(*result);
+                continue;
             }
-            format!("{};", out.trim_start_matches("else "))
-        } else {
-            ternary
+            let mut labels = Vec::new();
+            for condition in conditions {
+                labels.push(self.switch_case_label(*condition)?);
+            }
+            cases.push((labels, *result));
+        }
+        if cases.is_empty() {
+            return None;
+        }
+        let mut out = format!("switch ({subject_java}) {{\n");
+        for (labels, result) in cases {
+            out.push_str(&format!(
+                "case {} -> {};\n",
+                labels.join(", "),
+                self.when_arm_body(result)
+            ));
+        }
+        out.push_str(&format!(
+            "default -> {};\n}}",
+            default_arm
+                .flatten()
+                .map(|result| self.when_arm_body(Some(result)))
+                .unwrap_or_else(|| "throw new IllegalStateException()".to_string())
+        ));
+        Some(out)
+    }
+
+    fn switch_case_label(&self, node: tree_sitter::Node) -> Option<String> {
+        match node.kind() {
+            "number_literal" | "string_literal" => Some(self.unit.text(node).trim().to_string()),
+            "navigation_expression" => node
+                .children(&mut node.walk())
+                .filter(|child| child.kind() == "identifier")
+                .last()
+                .map(|child| self.unit.text(child).trim().to_string())
+                .filter(|label| !label.is_empty()),
+            "identifier" => {
+                let label = self.unit.text(node).trim().to_string();
+                (!label.is_empty() && label != "else").then_some(label)
+            }
+            _ => None,
         }
     }
 
+    fn when_arm_body(&mut self, result: Option<tree_sitter::Node>) -> String {
+        match result {
+            Some(node) if node.kind() == "throw_expression" => self.throw_expr(node),
+            Some(node) => self.transpile(node),
+            None => "null".to_string(),
+        }
+    }
+
+    fn when_if_else(
+        &mut self,
+        node: tree_sitter::Node,
+        subject: Option<tree_sitter::Node>,
+        subject_java: &str,
+        arms: &[(Vec<tree_sitter::Node>, Option<tree_sitter::Node>)],
+    ) -> String {
+        let yield_return = node
+            .parent()
+            .is_some_and(|parent| matches!(parent.kind(), "return_expression" | "function_body"));
+        let mut out = String::new();
+        let mut emitted_branch = false;
+        for (conditions, result) in arms {
+            let is_else = conditions.is_empty()
+                || conditions
+                    .iter()
+                    .all(|c| self.unit.text(*c).trim() == "else");
+            let mut cast_type = None;
+            let mut cond_parts = Vec::new();
+            for condition in conditions {
+                let text = self.unit.text(*condition);
+                if text.trim() == "else" {
+                    continue;
+                } else if condition.kind() == "range_test" {
+                    cond_parts.push(self.range_test_cond(*condition, subject_java));
+                } else if condition.kind() == "type_test" {
+                    let ty = condition
+                        .children(&mut condition.walk())
+                        .find(|child| child.is_named())
+                        .map(|child| self.unit.text(child).trim().replace(' ', ""))
+                        .unwrap_or_default();
+                    cond_parts.push(format!("{subject_java} instanceof {ty}"));
+                    cast_type = Some(ty);
+                } else {
+                    let rendered = self.transpile(*condition);
+                    if subject.is_some() && rendered != "true" {
+                        cond_parts.push(format!("Objects.equals({subject_java}, {rendered})"));
+                    } else {
+                        cond_parts.push(rendered);
+                    }
+                }
+            }
+            let mut body = self.when_arm_body(*result);
+            if let (Some(ty), Some(_)) = (&cast_type, subject) {
+                body = body.replace(
+                    &format!("{subject_java}."),
+                    &format!("(({}) {}).", ty, subject_java),
+                );
+            }
+            let body = if body.trim_start().starts_with("throw ") {
+                format!("{body};")
+            } else if yield_return {
+                format!("return {body};")
+            } else {
+                format!("{body};")
+            };
+            if is_else {
+                out.push_str(&format!("else {{\n{body}\n}}"));
+            } else if !emitted_branch {
+                let cond = if cond_parts.is_empty() {
+                    "true".to_string()
+                } else {
+                    cond_parts.join(" || ")
+                };
+                out.push_str(&format!("if ({cond}) {{\n{body}\n}}"));
+                emitted_branch = true;
+            } else {
+                let cond = cond_parts.join(" || ");
+                out.push_str(&format!(" else if ({cond}) {{\n{body}\n}}"));
+            }
+        }
+        if out.is_empty() {
+            "null".to_string()
+        } else {
+            out
+        }
+    }
+
+    fn throw_expr(&mut self, node: tree_sitter::Node) -> String {
+        let ctor = node
+            .children(&mut node.walk())
+            .find(|child| child.is_named())
+            .map(|child| self.transpile(child))
+            .unwrap_or_else(|| "RuntimeException()".to_string());
+        if ctor.trim_start().starts_with("new ") {
+            format!("throw {ctor}")
+        } else {
+            format!("throw new {ctor}")
+        }
+    }
     /// `x in lo..hi` when-condition -> `x >= lo && x <= hi` (`!in` negated).
     /// The subject is the when-expression's subject, not part of the node.
     fn range_test_cond(&mut self, cond: tree_sitter::Node, subject: &str) -> String {
