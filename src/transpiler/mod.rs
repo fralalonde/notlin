@@ -93,6 +93,7 @@ pub fn transpile_with_workspace(
             annots,
             untranslatable_as_error,
             cli.lombok,
+            cli.commons_lang,
             cli.in_place,
         )
         .with_workspace(workspace, translation_roots);

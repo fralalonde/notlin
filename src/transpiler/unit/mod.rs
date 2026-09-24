@@ -28,6 +28,8 @@ pub struct Unit<'a> {
     /// Assume Lombok on target classpath (--lombok): data classes emit as
     /// @Data classes (mutable), hand-rolled accessors become annotations.
     pub lombok: bool,
+    /// Assume Apache Commons Lang 3 on the target classpath (--commons-lang).
+    pub commons_lang: bool,
     pub in_place: bool,
     /// Per-file coverage: which declarations translated, which didn't.
     pub coverage: FileCoverage,
@@ -74,9 +76,19 @@ pub struct Unit<'a> {
     /// Set by transpile_target when the LHS was rewritten to a setter call —
     /// the assignment emitter then closes the call instead of emitting `=`.
     pub(crate) pending_setter: bool,
+    /// Name of the function whose body is currently being transpiled (used
+    /// to detect self-setter field writes that must not re-enter `setX(...)`).
+    pub(crate) current_function_name: Option<String>,
     /// Set by navigation_call when the member mapping already consumed the
     /// call args (joinToString) — call.rs must not append its own `(args)`.
     pub(crate) pending_full_call: bool,
+    /// Set by binary() when a nested generic-call-with-trailing-lambda
+    /// (`spec<String> { ... }` parsed as `spec < String`) returned bare callee
+    /// text: the outer `>` half of the merged binary_expression pair is the
+    /// type-argument list's closing bracket, NOT a comparison — the outer
+    /// binary must skip its compareTo-rewrite and just pass the callee
+    /// through so call.rs can attach the lambda.
+    pub(crate) pending_generic_call: bool,
     /// function name -> Java return type, filled when each function is
     /// emitted; lets `val p = pair()` infer the fn's return type for
     /// member-call context (Pair.first -> getKey()).
@@ -97,6 +109,12 @@ pub struct Unit<'a> {
     /// enum declarations in this file (simple names) — `Enum#name` is
     /// public so `.name` on an enum-typed receiver stays a field read.
     pub(crate) enum_types: std::collections::HashSet<String>,
+    /// Instance property accessors across the file: property name -> Java
+    /// getter name (`activity` -> `getActivity`). A bare identifier inside
+    /// a body that isn't a local/param resolves against this so body text
+    /// referencing a before-or-after-declared property member lowers to
+    /// the accessor (interfaces especially: `get() = activity`).
+    pub(crate) self_getters: std::collections::HashMap<String, String>,
     pub(crate) workspace: Option<&'a SourceIndex>,
     pub(crate) workspace_file: Option<PathBuf>,
     pub(crate) translation_roots: &'a [PathBuf],
@@ -110,6 +128,7 @@ impl<'a> Unit<'a> {
         annots: AnnotationSet,
         untranslatable_as_error: bool,
         lombok: bool,
+        commons_lang: bool,
         in_place: bool,
     ) -> Self {
         Self {
@@ -119,6 +138,7 @@ impl<'a> Unit<'a> {
             annots,
             untranslatable_as_error,
             lombok,
+            commons_lang,
             in_place,
             coverage: FileCoverage::default(),
             current_decl: None,
@@ -133,13 +153,16 @@ impl<'a> Unit<'a> {
             current_object: None,
             static_member_types: std::collections::HashMap::new(),
             pending_setter: false,
+            current_function_name: None,
             pending_full_call: false,
+            pending_generic_call: false,
             fn_rets: std::collections::HashMap::new(),
             pending_nav_text: None,
             pending_join_to_string: None,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
             enum_types: std::collections::HashSet::new(),
+            self_getters: std::collections::HashMap::new(),
             workspace: None,
             workspace_file: None,
             translation_roots: &[],
@@ -290,7 +313,34 @@ impl<'a> Unit<'a> {
             .unwrap_or(raw)
             .trim_end_matches(';')
             .trim();
-        if path.ends_with(".*") || path.contains(" as ") {
+        // kotlin.reflect / kotlin.jvm.* machinery has no Java counterpart:
+        // importing it produces "cannot find symbol" noise. Drop them; the
+        // using sites are warned separately as approximations.
+        if path.starts_with("kotlin.reflect.")
+            || path.starts_with("kotlin.jvm.")
+            || path.starts_with("kotlin.properties.")
+        {
+            let _ = path;
+            return String::new();
+        }
+        if path.ends_with(".*") {
+            // Member wildcard: `import pkg.Kind.*`. When `Kind` is a known
+            // enum this is really an enum-constant import, which Java only
+            // accepts as a static wildcard — rewrite to the static form.
+            let head = path.trim_end_matches(".*");
+            let last = head.rsplit('.').next().unwrap_or(head);
+            let is_enum = self.enum_types.contains(last)
+                || self.workspace.map(|w| {
+                    w.declarations().any(|d| {
+                        d.name == last && d.kind == crate::workspace::DeclarationKind::Enum
+                    })
+                }) == Some(true);
+            if is_enum {
+                return format!("static {head}.*");
+            }
+            return path.to_string();
+        }
+        if path.contains(" as ") {
             return path.to_string();
         }
         let last = path.rsplit('.').next().unwrap_or(path);
@@ -298,11 +348,43 @@ impl<'a> Unit<'a> {
             && last
                 .chars()
                 .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_');
+        // Enum-constant member imports (`import pkg.Kind.YES`) don't exist in
+        // Java unless spelled `import static`. Mark for the static form; the
+        // renderer prepends `import`. Static imports render their full text
+        // (sans trailing `;`), so return the whole `static pkg.Kind.YES`.
         if is_package_name {
             format!("{path}.*")
+        } else if self.unit_is_enum_constant(path) {
+            format!("static {path}")
         } else {
             path.to_string()
         }
+    }
+
+    /// An import path's last segment refers to an enum constant when the
+    /// parent type is a known enum in the workspace index and the last
+    /// segment starts uppercase but isn't itself a known type.
+    fn unit_is_enum_constant(&self, path: &str) -> bool {
+        let mut parts = path.rsplit('.');
+        let last = parts.next().unwrap_or("");
+        let Some(parent_ty) = parts.next() else {
+            return false;
+        };
+        // Conventional: enum constants are SCREAMING_CASE; CamelCase segments
+        // could be nested classes, lowercase segments could be packages.
+        if last.is_empty() || last.chars().any(|c| c.is_ascii_lowercase()) {
+            return false;
+        }
+        // Workspace lookup is authoritative — the enum may live in another
+        // file of the same translation root.
+        if let Some(workspace) = self.workspace {
+            for decl in workspace.declarations() {
+                if decl.name == parent_ty && decl.kind == crate::workspace::DeclarationKind::Enum {
+                    return true;
+                }
+            }
+        }
+        self.enum_types.contains(parent_ty)
     }
     pub fn run(&mut self, root: tree_sitter::Node<'a>) -> Vec<(String, String)> {
         // Collect top-level structure
@@ -321,7 +403,10 @@ impl<'a> Unit<'a> {
                     }
                 }
                 "import" => {
-                    imports.push(self.kotlin_import_to_java(child));
+                    let imp = self.kotlin_import_to_java(child);
+                    if !imp.is_empty() {
+                        imports.push(imp);
+                    }
                 }
                 "shebang_line" | ";" | "line_comment" | "multiline_comment" => {}
                 "annotated_expression" => {
@@ -386,6 +471,52 @@ impl<'a> Unit<'a> {
                         );
                         self.end_decl();
                         continue;
+                    }
+                    // Kotlin enum with a pre-existing Java consumer of the
+                    // Kotlin `entries` ABI (`E.getEntries()`): a plain Java
+                    // enum drops that static and breaks the caller — retain.
+                    let is_enum = kt::child(*decl, "enum_class_body").is_some();
+                    if is_enum
+                        && self.workspace.is_some_and(|ws| {
+                            ws.has_java_get_entries_consumer(&type_name)
+                                || ws.has_external_kotlin_reference_by_name(&type_name)
+                        })
+                    {
+                        self.diag_untranslatable(
+                            *decl,
+                            "Kotlin enum `entries` ABI (`getEntries()`) is consumed by pre-existing Java code; enum remains Kotlin until the consumer migrates",
+                        );
+                        self.end_decl();
+                        continue;
+                    }
+                    // Mixed-language accessor ABI: an abstract member of a
+                    // RETAINED Kotlin supertype whose Java-visible return type
+                    // differs from this class's own member of the same name
+                    // cannot be satisfied by a Java class (Java has no
+                    // covariant cross-language absolvability) — retain.
+                    if let Some(ws) = self.workspace {
+                        let supers: Vec<String> = kt::child(*decl, "delegation_specifiers")
+                            .map(|dc| {
+                                let mut c = dc.walk();
+                                dc.children(&mut c)
+                                    .filter(|s| s.kind() == "delegation_specifier")
+                                    .map(|s| {
+                                        s.child_by_field_name("user_type")
+                                            .map(|u| self.text(u).trim().to_string())
+                                            .unwrap_or_else(|| self.text(s).trim().to_string())
+                                    })
+                                    .filter(|s| !s.is_empty())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if ws.retained_supertype_member_mismatch(&supers, &type_name) {
+                            self.diag_untranslatable(
+                                *decl,
+                                "class implements a retained Kotlin supertype whose abstract member return type is incompatible with the class's own member; Java return types must match exactly",
+                            );
+                            self.end_decl();
+                            continue;
+                        }
                     }
                     self.transpile_type_decl_set(&mut out, &package2, &imports2, |unit, out| {
                         unit.transpile_type_decl(*decl, out);

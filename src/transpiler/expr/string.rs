@@ -39,9 +39,14 @@ impl<'a, 'u> Expr<'a, 'u> {
                             .map(|(i, c)| i + c.len_utf8())
                             .last()
                             .unwrap_or(0);
-                        let ident = &raw[..ident_end];
+                        let ident = raw[..ident_end].to_string();
                         let rest = &raw[ident_end..];
-                        parts.push(ident.to_string());
+                        // The interpolated name splices the implicit `this`
+                        // receiver around that identifier: `"... $name ..."`
+                        // reads `this.getName()`, NOT a bare unqualified
+                        // symbol (which javac rejects on interfaces).
+                        let interped = self.transpile_identifier_text(&ident);
+                        parts.push(interped);
                         if !rest.is_empty() {
                             parts.push(format!("{:?}", rest));
                         }
@@ -87,5 +92,36 @@ impl<'a, 'u> Expr<'a, 'u> {
         } else {
             parts.join(" + ")
         }
+    }
+}
+
+impl<'a, 'u> Expr<'a, 'u> {
+    /// Transpile a bare identifier spliced by string interpolation with the
+    /// same rules as a real `identifier` expression node: property accessors
+    /// on the implicit `this` (`"...$name..." -> "..." + this.getName()`).
+    pub(crate) fn transpile_identifier_text(&mut self, ident: &str) -> String {
+        if self.unit.current_object.as_deref() == Some(ident) {
+            return format!("{}.INSTANCE", ident);
+        }
+        if !self.unit.var_types.contains_key(ident)
+            && self.unit.var_types.is_empty()
+            && let Some(getter) = self.unit.self_getters.get(ident)
+        {
+            return format!("this.{}()", getter);
+        }
+        if !self.unit.var_types.contains_key(ident)
+            && let Some(owner) = self
+                .unit
+                .workspace
+                .and_then(|w| w.find_property_owner(ident))
+        {
+            let _ = owner;
+            let mut cap = ident.to_string();
+            if let Some(first) = cap.chars().next() {
+                cap = first.to_uppercase().collect::<String>() + &cap[1..];
+            }
+            return format!("this.get{}()", cap);
+        }
+        ident.to_string()
     }
 }

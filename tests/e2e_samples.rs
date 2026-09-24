@@ -65,7 +65,7 @@ fn all_samples_parse_without_errors() {
 
 #[test]
 fn generic_variance_becomes_java_wildcards() {
-    let source = "interface Event\ninterface Registry { val eventType: KClass<out Event> }\n";
+    let source = "interface Event\ninterface Registry { val eventType: Class<out Event> }\n";
     let (files, errors) = transpile_src(source, "Variance.kt");
     assert_eq!(errors, 0);
     let registry = files
@@ -74,10 +74,10 @@ fn generic_variance_becomes_java_wildcards() {
         .map(|(_, content)| content)
         .expect("Registry.java");
     assert!(
-        registry.contains("KClass<? extends Event> getEventType()"),
+        registry.contains("Class<? extends Event> getEventType()"),
         "{registry}"
     );
-    assert!(!registry.contains("KClass<out>"), "{registry}");
+    assert!(!registry.contains("KClass"), "{registry}");
 }
 
 #[test]
@@ -549,4 +549,65 @@ fn property_visibility_matches_kotlin() {
     assert!(vault.contains("protected String getName()"));
     assert!(vault.contains("private void setName(String name)"));
     assert!(!vault.contains("public int getSecret()"));
+}
+
+#[test]
+fn enum_wildcard_imports_become_java_static_imports() {
+    // Java rejects non-static wildcard imports for enum constants;
+    // `import pkg.Kind.*` where Kind is a known enum (indexed as one in
+    // the workspace) must lower to a static import. The enum is indexed
+    // through a real workspace root so detection goes through the index.
+    let workspace =
+        std::env::temp_dir().join(format!("notlin-enum-static-import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("Level.kt"),
+        "package neutral.types\nenum class Level { LOW, HIGH }\n",
+    )
+    .unwrap();
+    let root_s = workspace.to_string_lossy().to_string();
+    let (files2, _, _, _) = {
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--root", &root_s, "Consumer.kt"]);
+        let index = notlin::workspace::SourceIndex::discover(&workspace).unwrap();
+        notlin::transpiler::transpile_with_workspace(
+            "package neutral.consumer\nimport neutral.types.Level.*\nenum class Notice(val level: Level) { SAMPLE(HIGH) }\n",
+            &std::path::PathBuf::from("Consumer.kt"),
+            &cli,
+            Some(&index),
+            std::slice::from_ref(&workspace),
+        )
+    };
+    let _ = std::fs::remove_dir_all(&workspace);
+    let notice = files2
+        .iter()
+        .find(|(n, _)| n == "Notice.java")
+        .map(|(_, c)| c.clone())
+        .expect("Notice.java");
+    assert!(
+        notice.contains("import static neutral.types.Level.*;"),
+        "enum wildcard must become a static import: {notice}"
+    );
+}
+
+#[test]
+fn enum_defaulted_ctor_params_fill_constant_sites() {
+    // Kotlin enum ctor params with defaults are omitted at some constants;
+    // Java does not default enum ctor args, so generated constant arguments
+    // must include every remaining parameter, in order.
+    let (files, errors) = transpile_src(
+        "enum class Kind(val alias: String, val state: State = State.OK) {\nA(\"a\"),\nB(\"b\", State.BAD)\n}\nenum class State { OK, BAD }\n",
+        "Enums.kt",
+    );
+    assert_eq!(errors, 0);
+    let kind = files
+        .iter()
+        .find(|(n, _)| n == "Kind.java")
+        .map(|(_, c)| c.as_str())
+        .expect("Kind.java");
+    assert!(
+        kind.contains("A(\"a\", State.OK)"),
+        "defaulted ctor param must be filled at the constant: {kind}"
+    );
+    assert!(kind.contains("B(\"b\", State.BAD)"));
 }

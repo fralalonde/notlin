@@ -145,22 +145,9 @@ impl Diagnostics {
     }
 
     pub fn print(&self) {
-        for d in &self.items {
-            eprintln!("{}", d.render());
+        for diagnostic in &self.items {
+            eprintln!("{}", diagnostic.render());
         }
-        let summary = format!(
-            "{} error(s), {} warning(s)",
-            self.error_count(),
-            self.warning_count()
-        );
-        let summary = if self.error_count() > 0 {
-            summary.red().to_string()
-        } else if self.warning_count() > 0 {
-            summary.yellow().to_string()
-        } else {
-            summary.green().to_string()
-        };
-        eprintln!("{}", summary);
     }
 
     #[allow(dead_code)]

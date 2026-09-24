@@ -40,6 +40,29 @@ impl<'a, 'u> Expr<'a, 'u> {
                 // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
                 if self.unit.current_object.as_deref() == Some(name.as_str()) {
                     format!("{}.INSTANCE", name)
+                } else if !self.unit.var_types.contains_key(&name)
+                    && self.unit.var_types.is_empty()
+                    && let Some(getter) = self.unit.self_getters.get(&name)
+                {
+                    // Not a local/param in this scope: a bare identifier
+                    // naming a property member of the enclosing type reads
+                    // through its accessor (implicit `this`).
+                    format!("this.{}()", getter)
+                } else if !self.unit.var_types.contains_key(&name)
+                    && let Some(owner) = self
+                        .unit
+                        .workspace
+                        .and_then(|w| w.find_property_owner(&name))
+                {
+                    // Indexed property owner: same accessor shape whether
+                    // the owner translated or stayed Kotlin. Conservative
+                    // shape: only fire when no local of that name exists.
+                    let _ = owner;
+                    let mut cap = name.clone();
+                    if let Some(first) = cap.chars().next() {
+                        cap = first.to_uppercase().collect::<String>() + &cap[1..];
+                    }
+                    format!("this.get{}()", cap)
                 } else {
                     name
                 }
@@ -52,6 +75,13 @@ impl<'a, 'u> Expr<'a, 'u> {
                 .ext_receiver_name
                 .clone()
                 .unwrap_or_else(|| "this".to_string()),
+            // `super<T>` qualifier: Java drops the explicit supertype — an
+            // interface super-access is just `T.super.member` (a Kotlin class
+            // super-access is the plain-`super` form, which falls through).
+            "super_expression" => match kt::child(node, "user_type") {
+                Some(ty) => format!("{}.super", kt::java_type(ty, self.unit.source).trim()),
+                None => "super".to_string(),
+            },
             "navigation_expression" => self.navigation(node),
             "call_expression" => self.call(node),
             "infix_expression" => self.infix_expr(node),
@@ -106,6 +136,29 @@ impl<'a, 'u> Expr<'a, 'u> {
             "jump_expression" => self.jump(node),
             "throw_expression" => self.throw_expr(node),
             "if_expression" => self.if_expr(node),
+            // Kotlin vararg spread `*expr`. Java has no spread syntax, so the
+            // leaked `*` would be a syntax error — never pass the operator
+            // through. The practical cases:
+            //   `arrayOf(*arr)`  (spread as the only/first factory arg) is an
+            //     array copy — handled in call.rs's array-factory arm;
+            //   everything else passes the array itself and records the
+            //     approximation (the callee must accept the array).
+            "spread_expression" => {
+                let mut cursor = node.walk();
+                let inner = node
+                    .children(&mut cursor)
+                    .find(|c| c.is_named())
+                    .map(|c| self.transpile(c))
+                    .unwrap_or_else(|| "null".to_string());
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "vararg spread `*expr` lowered to the array itself (Java has no spread at call sites; callee must accept the array)",
+                );
+                inner
+            }
+            "as_expression" => self.as_expr(node),
+            "unary_expression" => self.unary_expr(node),
             _ => {
                 // Last resort: try to copy verbatim text if it's plausible Java,
                 // else emit null and warn.
@@ -154,6 +207,25 @@ impl<'a, 'u> Expr<'a, 'u> {
                 let raw = self.unit.text(node).replace("?.", ".");
                 if let Some(dot) = raw.rfind('.') {
                     let member = &raw[dot + 1..];
+                    // Inside the setter for the SAME property
+                    // (`fun setEquipmentSet(v) { this.equipmentSet = ... }`),
+                    // `this.member = ...` is a FIELD write — rewriting it to
+                    // `this.setMember(...)` re-enters the setter (infinite
+                    // recursion) and flips the parameter type.
+                    let in_own_setter =
+                        self.unit.current_function_name.as_deref().is_some_and(|f| {
+                            f.starts_with("set")
+                                && f[3..]
+                                    .chars()
+                                    .next()
+                                    .map(|c| c.to_ascii_lowercase().to_string())
+                                    .map(|l| format!("{l}{}", &f[4..]))
+                                    .is_some_and(|prop| prop == member)
+                        });
+                    if in_own_setter {
+                        // plain field write: emit the raw `this.member` text
+                        return raw;
+                    }
                     if member
                         .chars()
                         .next()
@@ -384,6 +456,103 @@ impl<'a, 'u> Expr<'a, 'u> {
             format!("throw {ctor}")
         } else {
             format!("throw new {ctor}")
+        }
+    }
+
+    /// `x as T` -> `(T) x`; `x as? T` -> a null-safe ternary cast. Kotlin `as`
+    /// on a receiver that is smart-cast-safe is always a hard cast in Java.
+    fn as_expr(&mut self, node: tree_sitter::Node) -> String {
+        let mut cursor = node.walk();
+        let kids: Vec<_> = node.children(&mut cursor).collect();
+        let left = kids.iter().find(|c| c.is_named()).copied();
+        let ty = kids
+            .iter()
+            .filter(|c| c.is_named())
+            .nth(1)
+            .map(|t| box_primitive(&kt::java_type(*t, self.unit.source)))
+            .unwrap_or_else(|| "Object".to_string());
+        let nullable = kids.iter().any(|c| self.unit.text(*c).trim() == "as?");
+        let Some(left) = left else {
+            self.unit
+                .diag_untranslatable(node, "`as` cast with no subject expression".to_string());
+            return "null".to_string();
+        };
+        let l_java = self.transpile(left);
+        if nullable {
+            self.unit.diags.warn_approx(
+                node,
+                self.unit.file,
+                format!("`as?` cast to `{ty}` lowered to instanceof-check cast"),
+            );
+            format!(
+                "({} instanceof {} ? ({}) {} : null)",
+                l_java, ty, ty, l_java
+            )
+        } else {
+            format!("(({}) {})", ty, l_java)
+        }
+    }
+
+    /// `expr!!` (branching not-null assertion) and Java-expressible postfix
+    /// unary forms (`++`/`-`/`+`/`!`). `!!` has no Java operator; the honest
+    /// lowering is `Objects.requireNonNull(expr)` so NPE timing is preserved.
+    fn unary_expr(&mut self, node: tree_sitter::Node) -> String {
+        let mut cursor = node.walk();
+        let kids: Vec<_> = node.children(&mut cursor).collect();
+        let is_not_null = kids
+            .iter()
+            .any(|c| c.kind() == "!!" || self.unit.text(*c).trim() == "!!");
+        if is_not_null {
+            let arg = kids
+                .iter()
+                .find(|c| c.kind() == "argument" || c.is_named())
+                .copied();
+            let Some(arg) = arg else {
+                self.unit.diag_untranslatable(
+                    node,
+                    "`!!` assertion with no subject expression".to_string(),
+                );
+                return "null".to_string();
+            };
+            let a_java = self.transpile(arg);
+            if a_java.contains("?") || a_java.contains(" instanceof ") {
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "`!!` on a lowered (ternary/instanceof) expression: null-check is skipped inside the cast",
+                );
+                return a_java;
+            }
+            self.unit.diags.warn_approx(
+                node,
+                self.unit.file,
+                "`!!` lowered to Objects.requireNonNull (throws NPE at the same point)",
+            );
+            return format!("java.util.Objects.requireNonNull({})", a_java);
+        }
+        // Other postfix/prefix unary forms: map operator -> text directly.
+        let mut op = String::new();
+        let mut arg_text = None;
+        for c in &kids {
+            if c.is_named() {
+                arg_text = Some(self.transpile(*c));
+            } else {
+                let t = self.unit.text(*c).trim().to_string();
+                match t.as_str() {
+                    "-" | "+" | "!" | "++" | "--" => op = t,
+                    _ => {}
+                }
+            }
+        }
+        let Some(arg_text) = arg_text else {
+            return "null".to_string();
+        };
+        if op.is_empty() {
+            arg_text
+        } else if op == "++" || op == "--" {
+            format!("{}{}", arg_text, op)
+        } else {
+            format!("{}{}", op, arg_text)
         }
     }
     /// `x in lo..hi` when-condition -> `x >= lo && x <= hi` (`!in` negated).

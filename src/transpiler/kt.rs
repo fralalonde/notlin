@@ -125,7 +125,20 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                     out.push_str(text(child, source));
                 }
             }
-            let mapped = crate::transpiler::types::map_type_name(out.trim());
+            // `KClass<T>` is Java `Class<T>` through interop; the bare-name
+            // map can't fire because the full text includes type args.
+            let whole = out.trim();
+            for (kt_name, j_name) in [
+                ("KClass<", "Class<"),
+                ("MutableList<", "ArrayList<"),
+                ("MutableMap<", "HashMap<"),
+                ("MutableSet<", "HashSet<"),
+            ] {
+                if whole.starts_with(kt_name) {
+                    return format!("{}{}", j_name, &whole[kt_name.len()..]);
+                }
+            }
+            let mapped = crate::transpiler::types::map_type_name(whole);
             if mapped == "__NOTLIN_ARRAY__" || out.trim().starts_with("Array<") {
                 // `Array<T>` -> `T[]`; rebuild from the type_arguments child
                 let mut cursor = node.walk();

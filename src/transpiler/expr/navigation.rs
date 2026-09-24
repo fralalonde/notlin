@@ -6,6 +6,67 @@ use crate::transpiler::kt;
 
 impl<'a, 'u> Expr<'a, 'u> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
+        // Map/Iterable collection ops (`x.filterValues { .. }`,
+        // `x.mapKeys { .. }`, `x.associateBy { .. }`) — Java has no such
+        // members: lower through stream/entrySet before generic handling.
+        let navtext = self.unit.text(node);
+        let navtrim = navtext.trim().trim_start_matches('(').to_string();
+        let op_member = navtrim.rsplit_once('.').map(|(_, m)| m.trim().to_string());
+        if matches!(
+            op_member.as_deref(),
+            Some("filterValues")
+                | Some("mapKeys")
+                | Some("associateBy")
+                | Some("filterNotNull")
+                | Some("filterIsInstance")
+        ) {
+            // filterNotNull/filterIsInstance have argless or type-arg call
+            // shapes; handle them before map_entry_op. Their lambda (when
+            // present) passes into the entry-op helper only for the listed
+            // Map ops; the iterable ones lower inline here.
+            let member = op_member.unwrap_or_default();
+            if let Some(nav_base) = node.children(&mut node.walk()).find(|c| c.is_named()) {
+                let base_java = self.transpile(nav_base);
+                if member == "filterNotNull" {
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "Iterable.filterNotNull lowered to stream().filter(Objects::nonNull).collect(toList())",
+                    );
+                    self.unit.pending_full_call = true;
+                    return format!(
+                        "{base_java}.stream().filter(Objects::nonNull).collect(java.util.stream.Collectors.toList())"
+                    );
+                }
+                if member == "filterIsInstance" {
+                    // filterIsInstance<T>() — the type argument arrives on
+                    // the enclosing call's type_arguments; conservatively
+                    // lower without the cast when it is not recoverable.
+                    let ty = node
+                        .parent()
+                        .and_then(|p| kt::child(p, "type_arguments"))
+                        .map(|t| self.unit.text(t).to_string())
+                        .map(|t| {
+                            t.trim_start_matches('<')
+                                .trim_end_matches('>')
+                                .trim()
+                                .to_string()
+                        });
+                    if let Some(ty) = ty {
+                        self.unit.diags.warn_approx(
+                            node,
+                            self.unit.file,
+                            "Iterable.filterIsInstance<T> lowered to stream().filter(x -> x instanceof T).map(x -> (T) x).collect(toList())",
+                        );
+                        self.unit.pending_full_call = true;
+                        return format!(
+                            "{base_java}.stream().filter(x -> x instanceof {ty}).map(x -> ({ty}) x).collect(java.util.stream.Collectors.toList())"
+                        );
+                    }
+                }
+                return self.map_entry_op(node, &base_java, &member);
+            }
+        }
         let mut cursor = node.walk();
         let kids: Vec<_> = node.children(&mut cursor).collect();
         // base . member (possibly ?. or ::)
@@ -44,6 +105,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                             | "keys"
                             | "values"
                             | "entries"
+                            | "stream"
                     ) {
                         // property-like reads -> Java accessor calls; keys/
                         // entries have different Java names (Map API)
@@ -79,6 +141,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                         if let Some(accessor) = self.unit.companion_members.get(&member_name) {
                             // known companion member name: getter call
                             let _ = &base_text;
+
                             result.push_str(&format!(".{}", accessor));
                         } else {
                             result.push_str(&format!(".{}", member_name));
@@ -124,15 +187,137 @@ impl<'a, 'u> Expr<'a, 'u> {
                         // while java.lang.Enum constants expose `name` —
                         // so route enum-typed receivers to .name only when
                         // the base is a known enum type.
-                        if member_name == "name"
-                            && base
-                                .map(|b| {
-                                    let raw = self.unit.text(b).trim().to_string();
-                                    let first = raw.split('.').next().unwrap_or("").to_string();
-                                    self.unit.enum_types.contains(first.as_str())
-                                })
-                                .unwrap_or(false)
-                        {
+                        let base_is_enum = |b: tree_sitter::Node| -> bool {
+                            let raw = self.unit.text(b).trim().to_string();
+                            let first = raw.split('.').next().unwrap_or("").to_string();
+                            if self.unit.enum_types.contains(first.as_str()) {
+                                return true;
+                            }
+                            // `this.getType().name` where getType() or
+                            // `type` resolves to an indexed ENUM
+                            // declaration (Kotlin or Java): Enum's
+                            // accessor is `name()`, not getName().
+                            if let Some(ws) = self.unit.workspace {
+                                let declaring = self
+                                    .unit
+                                    .workspace_file
+                                    .as_deref()
+                                    .unwrap_or(self.unit.file);
+                                let recv = raw
+                                    .rsplit('.')
+                                    .next()
+                                    .unwrap_or("")
+                                    .trim_end_matches("()")
+                                    .trim_start_matches("this.")
+                                    .to_string();
+                                let ty = ws
+                                    .property_type_in_file(declaring, &recv)
+                                    .or_else(|| ws.method_return_type_in_file(declaring, &recv))
+                                    .or_else(|| {
+                                        // The receiver may be `this.<prop>`
+                                        // where <prop> is declared INSIDE the
+                                        // class this file emits — resolve
+                                        // through that class's own members
+                                        // (declaration lookup by name,
+                                        // independent of file path equalities).
+                                        {
+                                            // Declaration lookup by NAME:
+                                            // pick the class named in the
+                                            // raw receiver prefix (e.g.
+                                            // `PropertyTagType`), regardless
+                                            // of workspace-file path mismatch.
+                                            let owner = raw
+                                                .trim()
+                                                .trim_start_matches("this.")
+                                                .rsplit('.')
+                                                .nth(1)
+                                                .unwrap_or("")
+                                                .trim_end_matches("()")
+                                                .to_string();
+                                            if owner.is_empty() {
+                                                // Bare.property receiver: collect
+                                                // EVERY indexed member with this
+                                                // name and prefer one whose type
+                                                // resolves to an indexed ENUM —
+                                                // the same member name may exist
+                                                // on many types (cross-file
+                                                // shadowing), so first-match is
+                                                // unreliable.
+                                                let mut hit: Option<Option<String>> =
+                                                    None;
+                                                for cl in ws.declarations() {
+                                                    for mm in &cl.members {
+                                                        if mm.name != recv {
+                                                            continue;
+                                                        }
+                                                        let bare = mm
+                                                            .type_name
+                                                            .as_deref()
+                                                            .unwrap_or("")
+                                                            .split('<')
+                                                            .next()
+                                                            .unwrap_or("")
+                                                            .trim()
+                                                            .to_string();
+                                                        let enum_typed = bare
+                                                            .get(0..1)
+                                                            .is_some_and(|c| {
+                                                                c.chars()
+                                                                    .next()
+                                                                    .is_some_and(|c| {
+                                                                        c.is_ascii_uppercase()
+                                                                    })
+                                                            })
+                                                            && ws.declarations().any(|d| {
+                                                                d.name == bare
+                                                                    && d.kind
+                                                                        == crate::workspace::DeclarationKind::Enum
+                                                            });
+                                                        if enum_typed {
+                                                            hit = Some(mm.type_name.clone());
+                                                            break;
+                                                        }
+                                                    }
+                                                    if hit.is_some() {
+                                                        break;
+                                                    }
+                                                }
+                                                hit.unwrap_or(None)
+                                            } else if owner.get(0..1).is_some_and(|c| {
+                                                c.chars()
+                                                    .next()
+                                                    .is_some_and(|c| c.is_ascii_uppercase())
+                                            }) {
+                                                ws.declarations().find_map(|cl| {
+                                                    if cl.name != owner {
+                                                        return None;
+                                                    }
+                                                    cl.members.iter().find_map(|mm| {
+                                                        if mm.name == recv {
+                                                            mm.type_name.clone()
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                    })
+                                    .map(|t| t.split('<').next().unwrap_or(&t).trim().to_string());
+                                if let Some(t) = ty {
+                                    if ws.declarations().any(|d| {
+                                        d.name == t
+                                            && d.kind == crate::workspace::DeclarationKind::Enum
+                                    }) {
+                                        return true;
+                                    }
+                                }
+                            }
+                            false
+                        };
+                        if member_name == "name" && base.map(base_is_enum).unwrap_or(false) {
                             // JDK 25: Enum#name is a private field; the
                             // public accessor is the method `name()`.
                             result.push_str(".name()");
@@ -150,6 +335,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                                 ct.map(|c| {
                                     let bare = c.strip_prefix("@Nullable ").unwrap_or(&c).trim();
                                     self.unit.data_components.contains_key(bare)
+                                        && !self.unit.lombok
                                 })
                                 .unwrap_or(false)
                             })
@@ -172,9 +358,55 @@ impl<'a, 'u> Expr<'a, 'u> {
                             && base
                                 .map(|b| self.unit.text(b).trim() == "it")
                                 .unwrap_or(false)
+                            && self
+                                .unit
+                                .workspace
+                                .is_none_or(|ws| ws.find_property_owner("name").is_none())
                         {
                             result.push_str(".name()");
                             continue;
+                        }
+                        // enum-typed receiver `x.name`: JDK accessor
+                        // `name()`, never `getName()` — resolve the base
+                        // type from var_types and the workspace index.
+                        if member_name == "name" {
+                            let base_raw = base
+                                .map(|b| self.unit.text(b).trim().to_string())
+                                .unwrap_or_default();
+                            let base_ty = self
+                                .unit
+                                .var_types
+                                .get(&base_raw)
+                                .or(self
+                                    .unit
+                                    .var_types
+                                    .get(base_raw.trim_start_matches("this.")))
+                                .cloned();
+                            let enum_hit = base_ty
+                                .map(|t| {
+                                    t.split('<')
+                                        .next()
+                                        .unwrap_or(&t)
+                                        .trim()
+                                        .trim_start_matches("@Nullable ")
+                                        .trim_end_matches("()")
+                                        .to_string()
+                                })
+                                .and_then(|t0| {
+                                    self.unit.workspace.and_then(|ws| {
+                                        ws.declarations()
+                                            .any(|d| {
+                                                d.name == t0
+                                                    && d.kind
+                                                        == crate::workspace::DeclarationKind::Enum
+                                            })
+                                            .then_some(t0)
+                                    })
+                                });
+                            if enum_hit.is_some() {
+                                result.push_str(".name()");
+                                continue;
+                            }
                         }
                         let cap: String = member_name
                             .chars()
@@ -182,11 +414,40 @@ impl<'a, 'u> Expr<'a, 'u> {
                             .map(|c| c.to_uppercase().collect::<String>())
                             .unwrap_or_default()
                             + member_name.chars().skip(1).collect::<String>().as_str();
+                        // `kClass.java` (KClass -> Class interop) reads as
+                        // `getClass()` in Java, never a `getJava()` property.
+                        // `receiver.javaClass` is the same interop getter
+                        // spelled as a property: `getClass()` is the only
+                        // valid Java form.
+                        if member_name == "java" {
+                            // Kotlin `KClass<T>.java` is already a Java
+                            // `Class<T>` after parameter lowering; erase the
+                            // interop-only bridge rather than calling
+                            // `Class.getClass()`.
+                            continue;
+                        }
+                        if member_name == "javaClass" {
+                            if !result.ends_with(".class") {
+                                result.push_str(".getClass()");
+                            }
+                            continue;
+                        }
+
                         result.push_str(&format!(".get{}()", cap));
                     }
                 }
             } else if w[1].kind() == "::" {
                 // Class/object references and method refs; pass through.
+                // `X::class` is the Java class literal `X.class`.
+                if self.unit.text(w[2]).trim() == "class" {
+                    result.push_str(".class");
+                    continue;
+                } else if self.unit.text(w[2]).trim() == "java" {
+                    // `X.java` where X is a KClass expression: JVM interop
+                    // getter is `getClass()`, not `getJava()`.
+                    result.push_str(".getClass()");
+                    continue;
+                }
             }
         }
         // Fallback: if windows didn't yield members, join verbatim
@@ -299,6 +560,24 @@ impl<'a, 'u> Expr<'a, 'u> {
                 self.unit.pending_full_call = true;
             }
         }
+        // Map ops (`m.filterValues { … }`, `m.mapKeys { … }`): Java Map has
+        // no such members — lower through the entrySet stream, regardless of
+        // receiver complexity.
+        let tail_member = raw_trimmed
+            .rsplit_once('.')
+            .map(|(_, m)| m.trim().to_string());
+        if matches!(
+            tail_member.as_deref(),
+            Some("filterValues") | Some("mapKeys")
+        ) {
+            let member = tail_member.unwrap_or_default();
+            let base = self.transpile(
+                node.children(&mut node.walk())
+                    .find(|c| c.is_named())
+                    .expect("navigation base"),
+            );
+            return self.map_entry_op(node, &base, &member);
+        }
         // Compound receiver (itself a call/index/nav chain): the base must be
         // translated as an expression — raw-text surgery would leave inner
         // extension call sites verbatim (`s.shout().lowercase` would stay
@@ -326,6 +605,11 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .next_back();
                 if let Some(member) = member {
                     let base_java = self.transpile(b);
+                    // `m.filterValues { v -> pred }` — Java Map has no
+                    // filterValues member: lower to entrySet stream + toMap.
+                    if member == "filterValues" || member == "mapKeys" {
+                        return self.map_entry_op(node, &base_java, &member);
+                    }
                     // `chained.sorted()` (no args) on a mid-stream List —
                     // Kotlin sorted() returns a NEW sorted list; the Java
                     // List API has no equivalent member.
@@ -409,10 +693,37 @@ impl<'a, 'u> Expr<'a, 'u> {
                             return assembled;
                         }
                     }
-                    return match kotlin_member_to_java(&member) {
-                        Some(jm) if jm != member => format!("{}.{}", base_java, jm),
-                        Some(_) => format!("{}.{}", base_java, member),
-                        None if member == "copy" => {
+                    // Trailing lambda on the enclosing call: e.g.
+                    // `map.values.firstOrNull { … }` mapped here would shadow
+                    // call.rs's firstOrNull { pred } rewrite — keep bare.
+                    let outer_lambda = node
+                        .parent()
+                        .filter(|p| p.kind() == "call_expression")
+                        .map(|p| {
+                            kt::child(p, "lambda_literal").is_some()
+                                || kt::child(p, "annotated_lambda").is_some()
+                        })
+                        .unwrap_or(false);
+                    let base_stream_ready = base_java.ends_with(".stream()");
+                    let jm_first = |jm: &str| -> String {
+                        // A mapped form that starts by opening a stream must
+                        // not double-stream a receiver that already is one
+                        // (`x.stream().first()` chain).
+                        if base_stream_ready && let Some(rest) = jm.strip_prefix("stream().") {
+                            format!("{rest}")
+                        } else if base_stream_ready && jm == "stream()" {
+                            String::new()
+                        } else {
+                            jm.to_string()
+                        }
+                    };
+                    return match (kotlin_member_to_java(&member), outer_lambda) {
+                        (Some(jm), false) if jm != member => {
+                            format!("{}.{}", base_java, jm_first(&jm))
+                        }
+                        (Some(_), true) => format!("{}.{}", base_java, member),
+                        (Some(_), _) => format!("{}.{}", base_java, member),
+                        (None, _) if member == "copy" => {
                             // Hand the FULL callee text (receiver + `.copy`)
                             // to call.rs — its copy arm rebuilds the ctor
                             // with named-arg substitution using
@@ -424,7 +735,101 @@ impl<'a, 'u> Expr<'a, 'u> {
                             );
                             format!("{}.{}", base_java, member)
                         }
-                        None => {
+                        (None, _) => {
+                            // Collection-algebra member calls (`m.plus(x)`,
+                            // `m.minus(k)`) have NO Java member form: the
+                            // receiver's indexed property type proves a
+                            // collection — taint the caller instead of
+                            // emitting an unresolvable member.
+                            if matches!(member.as_str(), "plus" | "minus" | "times")
+                                && let Some(ws) = self.unit.workspace
+                                && let Some((_, head)) =
+                                    raw_trimmed.rsplit_once(&format!(".{member}"))
+                                && let Some(ty) = {
+                                    let last = head
+                                        .trim()
+                                        .rsplit('.')
+                                        .next()
+                                        .unwrap_or("")
+                                        .trim_end_matches("()");
+                                    let declaring = self
+                                        .unit
+                                        .workspace_file
+                                        .as_deref()
+                                        .unwrap_or(self.unit.file);
+                                    ws.property_type_in_file(declaring, last)
+                                        .or_else(|| ws.property_type_of_getter(last))
+                                }
+                                && (ty.contains("Map<")
+                                    || ty.contains("List<")
+                                    || ty.contains("Set<")
+                                    || ty.contains("Collection<")
+                                    || ty.contains("Iterable<"))
+                            {
+                                self.unit.diag_untranslatable(
+                                    node,
+                                    format!(
+                                        "collection `{member}` member call on `{ty}` receiver: stdlib collection algebra has no Java member form; declaration retained in Kotlin"
+                                    ),
+                                );
+                                return raw_trimmed.to_string();
+                            }
+                            if member == "stream" {
+                                let base = raw_trimmed
+                                    .rsplit_once('.')
+                                    .map(|(b, _)| b)
+                                    .unwrap_or(raw_trimmed.as_str());
+                                return format!("{}.stream()", base.trim());
+                            }
+                            // Kotlin property access on an unknown receiver
+                            // (`it.name`): if the member is a known
+                            // workspace PROPERTY, read it through its Java
+                            // getter (`get<Name>()`); emitting
+                            // `name()` breaks on every translated
+                            // entity whose accessor is `getName()`.
+                            if member.as_str() != "name"
+                                && !matches!(
+                                    member.as_str(),
+                                    "map"
+                                        | "filter"
+                                        | "forEach"
+                                        | "flatMap"
+                                        | "sorted"
+                                        | "distinct"
+                                        | "mapNotNull"
+                                        | "any"
+                                        | "all"
+                                        | "none"
+                                        | "count"
+                                        | "first"
+                                        | "last"
+                                        | "plus"
+                                        | "minus"
+                                        | "times"
+                                        | "stream"
+                                        | "toList"
+                                        | "toMap"
+                                        | "size"
+                                        | "keys"
+                                        | "values"
+                                        | "entries"
+                                        | "joinToString"
+                                )
+                                && self.unit.workspace.is_some_and(|ws| {
+                                    ws.find_property_owner(member.as_str()).is_some()
+                                })
+                            {
+                                let mut chars = member.chars();
+                                let getter = format!(
+                                    "get{}{}",
+                                    chars
+                                        .next()
+                                        .map(|c| c.to_ascii_uppercase().to_string())
+                                        .unwrap_or_default(),
+                                    chars.as_str()
+                                );
+                                return format!("{}.{}()", base_java, getter);
+                            }
                             self.unit.diags.warn_approx(
                                 node,
                                 self.unit.file,
@@ -665,8 +1070,16 @@ impl<'a, 'u> Expr<'a, 'u> {
                     base
                 );
             }
+            let outer_lambda = node
+                .parent()
+                .filter(|p| p.kind() == "call_expression")
+                .map(|p| {
+                    kt::child(p, "lambda_literal").is_some()
+                        || kt::child(p, "annotated_lambda").is_some()
+                })
+                .unwrap_or(false);
             if let Some(java_member) = kotlin_member_to_java(member) {
-                if java_member != member {
+                if java_member != member && !outer_lambda {
                     if java_member.contains('(') {
                         // Full-call mapping (`stream().findFirst().orElse(null)`,
                         // `reversed()`): the mapped text is the whole member
@@ -680,17 +1093,137 @@ impl<'a, 'u> Expr<'a, 'u> {
                         raw_trimmed[dot + 1..].replacen(member, &java_member, 1)
                     );
                 }
+                if outer_lambda {
+                    // A trailing lambda is attached to this call — leave the
+                    // member name bare so call.rs's lambda-gated arms
+                    // (firstOrNull { pred }, etc.) assemble the call.
+                    return raw_trimmed.to_string();
+                }
                 return raw_trimmed.to_string();
             }
-            // Unknown member on a receiver: warn, pass through
-            self.unit.diags.warn_approx(
-                node,
-                self.unit.file,
-                format!(
-                    "stdlib member `.{}` not mapped; emitted verbatim (verify Java equivalent exists)",
-                    member
-                ),
-            );
+            // Unknown member on a receiver: if it resolves to a companion
+            // method of a RETAINED Kotlin declaration with type arguments,
+            // the call has no Java ABI (reified inline fns inline only at
+            // Kotlin call sites) — taint the caller instead of emitting
+            // dead Java.
+            if self.unit.workspace.is_some()
+                && node
+                    .parent()
+                    .is_some_and(|c| kt::child(c, "type_arguments").is_some())
+                && let Some(ws) = self.unit.workspace
+                && let Some(owner) = ws.find_static_member_owner(member)
+                && owner.language == crate::workspace::SourceLanguage::Kotlin
+            {
+                self.unit.diag_untranslatable(
+                    node,
+                    format!(
+                        "call `{}.{}` targets a reified/inline companion function of retained Kotlin declaration `{}`; no Java-callable ABI exists",
+                        raw_trimmed.rsplit_once(&format!(".{member}")).map(|(b, _)| b.trim().to_string()).unwrap_or_default(), member, owner.name
+                    ),
+                );
+            } else if node.parent().is_some_and(|p| p.kind() == "call_expression")
+                && let Some(dot_pos) = raw_trimmed.trim_end_matches('(').rfind('.')
+                && let Some(owner_name) = raw_trimmed[..dot_pos].rsplit('.').next().map(str::trim)
+                && let Some(ws) = self.unit.workspace
+                && let Some(owner) = ws.find_static_member(owner_name, member)
+                && owner.language == crate::workspace::SourceLanguage::Kotlin
+            {
+                // A KClass-formal companion fn takes a KClass at the Java
+                // ABI: a `K::class` literal lowered to `K.class` is not a
+                // valid Java form for it — taint the caller.
+                if node
+                    .parent()
+                    .and_then(|p| kt::child(p, "value_arguments"))
+                    .is_some_and(|va: tree_sitter::Node| {
+                        let mut c = va.walk();
+                        va.children(&mut c)
+                            .filter(|arg| arg.kind() == "value_argument")
+                            .any(|arg| {
+                                arg.children(&mut arg.walk())
+                                    .filter(|x| x.is_named())
+                                    .any(|x| self.unit.text(x).contains("::class"))
+                            })
+                    })
+                {
+                    self.unit.diag_untranslatable(
+                        node,
+                        format!(
+                            "call `{owner_fallback}.{member}` passes a `KClass` literal into a KClass-formal companion of retained Kotlin declaration `{owner_name}`; no Java-callable literal exists",
+                            owner_fallback = raw_trimmed.rsplit_once(&format!(".{member}")).map(|(b, _)| b.trim().to_string()).unwrap_or_default()
+                        ),
+                    );
+                    return raw_trimmed.to_string();
+                }
+                // Companion fn of a retained Kotlin declaration: Java reaches
+                // it through the generated `Companion` holder — plain
+                // companion members are not static bridges without
+                // @JvmStatic.
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    format!(
+                        "companion call on retained Kotlin decl `{}` routed via `Companion.{}`",
+                        owner.name, member
+                    ),
+                );
+                // Insert `.Companion` before the member name; call.rs still
+                // appends `(args)`.
+                if let Some(dot) = raw_trimmed.trim_end_matches('(').rfind('.') {
+                    let base = raw_trimmed[..dot].to_string();
+                    return format!("{base}.Companion.{member}");
+                }
+                return format!("Companion.{member}");
+            } else {
+                // Collection-algebra member calls (`m.plus(x)`,
+                // `m.minus(k)`, `s.times(…)`) have NO Java member form: the
+                // receiver's indexed property type proves a Map — taint the
+                // caller rather than emitting a member javac cannot resolve.
+                if matches!(member, "plus" | "minus" | "times")
+                    && let Some(ws) = self.unit.workspace
+                    && let Some(callee_head) = raw_trimmed.rsplit_once(&format!(".{member}"))
+                    && let Some(ty) = {
+                        let last = callee_head
+                            .1
+                            .trim()
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .trim_end_matches("()");
+                        let declaring = self
+                            .unit
+                            .workspace_file
+                            .as_deref()
+                            .unwrap_or(self.unit.file);
+                        ws.property_type_in_file(declaring, last)
+                            .or_else(|| ws.property_type_of_getter(last))
+                    }
+                {
+                    // Only collection receivers are unsound: String.plus is
+                    // Java `+` concat; user overloads keep their methods.
+                    if ty.contains("Map<")
+                        || ty.contains("List<")
+                        || ty.contains("Set<")
+                        || ty.contains("Collection<")
+                        || ty.contains("Iterable<")
+                    {
+                        self.unit.diag_untranslatable(
+                            node,
+                            format!(
+                                "collection `{member}` member call on `{ty}` receiver: stdlib collection algebra has no Java member form; declaration retained in Kotlin"
+                            ),
+                        );
+                        return raw_trimmed.to_string();
+                    }
+                }
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    format!(
+                        "stdlib member `.{}` not mapped; emitted verbatim (verify Java equivalent exists)",
+                        member
+                    ),
+                );
+            }
         }
         raw_trimmed.to_string()
     }
@@ -758,6 +1291,7 @@ fn kotlin_member_to_java(member: &str) -> Option<String> {
         "lowercase" => Some("toLowerCase"),
         "keys" => Some("keySet"),
         "entries" => Some("entrySet"),
+        "stream" => Some("stream()"),
         // no-arg collection ops with Java Collection/Stream equivalents.
         // Lambda params `__left`/`__right` can never collide with Kotlin
         // identifiers (Kotlin forbids leading underscores), so `(a, b) -> b`
@@ -766,6 +1300,9 @@ fn kotlin_member_to_java(member: &str) -> Option<String> {
         // route through call.rs's filter(...) form; bare calls hit the
         // fallback passthrough (find symbol error is the least-broken).
         "last" => Some("stream().reduce((__left, __right) -> __right).orElse(null)"),
+        // Map-only ops: Java has no such members; lower through entrySet
+        // streams. The emit-site wraps these in `entrySet().stream().` +
+        // `.collect(Collectors.toMap(...))` when the receiver is a Map.
         "lastOrNull" => Some("stream().reduce((__left, __right) -> __right).orElse(null)"),
         "reversed" => Some("reversed()"),
         "count" => Some("size()"),
@@ -814,4 +1351,146 @@ fn kotlin_member_to_java(member: &str) -> Option<String> {
         return Some(member.to_string());
     }
     None
+}
+
+/// Map.filterValues lambda with value param — the emitted Java predicate
+/// compares `e.getValue()`; the translation engine already renders the body
+/// with the value param bound, so the placeholder rename happens in the
+/// param arm: `{ v -> body }` becomes `v` kept and used via cast below.
+fn _unit_replace_value_placeholder(_body: String) -> String {
+    String::new()
+}
+
+/// Replace whole-word occurrences of `word` in `text`.
+fn replace_whole_word(text: &str, word: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find(word) {
+        let before_ok = rest[..idx]
+            .chars()
+            .next_back()
+            .map(|c| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        let after_idx = idx + word.len();
+        let after_ok = rest[after_idx..]
+            .chars()
+            .next()
+            .map(|c| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        if before_ok && after_ok {
+            out.push_str(&rest[..idx]);
+            out.push_str(replacement);
+        } else {
+            out.push_str(&rest[..after_idx]);
+        }
+        rest = &rest[after_idx..];
+    }
+    out.push_str(rest);
+    out
+}
+
+impl<'a, 'u> Expr<'a, 'u> {
+    /// `map.filterValues { v -> pred }` / `map.mapKeys { k -> f }` — Java Map
+    /// has no such members; lower through the entrySet stream.
+    pub(crate) fn map_entry_op(
+        &mut self,
+        node: tree_sitter::Node<'_>,
+        base_java: &str,
+        member: &str,
+    ) -> String {
+        let lambda = node.parent().and_then(|p| {
+            // trailing lambda lives directly under the call or as the only
+            // value_argument
+            kt::child(p, "annotated_lambda")
+                .and_then(|al| kt::child(al, "lambda_literal"))
+                .or_else(|| kt::child(p, "lambda_literal"))
+                .or_else(|| {
+                    kt::child(p, "value_arguments").and_then(|va| {
+                        let mut c = va.walk();
+                        va.children(&mut c)
+                            .filter(|arg| arg.kind() == "value_argument")
+                            .find_map(|arg| {
+                                arg.children(&mut arg.walk())
+                                    .find(|n| n.kind() == "lambda_literal")
+                            })
+                    })
+                })
+        });
+        // Without a lambda this call cannot be lowered soundly.
+        let Some(l) = lambda else {
+            self.unit.diags.warn_approx(
+                node,
+                self.unit.file,
+                format!("Map.{member} requires its filter/map lambda; kept as-is"),
+            );
+            return format!("{base_java}.{member}");
+        };
+        let raw = self.transpile(l);
+        let trimmed = raw
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        let (raw_params, body) = trimmed.split_once("->").unwrap_or(("", trimmed));
+        let param = raw_params
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim()
+            .to_string();
+        let body = body.trim().to_string();
+        self.unit.pending_full_call = true;
+        match member {
+            "filterValues" => {
+                let bound = if param.is_empty() {
+                    body
+                } else {
+                    replace_whole_word(&body, &param, "e.getValue()")
+                };
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "Map.filterValues lowered to entrySet().stream().filter(...).collect(toMap(getKey, getValue))",
+                );
+                format!(
+                    "{base_java}.entrySet().stream().filter(e -> {bound}).collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue))"
+                )
+            }
+            "associateBy" => {
+                // Iterable.associateBy { k } -> stream().collect(toMap(kfn,
+                // v -> v)). The element param (named or `it`) binds to `v`.
+                let bound = if param.is_empty() {
+                    replace_whole_word(&body, "it", "v")
+                } else {
+                    replace_whole_word(&body, &param, "v")
+                };
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "Iterable.associateBy lowered to stream().collect(toMap(keyfn, v -> v))",
+                );
+                format!(
+                    "{base_java}.stream().collect(java.util.stream.Collectors.toMap(v -> {bound}, v -> v))"
+                )
+            }
+            _ => {
+                // mapKeys: pred is a key-to-key remap — body's param slot is
+                // the KEY: bind to e.getKey(). The RESULT map keeps the
+                // original values.
+                let bound = if param.is_empty() {
+                    body
+                } else {
+                    replace_whole_word(&body, &param, "e.getKey()")
+                };
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "Map.mapKeys lowered to entrySet().stream().collect(toMap(keyfn, Map.Entry::getValue))",
+                );
+                format!(
+                    "{base_java}.entrySet().stream().collect(java.util.stream.Collectors.toMap(e -> {bound}, Map.Entry::getValue))"
+                )
+            }
+        }
+    }
 }

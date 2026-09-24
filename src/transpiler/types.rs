@@ -22,8 +22,14 @@ impl AnnotationSet {
 pub fn map_type_name(kotlin_type: &str) -> &str {
     match kotlin_type {
         "Any" => "Object",
-        "Unit" => "void",
+        // Kotlin KClass surfaces as java.lang.Class through the JVM
+        // interop boundary — a Java `KClass` reference never resolves.
+        "KClass" => "Class",
+        "MutableList" => "ArrayList",
+        "MutableMap" => "HashMap",
+        "MutableSet" => "HashSet",
         "Nothing" => "Void",
+        "Unit" => "void",
         "Int" => "int",
         "Long" => "long",
         "Short" => "short",

@@ -1,9 +1,294 @@
 use clap::Parser;
+use filetime::{FileTime, set_file_mtime};
 use notlin::cli::Cli;
 use notlin::transpiler;
 use notlin::workspace::{SourceIndex, SourceLanguage};
 use std::fs;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+fn symlink_file(target: &Path, link: &Path) -> bool {
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_file(target, link);
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    match result {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => false,
+        Err(error) => panic!("could not create test symlink: {error}"),
+    }
+}
+
+fn symlink_dir(target: &Path, link: &Path) -> bool {
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_dir(target, link);
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    match result {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => false,
+        Err(error) => panic!("could not create test symlink: {error}"),
+    }
+}
+
+#[test]
+fn workspace_discovery_ignores_unrelated_dangling_symlinks() {
+    let root = std::env::temp_dir().join(format!("notlin-dangling-link-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("Types.kt"), "package sample\nclass Types\n").unwrap();
+    if !symlink_file(Path::new("missing-target"), &root.join("unrelated-link")) {
+        fs::remove_dir_all(root).unwrap();
+        return;
+    }
+
+    let index = SourceIndex::discover(&root).unwrap();
+
+    assert_eq!(index.declarations().next().unwrap().name, "Types");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cache_directory_symlink_is_not_followed() {
+    let root = std::env::temp_dir().join(format!("notlin-cache-link-{}", std::process::id()));
+    let outside = std::env::temp_dir().join(format!("notlin-cache-outside-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(root.join("Types.kt"), "package sample\nclass Types\n").unwrap();
+    if !symlink_dir(&outside, &root.join(".notlin")) {
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        return;
+    }
+
+    let (index, stats) = SourceIndex::discover_with_stats(&root).unwrap();
+
+    assert_eq!(index.declarations().next().unwrap().name, "Types");
+    assert!(!stats.cache_written);
+    assert!(!outside.join("index-v1.bin").exists());
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn cache_temporary_symlink_is_not_followed() {
+    let root = std::env::temp_dir().join(format!("notlin-cache-temp-link-{}", std::process::id()));
+    let outside =
+        std::env::temp_dir().join(format!("notlin-cache-temp-outside-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir_all(root.join(".notlin")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(root.join("Types.kt"), "package sample\nclass Types\n").unwrap();
+    let sentinel = outside.join("sentinel");
+    fs::write(&sentinel, "untouched").unwrap();
+    let temporary = root
+        .join(".notlin")
+        .join(format!("index-v1.bin.tmp-{}", std::process::id()));
+    if !symlink_file(&sentinel, &temporary) {
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        return;
+    }
+
+    let (_, stats) = SourceIndex::discover_with_stats(&root).unwrap();
+
+    assert!(!stats.cache_written);
+    assert_eq!(fs::read_to_string(&sentinel).unwrap(), "untouched");
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn cache_file_symlink_is_not_followed() {
+    let root = std::env::temp_dir().join(format!("notlin-cache-file-link-{}", std::process::id()));
+    let outside =
+        std::env::temp_dir().join(format!("notlin-cache-file-outside-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir_all(root.join(".notlin")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(root.join("Types.kt"), "package sample\nclass Types\n").unwrap();
+    let sentinel = outside.join("sentinel");
+    fs::write(&sentinel, "untouched").unwrap();
+    if !symlink_file(&sentinel, &root.join(".notlin/index-v1.bin")) {
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        return;
+    }
+
+    let (_, stats) = SourceIndex::discover_with_stats(&root).unwrap();
+
+    assert!(!stats.cache_written);
+    assert_eq!(fs::read_to_string(&sentinel).unwrap(), "untouched");
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn workspace_discovery_stops_at_symlink_cycles() {
+    let root = std::env::temp_dir().join(format!("notlin-symlink-cycle-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(root.join("Types.kt"), "package sample\nclass Types\n").unwrap();
+    if !symlink_dir(&root, &root.join("nested/back")) {
+        fs::remove_dir_all(root).unwrap();
+        return;
+    }
+
+    let index = SourceIndex::discover(&root).unwrap();
+
+    assert_eq!(index.files.len(), 1);
+    assert_eq!(index.declarations().next().unwrap().name, "Types");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn persistent_index_reuses_unchanged_sources() {
+    let root = std::env::temp_dir().join(format!("notlin-index-cache-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("Types.kt"), "package sample\nclass Types\n").unwrap();
+
+    let (_, first) = SourceIndex::discover_with_stats(&root).unwrap();
+    assert_eq!(first.parsed_files, 1);
+    assert_eq!(first.reused_files, 0);
+    assert!(root.join(".notlin/index-v1.bin").is_file());
+
+    let (index, second) = SourceIndex::discover_with_stats(&root).unwrap();
+    assert_eq!(second.parsed_files, 0);
+    assert_eq!(second.reused_files, 1);
+    assert_eq!(index.declarations().next().unwrap().name, "Types");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn persistent_index_detects_same_size_same_mtime_changes() {
+    let root =
+        std::env::temp_dir().join(format!("notlin-index-fingerprint-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("Types.kt");
+    fs::write(&source, "package sample\nclass Before\n").unwrap();
+    let original_mtime = FileTime::from_last_modification_time(&fs::metadata(&source).unwrap());
+    SourceIndex::discover_with_stats(&root).unwrap();
+
+    fs::write(&source, "package sample\nclass Afterx\n").unwrap();
+    set_file_mtime(&source, original_mtime).unwrap();
+    let (index, stats) = SourceIndex::discover_with_stats(&root).unwrap();
+
+    assert_eq!(stats.parsed_files, 1);
+    assert_eq!(stats.reused_files, 0);
+    assert_eq!(index.declarations().next().unwrap().name, "Afterx");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn persistent_index_persists_metadata_only_updates_once() {
+    let root = std::env::temp_dir().join(format!("notlin-index-touch-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("Types.kt");
+    fs::write(&source, "package sample\nclass Types\n").unwrap();
+    let original_mtime = FileTime::from_last_modification_time(&fs::metadata(&source).unwrap());
+    SourceIndex::discover_with_stats(&root).unwrap();
+
+    let touched_mtime = FileTime::from_unix_time(original_mtime.unix_seconds() + 2, 0);
+    set_file_mtime(&source, touched_mtime).unwrap();
+    let (_, second) = SourceIndex::discover_with_stats(&root).unwrap();
+    let (_, third) = SourceIndex::discover_with_stats(&root).unwrap();
+
+    assert_eq!(second.parsed_files, 0);
+    assert_eq!(second.reused_files, 1);
+    assert!(second.cache_written);
+    assert!(!third.cache_written);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn oversized_index_cache_is_ignored_and_replaced() {
+    let root = std::env::temp_dir().join(format!("notlin-index-oversized-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join(".notlin")).unwrap();
+    fs::write(root.join("Types.kt"), "package sample\nclass Types\n").unwrap();
+    let cache_path = root.join(".notlin/index-v1.bin");
+    fs::File::create(&cache_path)
+        .unwrap()
+        .set_len(257 * 1024 * 1024)
+        .unwrap();
+
+    let (index, stats) = SourceIndex::discover_with_stats(&root).unwrap();
+
+    assert_eq!(index.declarations().next().unwrap().name, "Types");
+    assert_eq!(stats.parsed_files, 1);
+    assert!(stats.cache_written);
+    assert!(fs::metadata(&cache_path).unwrap().len() < 257 * 1024 * 1024);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn persistent_index_removes_deleted_sources() {
+    let root = std::env::temp_dir().join(format!("notlin-index-delete-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let removed = root.join("Removed.kt");
+    fs::write(&removed, "package sample\nclass Removed\n").unwrap();
+    fs::write(root.join("Stable.kt"), "package sample\nclass Stable\n").unwrap();
+    SourceIndex::discover_with_stats(&root).unwrap();
+
+    fs::remove_file(&removed).unwrap();
+    let (index, stats) = SourceIndex::discover_with_stats(&root).unwrap();
+
+    assert_eq!(stats.parsed_files, 0);
+    assert_eq!(stats.reused_files, 1);
+    assert!(stats.cache_written);
+    assert!(
+        !index
+            .declarations()
+            .any(|declaration| declaration.name == "Removed")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn persistent_index_reparses_only_changed_sources() {
+    let root = std::env::temp_dir().join(format!("notlin-index-update-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let changed = root.join("Changed.kt");
+    fs::write(&changed, "package sample\nclass Before\n").unwrap();
+    fs::write(
+        root.join("Stable.java"),
+        "package sample; class Stable {}\n",
+    )
+    .unwrap();
+    SourceIndex::discover_with_stats(&root).unwrap();
+
+    fs::write(&changed, "package sample\nclass AfterChange\n").unwrap();
+    let (index, stats) = SourceIndex::discover_with_stats(&root).unwrap();
+
+    assert_eq!(stats.parsed_files, 1);
+    assert_eq!(stats.reused_files, 1);
+    assert!(
+        index
+            .declarations()
+            .any(|declaration| declaration.name == "AfterChange")
+    );
+    assert!(
+        !index
+            .declarations()
+            .any(|declaration| declaration.name == "Before")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
 
 #[test]
 fn discovers_kotlin_and_java_sources_recursively() {

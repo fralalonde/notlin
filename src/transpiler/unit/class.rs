@@ -7,6 +7,12 @@ use crate::transpiler::expr::Expr;
 use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
+/// One companion fn captured for the nested `Companion` bridge.
+struct BridgeSig {
+    signature: String,
+    call: String,
+}
+
 impl<'a> Unit<'a> {
     pub(crate) fn collect_type_relations(&mut self, root: tree_sitter::Node<'a>) {
         let mut stack: Vec<tree_sitter::Node<'a>> = vec![root];
@@ -123,16 +129,21 @@ impl<'a> Unit<'a> {
     ) {
         // Provenance header: every generated .java records which .kt produced
         // it (in-place migration trims the .kt, so the pair must stay matchable).
+        // Forward slashes only: a raw backslash inside a Java comment is not a
+        // unicode escape today, but `\c`-style prefixes would be rejected as
+        // illegal escapes by javac on any path containing one.
         out.line(format!(
             "// NOTLIN: generated from {} — do not edit by hand while the source .kt exists",
-            self.file.display()
+            self.file.display().to_string().replace('\\', "/")
         ));
         if !package.is_empty() {
             out.line(format!("package {};", package));
             out.blank();
         }
         for imp in imports {
-            out.line(format!("import {};", imp));
+            if !imp.is_empty() {
+                out.line(format!("import {};", imp));
+            }
         }
         // Under --lombok the emitted @Data/@AllArgsConstructor need their
         // imports; user-declared lombok imports (Lombok-flagged source) may
@@ -180,6 +191,32 @@ impl<'a> Unit<'a> {
             || workspace.property_smart_cast_used_by_kotlin(indexed_path, target)
     }
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
+        // `KClass<T>` type references lower to Java `Class<T>` (kt.rs /
+        // types.rs interop mapping). That ABI change is only compatible
+        // when no RESIDUAL Kotlin file consumes this declaration: a
+        // retained Kotlin caller passing `X::class` (KClass) to the
+        // translated Java `Class` overload no longer compiles, and
+        // override/property type agreement breaks. The index proves it:
+        // retention when residual Kotlin references the declaration,
+        // translation when only Java (or nobody) does — Kotlin callers ad
+        // apt via `X::class.java`, which is legal against a `Class` param.
+        if self.text(decl).contains("KClass") {
+            let name = kt::field(decl, "name")
+                .map(|n| self.text(n).to_string())
+                .unwrap_or_default();
+            let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
+            if self
+                .workspace
+                .map(|w| w.has_external_kotlin_reference(indexed_path, &name))
+                .unwrap_or(true)
+            {
+                self.diag_untranslatable(
+                    decl,
+                    "declaration references kotlin.reflect.KClass consumed by residual Kotlin; retained in Kotlin",
+                );
+                return;
+            }
+        }
         let mut is_data = false;
         let mut is_sealed = false;
         let mut is_enum = false;
@@ -301,6 +338,7 @@ impl<'a> Unit<'a> {
         // (constructor_invocation / explicit_delegation / user_type).
         let mut extends = String::new();
         let mut superclass: Option<String> = None;
+        let mut super_ctor_args: Option<String> = None;
         if let Some(dc) = kt::child(decl, "delegation_specifiers") {
             let mut parts: Vec<String> = Vec::new();
             let mut cursor = dc.walk();
@@ -314,13 +352,71 @@ impl<'a> Unit<'a> {
                     continue;
                 };
                 match inner.kind() {
-                    // `: Parent()` — constructor invocation => class superclass
+                    // `: Parent(args)` — constructor invocation => class
+                    // superclass with ctor ARGUMENTS that must be forwarded
+                    // (`: RuntimeException(message)`); dropping them makes
+                    // the Java parent's required ctor unreachable.
                     "constructor_invocation" => {
                         if let Some(ut) = inner
                             .children(&mut inner.walk())
                             .find(|c| c.kind() == "user_type")
                         {
-                            parts.push(format!("class:{}", self.text(ut).replace(" ", "")));
+                            // raw text keeps Kotlin spellings (`Any`); run
+                            // through the Kotlin->Java type-name mapping.
+                            let t_j = kt::java_type(ut, self.source).replace(" ", "");
+                            parts.push(format!("class:{}", t_j));
+                            let mut args_collected: Vec<String> = Vec::new();
+                            if let Some(va) = inner
+                                .children(&mut inner.walk())
+                                .find(|c| c.kind() == "value_arguments")
+                            {
+                                let mut acur = va.walk();
+                                for a in va
+                                    .children(&mut acur)
+                                    .filter(|c| c.kind() == "value_argument")
+                                {
+                                    let expr_node = a
+                                        .children(&mut a.walk())
+                                        .find(|c| c.is_named())
+                                        .unwrap_or(a);
+                                    let raw_expr = self.text(expr_node).trim().to_string();
+                                    let mut e = Expr { unit: self };
+                                    let rendered = if expr_node.kind() == "navigation_expression" {
+                                        let raw = raw_expr.as_str();
+                                        let mut pieces = raw.split('.');
+                                        let base = pieces.next().unwrap_or(raw).trim();
+                                        let member = pieces.next().unwrap_or("").trim();
+                                        if params.iter().any(|(_, pname, _)| pname == base)
+                                            && !member.is_empty()
+                                        {
+                                            format!("{}.get{}()", base, capitalize(member))
+                                        } else {
+                                            e.transpile(expr_node)
+                                        }
+                                    } else if expr_node.kind() == "call" {
+                                        e.transpile(expr_node)
+                                    } else {
+                                        self.text(expr_node).trim().to_string()
+                                    };
+                                    let head = rendered.split('(').next().unwrap_or("");
+                                    let rendered = if rendered.ends_with(')')
+                                        && head
+                                            .chars()
+                                            .next()
+                                            .is_some_and(|c| c.is_ascii_uppercase())
+                                        && !rendered.starts_with("new ")
+                                    {
+                                        format!("new {}", rendered)
+                                    } else {
+                                        rendered
+                                    };
+                                    args_collected.push(rendered);
+                                }
+                            }
+                            if !args_collected.is_empty() {
+                                superclass = Some(t_j.clone());
+                                super_ctor_args = Some(args_collected.join(", "));
+                            }
                         }
                     }
                     // `: Greeter by Parent2()` — delegation: implement the
@@ -426,9 +522,12 @@ impl<'a> Unit<'a> {
         };
 
         if is_interface {
+            // Interfaces declared type parameters too (`interface
+            // IActivityUpdatedEvent<T : Activity>`) — emit them or the
+            // `T` references in extends/implies clauses won't resolve.
             out.open(format!(
-                "{}{}interface {}{}",
-                visibility, modifiers, name, extends
+                "{}{}interface {}{}{}",
+                visibility, modifiers, name, type_params, extends
             ));
             if let Some(body) = kt::child(decl, "class_body") {
                 let mut cursor = body.walk();
@@ -517,6 +616,56 @@ impl<'a> Unit<'a> {
                 let final_kw = if *is_val { "final " } else { "" };
                 out.line(format!("private {}{} {};", final_kw, ftype, fname));
             }
+            for (_, fname, ftype) in &params {
+                if ftype == "boolean" {
+                    out.line(format!(
+                        "public boolean get{}() {{ return {}; }}",
+                        capitalize(fname),
+                        fname
+                    ));
+                }
+            }
+            if let Some(pc) = kt::child(decl, "primary_constructor") {
+                if let Some(cps) = kt::child(pc, "class_parameters") {
+                    let mut defaults = Vec::new();
+                    for cp in cps.children(&mut cps.walk()) {
+                        if cp.kind() != "class_parameter" {
+                            continue;
+                        }
+                        let has_default = cp
+                            .children(&mut cp.walk())
+                            .any(|c| c.kind() == "default_value");
+                        defaults.push(has_default);
+                    }
+                    if defaults.last() == Some(&true) && params.len() > 1 {
+                        let prefix = &params[..params.len() - 1];
+                        let (_, _, default_ty) = &params[params.len() - 1];
+                        let default_expr = cps
+                            .children(&mut cps.walk())
+                            .filter(|c| c.kind() == "class_parameter")
+                            .last()
+                            .and_then(|cp| kt::child(cp, "default_value"))
+                            .and_then(|dv| dv.children(&mut dv.walk()).find(|c| c.is_named()))
+                            .map(|n| Expr { unit: self }.transpile(n))
+                            .unwrap_or_else(|| default_ty.clone());
+                        let signature = prefix
+                            .iter()
+                            .map(|(_, n, t)| format!("{} {}", t, n))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let values = prefix
+                            .iter()
+                            .map(|(_, n, _)| n.clone())
+                            .chain(std::iter::once(default_expr))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        out.line(format!(
+                            "public {}({}) {{ this({}); }}",
+                            name, signature, values
+                        ));
+                    }
+                }
+            }
             out.blank();
             if let Some(body) = kt::child(decl, "class_body") {
                 self.transpile_class_body(body, out);
@@ -553,16 +702,21 @@ impl<'a> Unit<'a> {
             // explicit fields + accessors (signature-identical to the
             // record's: final fields, equals/hashCode/toString inherited or
             // approximated). With `extends` present, emit that form.
+            // Type parameters must ride along on every shape — a record
+            // `data class FindQ<T : IObj>(...)` needs `record FindQ<T>(...)`
+            // or every `T` reference inside fails to resolve.
+            let tp = type_params.trim_end(); // "<T> " / ""
             if extends.is_empty() {
                 out.open(format!(
-                    "{}record {}({})",
+                    "{}record {}{}({})",
                     visibility,
                     name,
+                    tp.trim_end(),
                     comps.join(", ")
                 ));
             } else {
                 let inner = if extends.is_empty() {
-                    format!("{}final class {}", visibility, name)
+                    format!("{}final class {}{}", visibility, name, tp)
                 } else {
                     // must nest inside `extends X` clause: nested class
                     // inheritance in one line
@@ -575,8 +729,8 @@ impl<'a> Unit<'a> {
                         ""
                     };
                     format!(
-                        "{}{}final class {} {}",
-                        visibility, static_kw, name, extends
+                        "{}{}final class {}{} {}",
+                        visibility, static_kw, name, tp, extends
                     )
                 };
                 out.open(inner);
@@ -642,7 +796,12 @@ impl<'a> Unit<'a> {
             // Lombok annotations placed BEFORE the class declaration.
             if self.lombok && !params.is_empty() {
                 out.line("@Data");
-                out.line("@AllArgsConstructor");
+                // @AllArgsConstructor's synthesized ctor collides with the
+                // explicit super-forwarding ctor emitted below — only
+                // annotate when the explicit one is not being written.
+                if super_ctor_args.is_none() {
+                    out.line("@AllArgsConstructor");
+                }
                 out.blank();
             }
             out.open(format!(
@@ -658,7 +817,26 @@ impl<'a> Unit<'a> {
                 out.blank();
             }
             // constructor (redundant under --lombok: AllArgsConstructor)
-            if !params.is_empty() && !self.lombok {
+            if let Some(sargs) = &super_ctor_args {
+                // superclass ctor needs arguments: emit an explicit ctor
+                // forwarding them (`: Parent("template")` -> super("template")).
+                // @AllArgsConstructor's generated ctor cannot express the
+                // super-call, so the explicit one is required regardless.
+                out.open(format!("public {}({})", name, {
+                    params
+                        .iter()
+                        .map(|(_, n, t)| format!("{} {}", t, n))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }));
+                out.line(format!("super({});", sargs));
+                for (_, fname, _) in &params {
+                    out.line(format!("this.{} = {};", fname, fname));
+                }
+                out.close();
+                out.blank();
+            }
+            if !params.is_empty() && !self.lombok && super_ctor_args.is_none() {
                 out.open(format!("public {}({})", name, {
                     params
                         .iter()
@@ -746,6 +924,42 @@ impl<'a> Unit<'a> {
                             }
                         };
                         Some((is_val, self.text(ident).to_string(), ty_java))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Transpiled default expressions for primary-ctor parameters, aligned
+    /// by index (`None` where the parameter has no default). Used to fill
+    /// enum-constant call sites, since Java has no default arguments.
+    fn class_param_defaults(&mut self, decl: tree_sitter::Node) -> Vec<Option<String>> {
+        kt::child(decl, "primary_constructor")
+            .and_then(|pc| kt::child(pc, "class_parameters"))
+            .map(|cps| {
+                let mut cursor = cps.walk();
+                cps.children(&mut cursor)
+                    .filter(|c| c.kind() == "class_parameter")
+                    .map(|cp| {
+                        // The grammar nests the default as whatever
+                        // expression follows the `=` child (no dedicated
+                        // wrapper node). Only params that HAVE a `=`
+                        // contribute an entry; the last named child is the
+                        // default expression.
+                        let has_default = cp
+                            .children(&mut cp.walk())
+                            .any(|c| !c.is_named() && c.kind() == "=");
+                        if has_default {
+                            cp.children(&mut cp.walk())
+                                .filter(|c| c.is_named())
+                                .last()
+                                .map(|ex| {
+                                    let mut e = Expr { unit: self };
+                                    e.transpile(ex)
+                                })
+                        } else {
+                            None
+                        }
                     })
                     .collect()
             })
@@ -857,6 +1071,10 @@ impl<'a> Unit<'a> {
             .iter()
             .map(|(_, fname, ftype)| (fname.clone(), ftype.clone()))
             .collect();
+        // Defaulted ctor params: Java enum constants must pass every
+        // trailing argument; a constant that omits a defaulted param gets
+        // the default expression transpiled in.
+        let param_defaults = self.class_param_defaults(decl);
         let body = kt::child(decl, "enum_class_body").or_else(|| kt::child(decl, "class_body"));
 
         // Split the body: constants first (Java requires them before any
@@ -896,6 +1114,16 @@ impl<'a> Unit<'a> {
                                         {
                                             let mut e2 = Expr { unit: self };
                                             args.push(e2.transpile(ex));
+                                        }
+                                    }
+                                    // Fill omitted defaulted parameters so
+                                    // the call site compiles in Java.
+                                    while args.len() < param_defaults.len() {
+                                        match &param_defaults[args.len()] {
+                                            Some(default_expr) => {
+                                                args.push(default_expr.clone());
+                                            }
+                                            None => break,
                                         }
                                     }
                                     e.push_str(&format!("({})", args.join(", ")));
@@ -1074,6 +1302,7 @@ impl<'a> Unit<'a> {
             return;
         };
         let mut mutable_state = false;
+        let mut bridge_sigs: Vec<BridgeSig> = Vec::new();
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
             match member.kind() {
@@ -1087,12 +1316,17 @@ impl<'a> Unit<'a> {
                         let pname = self.text(n).to_string();
                         let cap: String = capitalize(&pname);
                         self.companion_members
-                            .insert(pname, format!("get{}()", cap));
+                            .insert(pname.clone(), format!("get{}()", cap));
                     }
                     self.transpile_property_opts(member, out, true, Some(owner));
                     out.blank();
                 }
                 "function_declaration" => {
+                    // Capture the Java signature from the source AST before
+                    // translating, for the nested Companion bridge.
+                    if let Some(sig) = self.companion_fn_signature(member) {
+                        bridge_sigs.push(sig);
+                    }
                     self.transpile_function_opts(
                         member, true, /*make_static=*/ true, false, out,
                     );
@@ -1115,6 +1349,69 @@ impl<'a> Unit<'a> {
                 "companion object state (var members) approximated as static fields of the enclosing class — Kotlin stores companion state on the Companion singleton instance; API shape preserved, storage location approximated",
             );
         }
+        if !bridge_sigs.is_empty() {
+            self.diag_approx(
+                companion,
+                "companion fns also reachable via Owner.Companion.fn(...) in Kotlin call sites; emitted a nested Companion bridge that delegates to the class statics so both call forms compile",
+            );
+            out.blank();
+            out.open(String::from("public static final class Companion"));
+            for sig in &bridge_sigs {
+                out.open(format!("public {}", sig.signature));
+                out.line(format!("return {}.{};", owner, sig.call));
+                out.close();
+            }
+            out.close();
+            out.blank();
+        }
+    }
+
+    /// Java signature + delegate call captured from a companion fn's source
+    /// AST (`static Ret fn(Type p, ...)` / `fn(p, ...)`). Params with default
+    /// expressions are skipped: the bridge assumes the full argument list.
+    fn companion_fn_signature(&mut self, member: tree_sitter::Node<'_>) -> Option<BridgeSig> {
+        let name = kt::field(member, "name")?;
+        let fn_name = self.text(name).to_string();
+        let params_node = kt::child(member, "function_value_parameters")?;
+        let mut cursor = params_node.walk();
+        let mut args = Vec::new();
+        for param in params_node.children(&mut cursor) {
+            if param.kind() != "parameter" {
+                continue;
+            }
+            let param_children: Vec<_> = param.children(&mut param.walk()).collect();
+            if param_children
+                .iter()
+                .any(|c| !c.is_named() && c.kind() == "=")
+            {
+                return None;
+            }
+            let pname = param_children
+                .iter()
+                .find(|c| c.kind() == "identifier")
+                .map(|c| self.text(*c).to_string())
+                .unwrap_or_else(|| format!("p{}", args.len()));
+            let ptype_node = param_children.iter().find(|c| {
+                matches!(
+                    c.kind(),
+                    "user_type" | "nullable_type" | "type_reference" | "type"
+                )
+            })?;
+            let ptype = kt::java_type_ann(*ptype_node, self.source, self.annots);
+            args.push(format!("{} {}", ptype, pname));
+        }
+        let ret = kt::child(member, "user_type")
+            .or_else(|| kt::child(member, "type_reference"))
+            .map(|t| kt::java_type_ann(t, self.source, self.annots))
+            .unwrap_or_else(|| String::from("void"));
+        let names: Vec<&str> = args
+            .iter()
+            .filter_map(|a| a.split(' ').next_back())
+            .collect();
+        Some(BridgeSig {
+            signature: format!("static {ret} {fn_name}({})", args.join(", ")),
+            call: format!("{fn_name}({})", names.join(", ")),
+        })
     }
 
     fn transpile_object(

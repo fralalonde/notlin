@@ -5,6 +5,7 @@ use notlin::migrate::{self, MigrateOutcome};
 use notlin::transpiler;
 use notlin::workspace::SourceIndex;
 use std::collections::HashSet;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -35,12 +36,14 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         .unwrap_or(std::env::current_dir().map_err(|e| format!("current directory: {e}"))?);
     let workspace_root = std::fs::canonicalize(&workspace_root)
         .map_err(|e| format!("workspace root {}: {e}", workspace_root.display()))?;
-    let index = SourceIndex::discover(&workspace_root)?;
-    log::info!(
-        "indexed {} Kotlin and {} Java files from {}",
+    let (index, index_stats) = SourceIndex::discover_with_stats(&workspace_root)?;
+    log::debug!(
+        "indexed {} Kotlin and {} Java files from {} ({} parsed, {} cached)",
         index.kotlin_files().count(),
         index.java_files().count(),
-        workspace_root.display()
+        workspace_root.display(),
+        index_stats.parsed_files,
+        index_stats.reused_files,
     );
 
     let translation_roots = if cli.input.is_empty() {
@@ -50,7 +53,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             .iter()
             .filter(|input| input.as_os_str() != "-")
             .map(|input| {
-                log::info!("source root {}", input.to_string_lossy());
+                log::debug!("source root {}", input.to_string_lossy());
                 std::fs::canonicalize(input)
                     .map_err(|e| format!("translation root {}: {e}", input.display()))
             })
@@ -60,6 +63,8 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     if files.is_empty() {
         return Err("no input files given (positional <INPUT>..., or use - for stdin)".into());
     }
+    let stdout = std::io::stdout();
+    let mut stdout = BufWriter::new(stdout.lock());
 
     let mut total_errors = 0usize;
     let mut total_warnings = 0usize;
@@ -67,11 +72,13 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let mut outcomes: Vec<(PathBuf, MigrateOutcome)> = Vec::new();
 
     for file in &files {
-        log::info!("transpiling {}", file.display());
+        log::debug!("transpiling {}", file.display());
         let source = read_source(file)?;
 
         if cli.dump_ast {
-            print!("{}", transpiler::dump_ast(&source));
+            stdout
+                .write_all(transpiler::dump_ast(&source).as_bytes())
+                .map_err(|error| format!("stdout: {error}"))?;
             continue;
         }
 
@@ -101,18 +108,28 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                         std::fs::create_dir_all(parent)
                             .map_err(|e| format!("{}: {e}", parent.display()))?;
                     }
-                    std::fs::write(&target, content)
+                    let file = std::fs::File::create(&target)
                         .map_err(|e| format!("{}: {e}", target.display()))?;
-                    log::info!("wrote {}", target.display());
+                    let mut writer = BufWriter::new(file);
+                    writer
+                        .write_all(content.as_bytes())
+                        .map_err(|e| format!("{}: {e}", target.display()))?;
+                    writer
+                        .flush()
+                        .map_err(|e| format!("{}: {e}", target.display()))?;
+                    log::debug!("wrote {}", target.display());
                 }
                 java_written += java_files.len();
             }
             None => {
                 for (name, content) in &java_files {
                     if java_files.len() > 1 {
-                        println!("// ===== {} =====", name);
+                        writeln!(stdout, "// ===== {} =====", name)
+                            .map_err(|error| format!("stdout: {error}"))?;
                     }
-                    print!("{content}");
+                    stdout
+                        .write_all(content.as_bytes())
+                        .map_err(|error| format!("stdout: {error}"))?;
                 }
             }
         }
@@ -131,18 +148,52 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 let outcome = migrate::migrate(file, &source, &coverage)?;
                 match &outcome {
                     migrate::MigrateOutcome::Deleted => {
-                        println!("{}: {}", "deleted".green(), file.display());
+                        log::debug!("deleted {}", file.display());
                     }
                     migrate::MigrateOutcome::Trimmed { remaining_bytes } => {
-                        println!(
-                            "{}: {} ({} bytes remain)",
-                            "trimmed".yellow(),
-                            file.display(),
-                            remaining_bytes
+                        log::debug!(
+                            "trimmed {} ({remaining_bytes} bytes remain)",
+                            file.display()
                         );
                     }
                     migrate::MigrateOutcome::Untouched => {
-                        log::info!("{}: no translated content; untouched", file.display());
+                        log::debug!("{}: no translated content; untouched", file.display());
+                        // Orphan cleanup: a prior run may have generated Java
+                        // outputs whose declarations this run retained in
+                        // Kotlin. Generated outputs are marked with the
+                        // `NOTLIN: generated from <source>` header — delete
+                        // those whose source is THIS file, otherwise javac
+                        // keeps compiling a stale class that no longer
+                        // matches the retained Kotlin ABI. Generated outputs
+                        // land next to the source in in-place mode.
+                        if effective_out_dir.is_none() {
+                            if let Some(dir) = file.parent() {
+                                let source_canon =
+                                    std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
+                                let source_text = source_canon.to_string_lossy().to_string();
+                                if let Ok(entries) = std::fs::read_dir(dir) {
+                                    for entry in entries.flatten() {
+                                        let path = entry.path();
+                                        if path.extension().and_then(|e| e.to_str()) != Some("java")
+                                        {
+                                            continue;
+                                        }
+                                        if let Ok(first_line) =
+                                            std::fs::read_to_string(&path).map(|content| {
+                                                content.lines().next().unwrap_or("").to_string()
+                                            })
+                                        {
+                                            if first_line.contains("NOTLIN: generated from")
+                                                && first_line.contains(&source_text)
+                                            {
+                                                let _ = std::fs::remove_file(&path);
+                                                log::info!("deleted orphan {}", path.display());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 outcomes.push((file.clone(), outcome));
@@ -161,23 +212,30 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         || (untranslatable_strict && total_warnings > 0)
         || (cli.deny_warnings && total_warnings > 0);
 
-    // Pre-exit operation summary (stderr): per-file disposition plus the
-    // tallies that decide the exit code.
-    eprintln!("summary:");
-    for (path, outcome) in &outcomes {
-        let action = match outcome {
-            MigrateOutcome::Deleted => "deleted".green(),
-            MigrateOutcome::Trimmed { .. } => "trimmed".yellow(),
-            MigrateOutcome::Untouched => "untouched".normal(),
-        };
-        eprintln!("  {}: {}", path.display(), action);
-    }
+    let deleted = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Deleted))
+        .count();
+    let trimmed = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Trimmed { .. }))
+        .count();
+    let untouched = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Untouched))
+        .count();
+    stdout.flush().map_err(|error| format!("stdout: {error}"))?;
     eprintln!(
-        "notlin: {} file(s) processed, {} java file(s) written, {} error(s), {} warning(s) — {}",
+        "notlin: {} file(s) processed, {} java file(s) written, {} error(s), {} warning(s){} — {}",
         files.len(),
         java_written,
         total_errors,
         total_warnings,
+        if outcomes.is_empty() {
+            String::new()
+        } else {
+            format!(", migration: {deleted} deleted, {trimmed} trimmed, {untouched} untouched")
+        },
         if failed {
             "failed".red()
         } else {
@@ -193,16 +251,19 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
 }
 
 fn read_source(file: &Path) -> Result<String, String> {
+    let mut source = String::new();
     if file.as_os_str() == "-" {
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
+        let stdin = std::io::stdin();
+        BufReader::new(stdin.lock())
+            .read_to_string(&mut source)
             .map_err(|e| format!("stdin: {e}"))?;
-        Ok(buf)
     } else {
-        std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))
+        let input = std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        BufReader::new(input)
+            .read_to_string(&mut source)
+            .map_err(|e| format!("{}: {e}", file.display()))?;
     }
+    Ok(source)
 }
 
 fn collect_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
@@ -213,10 +274,9 @@ fn collect_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
             continue;
         }
         if input.is_dir() {
-            let mut dir_files: Vec<PathBuf> = walk(input)?
-                .into_iter()
-                .filter(|p| p.extension().is_some_and(|e| e == "kt"))
-                .collect();
+            let canonical = std::fs::canonicalize(input)
+                .map_err(|e| format!("input directory {}: {e}", input.display()))?;
+            let mut dir_files = walk_kotlin(&canonical)?;
             dir_files.sort();
             files.extend(dir_files);
         } else {
@@ -237,21 +297,33 @@ fn collect_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
         };
         seen.insert(identity)
     });
-    log::info!("collected {} .kt files", files.len());
+    log::debug!("collected {} .kt files", files.len());
     Ok(files)
 }
 
-fn walk(dir: &Path) -> Result<Vec<PathBuf>, String> {
+fn walk_kotlin(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let entries = std::fs::read_dir(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+    let mut visited_directories = HashSet::from([dir.to_path_buf()]);
+    while let Some(directory) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
         for entry in entries {
-            let entry = entry.map_err(|e| format!("{}: {e}", d.display()))?;
+            let entry = entry.map_err(|e| format!("{}: {e}", directory.display()))?;
             let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
+            let is_kotlin = path.extension().is_some_and(|extension| extension == "kt");
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) if !is_kotlin => continue,
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            };
+            if metadata.is_dir() {
+                let canonical =
+                    std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                if visited_directories.insert(canonical.clone()) {
+                    stack.push(canonical);
+                }
+            } else if metadata.is_file() && is_kotlin {
                 out.push(path);
             }
         }

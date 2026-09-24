@@ -213,6 +213,13 @@ impl<'a> Unit<'a> {
                 setter_name.clone()
             },
         );
+        // Bare-identifier resolution: instance properties register their
+        // getter so body text naming the property (`get() = activity`)
+        // lowers to the accessor instead of an unresolvable bare name.
+        // Static members are reached through the owner, never bare.
+        if !make_static {
+            self.self_getters.insert(name.clone(), getter_name.clone());
+        }
         let mut conflicts: Vec<String> = Vec::new();
         if let Some(body) = kt::parent_of(decl).filter(|p| p.kind() == "class_body") {
             let mut cursor = body.walk();

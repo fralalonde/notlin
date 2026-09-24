@@ -6,6 +6,91 @@ use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
 impl<'a> Unit<'a> {
+    /// Name of the nearest enclosing class/interface declaration, if this
+    /// function is a class-body member.
+    fn enclosing_class_name(&self, decl: tree_sitter::Node) -> Option<String> {
+        let mut node = kt::parent_of(decl);
+        while let Some(n) = node {
+            if n.kind() == "class_declaration" {
+                return kt::field(n, "name").map(|nm| self.text(nm).to_string());
+            }
+            node = kt::parent_of(n);
+        }
+        None
+    }
+
+    /// Detects `override fun f` inside a class where the supertype (per the
+    /// workspace index) declares the same function with a DIFFERENT type —
+    /// i.e. the override narrows the supertype's return type. Returns the
+    /// supertype-declared type when a conflict exists.
+    fn covariant_iface_return_conflict(&self, decl: tree_sitter::Node) -> Option<String> {
+        let workspace = self.workspace?;
+        let class_name = self.enclosing_class_name(decl)?;
+        let is_override = kt::child(decl, "modifiers")
+            .map(|m| self.text(m).contains("override"))
+            .unwrap_or(false);
+        if !is_override {
+            return None;
+        }
+        let fname = kt::field(decl, "name")
+            .map(|n| self.text(n).to_string())
+            .unwrap_or_default();
+        // This function's (Java) return type, as emitted.
+        let my_ret = self
+            .declared_return_node(decl)
+            .map(|n| kt::java_type_ann(n, self.source, self.annots));
+        // Any DECLARED supertype of the class declaring `fname`?
+        for decl_d in workspace.declarations() {
+            if decl_d.name != class_name {
+                continue;
+            }
+            for st in &decl_d.supertypes {
+                for iface in workspace.declarations() {
+                    if iface.name != *st {
+                        continue;
+                    }
+                    for member in &iface.members {
+                        if member.name == fname
+                            && member.kind == crate::workspace::MemberKind::Method
+                        {
+                            if let Some(declared) = &member.type_name {
+                                if let Some(my_ret) = &my_ret {
+                                    let declared_java = declared.clone();
+                                    if !declared_java.is_empty()
+                                        && declared_java != *my_ret
+                                        && declared_java != "Object"
+                                    {
+                                        return Some(declared_java);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn declared_return_node<'b>(
+        &self,
+        decl: tree_sitter::Node<'b>,
+    ) -> Option<tree_sitter::Node<'b>> {
+        let mut cursor = decl.walk();
+        let kids: Vec<_> = decl.children(&mut cursor).collect();
+        let mut after_params = false;
+        for k in kids {
+            if k.kind() == "function_value_parameters" {
+                after_params = true;
+                continue;
+            }
+            if after_params && k.is_named() && matches!(k.kind(), "user_type" | "nullable_type") {
+                return Some(k);
+            }
+        }
+        None
+    }
+
     pub(crate) fn transpile_function(
         &mut self,
         decl: tree_sitter::Node,
@@ -23,6 +108,21 @@ impl<'a> Unit<'a> {
         is_main: bool,
         out: &mut JavaOut,
     ) {
+        // Covariant-override guard: a Kotlin data class often narrows an
+        // interface function's return type (`override fun with(...): Impl`).
+        // The translated Java class then overrides the Kotlin interface
+        // member with a different JVM descriptor family, and kotlinc's
+        // fake-override synthesis can crash resolving it. If a known
+        // supertype declares this member with a different type, keep the
+        // declaration in Kotlin.
+        self.current_function_name = None;
+        if let Some(_iface_type) = self.covariant_iface_return_conflict(decl) {
+            self.diag_untranslatable(
+                decl,
+                "override narrows a supertype function return type; retained in Kotlin",
+            );
+            return;
+        }
         // Each declaration is its own translation scope: params and locals
         // must not leak from a previously emitted function (var_types
         // persists on Unit across top-level and member declarations).
@@ -35,6 +135,7 @@ impl<'a> Unit<'a> {
         let name = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_else(|| "anon".to_string());
+        self.current_function_name = Some(name.clone());
         let visibility = self.visibility_of(decl);
 
         // function_modifier children (suspend/operator/infix/tailrec/

@@ -68,6 +68,27 @@ impl<'a, 'u> Expr<'a, 'u> {
 
         match (left, right, op) {
             (Some(l), Some(r), Some(op)) => {
+                // Grammar collision: a generic call with a trailing lambda
+                // (`Host.spec<String> { ... }`) parses as
+                // binary_expression(left=nav `Host.spec`, op=`<`,
+                // right=`String`) > (right=lambda). Kotlin here means a
+                // generic CALL — the `<`/`>` are type-argument brackets, not
+                // comparisons. Detect: op is `<`, the left operand ends in an
+                // identifier (a callee), the right is a bare type-ish
+                // identifier, and the node's raw text closes with `>` before
+                // the trailing lambda.
+                if op == "<" {
+                    if let Some(rhs_text) = self.is_generic_call_binary(node) {
+                        let callee_java = self.transpile_callee_generic(l, Some(rhs_text.as_str()));
+                        // Tell the outer `>` binary (the type list's closing
+                        // bracket) not to treat this as a comparison.
+                        self.unit.pending_generic_call = true;
+                        // The trailing lambda belongs to the OUTER call node;
+                        // call.rs re-finds it (`annotated_lambda` child) and
+                        // appends. Return just the callee.
+                        return callee_java;
+                    }
+                }
                 // Elvis `?:` arrives as a binary_expression operator in this grammar
                 if op == "?:" {
                     self.unit.diags.warn_approx(
@@ -108,6 +129,9 @@ impl<'a, 'u> Expr<'a, 'u> {
                 let java_op = match op.as_str() {
                     "&&" | "and" => "&&",
                     "||" | "or" => "||",
+                    // Kotlin referential equality: Java identity compare.
+                    "===" => "==",
+                    "!==" => "!=",
                     _ => op.as_str(),
                 };
                 // Ordered comparisons on non-primitive operands require
@@ -117,6 +141,43 @@ impl<'a, 'u> Expr<'a, 'u> {
                 // operands need a compareTo-based form.
                 let is_ordered_cmp = matches!(java_op, "<" | ">" | "<=" | ">=");
                 if is_ordered_cmp {
+                    // A trailing-lambda generic call (`spec<String> { ... }`)
+                    // arrives as TWO stacked binary_expressions: inner
+                    // (`spec < String`) then outer (`(inner) > lambda`). A
+                    // real comparison never has a bare type name or lambda as
+                    // the right operand with an identifier receiver on the
+                    // left — detect the outer shape structurally so the
+                    // lambda bracket stays a call, not a compareTo.
+                    let lhs_generic_call = l.kind() == "binary_expression"
+                        && matches!(self.is_generic_call_binary(l), Some(_));
+                    if lhs_generic_call {
+                        let callee_java = self.transpile(l);
+                        self.unit.pending_generic_call = false;
+                        // The lambda is this OUTER binary's right child —
+                        // there is no enclosing call_expression for call.rs
+                        // to find it in; attach it here as the call argument.
+                        let lambda = (if r.kind() == "lambda_literal" {
+                            Some(r)
+                        } else {
+                            r.children(&mut r.walk())
+                                .find(|c| c.kind() == "lambda_literal")
+                        })
+                        .or_else(|| {
+                            kt::child(r, "annotated_lambda")
+                                .and_then(|al| kt::child(al, "lambda_literal"))
+                        });
+                        let callee_java = match (lambda, callee_java.is_empty()) {
+                            (Some(lam), false) => {
+                                if callee_java.ends_with(')') {
+                                    callee_java
+                                } else {
+                                    format!("{}({})", callee_java, self.transpile(lam))
+                                }
+                            }
+                            _ => callee_java,
+                        };
+                        return callee_java;
+                    }
                     let lhs_text = self.unit.text(l).trim();
                     let rhs_text = self.unit.text(r).trim();
                     let either_primitive = lhs_text.parse::<i64>().is_ok()
@@ -144,7 +205,11 @@ impl<'a, 'u> Expr<'a, 'u> {
                         };
                     }
                 }
-                // Kotlin `==` is structural equals for objects; Java `==` is identity.
+                // Kotlin `==` is structural equals for objects; Java `==` is
+                // identity. `===` (referential) reached here already rewritten
+                // to java_op "==" / "!=", but MUST keep identity semantics —
+                // track the original operator separately.
+                let referential = matches!(op.as_str(), "===" | "!==");
                 let op_java = if java_op == "==" || java_op == "!=" {
                     let lhs_text = self.unit.text(l);
                     // Primitive when a literal, or a known primitive param/local.
@@ -154,6 +219,13 @@ impl<'a, 'u> Expr<'a, 'u> {
                             .var_types
                             .get(lhs_text.trim())
                             .is_some_and(|t| is_primitive_type(t));
+                    if referential {
+                        // Referential equality keeps Java identity regardless
+                        // of operand type.
+                        let rhs = self.transpile(r);
+                        let lhs = self.transpile(l);
+                        return format!("({} {} {})", lhs, java_op, rhs);
+                    }
                     if !is_primitive {
                         let rhs = self.transpile(r);
                         let lhs = self.transpile(l);
@@ -192,6 +264,33 @@ impl<'a, 'u> Expr<'a, 'u> {
                         "%" => "rem",
                         _ => "",
                     };
+                    // Kotlin stdlib collection algebra (`Map + Map`,
+                    // `Map - k`) has NO Java member and no sound
+                    // expression-position lowering: the result needs a
+                    // fresh collection + putAll/remove. Not a user operator
+                    // overload — taint instead of a broken call.
+                    // (List/Set plus hold their pre-existing approximations;
+                    // narrowing here keeps the retention claim tight.)
+                    if is_arith
+                        && matches!(op.as_str(), "+" | "-")
+                        && (ty.contains("Map<")
+                            || ty.contains("List<")
+                            || ty.contains("Set<")
+                            || ty.contains("Collection<")
+                            || ty.contains("Iterable<"))
+                    {
+                        self.unit.diag_untranslatable(
+                            node,
+                            format!(
+                                "collection `{}` on a `{}` operand: stdlib collection algebra has no Java expression form; declaration retained in Kotlin",
+                                op, ty
+                            ),
+                        );
+                        let _ = mname;
+                        // syntactically inert placeholder, mirroring the
+                        // scope-function taint return
+                        return "null".to_string();
+                    }
                     if !mname.is_empty() {
                         self.unit.diags.warn_approx(
                             node,
@@ -253,16 +352,105 @@ impl<'a, 'u> Expr<'a, 'u> {
     }
 }
 
-impl Expr<'_, '_> {
+impl<'a, 'u> Expr<'a, 'u> {
+    /// Detects the `callee < Type` binary shape produced when a generic call
+    /// with a trailing lambda is parsed; returns the phantom type-argument
+    /// text when shaped. Structural (no transpilation, no side effects).
+    fn is_generic_call_binary(&self, node: tree_sitter::Node) -> Option<String> {
+        let left = kt::field(node, "left")?;
+        let right = kt::field(node, "right")?;
+        let op = kt::field(node, "operator").map(|o| self.unit.text(o).trim().to_string())?;
+        if op != "<" {
+            return None;
+        }
+        let lhs_text = self.unit.text(left).trim();
+        let rhs_text = self.unit.text(right).trim();
+        let callee_shaped = lhs_text
+            .rsplit('.')
+            .next()
+            .map(|s| {
+                s.chars()
+                    .next()
+                    .map(|c| c.is_ascii_lowercase() || c == '_')
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let type_shaped = rhs_text
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_uppercase())
+            .unwrap_or(false)
+            && !rhs_text.contains('(')
+            && !lhs_text.contains('(')
+            && self.unit.var_types.get(rhs_text).is_none();
+        if callee_shaped && type_shaped {
+            Some(rhs_text.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Java type of an operand (for operator-overload detection): known
     /// locals via var_types; constructor calls via callee name; else None.
-    fn infer_operand_type(&self, node: tree_sitter::Node) -> Option<String> {
+    /// File-scoped property lookup used by call/nav receivers: an indexed
+    /// property named exactly `prop` in THIS unit's declaring file beats
+    /// cross-file name collisions, then falls back to getter-shape and
+    /// workspace-wide matches.
+    pub(crate) fn scope_property_type(&self, prop: &str) -> Option<String> {
+        let ws = self.unit.workspace?;
+        let declaring = self
+            .unit
+            .workspace_file
+            .as_deref()
+            .unwrap_or(self.unit.file);
+        let in_file = ws.property_type_in_file(declaring, prop);
+        let getter = ws.property_type_of_getter(prop);
+        in_file.or(getter)
+    }
+
+    pub(crate) fn infer_operand_type(&self, node: tree_sitter::Node) -> Option<String> {
         let t = self.unit.text(node).trim().to_string();
         if let Some(vt) = self.unit.var_types.get(&t) {
             if is_primitive_type(vt) || vt == "String" {
                 return None;
             }
             return Some(vt.clone());
+        }
+        // member access `x.getFoo()` / `getFoo()` / bare `foo`: the indexed
+        // property type of the getter's backing field
+        if let Some(ws) = self.unit.workspace {
+            let getter = t
+                .rsplit_once('.')
+                .map(|(_, last)| last.trim_end_matches("()").trim().to_string())
+                .unwrap_or_else(|| t.clone());
+            if getter
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+            {
+                if let Some(ty) = ws.property_type_of_getter(&getter) {
+                    if !is_primitive_type(&ty) && ty != "String" && ty != "Object" {
+                        return Some(ty);
+                    }
+                    return None;
+                }
+            }
+            // bare field name: property type straight from the index
+            if getter
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase())
+            {
+                if let Some(ty) = ws
+                    .bare_property_type(&getter)
+                    .or_else(|| ws.property_type_of_getter(&getter))
+                {
+                    if !is_primitive_type(&ty) && ty != "String" && ty != "Object" {
+                        return Some(ty);
+                    }
+                    return None;
+                }
+            }
         }
         // constructor call: `Pt(1, 2)` -> first word before '('
         let head = t.split('(').next().unwrap_or("").trim().to_string();

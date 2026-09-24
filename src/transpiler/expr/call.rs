@@ -23,6 +23,18 @@ impl<'a, 'u> Expr<'a, 'u> {
                     .find(|c| c.kind() == "annotated_lambda")
                     .and_then(|al| kt::child(*al, "lambda_literal"))
             });
+        let lambda_arg = lambda_arg.or_else(|| {
+            if self.unit.text(node).contains("anyMatch") {
+                let mut stack: Vec<tree_sitter::Node> = kids.iter().copied().collect();
+                while let Some(current) = stack.pop() {
+                    if current.kind() == "lambda_literal" {
+                        return Some(current);
+                    }
+                    stack.extend(current.children(&mut current.walk()));
+                }
+            }
+            None
+        });
 
         let mut args: Vec<String> = Vec::new();
         if let Some(an) = args_node {
@@ -44,7 +56,16 @@ impl<'a, 'u> Expr<'a, 'u> {
                     }
                     let expr = namedkids
                         .first()
-                        .map(|e| self.transpile(*e))
+                        .map(|e| {
+                            if e.kind() == "spread_expression" {
+                                e.children(&mut e.walk())
+                                    .find(|c| c.is_named())
+                                    .map(|inner| self.transpile(inner))
+                                    .unwrap_or_default()
+                            } else {
+                                self.transpile(*e)
+                            }
+                        })
                         .unwrap_or_default();
                     args.push(expr);
                 } else if arg.kind() == "named_argument" {
@@ -77,6 +98,121 @@ impl<'a, 'u> Expr<'a, 'u> {
             if self.unit.receiver_is_array(base) && matches!(member.as_str(), "size" | "length") {
                 // Kotlin `arr.size()`/`arr.size` -> Java `arr.length`.
                 return format!("{}.length", self.transpile(base));
+            }
+            // Map/collection operator members (Map.plus / Map.minus / error
+            // only path) emit broken Java when passed through verbatim.
+            // Conservative rule: member calls named plus/minus/times on a
+            // receiver whose type resolves to a Map taint the caller. A
+            // user-defined operator overload keeps its emission (it nests a
+            // real method) — detectability lives in the workspace.
+            if matches!(member.as_str(), "plus" | "minus" | "times") {
+                let recv_text = self.unit.text(base);
+                // Receiver type: local inference first, then the file-scoped
+                // property/getter lookup (bare `contexts`, `this.getContexts()`,
+                // etc.) — cross-file same-name properties must not win over
+                // the declaring file's own member.
+                let prop = recv_text
+                    .trim()
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches("()")
+                    .trim_start_matches("this.");
+                let recv_ty = self
+                    .infer_operand_type(base)
+                    .or_else(|| self.scope_property_type(prop))
+                    .or_else(|| {
+                        self.scope_property_type(
+                            recv_text
+                                .trim()
+                                .trim_start_matches("this.")
+                                .trim_end_matches("()"),
+                        )
+                    });
+                if recv_ty.is_some_and(|ty| {
+                    ty.contains("Map<")
+                        || ty.contains("List<")
+                        || ty.contains("Set<")
+                        || ty.contains("Collection<")
+                        || ty.contains("Iterable<")
+                }) {
+                    self.unit.diag_untranslatable(
+                        nav,
+                        format!(
+                            "Map `{member}` member call: collection algebra has no Java member form; declaration retained in Kotlin"
+                        ),
+                    );
+                    return "null".to_string();
+                }
+            }
+            if matches!(
+                member.as_str(),
+                "filterValues"
+                    | "mapKeys"
+                    | "associateBy"
+                    | "filterNotNull"
+                    | "filterIsInstance"
+                    | "minus"
+            ) {
+                let base_java = if base.kind() == "navigation_expression" {
+                    self.navigation_call(base)
+                } else {
+                    self.transpile(base)
+                };
+                if member == "filterNotNull" {
+                    self.unit.diags.warn_approx(
+                        nav,
+                        self.unit.file,
+                        "Iterable.filterNotNull lowered to stream().filter(Objects::nonNull).collect(toList())",
+                    );
+                    self.unit.pending_full_call = true;
+                    return format!(
+                        "{base_java}.stream().filter(Objects::nonNull).collect(java.util.stream.Collectors.toList())"
+                    );
+                }
+                if member == "filterIsInstance" {
+                    let ty = self.type_arg_of(node).map(|t| {
+                        t.trim_start_matches('<')
+                            .trim_end_matches('>')
+                            .trim()
+                            .to_string()
+                    });
+                    if let Some(ty) = ty {
+                        self.unit.diags.warn_approx(
+                            nav,
+                            self.unit.file,
+                            "Iterable.filterIsInstance<T> lowered to stream().filter(x -> x instanceof T).map(x -> (T) x).collect(toList())",
+                        );
+                        self.unit.pending_full_call = true;
+                        return format!(
+                            "{base_java}.stream().filter(x -> x instanceof {ty}).map(x -> ({ty}) x).collect(java.util.stream.Collectors.toList())"
+                        );
+                    }
+                }
+                if member == "minus" {
+                    let arg = node
+                        .children(&mut node.walk())
+                        .find(|c| c.kind() == "value_arguments")
+                        .and_then(|va| {
+                            let mut c = va.walk();
+                            va.children(&mut c)
+                                .find(|a| a.kind() == "value_argument")
+                                .and_then(|a| a.children(&mut a.walk()).find(|cc| cc.is_named()))
+                                .map(|e| self.transpile(e))
+                        });
+                    if let Some(arg) = arg {
+                        self.unit.diags.warn_approx(
+                            nav,
+                            self.unit.file,
+                            "Iterable.minus(elem) lowered to stream().filter(x -> !Objects.equals(x, elem)).collect(toList())",
+                        );
+                        self.unit.pending_full_call = true;
+                        return format!(
+                            "{base_java}.stream().filter(x -> !Objects.equals(x, {arg})).collect(java.util.stream.Collectors.toList())"
+                        );
+                    }
+                }
+                return self.map_entry_op(nav, &base_java, &member);
             }
             // Primitive-valued receivers (`.size()`, `.length`, `.count()`)
             // also can't take `.toString()` — same static wrapper path.
@@ -173,6 +309,14 @@ impl<'a, 'u> Expr<'a, 'u> {
                         };
                     }
                 }
+            }
+            if self.unit.lombok
+                && self.unit.commons_lang
+                && member == "toList"
+                && self.unit.receiver_is_array(base)
+            {
+                let receiver = self.transpile(base);
+                return format!("org.apache.commons.lang3.ArrayUtils.toList({receiver})");
             }
             if let Some(_recv_ty) = self.unit.extension_fns.get(member.as_str()) {
                 // `x.f(...)` for a same-file extension -> static `f(x, ...)`.
@@ -385,6 +529,9 @@ impl<'a, 'u> Expr<'a, 'u> {
                         | "any"
                         | "all"
                         | "none"
+                        | "anyMatch"
+                        | "allMatch"
+                        | "noneMatch"
                         | "count"
                         | "first"
                         | "firstOrNull"
@@ -543,6 +690,52 @@ impl<'a, 'u> Expr<'a, 'u> {
             let base_str = callee_java[..callee_java.len() - member.len()]
                 .trim_end_matches('.')
                 .to_string();
+            // Optional receiver (`opt.map { .. }`): Java Optional has its own
+            // map/flatMap/filter members — no stream/collect detour; keep the
+            // chain on the Optional so terminals like orElse/orElseGet that
+            // follow still apply.
+            if matches!(
+                member,
+                "map" | "mapNotNull" | "mapIndexed" | "filter" | "filterIndexed" | "flatMap"
+            ) && {
+                let recv_name = |s: &String| {
+                    s.rsplit('.')
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches("()")
+                        .trim_start_matches("this.")
+                        .to_string()
+                };
+                let mrti = |name: &str| -> Option<String> {
+                    let ws = self.unit.workspace?;
+                    let declaring = self
+                        .unit
+                        .workspace_file
+                        .as_deref()
+                        .unwrap_or(self.unit.file);
+                    ws.method_return_type_in_file(declaring, name)
+                };
+                // Receiver kind matters: `getX()` is a METHOD call — its
+                // declared return type wins; getter-name properties are only
+                // a fallback for field-style receivers. A cross-file property
+                // with the same name must not shadow the local method.
+                mrti(base_str.as_str())
+                    .or_else(|| self.scope_property_type(&recv_name(&base_str)))
+                    .or_else(|| {
+                        mrti(
+                            base_str
+                                .trim()
+                                .trim_start_matches("this.")
+                                .trim_end_matches("()")
+                                .rsplit('.')
+                                .next()
+                                .unwrap_or(""),
+                        )
+                    })
+                    .is_some_and(|t| t.contains("Optional<"))
+            } {
+                return format!("{}.{}({})", base_str, stream_fn, self.transpile(lambda));
+            }
             match member {
                 // fold(init) { acc, x -> ... } -> reduce(identity, op)
                 "fold" => {
@@ -629,6 +822,32 @@ impl<'a, 'u> Expr<'a, 'u> {
                 }
                 _ => {}
             }
+            // Chained stream continuation (`xs.stream().filter {..}.findFirst()`):
+            // the base already ends `.stream()` AND the lambda member is a
+            // stream-monadic op — the result must stay a Stream so terminal
+            // members appended by the compound chain still apply. Emitting a
+            // collect here (or double-streaming) breaks the outer chain.
+            let continuation = base_str.ends_with(".stream()")
+                && matches!(
+                    member,
+                    "map"
+                        | "mapNotNull"
+                        | "mapIndexed"
+                        | "filter"
+                        | "filterIndexed"
+                        | "sorted"
+                        | "flatMap"
+                        | "distinct"
+                );
+            if continuation {
+                let inner = &base_str[..base_str.len() - ".stream()".len()];
+                return format!(
+                    "{}.stream().{}({})",
+                    inner,
+                    stream_fn,
+                    self.transpile(lambda)
+                );
+            }
             return if let Some(sep) = self.unit.pending_join_to_string.take() {
                 format!(
                     "{}.{}({}).collect(java.util.stream.Collectors.joining({}))",
@@ -712,8 +931,131 @@ impl<'a, 'u> Expr<'a, 'u> {
                 // Kotlin array literal factories -> Java array literals:
                 // `intArrayOf(1, 2)` -> `new int[]{1, 2}`, `arrayOf(...)` ->
                 // `new Object[]{...}` (reuses the inference table).
-                let elem = primitive_array_factory(k).unwrap().trim_end_matches("[]");
-                format!("new {}[]{{{}}}", elem, args.join(", "))
+                // A lone spread arg (`arrayOf(*arr)`) is an array copy:
+                // `java.util.Arrays.copyOf(arr, arr.length)` — the literal
+                // spread `{*arr}` text is invalid Java.
+                let elem_ty = primitive_array_factory(k).unwrap();
+                let spread_arg = {
+                    // a spread arg was lowered to the bare array text by
+                    // transpile()'s spread arm — spot it via the raw subtree
+                    let mut found = false;
+                    let mut cursor = node.walk();
+                    if let Some(va) = kt::child(node, "value_arguments") {
+                        let mut vcur = va.walk();
+                        for argn in va.children(&mut vcur) {
+                            if argn.kind() == "value_argument"
+                                && argn
+                                    .children(&mut argn.walk())
+                                    .any(|c| c.kind() == "spread_expression")
+                            {
+                                found = true;
+                            }
+                        }
+                    }
+                    found
+                };
+                if spread_arg {
+                    // A Java array literal cannot spread (`{*a}` is invalid);
+                    // the array of the spread parts plus trailing elements is
+                    // rebuilt as a concat of flattened element streams. Order
+                    // and contents are preserved; shape degrades to Object[]
+                    // for `arrayOf` (and is rejected honestly for primitives
+                    // via javac on the target).
+                    let mut parts: Vec<String> = Vec::new();
+                    let mut cursor = node.walk();
+                    if let Some(va) = kt::child(node, "value_arguments") {
+                        let mut vcur = va.walk();
+                        for argn in va.children(&mut vcur) {
+                            if argn.kind() != "value_argument" {
+                                continue;
+                            }
+                            let mut acur = argn.walk();
+                            let ex = match argn.children(&mut acur).find(|c| c.is_named()) {
+                                Some(e) => e,
+                                None => continue,
+                            };
+                            if ex.kind() == "spread_expression" {
+                                let mut scur = ex.walk();
+                                let arr = ex
+                                    .children(&mut scur)
+                                    .find(|c| c.is_named())
+                                    .map(|c| self.transpile(c))
+                                    .unwrap_or_else(|| "null".to_string());
+                                parts.push(format!("java.util.stream.Stream.of({})", arr));
+                            } else {
+                                let v = self.transpile(ex);
+                                parts.push(format!("java.util.stream.Stream.of({})", v));
+                            }
+                        }
+                    }
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "spread in array factory lowered to a flattened element stream; produces Object[] (primitive element trays need hand migration)",
+                    );
+                    // Compose flatMap for multi-part spreads:
+                    let merged = if parts.len() == 1 {
+                        let h = parts[0]
+                            .strip_prefix("java.util.stream.Stream.of(")
+                            .unwrap_or(&parts[0])
+                            .trim_end_matches(')');
+                        format!("java.util.stream.Stream.of({}).toArray()", h)
+                    } else {
+                        // Java streams can't concat an element stream with a
+                        // bare scalar: wrap each non-spread part in a
+                        // one-element Object[] so concat stays homogeneous.
+                        // A spread part keeps its own object stream.
+                        let strip = |s: &str| {
+                            s.strip_prefix("java.util.stream.Stream.of(")
+                                .unwrap_or(s)
+                                .trim_end_matches(')')
+                                .to_string()
+                        };
+                        let spread_flags = {
+                            let mut flags: Vec<bool> = Vec::new();
+                            let mut cursor = node.walk();
+                            if let Some(va) = kt::child(node, "value_arguments") {
+                                let mut vcur = va.walk();
+                                for argn in va.children(&mut vcur) {
+                                    if argn.kind() != "value_argument" {
+                                        continue;
+                                    }
+                                    let mut acur = argn.walk();
+                                    let is_spread = argn
+                                        .children(&mut acur)
+                                        .any(|c| c.kind() == "spread_expression");
+                                    flags.push(is_spread);
+                                }
+                            }
+                            flags
+                        };
+                        let mut chain: String = if spread_flags.first() == Some(&true) {
+                            parts[0].clone()
+                        } else {
+                            format!(
+                                "java.util.stream.Stream.of(new Object[]{{{}}})",
+                                strip(&parts[0])
+                            )
+                        };
+                        for (i, p) in parts[1..].iter().enumerate() {
+                            let tail = if spread_flags.get(i + 1) == Some(&true) {
+                                p.clone()
+                            } else {
+                                format!("java.util.stream.Stream.of(new Object[]{{{}}})", strip(p))
+                            };
+                            chain = format!("java.util.stream.Stream.concat({}, {})", chain, tail);
+                        }
+                        format!("{}.toArray()", chain)
+                    };
+                    merged
+                } else {
+                    // `arrayOf(a, b)` style literal: elem_ty ends in `[]`
+                    format!(
+                        "new {}[]{{{}}}",
+                        elem_ty.trim_end_matches("[]"),
+                        args.join(", ")
+                    )
+                }
             }
             _ => {
                 // Uppercase callee = constructor call — bare `Foo` or nested
@@ -736,14 +1078,39 @@ impl<'a, 'u> Expr<'a, 'u> {
                         .next()
                         .is_some_and(|c| c.is_ascii_uppercase())
                 {
+                    // Sealed/abstract Kotlin classes route construction
+                    // through their companion `operator fun invoke(...)`:
+                    // `Surname(...)` is a factory call
+                    // (`Owner.invoke(...)`), NOT a constructor — Java
+                    // `new Surname(...)` does not compile.
+                    if let Some(ws) = self.unit.workspace {
+                        let base_name = callee_java.rsplit('.').next().unwrap_or("").to_string();
+                        if ws.find_static_member(&base_name, "invoke").is_some() {
+                            self.unit.diags.warn_approx(
+                                node,
+                                self.unit.file,
+                                format!(
+                                    "companion `operator fun invoke` on `{base_name}`: factory call routed via `.{base_name}.invoke(...)` (not a constructor)"
+                                ),
+                            );
+                            return format!("{}.invoke({})", callee_java, args.join(", "));
+                        }
+                    }
                     format!("new {}({})", callee_java, args.join(", "))
-                } else if callee_java.ends_with(')') && (args.is_empty() || nav_assembled) {
+                } else if callee_java.ends_with(')')
+                    && (args.is_empty() || (nav_assembled && lambda_arg.is_some()))
+                {
                     // Mapped member that is already a complete call expression
                     // (`xs.get(0)`, `xs.stream().findFirst().orElse(null)`):
                     // it IS the call — no `()` wrapper to add. A trailing
                     // lambda argument still appends (fold(idx) { ... }).
                     if let Some(la) = lambda_arg {
-                        if let Some(assembled) = nav_text {
+                        if callee_java.ends_with(".anyMatch")
+                            || callee_java.ends_with(".allMatch")
+                            || callee_java.ends_with(".noneMatch")
+                        {
+                            format!("{}({})", callee_java, args.join(", "))
+                        } else if let Some(assembled) = nav_text {
                             // navigation_call already merged the lambda and
                             // assembled `stream().reduce(identity, op)`.
                             let _ = la;
@@ -782,6 +1149,29 @@ impl<'a, 'u> Expr<'a, 'u> {
         }
     }
 
+    /// Callee translation when the type-argument brackets were swallowed into
+    /// a binary_expression (`spec<String> { ... }`): translate the callee,
+    /// drop the phantom `<Type>` text, and emit a warn explaining the
+    /// type-argument loss (Java re-inferable in the common `fun <T>` case).
+    pub(crate) fn transpile_callee_generic(
+        &mut self,
+        callee: tree_sitter::Node,
+        type_arg: Option<&str>,
+    ) -> String {
+        let base = self.transpile_callee(callee);
+        if let Some(ty) = type_arg {
+            self.unit.diags.warn_approx(
+                callee,
+                self.unit.file,
+                format!(
+                    "generic call `{}` with type argument `<{}>` merged from lambda-bracket ambiguity; type argument dropped (Java inference must re-derive it)",
+                    base, ty
+                ),
+            );
+        }
+        base
+    }
+
     fn type_arg_of(&self, call: tree_sitter::Node) -> Option<String> {
         kt::child(call, "type_arguments").map(|t| self.unit.text(t).to_string())
     }
@@ -794,6 +1184,8 @@ impl<'a, 'u> Expr<'a, 'u> {
         let kids: Vec<_> = node.children(&mut cursor).collect();
         // params
         let mut params_java = String::new();
+        // lambda params registered as locals for the body; popped after
+        let mut inserted: Vec<String> = Vec::new();
         let mut body_nodes: Vec<tree_sitter::Node> = Vec::new();
         let mut after_arrow = !kids.iter().any(|c| c.kind() == "->");
         for c in kids {
@@ -807,6 +1199,18 @@ impl<'a, 'u> Expr<'a, 'u> {
                         .map(|n| self.unit.text(n).to_string())
                         .collect();
                     params_java = names.join(", ");
+                    // Lambda params are LOCALS: register them before the body
+                    // transpiles, otherwise the body's bare identifier falls
+                    // through to workspace property resolution and gets
+                    // rewritten to a spurious `this.getX()`.
+                    for n in &names {
+                        if !self.unit.var_types.contains_key(n) {
+                            self.unit
+                                .var_types
+                                .insert(n.to_string(), "__lambda_param".to_string());
+                            inserted.push(n.to_string());
+                        }
+                    }
                 }
                 "->" => after_arrow = true,
                 k if after_arrow && c.is_named() && k != "{" && k != "}" => {
@@ -823,6 +1227,9 @@ impl<'a, 'u> Expr<'a, 'u> {
                 body_java.push_str("; ");
             }
             body_java.push_str(&self.transpile(*bn));
+        }
+        for n in &inserted {
+            self.unit.var_types.remove(n);
         }
         if body_java.is_empty() {
             body_java = "{}".to_string();

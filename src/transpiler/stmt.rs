@@ -310,8 +310,28 @@ impl<'a, 'u> Stmt<'a, 'u> {
         if exprs.is_empty() {
             out.line("return;");
         } else {
-            let java = e.transpile(exprs[0]);
-            out.line(format!("return {};", fix_join_tail(&java)));
+            let mut java = e.transpile(exprs[0]);
+            if self.unit.current_function_name.as_deref() == Some("toString")
+                && !java.ends_with(".toString()")
+                && !java.starts_with('"')
+            {
+                java.push_str(".toString()");
+            }
+            let java = fix_join_tail(&java);
+            if java.contains(".getConstructor(") {
+                // Reflective instantiation throws checked exceptions in
+                // Java but is unchecked in Kotlin: wrap the reflective
+                // return in try/catch rethrowing RuntimeException so the
+                // method's exported signature (fixed by pre-existing Java
+                // callers) stays untouched.
+                out.open("try");
+                out.line(format!("return {};", java));
+                out.close_then("catch (Exception e)");
+                out.line("throw new RuntimeException(e);");
+                out.close();
+            } else {
+                out.line(format!("return {};", java));
+            }
         }
     }
 
