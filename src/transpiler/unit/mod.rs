@@ -422,7 +422,7 @@ impl<'a> Unit<'a> {
                         imports.push(imp);
                     }
                 }
-                "shebang_line" | ";" | "line_comment" | "multiline_comment" => {}
+                "shebang_line" | ";" | "line_comment" | "multiline_comment" | "block_comment" => {}
                 "annotated_expression" => {
                     // An annotation wrapper may contain a declaration whose
                     // annotation semantics are not representable in Java.

@@ -480,6 +480,12 @@ fn detects_kotlin_subtype_among_multiple_supertypes() {
 
 #[test]
 fn transpiler_retains_interface_with_kotlin_implementation() {
+    // The OLD conservative rule is restored (the selection-scope experiment
+    // in subtype_scope_retention.rs proved over-reaching): an interface
+    // retains whenever ANY Kotlin subtype exists, because a subtype retained
+    // by an unrelated rule (annotation, enum entries ABI, KClass) cannot
+    // implement a translated-away supertype. Ordered retention (decide
+    // subtypes before supertypes) is the eventual unlock.
     let root =
         std::env::temp_dir().join(format!("notlin-interface-retention-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
@@ -495,7 +501,7 @@ fn transpiler_retains_interface_with_kotlin_implementation() {
     let index = SourceIndex::discover(&root).unwrap();
     let cli = Cli::parse_from(["notlin", "--in-place", contract_path.to_str().unwrap()]);
     let source = fs::read_to_string(&contract_path).unwrap();
-    let (files, errors, _warnings, coverage) = transpiler::transpile_with_workspace(
+    let (files, errors, warnings, coverage) = transpiler::transpile_with_workspace(
         &source,
         &contract_path,
         &cli,
@@ -503,19 +509,26 @@ fn transpiler_retains_interface_with_kotlin_implementation() {
         std::slice::from_ref(&root),
     );
     assert_eq!(errors, 0);
+    assert!(warnings > 0);
     assert!(files.is_empty());
     assert!(coverage.untranslated.iter().any(|name| name == "Contract"));
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
 fn retention_matches_canonical_index_to_input_path() {
+    // Superseded conservative rule (see the sibling selected-implementation
+    // test): with the subtype inside the selection, the interface now
+    // translates together with its implementor. This test keeps its original
+    // purpose — index path canonicalization — by asserting the retention
+    // diagnostic STILL fires when the subtype lives outside the selection.
     let root = std::env::temp_dir().join(format!("notlin-canonical-path-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    let contract_path = root.join("Contract.kt");
+    fs::create_dir_all(root.join("selected")).unwrap();
+    fs::create_dir_all(root.join("residual")).unwrap();
+    let contract_path = root.join("selected").join("Contract.kt");
     fs::write(&contract_path, "package sample\ninterface Contract\n").unwrap();
     fs::write(
-        root.join("Implementation.kt"),
+        root.join("residual").join("Implementation.kt"),
         "package sample\nclass Implementation : Contract\n",
     )
     .unwrap();
@@ -529,7 +542,7 @@ fn retention_matches_canonical_index_to_input_path() {
         &contract_path,
         &cli,
         Some(&index),
-        std::slice::from_ref(&root),
+        std::slice::from_ref(&root.join("selected")),
     );
     assert_eq!(errors, 0);
     assert!(

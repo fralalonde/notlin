@@ -183,6 +183,12 @@ impl<'a> Unit<'a> {
             return false;
         };
         workspace.has_unselected_kotlin_subtype(target, self.translation_roots)
+            // An interface with ANY Kotlin subtype retains: a subtype may
+            // itself be retained by an unrelated rule (annotation, enum
+            // entries ABI, KClass...), and a retained Kotlin implementor
+            // cannot implement a translated-away supertype (Kotlin enum
+            // entries / fake overrides have no Java twin). Ordered retention
+            // (decide subtypes before supertypes) is the eventual fix.
             || (target.kind == crate::workspace::DeclarationKind::Interface
                 && workspace.has_kotlin_subtype(target))
             || (target.has_default_constructor_parameter
