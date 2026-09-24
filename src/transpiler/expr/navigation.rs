@@ -71,7 +71,98 @@ impl<'a, 'u> Expr<'a, 'u> {
         let kids: Vec<_> = node.children(&mut cursor).collect();
         // base . member (possibly ?. or ::)
         let base = kids.iter().find(|c| c.is_named()).copied();
+        // A supertype member access through `super` (`super.<member>`,
+        // optionally qualified `SuperT.super.<member>`) must resolve against
+        // the SUPERTYPE'S Java API. The qualifying supertype comes from the
+        // AST (`SuperT.super`) or, for a plain `super.<member>`, from the
+        // enclosing declaration's supertype list via the workspace index.
+        // A TRANSLATED supertype exposes a Lombok/inline default getter, so
+        // the interface-legal qualified form `SupName.super.getMember()` is
+        // required (plain `super.getMember()` does not compile in an
+        // interface default method). A RETAINED-Kotlin supertype has no
+        // JVM-visible Java method at all — the caller is tainted instead of
+        // emitting broken Java.
+        let mut super_owner = self.unit.pending_super_owner.take();
+        if let Some(b) = base
+            && b.kind() == "super_expression"
+            && super_owner.is_none()
+        {
+            // Plain `super.<member>`: the qualifying supertype is the first
+            // supertype of the enclosing declaration, resolved via the
+            // workspace index (the index stores each declaration's own
+            // supertype list). `current_decl` IS the enclosing declaration
+            // for top-level types; nested declarations walk up to their
+            // owning class.
+            super_owner = self.unit.current_decl.and_then(|d| {
+                let class_name = {
+                    let mut node = Some(d);
+                    let mut found = None;
+                    while let Some(n) = node {
+                        if n.kind() == "class_declaration" {
+                            found = kt::field(n, "name").map(|nm| self.unit.text(nm).to_string());
+                            break;
+                        }
+                        node = kt::parent_of(n);
+                    }
+                    found
+                };
+                class_name.and_then(|cn| {
+                    self.unit.workspace.and_then(|ws| {
+                        ws.declarations().find(|dc| dc.name == cn).and_then(|dc| {
+                            dc.supertypes
+                                .first()
+                                .map(|s| s.split('<').next().unwrap_or(s).trim().to_string())
+                        })
+                    })
+                })
+            });
+        }
+        if let Some(b) = base
+            && b.kind() == "super_expression"
+            && let Some(owner) = super_owner.clone()
+        {
+            // A supertype in the SAME FILE translates together with the
+            // caller (one unit), so its Java default getter exists even
+            // though the index still records its source as Kotlin. An
+            // index-qualifying Java declaration or a genuinely translated
+            // Kotlin declaration both count; a supertype that stays Kotlin
+            // (retained elsewhere / unselected file) does not.
+            let ws = self.unit.workspace;
+            let same_file = ws.and_then(|w| {
+                let declaring = self
+                    .unit
+                    .workspace_file
+                    .as_deref()
+                    .unwrap_or(self.unit.file);
+                w.source_file(declaring)
+            });
+            let same_file_hit = same_file.is_some_and(|f| {
+                f.declarations.iter().any(|d| {
+                    d.name == owner && d.language == crate::workspace::SourceLanguage::Kotlin
+                })
+            });
+            let translated = same_file_hit
+                || ws.is_some_and(|w| {
+                    w.declarations().any(|d| {
+                        d.name == owner && d.language == crate::workspace::SourceLanguage::Java
+                    })
+                });
+            if !translated {
+                self.unit.diag_untranslatable(
+                    node,
+                    format!(
+                        "`super.<member>` targets `{owner}`, which remains Kotlin; its JVM accessor is not Java-visible and the caller must stay Kotlin"
+                    ),
+                );
+                return "null".to_string();
+            }
+        }
         let mut result = base.map(|b| self.transpile(b)).unwrap_or_default();
+        if let Some(owner) = super_owner {
+            if !result.starts_with(&owner) {
+                result = format!("{owner}.{result}");
+            }
+        }
         for w in kids.windows(3) {
             if w[1].kind() == "." || w[1].kind() == "?." {
                 if w[1].kind() == "?." {

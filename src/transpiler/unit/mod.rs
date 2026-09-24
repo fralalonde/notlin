@@ -102,6 +102,12 @@ pub struct Unit<'a> {
     /// stream arm should collect with joining(sep) (not toList()) and the
     /// member's joinToString tail is stripped.
     pub(crate) pending_join_to_string: Option<String>,
+    /// Set by the super_expression arm when a qualified supertype member
+    /// access (`super.<member>`) follows and the qualifying supertype
+    /// (`SupName`) translated to Java: the navigation layer must emit the
+    /// qualified accessor form `SupName.super.getMember()`. Consumed (and
+    /// cleared) by the next navigation member step.
+    pub(crate) pending_super_owner: Option<String>,
     /// data class name -> record component list `(type, name)` in declaration
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
@@ -159,6 +165,7 @@ impl<'a> Unit<'a> {
             fn_rets: std::collections::HashMap::new(),
             pending_nav_text: None,
             pending_join_to_string: None,
+            pending_super_owner: None,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
             enum_types: std::collections::HashSet::new(),
@@ -472,15 +479,14 @@ impl<'a> Unit<'a> {
                         self.end_decl();
                         continue;
                     }
-                    // Kotlin enum with a pre-existing Java consumer of the
-                    // Kotlin `entries` ABI (`E.getEntries()`): a plain Java
-                    // enum drops that static and breaks the caller — retain.
+                    // Preserve the existing conservative blocker for residual
+                    // Kotlin references beyond `E.entries`. Entries-only Java
+                    // or Kotlin consumers are handled by the emitted bridge.
                     let is_enum = kt::child(*decl, "enum_class_body").is_some();
                     if is_enum
-                        && self.workspace.is_some_and(|ws| {
-                            ws.has_java_get_entries_consumer(&type_name)
-                                || ws.has_external_kotlin_reference_by_name(&type_name)
-                        })
+                        && self
+                            .workspace
+                            .is_some_and(|ws| ws.has_external_kotlin_reference_by_name(&type_name))
                     {
                         self.diag_untranslatable(
                             *decl,

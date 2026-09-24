@@ -78,10 +78,7 @@ impl<'a, 'u> Expr<'a, 'u> {
             // `super<T>` qualifier: Java drops the explicit supertype — an
             // interface super-access is just `T.super.member` (a Kotlin class
             // super-access is the plain-`super` form, which falls through).
-            "super_expression" => match kt::child(node, "user_type") {
-                Some(ty) => format!("{}.super", kt::java_type(ty, self.unit.source).trim()),
-                None => "super".to_string(),
-            },
+            "super_expression" => self.transpile_super_qualifier(node),
             "navigation_expression" => self.navigation(node),
             "call_expression" => self.call(node),
             "infix_expression" => self.infix_expr(node),
@@ -443,6 +440,24 @@ impl<'a, 'u> Expr<'a, 'u> {
             "null".to_string()
         } else {
             out
+        }
+    }
+
+    /// A `super_expression` (`super`, or a qualified `SuperType.super`):
+    /// the qualifying supertype matters for member access policy
+    /// (`super.<member>` must become `SupName.super.member` in Java). The
+    /// AST qualifier is authoritative when present; otherwise the
+    /// enclosing declaration's supertype list supplies it via the index
+    /// (`navigation()` resolves and taints). Pure text here: any
+    /// workspace-policy decision happens in `navigation()`.
+    fn transpile_super_qualifier(&mut self, node: tree_sitter::Node) -> String {
+        match kt::child(node, "user_type") {
+            Some(ty) => {
+                let name = kt::java_type(ty, self.unit.source).trim().to_string();
+                self.unit.pending_super_owner = Some(name.clone());
+                name
+            }
+            None => "super".to_string(),
         }
     }
 

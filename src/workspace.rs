@@ -7,7 +7,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -64,6 +64,7 @@ pub struct SourceFile {
     pub imports: Vec<String>,
     pub declarations: Vec<Declaration>,
     identifier_counts: HashMap<String, usize>,
+    enum_entries_qualifiers: HashMap<String, usize>,
     smart_cast_properties: HashSet<String>,
 }
 
@@ -245,13 +246,25 @@ impl SourceIndex {
     /// the Kotlin enum `entries` ABI. Translating the owning enum to a plain
     /// Java enum would drop that static and break the Java caller.
     pub fn has_java_get_entries_consumer(&self, owner: &str) -> bool {
-        let member = "getEntries";
         self.java_files().any(|file| {
-            file.identifier_counts.contains_key(member)
-                && (file.identifier_counts.contains_key(owner)
-                    || std::env::var("NOTLIN_DIAG_BROAD_ABI").is_ok_and(|v| v == "1")
-                        && file.imports.iter().any(|imp| imp.ends_with(".*")))
+            file.enum_entries_qualifiers.contains_key(owner)
+                || std::env::var("NOTLIN_DIAG_BROAD_ABI").is_ok_and(|v| v == "1")
+                    && file.identifier_counts.contains_key("getEntries")
+                    && file.imports.iter().any(|imp| imp.ends_with(".*"))
         })
+    }
+
+    /// A residual Kotlin source reads `<Owner>.entries`. The enum's own file
+    /// is excluded because same-unit references lower together with it.
+    pub fn has_kotlin_enum_entries_consumer(&self, owner: &str) -> bool {
+        self.kotlin_files().any(|file| {
+            !file.declarations.iter().any(|decl| decl.name == owner)
+                && file.enum_entries_qualifiers.contains_key(owner)
+        })
+    }
+
+    pub fn has_enum_entries_consumer(&self, owner: &str) -> bool {
+        self.has_java_get_entries_consumer(owner) || self.has_kotlin_enum_entries_consumer(owner)
     }
 
     /// The recorded type of a property named exactly `prop` (lower-case
@@ -453,12 +466,15 @@ impl SourceIndex {
     /// declaring file.
     pub fn has_external_kotlin_reference_by_name(&self, name: &str) -> bool {
         self.kotlin_files().any(|file| {
-            let self_file = file
-                .path
-                .file_stem()
-                .map(|s| s.to_string_lossy() == name)
-                .unwrap_or(false);
-            !self_file && file.identifier_counts.contains_key(name)
+            let self_file = file.declarations.iter().any(|decl| decl.name == name)
+                || file
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy() == name)
+                    .unwrap_or(false);
+            let references = file.identifier_counts.get(name).copied().unwrap_or(0);
+            let entries_only = file.enum_entries_qualifiers.get(name).copied().unwrap_or(0);
+            !self_file && references > entries_only
         })
     }
 
@@ -1087,7 +1103,7 @@ fn scan_source(
         .map_err(|error| format!("{}: {error}", canonical_path.display()))?;
     let package = package_name(&source);
     let imports = import_names(&source);
-    let (declarations, identifier_counts, smart_cast_properties) =
+    let (declarations, identifier_counts, enum_entries_qualifiers, smart_cast_properties) =
         parse_declarations(&source, language, package.as_deref())?;
     stats.parsed_files += 1;
     Ok(CachedSource {
@@ -1101,6 +1117,7 @@ fn scan_source(
             imports,
             declarations,
             identifier_counts,
+            enum_entries_qualifiers,
             smart_cast_properties,
         },
     })
@@ -1133,7 +1150,15 @@ fn parse_declarations(
     source: &str,
     language: SourceLanguage,
     package: Option<&str>,
-) -> Result<(Vec<Declaration>, HashMap<String, usize>, HashSet<String>), String> {
+) -> Result<
+    (
+        Vec<Declaration>,
+        HashMap<String, usize>,
+        HashMap<String, usize>,
+        HashSet<String>,
+    ),
+    String,
+> {
     let mut parser = tree_sitter::Parser::new();
     let grammar = match language {
         SourceLanguage::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
@@ -1164,11 +1189,65 @@ fn parse_declarations(
     }
     let mut identifier_counts = HashMap::new();
     collect_identifier_counts(tree.root_node(), source, &mut identifier_counts);
+    let mut enum_entries_qualifiers = HashMap::new();
+    collect_enum_entries_qualifiers(
+        tree.root_node(),
+        source,
+        language,
+        &mut enum_entries_qualifiers,
+    );
     let mut smart_cast_properties = HashSet::new();
     if language == SourceLanguage::Kotlin {
         collect_smart_cast_properties(tree.root_node(), source, &mut smart_cast_properties);
     }
-    Ok((declarations, identifier_counts, smart_cast_properties))
+    Ok((
+        declarations,
+        identifier_counts,
+        enum_entries_qualifiers,
+        smart_cast_properties,
+    ))
+}
+
+fn collect_enum_entries_qualifiers(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    language: SourceLanguage,
+    qualifiers: &mut HashMap<String, usize>,
+) {
+    let owner = match language {
+        SourceLanguage::Kotlin if node.kind() == "navigation_expression" => {
+            let identifiers: Vec<_> = node
+                .named_children(&mut node.walk())
+                .filter(|child| child.kind() == "identifier")
+                .collect();
+            if identifiers.len() == 2
+                && identifiers[1].utf8_text(source.as_bytes()).ok() == Some("entries")
+            {
+                identifiers[0].utf8_text(source.as_bytes()).ok()
+            } else {
+                None
+            }
+        }
+        SourceLanguage::Java if node.kind() == "method_invocation" => {
+            let object = node.child_by_field_name("object");
+            let name = node.child_by_field_name("name");
+            if object.is_some_and(|object| object.kind() == "identifier")
+                && name.and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                    == Some("getEntries")
+            {
+                object.and_then(|object| object.utf8_text(source.as_bytes()).ok())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(owner) = owner {
+        *qualifiers.entry(owner.to_string()).or_default() += 1;
+    }
+    for child in node.named_children(&mut node.walk()) {
+        collect_enum_entries_qualifiers(child, source, language, qualifiers);
+    }
 }
 
 fn collect_smart_cast_properties(

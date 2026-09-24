@@ -349,6 +349,30 @@ impl<'a, 'u> Expr<'a, 'u> {
         if callee_java == "print" {
             return format!("System.out.print({})", args.join(", "));
         }
+        // Kotlin stdlib `TODO(msg)` has type `Nothing` and always throws
+        // (NotImplementedError); Java has no such class. Lower to a THROW
+        // expression so statement emitters render it as `throw ...;`
+        // instead of `return new TODO(...);` (which references a class
+        // that does not exist). Under --commons-lang the throw carries
+        // org.apache.commons.lang3.NotImplementedException.
+        if callee_java == "TODO" {
+            self.unit.diags.warn_approx(
+                node,
+                self.unit.file,
+                "Kotlin `TODO(msg)` lowered to a NotImplemented-style throw (it is Nothing-typed, never returns)",
+            );
+            let msg = args.first().cloned().unwrap_or_default();
+            let exception = if self.unit.commons_lang {
+                "org.apache.commons.lang3.NotImplementedException".to_string()
+            } else {
+                "RuntimeException".to_string()
+            };
+            return if msg.is_empty() {
+                format!("throw new {exception}()")
+            } else {
+                format!("throw new {exception}({msg})")
+            };
+        }
 
         // `Receiver.copy(x = 1, z = 2)` on a data-class/record receiver:
         // Java records have no copy() — rebuild: `new Receiver(k, v, …)`

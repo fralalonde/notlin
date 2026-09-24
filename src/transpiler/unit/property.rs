@@ -26,6 +26,10 @@ impl<'a> Unit<'a> {
         // Fresh scope per property: getter/setter bodies must not see locals
         // declared while a previous property was translated.
         self.var_types.clear();
+        // A stale super-access owner would leak into an unrelated property's
+        // getter body; the pending flag is only valid for the immediately
+        // following navigation inside ONE expression.
+        self.pending_super_owner = None;
         let is_val = kt::child(decl, "val").is_some();
         let vd = kt::child(decl, "variable_declaration");
         let name = vd
@@ -257,7 +261,14 @@ impl<'a> Unit<'a> {
                         } else if c.is_named() && c.kind() != "=" {
                             let mut e = Expr { unit: self };
                             let java = e.transpile(c);
-                            out.line(format!("return {};", java));
+                            // A Nothing-typed body (e.g. `TODO(...)`) lowers
+                            // to `throw ...` — that is a statement, not a
+                            // value; `return throw ...;` would not compile.
+                            if java.trim_start().starts_with("throw ") {
+                                out.line(format!("{};", java));
+                            } else {
+                                out.line(format!("return {};", java));
+                            }
                         }
                     }
                 }

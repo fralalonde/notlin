@@ -1199,11 +1199,23 @@ impl<'a> Unit<'a> {
             }
         }
 
+        let emit_entries_bridge = self
+            .workspace
+            .is_some_and(|workspace| workspace.has_enum_entries_consumer(name));
         out.open(format!("{}enum {}{}", visibility, name, implements));
         // constants
         out.line(entries.join(",\n"));
-        if !members.is_empty() || !params.is_empty() {
+        if !members.is_empty() || !params.is_empty() || emit_entries_bridge {
             out.line(";");
+        }
+        if emit_entries_bridge {
+            out.blank();
+            out.open(format!(
+                "public static kotlin.enums.EnumEntries<{}> getEntries()",
+                name
+            ));
+            out.line("return kotlin.enums.EnumEntriesKt.enumEntries(values());");
+            out.close();
         }
         // ctor params -> fields + accessors + private ctor
         if !params.is_empty() {

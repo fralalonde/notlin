@@ -42,6 +42,14 @@ impl<'a, 'u> Stmt<'a, 'u> {
                 // Fall back to expression statement
                 let mut e = Expr { unit: self.unit };
                 let java = e.transpile(stmt);
+                // A Nothing-typed expression statement (`TODO(...)`) lowers
+                // to `throw ...` — emit the statement directly; it already
+                // carries its own effect.
+                if java.trim_start().starts_with("throw ") {
+                    let jt = java.trim_end().trim_end_matches(';');
+                    out.line(format!("{};", jt));
+                    return;
+                }
                 // Statement-level elvis with void arms: `x?.let{...} ?: y`
                 // transpiles to a (null-check ? void : void) ternary which
                 // javac rejects as a statement — lift to a real if/else.
@@ -318,6 +326,12 @@ impl<'a, 'u> Stmt<'a, 'u> {
                 java.push_str(".toString()");
             }
             let java = fix_join_tail(&java);
+            // A Nothing-typed return expression (e.g. `TODO(...)`) lowers to
+            // `throw ...` — a statement, not a value. Emit it bare.
+            if java.trim_start().starts_with("throw ") {
+                out.line(format!("{};", java));
+                return;
+            }
             if java.contains(".getConstructor(") {
                 // Reflective instantiation throws checked exceptions in
                 // Java but is unchecked in Kotlin: wrap the reflective
