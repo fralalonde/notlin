@@ -54,6 +54,11 @@ pub struct Declaration {
     pub supertypes: Vec<String>,
     pub members: Vec<Member>,
     pub has_default_constructor_parameter: bool,
+    /// Type-parameter names in declaration order (`ICreateObjectCommand` ->
+    /// `["T", "I"]`). Needed to distinguish a generic supertype member typed
+    /// by its own parameter (`payload: T`) — Java-erasure compatible with
+    /// any implementing type — from a genuinely different concrete type.
+    pub type_params: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +296,9 @@ impl SourceIndex {
         else {
             return false;
         };
+        // The own declaration's file resolves type names written in the
+        // implementing class (imports/same-package rules apply there).
+        let own_file = self.declaration_source_file(own).unwrap();
         let mut pending: Vec<&String> = supertypes.iter().collect();
         let mut visited: Vec<String> = supertypes
             .iter()
@@ -345,13 +353,26 @@ impl SourceIndex {
                     .find(|om| om.name == m.name && om.kind == m.kind)
                     && own_m.type_name.as_deref() != Some(sup_ty.as_str())
                 {
+                    // A supertype member typed by one of the SUPERTYPE's own
+                    // type parameters (`interface IObjectCommand<T, I> {
+                    // val payload: T }`) erases in Java to the parameter's
+                    // bound — ANY implementing type satisfies it, so a text
+                    // mismatch against the concrete class member is a false
+                    // positive, not a fake-override ABI conflict.
+                    if sup_decl.type_params.contains(&sup_ty)
+                        || is_java_compatible_narrow(
+                            self,
+                            own_file,
+                            &sup_ty,
+                            own_m.type_name.as_deref().unwrap_or(""),
+                        )
+                    {
+                        continue;
+                    }
                     // Type strings are index-qualified names; conflicting
                     // here means Kotlin fake-override semantics are being
                     // relied on — unsupported in plain Java.
-                    if !is_java_compatible_narrow(&sup_ty, own_m.type_name.as_deref().unwrap_or(""))
-                    {
-                        return true;
-                    }
+                    return true;
                 }
             }
         }
@@ -829,6 +850,55 @@ impl SourceIndex {
         matches.next().is_none().then_some(first)
     }
 
+    /// Public wrapper for narrowing checks: resolve a type name exactly like
+    /// the internal Kotlin-type resolver (imports + same-package + unique
+    /// Kotlin simple name).
+    pub fn resolve_kotlin_type_public<'a>(
+        &'a self,
+        source_file: &SourceFile,
+        type_name: &str,
+    ) -> Option<&'a Declaration> {
+        self.resolve_kotlin_type(source_file, type_name)
+    }
+
+    /// True when `decl`'s transitive supertype closure (Kotlin and Java
+    /// edges alike) contains the type named `target_base`.
+    pub fn supertype_closure_contains(
+        &self,
+        source_file: &SourceFile,
+        decl: &Declaration,
+        target_base: &str,
+    ) -> bool {
+        let mut visited = std::collections::HashSet::new();
+        let mut pending: Vec<&Declaration> = vec![decl];
+        while let Some(current) = pending.pop() {
+            if !visited.insert(declaration_key(current)) {
+                continue;
+            }
+            let current_file = self.declaration_source_file(current).unwrap_or(source_file);
+            for supertype in &current.supertypes {
+                let base = supertype
+                    .trim()
+                    .trim_end_matches('?')
+                    .split('<')
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if base == target_base {
+                    return true;
+                }
+                if let Some(next) = self.resolve_type(current_file, supertype) {
+                    pending.push(next);
+                }
+            }
+        }
+        false
+    }
+
     fn find_qualified(&self, qualified: &str) -> Option<&Declaration> {
         let (package, name) = qualified.rsplit_once('.')?;
         self.declarations().find(|declaration| {
@@ -1185,6 +1255,7 @@ fn parse_declarations(
             supertypes: supertypes(node, language, source),
             members: members(node, language, source),
             has_default_constructor_parameter: has_default_constructor_parameter(node, language),
+            type_params: type_param_names(node, source),
         });
     }
     let mut identifier_counts = HashMap::new();
@@ -1416,6 +1487,27 @@ fn supertypes(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &st
         .collect()
 }
 
+/// Type-parameter names of a declaration (`class Foo<T, I : Bar>` ->
+/// `["T", "I"]`), from the `type_parameters` AST child. Java only.
+fn type_param_names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let Some(params) = node
+        .children(&mut node.walk())
+        .find(|child| child.kind() == "type_parameters")
+    else {
+        return Vec::new();
+    };
+    params
+        .children(&mut params.walk())
+        .filter(|child| child.kind() == "type_parameter")
+        .filter_map(|child| {
+            child
+                .children(&mut child.walk())
+                .find(|inner| inner.kind() == "identifier")
+                .and_then(|id| node_text(id, source).ok())
+        })
+        .collect()
+}
+
 fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) -> Vec<Member> {
     let mut result = Vec::new();
     if language == SourceLanguage::Kotlin
@@ -1590,12 +1682,74 @@ fn node_text(node: tree_sitter::Node<'_>, source: &str) -> Result<String, String
         .map_err(|error| format!("invalid source text: {error}"))
 }
 
-/// A Java subclass member may NARROW a supertype return type only if the
-/// supertype type is assignable from the declared one — for our purposes,
-/// equal names, or the supertype is `Object`/`Any`. Everything else is a
-/// mismatch.
-fn is_java_compatible_narrow(super_ty: &str, own_ty: &str) -> bool {
-    super_ty == own_ty || super_ty == "Object" || super_ty == "Any"
+/// A Java member may NARROW a supertype member's return type when the own
+/// type is a Java SUBTYPE of the supertype's type: covariant return types
+/// are legal in Java for both classes and interfaces (JLS 8.4.5). Equal
+/// names, `Object`/`Any`, and type-parameter members always qualify.
+/// Everything else (unrelated types, invariant generics like
+/// `List<A>` vs `List<B>`) is a mismatch.
+fn is_java_compatible_narrow(
+    index: &SourceIndex,
+    source_file: &SourceFile,
+    super_ty: &str,
+    own_ty: &str,
+) -> bool {
+    if super_ty == own_ty || super_ty == "Object" || super_ty == "Any" {
+        return true;
+    }
+    // Invariant generics: `List<A>` only satisfies `List<A>` (wildcards are
+    // not emitted by the transpiler today).
+    let (sup_base, sup_args) = split_generic(super_ty);
+    let (own_base, own_args) = split_generic(own_ty);
+    if sup_base != own_base {
+        // Covariant narrowing requires own to be a SUBTYPE of sup: walk own's
+        // supertype closure through the index.
+        return index
+            .resolve_kotlin_type_public(source_file, own_ty)
+            .is_some_and(|own_decl| {
+                index.supertype_closure_contains(source_file, own_decl, sup_base)
+            });
+    }
+    match (sup_args, own_args) {
+        (None, _) => true, // raw sup type accepts any instantiation
+        (Some(_), None) => false,
+        (Some(sup), Some(own)) => {
+            // Generics are INVARIANT in Java: a nested argument must match
+            // exactly (`List<ItemImpl>` does not satisfy `List<Item>`, even
+            // though ItemImpl is an Item). Only the TOP-LEVEL narrowing is
+            // covariant.
+            sup.len() == own.len() && sup.iter().zip(own.iter()).all(|(s, o)| s == o)
+        }
+    }
+}
+
+/// `Map<String, List<Foo>>` -> (`Map`, Some(["String", "List<Foo>"])).
+fn split_generic(ty: &str) -> (&str, Option<Vec<&str>>) {
+    let open = ty.find('<');
+    let Some(open) = open else {
+        return (ty.trim(), None);
+    };
+    if !ty.ends_with('>') {
+        return (ty.trim(), None);
+    }
+    let base = ty[..open].trim();
+    let body = &ty[open + 1..ty.len() - 1];
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(body[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(body[start..].trim());
+    (base, Some(args))
 }
 
 /// Prefer a candidate type whose bare name is an indexed enum declaration.
