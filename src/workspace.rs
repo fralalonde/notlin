@@ -606,6 +606,117 @@ impl SourceIndex {
         })
     }
 
+    /// True when translating `target` would split a retained Kotlin interface
+    /// property from a fake override that still depends on it.
+    pub fn inherits_retained_kotlin_property_interface(
+        &self,
+        source_file: &SourceFile,
+        target: &Declaration,
+    ) -> bool {
+        let own_properties: HashSet<&str> = target
+            .members
+            .iter()
+            .filter(|member| member.kind == MemberKind::Property && !member.is_static)
+            .map(|member| member.name.as_str())
+            .collect();
+        let mut inherited_properties = HashSet::new();
+        for supertype in &target.supertypes {
+            if let Some(declaration) = self.resolve_kotlin_type(source_file, supertype) {
+                self.collect_retained_interface_property_names(
+                    declaration,
+                    &mut HashSet::new(),
+                    &mut inherited_properties,
+                );
+            }
+        }
+        if inherited_properties
+            .iter()
+            .any(|property| own_properties.contains(property.as_str()))
+        {
+            return true;
+        }
+
+        self.has_retained_property_branch_collision(source_file, target, &mut HashSet::new())
+    }
+
+    fn has_retained_property_branch_collision(
+        &self,
+        source_file: &SourceFile,
+        declaration: &Declaration,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if !visited.insert(declaration_key(declaration)) {
+            return false;
+        }
+
+        let mut seen = HashSet::new();
+        let mut direct_supertypes = Vec::new();
+        for supertype in &declaration.supertypes {
+            let Some(supertype) = self.resolve_kotlin_type(source_file, supertype) else {
+                continue;
+            };
+            let mut branch_properties = HashSet::new();
+            self.collect_retained_interface_property_names(
+                supertype,
+                &mut HashSet::new(),
+                &mut branch_properties,
+            );
+            if branch_properties
+                .iter()
+                .any(|property| !seen.insert(property.clone()))
+            {
+                return true;
+            }
+            direct_supertypes.push(supertype);
+        }
+
+        direct_supertypes.into_iter().any(|supertype| {
+            self.declaration_source_file(supertype).is_some_and(|file| {
+                self.has_retained_property_branch_collision(file, supertype, visited)
+            })
+        })
+    }
+
+    fn collect_retained_interface_property_names(
+        &self,
+        declaration: &Declaration,
+        visited: &mut HashSet<String>,
+        properties: &mut HashSet<String>,
+    ) {
+        if !visited.insert(declaration_key(declaration)) {
+            return;
+        }
+        if declaration.kind == DeclarationKind::Interface && self.has_kotlin_subtype(declaration) {
+            properties.extend(
+                declaration
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member.kind == MemberKind::Property
+                            && !member.is_static
+                            && member.visibility.as_deref() != Some("private")
+                    })
+                    .map(|member| member.name.clone()),
+            );
+        }
+        let Some(source_file) = self.declaration_source_file(declaration) else {
+            return;
+        };
+        for supertype in &declaration.supertypes {
+            if let Some(supertype) = self.resolve_kotlin_type(source_file, supertype) {
+                self.collect_retained_interface_property_names(supertype, visited, properties);
+            }
+        }
+    }
+
+    fn declaration_source_file(&self, declaration: &Declaration) -> Option<&SourceFile> {
+        self.files.iter().find(|file| {
+            file.declarations
+                .iter()
+                .any(|candidate| std::ptr::eq(candidate, declaration))
+        })
+    }
+
     fn resolve_kotlin_type<'a>(
         &'a self,
         source_file: &SourceFile,

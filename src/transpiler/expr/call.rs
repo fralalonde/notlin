@@ -633,6 +633,8 @@ impl<'a, 'u> Expr<'a, 'u> {
             // Arrays.stream(...) already IS a Stream — no .stream() tail.
             let stream_base = if base.starts_with("java.util.Arrays.stream") {
                 base.clone()
+            } else if base.ends_with(".stream()") {
+                base.clone()
             } else if self
                 .unit
                 .var_types
@@ -847,6 +849,9 @@ impl<'a, 'u> Expr<'a, 'u> {
                     stream_fn,
                     self.transpile(lambda)
                 );
+            }
+            if matches!(member, "anyMatch" | "allMatch" | "noneMatch") {
+                return format!("{}.{}({})", stream_base, stream_fn, self.transpile(lambda));
             }
             return if let Some(sep) = self.unit.pending_join_to_string.take() {
                 format!(
@@ -1083,8 +1088,23 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // `Surname(...)` is a factory call
                     // (`Owner.invoke(...)`), NOT a constructor — Java
                     // `new Surname(...)` does not compile.
+                    let mut ctor_args = args.clone();
                     if let Some(ws) = self.unit.workspace {
-                        let base_name = callee_java.rsplit('.').next().unwrap_or("").to_string();
+                        if let Some(decl) = ws.declarations().find(|d| d.name == callee_java) {
+                            let properties = decl
+                                .members
+                                .iter()
+                                .filter(|m| m.kind == crate::workspace::MemberKind::Property)
+                                .count();
+                            if decl.has_default_constructor_parameter
+                                && properties == ctor_args.len() + 1
+                            {
+                                ctor_args.push("null".to_string());
+                            }
+                        }
+                    }
+                    let base_name = callee_java.rsplit('.').next().unwrap_or("").to_string();
+                    if let Some(ws) = self.unit.workspace {
                         if ws.find_static_member(&base_name, "invoke").is_some() {
                             self.unit.diags.warn_approx(
                                 node,
@@ -1093,10 +1113,10 @@ impl<'a, 'u> Expr<'a, 'u> {
                                     "companion `operator fun invoke` on `{base_name}`: factory call routed via `.{base_name}.invoke(...)` (not a constructor)"
                                 ),
                             );
-                            return format!("{}.invoke({})", callee_java, args.join(", "));
+                            return format!("{}.invoke({})", callee_java, ctor_args.join(", "));
                         }
                     }
-                    format!("new {}({})", callee_java, args.join(", "))
+                    format!("new {}({})", callee_java, ctor_args.join(", "))
                 } else if callee_java.ends_with(')')
                     && (args.is_empty() || (nav_assembled && lambda_arg.is_some()))
                 {

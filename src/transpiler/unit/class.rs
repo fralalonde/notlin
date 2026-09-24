@@ -188,6 +188,8 @@ impl<'a> Unit<'a> {
             || (target.has_default_constructor_parameter
                 && workspace.has_kotlin_reference(indexed_path, name))
             || workspace.narrows_nullable_kotlin_property(source_file, target)
+            || (self.in_place
+                && workspace.inherits_retained_kotlin_property_interface(source_file, target))
             || workspace.property_smart_cast_used_by_kotlin(indexed_path, target)
     }
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
