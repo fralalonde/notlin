@@ -11,17 +11,17 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn interface_with_only_selected_kotlin_subtypes_still_retained() {
-    // The selection-scope experiment (translating hub+implementor together)
-    // over-reached: a Kotlin subtype retained by an unrelated rule (enum
-    // entries ABI, declaration annotation, KClass) cannot implement a
-    // translated-away interface — target builds failed on exactly that
-    // shape. Until retention is decided bottom-up (subtypes first), an
-    // interface retains whenever ANY Kotlin subtype exists.
+fn interface_with_only_selected_kotlin_subtypes_translate_via_fixpoint() {
+    // Superseded by the workspace-level retention fixpoint
+    // (tests/fixpoint_retention.rs): a hub interface with only selected,
+    // intrinsically CLEAN Kotlin subtypes translates together with them.
+    // The old blanket rule (retain on any Kotlin subtype) remains in force
+    // only for single-file mode without a workspace index.
     let root = Path::new("tests/tmp_scratch_subtype_scope");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
-    // One file, both selected: hub interface + Kotlin implementor.
+    // One file, both selected: hub interface + Kotlin implementor. Translating
+    // the DIRECTORY (not the single file) enables workspace fixpoint mode.
     fs::write(
         root.join("hub.kt"),
         "package neutral.subtype\n\
@@ -37,18 +37,19 @@ fn interface_with_only_selected_kotlin_subtypes_still_retained() {
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
         .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
-        .arg(root.join("hub.kt").to_str().unwrap())
+        .arg(root.as_os_str())
         .output()
         .expect("run notlin");
     let stderr = String::from_utf8_lossy(&out.stderr);
     let speaker_java = fs::read_to_string(root.join("Speaker.java")).unwrap_or_default();
+    let dog_java = fs::read_to_string(root.join("Dog.java")).unwrap_or_default();
     assert!(
-        speaker_java.is_empty(),
-        "hub with any Kotlin subtype must stay retained for now, got:\n{speaker_java}"
+        !speaker_java.is_empty() && !dog_java.is_empty(),
+        "clean hub and implementor in one selection must both translate.\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("N7395"),
-        "expected the retention diagnostic:\n{stderr}"
+        !stderr.contains("N7395"),
+        "selected-subtype retention must not fire:\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }

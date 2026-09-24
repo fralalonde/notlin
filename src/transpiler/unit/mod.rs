@@ -124,6 +124,11 @@ pub struct Unit<'a> {
     pub(crate) workspace: Option<&'a SourceIndex>,
     pub(crate) workspace_file: Option<PathBuf>,
     pub(crate) translation_roots: &'a [PathBuf],
+    /// Retention-fixpoint retained set from the caller (probe passes): names
+    /// known to be retained in Kotlin for intrinsic reasons. When Some, the
+    /// subtype rule consults it (`has_retained_kotlin_subtype`) instead of
+    /// retaining on every Kotlin subtype; None = conservative catch-all.
+    pub(crate) retained_hint: Option<std::collections::HashSet<String>>,
 }
 
 /// Constructor-mode flags bundled for `Unit::new` (a plain value object
@@ -180,6 +185,7 @@ impl<'a> Unit<'a> {
             workspace: None,
             workspace_file: None,
             translation_roots: &[],
+            retained_hint: None,
         }
     }
 

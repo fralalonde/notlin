@@ -5,6 +5,7 @@ use crate::workspace::SourceIndex;
 use std::path::{Path, PathBuf};
 
 pub mod expr;
+pub mod fixpoint;
 pub mod java;
 pub mod kt;
 pub mod stmt;
@@ -76,6 +77,30 @@ pub fn transpile_with_workspace(
     workspace: Option<&SourceIndex>,
     translation_roots: &[PathBuf],
 ) -> (Vec<(String, String)>, usize, usize, FileCoverage) {
+    transpile_with_workspace_hint(
+        source,
+        file,
+        cli,
+        workspace,
+        translation_roots,
+        None,
+        /*silent=*/ true,
+    )
+}
+
+/// Probe variant used by the retention fixpoint: `retained_hint` feeds the
+/// subtype rule (`Some` = fixpoint pass, `None` = conservative catch-all);
+/// `silent` suppresses console diagnostic printing for probe passes (the
+/// final pass prints its own diagnostics once).
+pub fn transpile_with_workspace_hint(
+    source: &str,
+    file: &Path,
+    cli: &Cli,
+    workspace: Option<&SourceIndex>,
+    translation_roots: &[PathBuf],
+    retained_hint: Option<std::collections::HashSet<String>>,
+    silent: bool,
+) -> (Vec<(String, String)>, usize, usize, FileCoverage) {
     let tree = parse(source);
     let mut diags = Diagnostics::new();
     let annots = match cli.annotations {
@@ -99,6 +124,7 @@ pub fn transpile_with_workspace(
             },
         )
         .with_workspace(workspace, translation_roots);
+        unit.retained_hint = retained_hint;
         let java_files = unit.run(tree.root_node());
         let mut coverage = std::mem::take(&mut unit.coverage);
         let approx = std::mem::take(&mut coverage.diags_approx);
@@ -125,6 +151,8 @@ pub fn transpile_with_workspace(
         );
     }
     let (errors, warnings) = (diags.error_count(), diags.warning_count());
-    diags.print();
+    if !silent {
+        diags.print();
+    }
     (java_files, errors, warnings, coverage)
 }

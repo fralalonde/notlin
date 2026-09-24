@@ -71,6 +71,62 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let mut java_written = 0usize;
     let mut outcomes: Vec<(PathBuf, MigrateOutcome)> = Vec::new();
 
+    // Workspace mode (index + more than one file): compute the retention
+    // fixpoint first (probe passes in memory, no writes, no printed
+    // diagnostics), then write each file's plan exactly once. The subtype
+    // retention rule then only fires for subtypes that are THEMSELVES
+    // retained, so clean hub-and-implementor families translate together.
+    if cli.workspace_root.is_some() || files.len() > 1 {
+        // Read every source up front; stdin ('-') cannot participate in a
+        // multi-file fixpoint (no path to index), so it keeps the old path.
+        if files.iter().all(|f| f.as_os_str() != "-") {
+            let sources: Vec<(PathBuf, String)> = files
+                .iter()
+                .map(|file| read_source(file).map(|source| (file.clone(), source)))
+                .collect::<Result<_, _>>()?;
+            let plans =
+                transpiler::fixpoint::plan_workspace(&sources, cli, &index, &translation_roots, 16);
+            for plan in &plans {
+                total_errors += plan.errors;
+                total_warnings += plan.warnings;
+                java_written += plan.java_files.len();
+                write_java_files(cli, &plan.file, &plan.java_files, &mut stdout)?;
+                let outcome = migrate_file(
+                    cli,
+                    &plan.file,
+                    &plan.source,
+                    plan.errors,
+                    plan.warnings,
+                    &plan.coverage,
+                )?;
+                match &outcome {
+                    migrate::MigrateOutcome::Deleted => {
+                        log::debug!("deleted {}", plan.file.display());
+                    }
+                    migrate::MigrateOutcome::Trimmed { remaining_bytes } => {
+                        log::debug!(
+                            "trimmed {} ({remaining_bytes} bytes remain)",
+                            plan.file.display()
+                        );
+                    }
+                    migrate::MigrateOutcome::Untouched => {
+                        log::debug!("{}: no translated content; untouched", plan.file.display());
+                    }
+                }
+                outcomes.push((plan.file.clone(), outcome));
+            }
+            return finish_run(
+                cli,
+                files.len(),
+                total_errors,
+                total_warnings,
+                java_written,
+                &outcomes,
+                &mut stdout,
+            );
+        }
+    }
+
     for file in &files {
         log::debug!("transpiling {}", file.display());
         let source = read_source(file)?;
@@ -240,6 +296,161 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     );
 
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Write one plan's java files: explicit -o dir, else next to the input
+/// (--in-place), else stdout. Mirrors the per-file loop's output precedence.
+fn write_java_files(
+    cli: &Cli,
+    file: &Path,
+    java_files: &[(String, String)],
+    stdout: &mut BufWriter<std::io::StdoutLock<'_>>,
+) -> Result<(), String> {
+    let effective_out_dir = match (&cli.out_dir, cli.in_place) {
+        (Some(d), _) => Some(d.clone()),
+        (None, true) => file.parent().map(|p| p.to_path_buf()),
+        (None, false) => None,
+    };
+    match &effective_out_dir {
+        Some(out_dir) => {
+            for (name, content) in java_files {
+                let target = out_dir.join(name);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("{}: {e}", parent.display()))?;
+                }
+                let out = std::fs::File::create(&target)
+                    .map_err(|e| format!("{}: {e}", target.display()))?;
+                let mut writer = BufWriter::new(out);
+                writer
+                    .write_all(content.as_bytes())
+                    .map_err(|e| format!("{}: {e}", target.display()))?;
+                writer
+                    .flush()
+                    .map_err(|e| format!("{}: {e}", target.display()))?;
+                log::debug!("wrote {}", target.display());
+            }
+        }
+        None => {
+            for (name, content) in java_files {
+                if java_files.len() > 1 {
+                    writeln!(stdout, "// ===== {name} =====")
+                        .map_err(|error| format!("stdout: {error}"))?;
+                }
+                stdout
+                    .write_all(content.as_bytes())
+                    .map_err(|error| format!("stdout: {error}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// --in-place migration for one plan: strip translated declarations, delete
+/// fully-translated files, orphan-cleanup retained ones. Mirrors the
+/// per-file loop's migration block.
+fn migrate_file(
+    cli: &Cli,
+    file: &Path,
+    source: &str,
+    errors: usize,
+    warnings: usize,
+    coverage: &notlin::diagnostics::FileCoverage,
+) -> Result<MigrateOutcome, String> {
+    if !cli.in_place || cli.dump_ast {
+        return Ok(MigrateOutcome::Untouched);
+    }
+    let strict_block =
+        matches!(cli.untranslatable, UntranslatableMode::Error) && (errors > 0 || warnings > 0);
+    if strict_block {
+        log::info!(
+            "{}: kept — run had errors/warnings in --untranslatable=error mode",
+            file.display()
+        );
+        return Ok(MigrateOutcome::Untouched);
+    }
+    let outcome = migrate::migrate(file, source, coverage)?;
+    if matches!(outcome, MigrateOutcome::Untouched) {
+        // Orphan cleanup: a prior run may have generated Java outputs whose
+        // declarations this run retained in Kotlin. Generated outputs are
+        // marked with the `NOTLIN: generated from <source>` header — delete
+        // those whose source is THIS file, otherwise javac keeps compiling
+        // a stale class that no longer matches the retained Kotlin ABI.
+        // Generated outputs land next to the source in in-place mode.
+        let has_out_dir = cli.out_dir.is_some();
+        if !has_out_dir && let Some(dir) = file.parent() {
+            let source_canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+            let source_text = source_canon.to_string_lossy().to_string();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("java") {
+                        continue;
+                    }
+                    if let Ok(first_line) = std::fs::read_to_string(&path)
+                        .map(|content| content.lines().next().unwrap_or("").to_string())
+                        && first_line.contains("NOTLIN: generated from")
+                        && first_line.contains(&source_text)
+                    {
+                        let _ = std::fs::remove_file(&path);
+                        log::info!("deleted orphan {}", path.display());
+                    }
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Shared run summary: failure policy, migration tally, final line.
+fn finish_run(
+    cli: &Cli,
+    file_count: usize,
+    total_errors: usize,
+    total_warnings: usize,
+    java_written: usize,
+    outcomes: &[(PathBuf, MigrateOutcome)],
+    stdout: &mut BufWriter<std::io::StdoutLock<'_>>,
+) -> Result<ExitCode, String> {
+    let untranslatable_strict = matches!(cli.untranslatable, UntranslatableMode::Error);
+    let failed = total_errors > 0
+        || (untranslatable_strict && total_warnings > 0)
+        || (cli.deny_warnings && total_warnings > 0);
+    let deleted = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Deleted))
+        .count();
+    let trimmed = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Trimmed { .. }))
+        .count();
+    let untouched = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Untouched))
+        .count();
+    stdout.flush().map_err(|error| format!("stdout: {error}"))?;
+    eprintln!(
+        "notlin: {} file(s) processed, {} java file(s) written, {} error(s), {} warning(s){} — {}",
+        file_count,
+        java_written,
+        total_errors,
+        total_warnings,
+        if outcomes.is_empty() {
+            String::new()
+        } else {
+            format!(", migration: {deleted} deleted, {trimmed} trimmed, {untouched} untouched")
+        },
+        if failed {
+            "failed".red()
+        } else {
+            "success".green()
+        }
+    );
     Ok(if failed {
         ExitCode::FAILURE
     } else {

@@ -77,6 +77,12 @@ pub struct SourceFile {
 pub struct SourceIndex {
     pub files: Vec<SourceFile>,
     kotlin_subtypes: HashMap<String, Vec<PathBuf>>,
+    /// Reverse subtype edges by SIMPLE name: `name -> [subtype simple names]`.
+    /// Shallow but unambiguous enough for retention fixpointing: the
+    /// fixpoint pre-pass taints a declaration when any of its simple-name
+    /// subtypes is retained, and simple-name collisions over-taint
+    /// conservatively (fewer translations, never a wrong Java ABI).
+    subtype_names: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -185,19 +191,34 @@ impl SourceIndex {
         let mut index = Self {
             files,
             kotlin_subtypes: HashMap::new(),
+            subtype_names: HashMap::new(),
         };
         let mut subtype_edges = Vec::new();
+        let mut subtype_name_edges = Vec::new();
         for file in index.kotlin_files() {
             for declaration in &file.declarations {
                 for supertype in &declaration.supertypes {
                     if let Some(target) = index.resolve_type(file, supertype) {
                         subtype_edges.push((declaration_key(target), file.path.clone()));
+                        subtype_name_edges
+                            .push((declaration_key(target), declaration.name.clone()));
                     }
                 }
             }
         }
         for (target, path) in subtype_edges {
             index.kotlin_subtypes.entry(target).or_default().push(path);
+        }
+        // Reverse subtype edges by simple name for the retention fixpoint
+        // (`subtype_names[hub] = [subtype names...]`). Simple names only:
+        // the fixpoint over-taints on name collisions, never under-taints.
+        for (target, subtype_name) in subtype_name_edges {
+            let target_name = target.rsplit_once('.').map(|(_, n)| n).unwrap_or(&target);
+            index
+                .subtype_names
+                .entry(target_name.to_string())
+                .or_default()
+                .push(subtype_name);
         }
 
         let new_cache = IndexCache {
@@ -588,6 +609,22 @@ impl SourceIndex {
 
     pub fn has_kotlin_subtype(&self, target: &Declaration) -> bool {
         self.kotlin_subtypes.contains_key(&declaration_key(target))
+    }
+
+    /// Retention fixpoint seed: true when any simple-name Kotlin subtype of
+    /// `target` is retained for an INTRINSIC reason (its own file taints
+    /// under the current fixpoint pass, independent of the subtype rule).
+    /// Shallow by simple name — collisions over-taint, never under-taint.
+    pub fn has_retained_kotlin_subtype(
+        &self,
+        target: &Declaration,
+        retained: &HashSet<String>,
+    ) -> bool {
+        let key = declaration_key(target);
+        let target_name = key.rsplit_once('.').map(|(_, n)| n).unwrap_or(&key);
+        self.subtype_names
+            .get(target_name)
+            .is_some_and(|subtypes| subtypes.iter().any(|s| retained.contains(s)))
     }
     pub fn has_unselected_kotlin_subtype(
         &self,

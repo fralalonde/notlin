@@ -183,14 +183,20 @@ impl<'a> Unit<'a> {
             return false;
         };
         workspace.has_unselected_kotlin_subtype(target, self.translation_roots)
-            // An interface with ANY Kotlin subtype retains: a subtype may
-            // itself be retained by an unrelated rule (annotation, enum
-            // entries ABI, KClass...), and a retained Kotlin implementor
-            // cannot implement a translated-away supertype (Kotlin enum
-            // entries / fake overrides have no Java twin). Ordered retention
-            // (decide subtypes before supertypes) is the eventual fix.
+            // Subtype rule, two modes:
+            // - No fixpoint hint (single-file mode): retain on ANY Kotlin
+            //   subtype — conservative, cannot know what translates later.
+            // - With hint (fixpoint pass): retain only when a Kotlin subtype
+            //   is ITSELF retained for an intrinsic reason; a retained
+            //   Kotlin implementor cannot implement a translated-away
+            //   supertype (enum entries ABI, KClass...). Monotone: seeds
+            //   (intrinsically tainted decls) never shrink, so iteration
+            //   reaches the least fixpoint.
             || (target.kind == crate::workspace::DeclarationKind::Interface
-                && workspace.has_kotlin_subtype(target))
+                && match self.retained_hint.as_ref() {
+                    Some(retained) => workspace.has_retained_kotlin_subtype(target, retained),
+                    None => workspace.has_kotlin_subtype(target),
+                })
             || (target.has_default_constructor_parameter
                 && workspace.has_kotlin_reference(indexed_path, name))
             || workspace.narrows_nullable_kotlin_property(source_file, target)
