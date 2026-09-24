@@ -126,26 +126,33 @@ pub struct Unit<'a> {
     pub(crate) translation_roots: &'a [PathBuf],
 }
 
+/// Constructor-mode flags bundled for `Unit::new` (a plain value object
+/// keeps the constructor under clippy's argument-count ceiling).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnitOptions {
+    pub untranslatable_as_error: bool,
+    pub lombok: bool,
+    pub commons_lang: bool,
+    pub in_place: bool,
+}
+
 impl<'a> Unit<'a> {
     pub fn new(
         source: &'a str,
         file: &'a Path,
         diags: &'a mut Diagnostics,
         annots: AnnotationSet,
-        untranslatable_as_error: bool,
-        lombok: bool,
-        commons_lang: bool,
-        in_place: bool,
+        options: UnitOptions,
     ) -> Self {
         Self {
             source,
             file,
             diags,
             annots,
-            untranslatable_as_error,
-            lombok,
-            commons_lang,
-            in_place,
+            untranslatable_as_error: options.untranslatable_as_error,
+            lombok: options.lombok,
+            commons_lang: options.commons_lang,
+            in_place: options.in_place,
             coverage: FileCoverage::default(),
             current_decl: None,
             decl_labels: std::collections::HashMap::new(),

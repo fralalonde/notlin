@@ -103,8 +103,10 @@ struct CachedDirectory {
 
 #[derive(Debug, PartialEq, Eq)]
 enum CachedEntry {
-    Directory(CachedDirectory),
-    Source(CachedSource),
+    Directory(Box<CachedDirectory>),
+    // Boxed: a `SourceFile` carries its declarations map, so the source
+    // variant dwarfs the directory pointer and this keeps the enum compact.
+    Source(Box<CachedSource>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +134,7 @@ fn flatten_sources(root: &CachedDirectory) -> Vec<CachedPathSource> {
                 CachedEntry::Directory(child) => visit(child, &path, output),
                 CachedEntry::Source(source) => output.push(CachedPathSource {
                     path,
-                    source: source.clone(),
+                    source: (**source).clone(),
                 }),
             }
         }
@@ -341,17 +343,14 @@ impl SourceIndex {
                     .members
                     .iter()
                     .find(|om| om.name == m.name && om.kind == m.kind)
+                    && own_m.type_name.as_deref() != Some(sup_ty.as_str())
                 {
-                    if own_m.type_name.as_deref() != Some(sup_ty.as_str()) {
-                        // Type strings are index-qualified names; conflicting
-                        // here means Kotlin fake-override semantics are being
-                        // relied on — unsupported in plain Java.
-                        if !is_java_compatible_narrow(
-                            &sup_ty,
-                            own_m.type_name.as_deref().unwrap_or(""),
-                        ) {
-                            return true;
-                        }
+                    // Type strings are index-qualified names; conflicting
+                    // here means Kotlin fake-override semantics are being
+                    // relied on — unsupported in plain Java.
+                    if !is_java_compatible_narrow(&sup_ty, own_m.type_name.as_deref().unwrap_or(""))
+                    {
+                        return true;
                     }
                 }
             }
@@ -371,7 +370,7 @@ impl SourceIndex {
                     .next()
                     .map(|c| c.to_ascii_lowercase().to_string())
                     .unwrap_or_default(),
-                &rest.chars().skip(1).collect::<String>()
+                rest.chars().skip(1).collect::<String>()
             )
         });
         let same = self.source_file(declaring).and_then(|file| {
@@ -488,7 +487,7 @@ impl SourceIndex {
         } else {
             format!(
                 "{}{}",
-                prop.chars().next()?.to_ascii_lowercase().to_string(),
+                prop.chars().next()?.to_ascii_lowercase(),
                 &prop[1..]
             )
         };
@@ -762,21 +761,21 @@ impl SourceIndex {
             return find(type_name.trim().trim_end_matches('?'));
         }
         for import in &source_file.imports {
-            if import.ends_with(&format!(".{simple}")) {
-                if let Some(found) = find(import) {
-                    return Some(found);
-                }
-            }
-            if let Some(package) = import.strip_suffix(".*") {
-                if let Some(found) = find(&format!("{package}.{simple}")) {
-                    return Some(found);
-                }
-            }
-        }
-        if let Some(package) = &source_file.package {
-            if let Some(found) = find(&format!("{package}.{simple}")) {
+            if import.ends_with(&format!(".{simple}"))
+                && let Some(found) = find(import)
+            {
                 return Some(found);
             }
+            if let Some(package) = import.strip_suffix(".*")
+                && let Some(found) = find(&format!("{package}.{simple}"))
+            {
+                return Some(found);
+            }
+        }
+        if let Some(package) = &source_file.package
+            && let Some(found) = find(&format!("{package}.{simple}"))
+        {
+            return Some(found);
         }
         let mut matches = self
             .declarations()
@@ -807,21 +806,21 @@ impl SourceIndex {
             return self.find_qualified(type_name.trim().trim_end_matches('?'));
         }
         for import in &source_file.imports {
-            if import.ends_with(&format!(".{simple}")) {
-                if let Some(found) = self.find_qualified(import) {
-                    return Some(found);
-                }
-            }
-            if let Some(package) = import.strip_suffix(".*") {
-                if let Some(found) = self.find_qualified(&format!("{package}.{simple}")) {
-                    return Some(found);
-                }
-            }
-        }
-        if let Some(package) = &source_file.package {
-            if let Some(found) = self.find_qualified(&format!("{package}.{simple}")) {
+            if import.ends_with(&format!(".{simple}"))
+                && let Some(found) = self.find_qualified(import)
+            {
                 return Some(found);
             }
+            if let Some(package) = import.strip_suffix(".*")
+                && let Some(found) = self.find_qualified(&format!("{package}.{simple}"))
+            {
+                return Some(found);
+            }
+        }
+        if let Some(package) = &source_file.package
+            && let Some(found) = self.find_qualified(&format!("{package}.{simple}"))
+        {
+            return Some(found);
         }
         let mut matches = self
             .declarations()
@@ -931,10 +930,10 @@ fn save_cache(root: &Path, cache: &IndexCache) -> bool {
     let temporary = format!("{CACHE_FILE}.tmp-{}", std::process::id());
     let backup = format!("{CACHE_FILE}.bak-{}", std::process::id());
     let result = (|| -> Result<(), String> {
-        if let Ok(metadata) = cache_dir.symlink_metadata(CACHE_FILE) {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(format!("unsafe index cache {CACHE_FILE}"));
-            }
+        if let Ok(metadata) = cache_dir.symlink_metadata(CACHE_FILE)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(format!("unsafe index cache {CACHE_FILE}"));
         }
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -1032,7 +1031,7 @@ fn scan_directory(
                 files,
                 stats,
             )?;
-            entries.insert(name, CachedEntry::Directory(child));
+            entries.insert(name, CachedEntry::Directory(Box::new(child)));
             continue;
         }
         if !is_file {
@@ -1044,7 +1043,7 @@ fn scan_directory(
         let previous = old_sources.get(&child_relative).copied();
         let source = scan_source(&path, language, previous, stats)?;
         files.push(source.source_file.clone());
-        entries.insert(name, CachedEntry::Source(source));
+        entries.insert(name, CachedEntry::Source(Box::new(source)));
     }
 
     let mut hasher = blake3::Hasher::new();
@@ -1085,18 +1084,18 @@ fn scan_source(
     let bytes = fs::read(&canonical_path)
         .map_err(|error| format!("{}: {error}", canonical_path.display()))?;
     let digest = *blake3::hash(&bytes).as_bytes();
-    if let Some(previous) = previous {
-        if previous.digest == digest {
-            let mut cached = previous.source_file.clone();
-            cached.path = canonical_path.clone();
-            stats.reused_files += 1;
-            return Ok(CachedSource {
-                size,
-                modified_nanos,
-                digest,
-                source_file: cached,
-            });
-        }
+    if let Some(previous) = previous
+        && previous.digest == digest
+    {
+        let mut cached = previous.source_file.clone();
+        cached.path = canonical_path.clone();
+        stats.reused_files += 1;
+        return Ok(CachedSource {
+            size,
+            modified_nanos,
+            digest,
+            source_file: cached,
+        });
     }
 
     let source = String::from_utf8(bytes)
@@ -1146,19 +1145,20 @@ fn import_names(source: &str) -> Vec<String> {
         .filter(|import| !import.is_empty())
         .collect()
 }
+/// Everything `parse_declarations` extracts from one source file's
+/// declaration tree (factored out of a tuple so the signature stays legible).
+type ParseDeclarations = (
+    Vec<Declaration>,
+    HashMap<String, usize>,
+    HashMap<String, usize>,
+    HashSet<String>,
+);
+
 fn parse_declarations(
     source: &str,
     language: SourceLanguage,
     package: Option<&str>,
-) -> Result<
-    (
-        Vec<Declaration>,
-        HashMap<String, usize>,
-        HashMap<String, usize>,
-        HashSet<String>,
-    ),
-    String,
-> {
+) -> Result<ParseDeclarations, String> {
     let mut parser = tree_sitter::Parser::new();
     let grammar = match language {
         SourceLanguage::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
@@ -1255,20 +1255,16 @@ fn collect_smart_cast_properties(
     source: &str,
     properties: &mut HashSet<String>,
 ) {
-    if node.kind() == "is_expression" {
-        if let Some(left) = node.child_by_field_name("left") {
-            if left.kind() == "navigation_expression" {
-                if let Some(property) = left
-                    .named_children(&mut left.walk())
-                    .filter(|child| child.kind() == "identifier")
-                    .last()
-                {
-                    if let Ok(name) = property.utf8_text(source.as_bytes()) {
-                        properties.insert(name.to_string());
-                    }
-                }
-            }
-        }
+    if node.kind() == "is_expression"
+        && let Some(left) = node.child_by_field_name("left")
+        && left.kind() == "navigation_expression"
+        && let Some(property) = left
+            .named_children(&mut left.walk())
+            .filter(|child| child.kind() == "identifier")
+            .last()
+        && let Ok(name) = property.utf8_text(source.as_bytes())
+    {
+        properties.insert(name.to_string());
     }
     for child in node.named_children(&mut node.walk()) {
         collect_smart_cast_properties(child, source, properties);
@@ -1280,10 +1276,10 @@ fn collect_identifier_counts(
     source: &str,
     counts: &mut HashMap<String, usize>,
 ) {
-    if node.kind() == "identifier" {
-        if let Ok(name) = node.utf8_text(source.as_bytes()) {
-            *counts.entry(name.to_string()).or_default() += 1;
-        }
+    if node.kind() == "identifier"
+        && let Ok(name) = node.utf8_text(source.as_bytes())
+    {
+        *counts.entry(name.to_string()).or_default() += 1;
     }
     for child in node.named_children(&mut node.walk()) {
         collect_identifier_counts(child, source, counts);
@@ -1422,8 +1418,8 @@ fn supertypes(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &st
 
 fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) -> Vec<Member> {
     let mut result = Vec::new();
-    if language == SourceLanguage::Kotlin {
-        if let Some(parameters) = node
+    if language == SourceLanguage::Kotlin
+        && let Some(parameters) = node
             .children(&mut node.walk())
             .find(|child| child.kind() == "primary_constructor")
             .and_then(|constructor| {
@@ -1431,35 +1427,34 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                     .children(&mut constructor.walk())
                     .find(|child| child.kind() == "class_parameters")
             })
+    {
+        for parameter in parameters
+            .named_children(&mut parameters.walk())
+            .filter(|parameter| parameter.kind() == "class_parameter")
         {
-            for parameter in parameters
-                .named_children(&mut parameters.walk())
-                .filter(|parameter| parameter.kind() == "class_parameter")
-            {
-                let is_property = parameter
-                    .children(&mut parameter.walk())
-                    .any(|child| matches!(child.kind(), "val" | "var"));
-                if !is_property {
-                    continue;
-                }
-                let Some(name_node) = parameter
-                    .named_children(&mut parameter.walk())
-                    .find(|child| child.kind() == "identifier")
-                else {
-                    continue;
-                };
-                let type_node = parameter
-                    .named_children(&mut parameter.walk())
-                    .find(|child| matches!(child.kind(), "user_type" | "nullable_type"));
-                result.push(Member {
-                    name: node_text(name_node, source).unwrap_or_default(),
-                    kind: MemberKind::Property,
-                    visibility: None,
-                    is_static: false,
-                    type_name: type_node.and_then(|node| node_text(node, source).ok()),
-                    is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
-                });
+            let is_property = parameter
+                .children(&mut parameter.walk())
+                .any(|child| matches!(child.kind(), "val" | "var"));
+            if !is_property {
+                continue;
             }
+            let Some(name_node) = parameter
+                .named_children(&mut parameter.walk())
+                .find(|child| child.kind() == "identifier")
+            else {
+                continue;
+            };
+            let type_node = parameter
+                .named_children(&mut parameter.walk())
+                .find(|child| matches!(child.kind(), "user_type" | "nullable_type"));
+            result.push(Member {
+                name: node_text(name_node, source).unwrap_or_default(),
+                kind: MemberKind::Property,
+                visibility: None,
+                is_static: false,
+                type_name: type_node.and_then(|node| node_text(node, source).ok()),
+                is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
+            });
         }
     }
     if let Some(body) = node.child_by_field_name("body").or_else(|| {

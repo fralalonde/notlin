@@ -1,5 +1,4 @@
 use clap::Parser;
-use notlin::transpiler;
 use std::path::PathBuf;
 
 /// A holder class with a `K -> V` map property that uses members of the Map

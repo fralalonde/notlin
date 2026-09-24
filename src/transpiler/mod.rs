@@ -91,10 +91,12 @@ pub fn transpile_with_workspace(
             file,
             &mut diags,
             annots,
-            untranslatable_as_error,
-            cli.lombok,
-            cli.commons_lang,
-            cli.in_place,
+            crate::transpiler::unit::UnitOptions {
+                untranslatable_as_error,
+                lombok: cli.lombok,
+                commons_lang: cli.commons_lang,
+                in_place: cli.in_place,
+            },
         )
         .with_workspace(workspace, translation_roots);
         let java_files = unit.run(tree.root_node());

@@ -77,17 +77,17 @@ impl<'a, 'u> Expr<'a, 'u> {
                 // identifier (a callee), the right is a bare type-ish
                 // identifier, and the node's raw text closes with `>` before
                 // the trailing lambda.
-                if op == "<" {
-                    if let Some(rhs_text) = self.is_generic_call_binary(node) {
-                        let callee_java = self.transpile_callee_generic(l, Some(rhs_text.as_str()));
-                        // Tell the outer `>` binary (the type list's closing
-                        // bracket) not to treat this as a comparison.
-                        self.unit.pending_generic_call = true;
-                        // The trailing lambda belongs to the OUTER call node;
-                        // call.rs re-finds it (`annotated_lambda` child) and
-                        // appends. Return just the callee.
-                        return callee_java;
-                    }
+                if op == "<"
+                    && let Some(rhs_text) = self.is_generic_call_binary(node)
+                {
+                    let callee_java = self.transpile_callee_generic(l, Some(rhs_text.as_str()));
+                    // Tell the outer `>` binary (the type list's closing
+                    // bracket) not to treat this as a comparison.
+                    self.unit.pending_generic_call = true;
+                    // The trailing lambda belongs to the OUTER call node;
+                    // call.rs re-finds it (`annotated_lambda` child) and
+                    // appends. Return just the callee.
+                    return callee_java;
                 }
                 // Elvis `?:` arrives as a binary_expression operator in this grammar
                 if op == "?:" {
@@ -148,8 +148,8 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // the right operand with an identifier receiver on the
                     // left — detect the outer shape structurally so the
                     // lambda bracket stays a call, not a compareTo.
-                    let lhs_generic_call = l.kind() == "binary_expression"
-                        && matches!(self.is_generic_call_binary(l), Some(_));
+                    let lhs_generic_call =
+                        l.kind() == "binary_expression" && self.is_generic_call_binary(l).is_some();
                     if lhs_generic_call {
                         let callee_java = self.transpile(l);
                         self.unit.pending_generic_call = false;
@@ -382,7 +382,7 @@ impl<'a, 'u> Expr<'a, 'u> {
             .unwrap_or(false)
             && !rhs_text.contains('(')
             && !lhs_text.contains('(')
-            && self.unit.var_types.get(rhs_text).is_none();
+            && !self.unit.var_types.contains_key(rhs_text);
         if callee_shaped && type_shaped {
             Some(rhs_text.to_string())
         } else {
@@ -427,29 +427,26 @@ impl<'a, 'u> Expr<'a, 'u> {
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_ascii_uppercase())
+                && let Some(ty) = ws.property_type_of_getter(&getter)
             {
-                if let Some(ty) = ws.property_type_of_getter(&getter) {
-                    if !is_primitive_type(&ty) && ty != "String" && ty != "Object" {
-                        return Some(ty);
-                    }
-                    return None;
+                if !is_primitive_type(&ty) && ty != "String" && ty != "Object" {
+                    return Some(ty);
                 }
+                return None;
             }
             // bare field name: property type straight from the index
             if getter
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_ascii_lowercase())
-            {
-                if let Some(ty) = ws
+                && let Some(ty) = ws
                     .bare_property_type(&getter)
                     .or_else(|| ws.property_type_of_getter(&getter))
-                {
-                    if !is_primitive_type(&ty) && ty != "String" && ty != "Object" {
-                        return Some(ty);
-                    }
-                    return None;
+            {
+                if !is_primitive_type(&ty) && ty != "String" && ty != "Object" {
+                    return Some(ty);
                 }
+                return None;
             }
         }
         // constructor call: `Pt(1, 2)` -> first word before '('

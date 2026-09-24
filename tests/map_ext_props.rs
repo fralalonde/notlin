@@ -1,5 +1,4 @@
 use clap::Parser;
-use notlin::transpiler;
 use std::path::PathBuf;
 
 /// Kotlin stdlib collection extensions invoked WITH parens (`isNotEmpty()`,

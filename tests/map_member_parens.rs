@@ -1,5 +1,4 @@
 use clap::Parser;
-use notlin::transpiler;
 use std::path::PathBuf;
 
 /// Java Map methods `containsKey`, `isNotEmpty`, `hashCode` must KEEP their

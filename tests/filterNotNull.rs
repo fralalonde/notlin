@@ -1,5 +1,4 @@
 use clap::Parser;
-use notlin::transpiler;
 use std::path::PathBuf;
 
 /// Kotlin `Array<T>.filterNotNull()` must lower to a Java stream expression

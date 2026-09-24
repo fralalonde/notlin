@@ -20,7 +20,7 @@ fn interface_super_property_gets_qualified_super_accessor() {
         "package neutral.superq\n\ninterface Base {\n    val alias: String\n        get() = \"g\"\n}\n\nenum class Impl : Base {\n    ONE;\n\n    override val alias: String\n        get() = super.alias + \"/x\"\n}\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+    let _out = Command::new(env!("CARGO_BIN_EXE_notlin"))
         .args(["--root", root.to_str().unwrap(), "--in-place"])
         .arg(root.join("m.kt").to_str().unwrap())
         .output()
@@ -57,7 +57,7 @@ fn super_property_against_retained_supertype_taints_caller() {
         "package neutral.superr\n\nenum class Impl : Base {\n    ONE;\n\n    override val alias: String\n        get() = super.alias + \"/x\"\n}\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+    let _out = Command::new(env!("CARGO_BIN_EXE_notlin"))
         .args(["--root", root.to_str().unwrap(), "--in-place"])
         .arg(root.join("impl.kt").to_str().unwrap())
         .output()

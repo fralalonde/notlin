@@ -627,45 +627,45 @@ impl<'a> Unit<'a> {
                     ));
                 }
             }
-            if let Some(pc) = kt::child(decl, "primary_constructor") {
-                if let Some(cps) = kt::child(pc, "class_parameters") {
-                    let mut defaults = Vec::new();
-                    for cp in cps.children(&mut cps.walk()) {
-                        if cp.kind() != "class_parameter" {
-                            continue;
-                        }
-                        let has_default = cp
-                            .children(&mut cp.walk())
-                            .any(|c| c.kind() == "default_value");
-                        defaults.push(has_default);
+            if let Some(pc) = kt::child(decl, "primary_constructor")
+                && let Some(cps) = kt::child(pc, "class_parameters")
+            {
+                let mut defaults = Vec::new();
+                for cp in cps.children(&mut cps.walk()) {
+                    if cp.kind() != "class_parameter" {
+                        continue;
                     }
-                    if defaults.last() == Some(&true) && params.len() > 1 {
-                        let prefix = &params[..params.len() - 1];
-                        let (_, _, default_ty) = &params[params.len() - 1];
-                        let default_expr = cps
-                            .children(&mut cps.walk())
-                            .filter(|c| c.kind() == "class_parameter")
-                            .last()
-                            .and_then(|cp| kt::child(cp, "default_value"))
-                            .and_then(|dv| dv.children(&mut dv.walk()).find(|c| c.is_named()))
-                            .map(|n| Expr { unit: self }.transpile(n))
-                            .unwrap_or_else(|| default_ty.clone());
-                        let signature = prefix
-                            .iter()
-                            .map(|(_, n, t)| format!("{} {}", t, n))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let values = prefix
-                            .iter()
-                            .map(|(_, n, _)| n.clone())
-                            .chain(std::iter::once(default_expr))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        out.line(format!(
-                            "public {}({}) {{ this({}); }}",
-                            name, signature, values
-                        ));
-                    }
+                    let has_default = cp
+                        .children(&mut cp.walk())
+                        .any(|c| c.kind() == "default_value");
+                    defaults.push(has_default);
+                }
+                if defaults.last() == Some(&true) && params.len() > 1 {
+                    let prefix = &params[..params.len() - 1];
+                    let (_, _, default_ty) = &params[params.len() - 1];
+                    let default_expr = cps
+                        .children(&mut cps.walk())
+                        .filter(|c| c.kind() == "class_parameter")
+                        .last()
+                        .and_then(|cp| kt::child(cp, "default_value"))
+                        .and_then(|dv| dv.children(&mut dv.walk()).find(|c| c.is_named()))
+                        .map(|n| Expr { unit: self }.transpile(n))
+                        .unwrap_or_else(|| default_ty.clone());
+                    let signature = prefix
+                        .iter()
+                        .map(|(_, n, t)| format!("{} {}", t, n))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let values = prefix
+                        .iter()
+                        .map(|(_, n, _)| n.clone())
+                        .chain(std::iter::once(default_expr))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.line(format!(
+                        "public {}({}) {{ this({}); }}",
+                        name, signature, values
+                    ));
                 }
             }
             out.blank();

@@ -1,5 +1,4 @@
 use clap::Parser;
-use notlin::transpiler;
 use std::path::PathBuf;
 
 /// Kotlin `Iterable.stream()` (stdlib-jdk8 extension) lowers to Java's

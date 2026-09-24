@@ -158,10 +158,10 @@ impl<'a, 'u> Expr<'a, 'u> {
             }
         }
         let mut result = base.map(|b| self.transpile(b)).unwrap_or_default();
-        if let Some(owner) = super_owner {
-            if !result.starts_with(&owner) {
-                result = format!("{owner}.{result}");
-            }
+        if let Some(owner) = super_owner
+            && !result.starts_with(&owner)
+        {
+            result = format!("{owner}.{result}");
         }
         for w in kids.windows(3) {
             if w[1].kind() == "." || w[1].kind() == "?." {
@@ -397,13 +397,13 @@ impl<'a, 'u> Expr<'a, 'u> {
                                         }
                                     })
                                     .map(|t| t.split('<').next().unwrap_or(&t).trim().to_string());
-                                if let Some(t) = ty {
-                                    if ws.declarations().any(|d| {
+                                if let Some(t) = ty
+                                    && ws.declarations().any(|d| {
                                         d.name == t
                                             && d.kind == crate::workspace::DeclarationKind::Enum
-                                    }) {
-                                        return true;
-                                    }
+                                    })
+                                {
+                                    return true;
                                 }
                             }
                             false
@@ -801,7 +801,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                         // not double-stream a receiver that already is one
                         // (`x.stream().first()` chain).
                         if base_stream_ready && let Some(rest) = jm.strip_prefix("stream().") {
-                            format!("{rest}")
+                            rest.to_string()
                         } else if base_stream_ready && jm == "stream()" {
                             String::new()
                         } else {

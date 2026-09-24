@@ -134,8 +134,8 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                 ("MutableMap<", "HashMap<"),
                 ("MutableSet<", "HashSet<"),
             ] {
-                if whole.starts_with(kt_name) {
-                    return format!("{}{}", j_name, &whole[kt_name.len()..]);
+                if let Some(stripped) = whole.strip_prefix(kt_name) {
+                    return format!("{}{}", j_name, stripped);
                 }
             }
             let mapped = crate::transpiler::types::map_type_name(whole);

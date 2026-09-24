@@ -1,5 +1,4 @@
 use clap::Parser;
-use notlin::transpiler;
 use std::path::PathBuf;
 
 fn emit(body: &str) -> (usize, Vec<String>) {

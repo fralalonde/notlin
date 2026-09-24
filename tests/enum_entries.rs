@@ -1,5 +1,4 @@
 use clap::Parser;
-use notlin::transpiler;
 use std::path::PathBuf;
 
 /// Kotlin enum `EnumKind.entries` lowers to Java `values()` — `getEntries()`

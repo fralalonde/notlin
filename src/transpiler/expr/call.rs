@@ -25,7 +25,7 @@ impl<'a, 'u> Expr<'a, 'u> {
             });
         let lambda_arg = lambda_arg.or_else(|| {
             if self.unit.text(node).contains("anyMatch") {
-                let mut stack: Vec<tree_sitter::Node> = kids.iter().copied().collect();
+                let mut stack: Vec<tree_sitter::Node> = kids.to_vec();
                 while let Some(current) = stack.pop() {
                     if current.kind() == "lambda_literal" {
                         return Some(current);
@@ -655,21 +655,20 @@ impl<'a, 'u> Expr<'a, 'u> {
                 }
             };
             // Arrays.stream(...) already IS a Stream — no .stream() tail.
-            let stream_base = if base.starts_with("java.util.Arrays.stream") {
-                base.clone()
-            } else if base.ends_with(".stream()") {
-                base.clone()
-            } else if self
-                .unit
-                .var_types
-                .get(base.trim())
-                .is_some_and(|t| t.starts_with("Map<"))
-            {
-                // Kotlin maps stream over their ENTRIES (Map.Entry pairs).
-                format!("{}.entrySet().stream()", base)
-            } else {
-                format!("{}.stream()", base)
-            };
+            let stream_base =
+                if base.starts_with("java.util.Arrays.stream") || base.ends_with(".stream()") {
+                    base.clone()
+                } else if self
+                    .unit
+                    .var_types
+                    .get(base.trim())
+                    .is_some_and(|t| t.starts_with("Map<"))
+                {
+                    // Kotlin maps stream over their ENTRIES (Map.Entry pairs).
+                    format!("{}.entrySet().stream()", base)
+                } else {
+                    format!("{}.stream()", base)
+                };
             let _ = &stream_base;
             let stream_fn = match member {
                 "map" | "mapNotNull" | "mapIndexed" => "map",
@@ -968,7 +967,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // a spread arg was lowered to the bare array text by
                     // transpile()'s spread arm — spot it via the raw subtree
                     let mut found = false;
-                    let mut cursor = node.walk();
+                    let _cursor = node.walk();
                     if let Some(va) = kt::child(node, "value_arguments") {
                         let mut vcur = va.walk();
                         for argn in va.children(&mut vcur) {
@@ -991,7 +990,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // for `arrayOf` (and is rejected honestly for primitives
                     // via javac on the target).
                     let mut parts: Vec<String> = Vec::new();
-                    let mut cursor = node.walk();
+                    let _cursor = node.walk();
                     if let Some(va) = kt::child(node, "value_arguments") {
                         let mut vcur = va.walk();
                         for argn in va.children(&mut vcur) {
@@ -1023,7 +1022,8 @@ impl<'a, 'u> Expr<'a, 'u> {
                         "spread in array factory lowered to a flattened element stream; produces Object[] (primitive element trays need hand migration)",
                     );
                     // Compose flatMap for multi-part spreads:
-                    let merged = if parts.len() == 1 {
+
+                    if parts.len() == 1 {
                         let h = parts[0]
                             .strip_prefix("java.util.stream.Stream.of(")
                             .unwrap_or(&parts[0])
@@ -1042,7 +1042,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                         };
                         let spread_flags = {
                             let mut flags: Vec<bool> = Vec::new();
-                            let mut cursor = node.walk();
+                            let _cursor = node.walk();
                             if let Some(va) = kt::child(node, "value_arguments") {
                                 let mut vcur = va.walk();
                                 for argn in va.children(&mut vcur) {
@@ -1075,8 +1075,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                             chain = format!("java.util.stream.Stream.concat({}, {})", chain, tail);
                         }
                         format!("{}.toArray()", chain)
-                    };
-                    merged
+                    }
                 } else {
                     // `arrayOf(a, b)` style literal: elem_ty ends in `[]`
                     format!(
@@ -1113,32 +1112,32 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // (`Owner.invoke(...)`), NOT a constructor — Java
                     // `new Surname(...)` does not compile.
                     let mut ctor_args = args.clone();
-                    if let Some(ws) = self.unit.workspace {
-                        if let Some(decl) = ws.declarations().find(|d| d.name == callee_java) {
-                            let properties = decl
-                                .members
-                                .iter()
-                                .filter(|m| m.kind == crate::workspace::MemberKind::Property)
-                                .count();
-                            if decl.has_default_constructor_parameter
-                                && properties == ctor_args.len() + 1
-                            {
-                                ctor_args.push("null".to_string());
-                            }
+                    if let Some(ws) = self.unit.workspace
+                        && let Some(decl) = ws.declarations().find(|d| d.name == callee_java)
+                    {
+                        let properties = decl
+                            .members
+                            .iter()
+                            .filter(|m| m.kind == crate::workspace::MemberKind::Property)
+                            .count();
+                        if decl.has_default_constructor_parameter
+                            && properties == ctor_args.len() + 1
+                        {
+                            ctor_args.push("null".to_string());
                         }
                     }
                     let base_name = callee_java.rsplit('.').next().unwrap_or("").to_string();
-                    if let Some(ws) = self.unit.workspace {
-                        if ws.find_static_member(&base_name, "invoke").is_some() {
-                            self.unit.diags.warn_approx(
+                    if let Some(ws) = self.unit.workspace
+                        && ws.find_static_member(&base_name, "invoke").is_some()
+                    {
+                        self.unit.diags.warn_approx(
                                 node,
                                 self.unit.file,
                                 format!(
                                     "companion `operator fun invoke` on `{base_name}`: factory call routed via `.{base_name}.invoke(...)` (not a constructor)"
                                 ),
                             );
-                            return format!("{}.invoke({})", callee_java, ctor_args.join(", "));
-                        }
+                        return format!("{}.invoke({})", callee_java, ctor_args.join(", "));
                     }
                     format!("new {}({})", callee_java, ctor_args.join(", "))
                 } else if callee_java.ends_with(')')

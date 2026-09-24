@@ -166,30 +166,27 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                         // keeps compiling a stale class that no longer
                         // matches the retained Kotlin ABI. Generated outputs
                         // land next to the source in in-place mode.
-                        if effective_out_dir.is_none() {
-                            if let Some(dir) = file.parent() {
-                                let source_canon =
-                                    std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
-                                let source_text = source_canon.to_string_lossy().to_string();
-                                if let Ok(entries) = std::fs::read_dir(dir) {
-                                    for entry in entries.flatten() {
-                                        let path = entry.path();
-                                        if path.extension().and_then(|e| e.to_str()) != Some("java")
-                                        {
-                                            continue;
-                                        }
-                                        if let Ok(first_line) =
-                                            std::fs::read_to_string(&path).map(|content| {
-                                                content.lines().next().unwrap_or("").to_string()
-                                            })
-                                        {
-                                            if first_line.contains("NOTLIN: generated from")
-                                                && first_line.contains(&source_text)
-                                            {
-                                                let _ = std::fs::remove_file(&path);
-                                                log::info!("deleted orphan {}", path.display());
-                                            }
-                                        }
+                        if effective_out_dir.is_none()
+                            && let Some(dir) = file.parent()
+                        {
+                            let source_canon =
+                                std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
+                            let source_text = source_canon.to_string_lossy().to_string();
+                            if let Ok(entries) = std::fs::read_dir(dir) {
+                                for entry in entries.flatten() {
+                                    let path = entry.path();
+                                    if path.extension().and_then(|e| e.to_str()) != Some("java") {
+                                        continue;
+                                    }
+                                    if let Ok(first_line) =
+                                        std::fs::read_to_string(&path).map(|content| {
+                                            content.lines().next().unwrap_or("").to_string()
+                                        })
+                                        && first_line.contains("NOTLIN: generated from")
+                                        && first_line.contains(&source_text)
+                                    {
+                                        let _ = std::fs::remove_file(&path);
+                                        log::info!("deleted orphan {}", path.display());
                                     }
                                 }
                             }

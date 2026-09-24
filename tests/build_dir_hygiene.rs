@@ -1,6 +1,5 @@
 use notlin::workspace::SourceIndex;
 use std::fs;
-use std::path::{Path, PathBuf};
 
 /// Build-output mirrors (target/build dirs like `build/k2j/...`) must not be
 /// indexed as Java sources:它们 shadow migrated sources and break companion

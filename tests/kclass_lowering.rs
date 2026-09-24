@@ -77,7 +77,7 @@ fn kclass_declaration_retained_while_kotlin_consumers_remain() {
 
     let index = SourceIndex::discover(&root).unwrap();
     let cli = Cli::parse_from(["notlin", decl_path.to_str().unwrap()]);
-    let (files, errors, warnings, coverage) = notlin::transpiler::transpile_with_workspace(
+    let (files, errors, warnings, _coverage) = notlin::transpiler::transpile_with_workspace(
         &source,
         &decl_path,
         &cli,

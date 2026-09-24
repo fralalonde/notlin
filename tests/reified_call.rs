@@ -44,12 +44,11 @@ fn reified_companion_calls_taint_caller() {
         .iter()
         .find(|(n, _)| n == "Kind.java")
         .map(|(_, c)| c.as_str());
-    match kind {
-        Some(c) => assert!(
+    if let Some(c) = kind {
+        assert!(
             !c.contains("Owner.make("),
             "un-callable reified companion leaked into Java: {c}"
-        ),
-        None => {}
+        )
     }
     let _ = fs::remove_dir_all(root);
 }

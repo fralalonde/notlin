@@ -21,7 +21,7 @@ fn retained_supertype_abi_mismatch_taints() {
         "package a\n\nclass ItemImpl(override val n: String) : Item\n\nclass Holder(\n    override val items: List<ItemImpl>\n) : Box\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+    let _out = Command::new(env!("CARGO_BIN_EXE_notlin"))
         .args(["--root", root.to_str().unwrap(), "--in-place"])
         .arg(root.join("impl.kt").to_str().unwrap())
         .output()
@@ -52,7 +52,7 @@ fn transitive_retained_supertype_abi_mismatch_taints() {
         "package b\n\nclass ItemImpl(override val n: String) : Item\n\nclass Holder(\n    override val items: List<ItemImpl>\n) : Box\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+    let _out = Command::new(env!("CARGO_BIN_EXE_notlin"))
         .args(["--root", root.to_str().unwrap(), "--in-place"])
         .arg(root.join("impl.kt").to_str().unwrap())
         .output()

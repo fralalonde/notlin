@@ -1,6 +1,5 @@
 use clap::Parser;
 use notlin::cli::Cli;
-use notlin::transpiler;
 use notlin::workspace::SourceIndex;
 use std::fs;
 

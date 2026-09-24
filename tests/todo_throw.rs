@@ -17,7 +17,7 @@ fn todo_call_throws_runtime_exception_in_getter_body() {
         "package neutral.todo\n\ninterface Kind { val key: String }\n\nenum class Flag : Kind {\n    A;\n\n    override val key: String\n        get() = TODO(\"Not yet implemented\")\n}\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+    let _out = Command::new(env!("CARGO_BIN_EXE_notlin"))
         .args(["--root", root.to_str().unwrap(), "--in-place"])
         .arg(root.join("m.kt").to_str().unwrap())
         .output()
@@ -48,7 +48,7 @@ fn todo_call_uses_commons_lang_not_implemented_with_flag() {
         "package neutral.todo.cl\n\ninterface Kind { val key: String }\n\nenum class Flag : Kind {\n    A;\n\n    override val key: String\n        get() = TODO(\"Not yet implemented\")\n}\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+    let _out = Command::new(env!("CARGO_BIN_EXE_notlin"))
         .args([
             "--root",
             root.to_str().unwrap(),

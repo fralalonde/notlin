@@ -52,17 +52,15 @@ impl<'a> Unit<'a> {
                     for member in &iface.members {
                         if member.name == fname
                             && member.kind == crate::workspace::MemberKind::Method
+                            && let Some(declared) = &member.type_name
+                            && let Some(my_ret) = &my_ret
                         {
-                            if let Some(declared) = &member.type_name {
-                                if let Some(my_ret) = &my_ret {
-                                    let declared_java = declared.clone();
-                                    if !declared_java.is_empty()
-                                        && declared_java != *my_ret
-                                        && declared_java != "Object"
-                                    {
-                                        return Some(declared_java);
-                                    }
-                                }
+                            let declared_java = declared.clone();
+                            if !declared_java.is_empty()
+                                && declared_java != *my_ret
+                                && declared_java != "Object"
+                            {
+                                return Some(declared_java);
                             }
                         }
                     }
