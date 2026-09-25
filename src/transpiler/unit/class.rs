@@ -354,6 +354,31 @@ impl<'a> Unit<'a> {
                 && workspace.inherits_retained_kotlin_property_interface(source_file, target))
             || workspace.property_smart_cast_used_by_kotlin(indexed_path, target)
     }
+
+    /// A Kotlin companion `operator fun invoke` gives the enclosing type a
+    /// class-call ABI (`Type(...)`) that Java cannot represent: Kotlin binds
+    /// that syntax to a Java constructor after migration, never to a static
+    /// factory. Only residual Kotlin callers make this a retention boundary.
+    fn has_companion_operator_invoke(&self, decl: tree_sitter::Node) -> bool {
+        let Some(body) = kt::child(decl, "class_body") else {
+            return false;
+        };
+        let mut stack: Vec<tree_sitter::Node> = body
+            .children(&mut body.walk())
+            .filter(|node| node.kind() == "companion_object")
+            .collect();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "function_declaration"
+                && kt::field(node, "name").is_some_and(|name| self.text(name) == "invoke")
+                && self.text(node).contains("operator")
+            {
+                return true;
+            }
+            stack.extend(node.children(&mut node.walk()));
+        }
+        false
+    }
+
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
         // `KClass<T>` type references lower to Java `Class<T>` (kt.rs /
         // types.rs interop mapping). That ABI change is only compatible
@@ -474,6 +499,19 @@ impl<'a> Unit<'a> {
         let name = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_else(|| "Anonymous".to_string());
+        let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
+        if self.has_companion_operator_invoke(decl)
+            && self
+                .workspace
+                .map(|workspace| workspace.has_external_kotlin_reference(indexed_path, &name))
+                .unwrap_or(true)
+        {
+            self.diag_untranslatable(
+                decl,
+                "companion operator `invoke` is consumed by residual Kotlin; Java constructors cannot preserve the Kotlin class-call ABI",
+            );
+            return;
+        }
         if self.workspace_requires_kotlin_retention(&name) {
             self.diag_untranslatable(
                 decl,
@@ -1760,6 +1798,116 @@ impl<'a> Unit<'a> {
         out.close();
     }
 
+    /// Lower a bodyless secondary constructor that delegates directly to this
+    /// class's primary constructor. More complex shapes remain Kotlin: Java
+    /// cannot preserve Kotlin default/vararg delegation or constructor bodies
+    /// without a wider call-site and flow analysis.
+    fn transpile_secondary_constructor(
+        &mut self,
+        member: tree_sitter::Node,
+        class_name: &str,
+        out: &mut JavaOut,
+    ) -> bool {
+        if kt::child(member, "function_body").is_some() {
+            return false;
+        }
+        let Some(delegation) = kt::child(member, "constructor_delegation_call") else {
+            return false;
+        };
+        if !self.text(delegation).trim_start().starts_with("this") {
+            return false;
+        }
+        let Some(params_node) = kt::child(member, "function_value_parameters") else {
+            return false;
+        };
+        let mut params = Vec::new();
+        let prior_var_types = std::mem::take(&mut self.var_types);
+        for param in params_node.children(&mut params_node.walk()) {
+            if param.kind() != "parameter" {
+                continue;
+            }
+            let children: Vec<_> = param.children(&mut param.walk()).collect();
+            if children
+                .iter()
+                .any(|child| (!child.is_named() && child.kind() == "=") || child.kind() == "vararg")
+            {
+                self.var_types = prior_var_types;
+                return false;
+            }
+            let Some(name_node) = children.iter().find(|child| child.kind() == "identifier") else {
+                self.var_types = prior_var_types;
+                return false;
+            };
+            let Some(type_node) = children.iter().find(|child| {
+                matches!(
+                    child.kind(),
+                    "user_type" | "nullable_type" | "type_reference" | "type"
+                )
+            }) else {
+                self.var_types = prior_var_types;
+                return false;
+            };
+            let name = self.text(*name_node).to_string();
+            let ty = kt::java_type_ann(*type_node, self.source, self.annots);
+            self.var_types.insert(name.clone(), ty.clone());
+            params.push((name, ty));
+        }
+        let Some(args_node) = kt::child(delegation, "value_arguments") else {
+            self.var_types = prior_var_types;
+            return false;
+        };
+        let mut args = Vec::new();
+        for arg in args_node.children(&mut args_node.walk()) {
+            if arg.kind() != "value_argument" || self.text(arg).contains('=') {
+                if arg.kind() == "value_argument" {
+                    self.var_types = prior_var_types;
+                    return false;
+                }
+                continue;
+            }
+            let Some(value) = arg.children(&mut arg.walk()).find(|child| child.is_named()) else {
+                self.var_types = prior_var_types;
+                return false;
+            };
+            if !self.is_safe_secondary_constructor_argument(value) {
+                self.var_types = prior_var_types;
+                return false;
+            }
+            args.push(Expr { unit: self }.transpile(value));
+        }
+        self.var_types = prior_var_types;
+        out.open(format!(
+            "public {}({})",
+            class_name,
+            params
+                .iter()
+                .map(|(name, ty)| format!("{} {}", ty, name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        out.line(format!("this({});", args.join(", ")));
+        out.close();
+        out.blank();
+        true
+    }
+
+    /// Delegated constructor arguments are deliberately narrower than the
+    /// general expression lowerer. This path writes a constructor before the
+    /// target build can validate it, so admit only values with a direct,
+    /// syntax-preserving Java form.
+    fn is_safe_secondary_constructor_argument(&self, node: tree_sitter::Node) -> bool {
+        match node.kind() {
+            "identifier" | "this_expression" | "number_literal" | "boolean_literal"
+            | "hex_literal" | "long_literal" | "real_literal" | "null_literal" => true,
+            "string_literal" => !self.text(node).contains('$'),
+            // `Owner.VALUE` is valid Java. Call-shaped navigation is not:
+            // it may hide a Kotlin extension or collection operation whose
+            // lowering has not passed the constructor gate.
+            "navigation_expression" => !self.text(node).contains('('),
+            _ => false,
+        }
+    }
+
     fn transpile_class_body(&mut self, body: tree_sitter::Node, out: &mut JavaOut) {
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
@@ -1781,7 +1929,16 @@ impl<'a> Unit<'a> {
                     out.blank();
                 }
                 "secondary_constructor" => {
-                    self.diag_untranslatable(member, "secondary constructors not yet supported");
+                    let class_name = kt::parent_of(body)
+                        .and_then(|class| kt::field(class, "name"))
+                        .map(|name| self.text(name).to_string())
+                        .unwrap_or_default();
+                    if !self.transpile_secondary_constructor(member, &class_name, out) {
+                        self.diag_untranslatable(
+                            member,
+                            "secondary constructor is not a bodyless direct `this(...)` delegation",
+                        );
+                    }
                 }
                 "class_declaration" | "object_declaration" => {
                     self.transpile_type_decl(member, out);
