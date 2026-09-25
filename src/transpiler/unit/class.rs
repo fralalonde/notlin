@@ -294,11 +294,11 @@ impl<'a> Unit<'a> {
         // declaration itself stays Kotlin (or translates separately, but the
         // Java side cannot reference a Kotlin-only element).
         if let Some(workspace) = self.workspace
-            && let Some(decl) = workspace
-                .declarations()
-                .find(|d| d.name == name && d.kind == crate::workspace::DeclarationKind::Annotation)
+            && workspace.declarations().any(|decl| {
+                decl.name == name && decl.kind == crate::workspace::DeclarationKind::Annotation
+            })
+            && !workspace.annotation_is_selected(&name, self.translation_roots)
         {
-            let _ = decl;
             return None;
         }
         // Rebuild from the parts: a use-site target (`@get:X(...)` -> `@X(...)`)
@@ -409,6 +409,10 @@ impl<'a> Unit<'a> {
         let mut is_data = false;
         let mut is_sealed = false;
         let mut is_enum = false;
+        let mut is_annotation = false;
+        let is_fun_interface = decl
+            .children(&mut decl.walk())
+            .any(|child| child.kind() == "fun");
         // Kotlin `interface` parses as class_declaration with an unnamed
         // `interface` keyword child.
         let is_interface = decl
@@ -449,8 +453,9 @@ impl<'a> Unit<'a> {
                                     modifiers.push(' ');
                                 }
                                 "enum" => is_enum = true,
-                                "annotation" | "companion" | "inline" | "value" | "expect"
-                                | "actual" | "external" | "inner" | "fun" => {
+                                "annotation" => is_annotation = true,
+                                "companion" | "inline" | "value" | "expect" | "actual"
+                                | "external" | "inner" => {
                                     self.diag_untranslatable(
                                         cm,
                                         format!("class modifier not supported: {}", self.text(cm)),
@@ -466,6 +471,9 @@ impl<'a> Unit<'a> {
                     _ => {}
                 }
             }
+        }
+        if is_fun_interface {
+            annotations.push("@FunctionalInterface".to_string());
         }
         // Kotlin permits repeating the same annotation on one declaration
         // (a stack of `@X(...)` lines); plain Java needs `@Repeatable` on the
@@ -522,6 +530,10 @@ impl<'a> Unit<'a> {
 
         if decl.kind() == "object_declaration" {
             self.transpile_object(decl, &name, &visibility, &annotations, out);
+            return;
+        }
+        if is_annotation {
+            self.transpile_annotation_decl(decl, &name, &visibility, out);
             return;
         }
         if is_enum {
@@ -882,47 +894,7 @@ impl<'a> Unit<'a> {
                     ));
                 }
             }
-            if let Some(pc) = kt::child(decl, "primary_constructor")
-                && let Some(cps) = kt::child(pc, "class_parameters")
-            {
-                let mut defaults = Vec::new();
-                for cp in cps.children(&mut cps.walk()) {
-                    if cp.kind() != "class_parameter" {
-                        continue;
-                    }
-                    let has_default = cp
-                        .children(&mut cp.walk())
-                        .any(|c| c.kind() == "default_value");
-                    defaults.push(has_default);
-                }
-                if defaults.last() == Some(&true) && params.len() > 1 {
-                    let prefix = &params[..params.len() - 1];
-                    let (_, _, default_ty) = &params[params.len() - 1];
-                    let default_expr = cps
-                        .children(&mut cps.walk())
-                        .filter(|c| c.kind() == "class_parameter")
-                        .last()
-                        .and_then(|cp| kt::child(cp, "default_value"))
-                        .and_then(|dv| dv.children(&mut dv.walk()).find(|c| c.is_named()))
-                        .map(|n| Expr { unit: self }.transpile(n))
-                        .unwrap_or_else(|| default_ty.clone());
-                    let signature = prefix
-                        .iter()
-                        .map(|(_, n, t)| format!("{} {}", t, n))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let values = prefix
-                        .iter()
-                        .map(|(_, n, _)| n.clone())
-                        .chain(std::iter::once(default_expr))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    out.line(format!(
-                        "public {}({}) {{ this({}); }}",
-                        name, signature, values
-                    ));
-                }
-            }
+            self.emit_jvm_overloads_primary_constructors(decl, &name, &params, out);
             out.blank();
             if let Some(body) = kt::child(decl, "class_body") {
                 self.transpile_class_body(body, out);
@@ -1115,6 +1087,7 @@ impl<'a> Unit<'a> {
                 out.close();
                 out.blank();
             }
+            self.emit_jvm_overloads_primary_constructors(decl, &name, &params, out);
             // accessors (skipped under --lombok: @Data generates them)
             if !self.lombok {
                 for (is_val, fname, ftype) in &params {
@@ -1136,6 +1109,25 @@ impl<'a> Unit<'a> {
             }
             out.close();
         }
+    }
+
+    fn transpile_annotation_decl(
+        &mut self,
+        decl: tree_sitter::Node,
+        name: &str,
+        visibility: &str,
+        out: &mut JavaOut,
+    ) {
+        let params = self.class_params(decl);
+        let defaults = self.class_param_defaults(decl);
+        out.open(format!("{visibility}@interface {name}"));
+        for ((_, param_name, param_type), default) in params.into_iter().zip(defaults) {
+            let suffix = default
+                .map(|value| format!(" default {value}"))
+                .unwrap_or_default();
+            out.line(format!("{param_type} {param_name}(){suffix};"));
+        }
+        out.close();
     }
 
     /// Primary constructor parameters -> (is_val, name, java_type). Shared by
@@ -1229,6 +1221,74 @@ impl<'a> Unit<'a> {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// `@JvmOverloads` exposes Java overloads for every omitted trailing
+    /// primary-constructor default. The Kotlin annotation itself has no Java
+    /// counterpart, so emit the overloads that express its ABI instead.
+    fn emit_jvm_overloads_primary_constructors(
+        &mut self,
+        decl: tree_sitter::Node,
+        name: &str,
+        params: &[(bool, String, String)],
+        out: &mut JavaOut,
+    ) {
+        let has_jvm_overloads = kt::child(decl, "primary_constructor")
+            .and_then(|constructor| kt::child(constructor, "modifiers"))
+            .is_some_and(|modifiers| {
+                modifiers
+                    .children(&mut modifiers.walk())
+                    .filter(|node| node.kind() == "annotation")
+                    .any(|annotation| self.text(annotation).contains("JvmOverloads"))
+            });
+        if !has_jvm_overloads || params.is_empty() {
+            return;
+        }
+
+        // Kotlin primary-constructor default expressions run before an instance
+        // exists. Seed the constructor parameters as locals while lowering so
+        // `label` stays `label`, rather than becoming `this.getLabel()`.
+        let prior_var_types = std::mem::replace(
+            &mut self.var_types,
+            params
+                .iter()
+                .map(|(_, param_name, param_type)| (param_name.clone(), param_type.clone()))
+                .collect(),
+        );
+        let defaults = self.class_param_defaults(decl);
+        self.var_types = prior_var_types;
+        let trailing_defaults = defaults
+            .iter()
+            .rev()
+            .take_while(|value| value.is_some())
+            .count();
+        if trailing_defaults == 0 {
+            return;
+        }
+        let first_omitted = params.len() - trailing_defaults;
+        for omitted in 1..=trailing_defaults {
+            let kept = params.len() - omitted;
+            let signature = params[..kept]
+                .iter()
+                .map(|(_, param_name, param_type)| format!("{} {}", param_type, param_name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let values = params[..kept]
+                .iter()
+                .map(|(_, param_name, _)| param_name.clone())
+                .chain(
+                    defaults[kept..]
+                        .iter()
+                        .map(|value| value.clone().expect("trailing constructor default")),
+                )
+                .collect::<Vec<_>>()
+                .join(", ");
+            debug_assert!(kept >= first_omitted);
+            out.blank();
+            out.open(format!("public {}({})", name, signature));
+            out.line(format!("this({});", values));
+            out.close();
+        }
     }
 
     /// `enum class` -> native Java enum. Constants become enum constants;
@@ -1401,7 +1461,7 @@ impl<'a> Unit<'a> {
                         let _ = has_class_body;
                         entries.push(e);
                     }
-                    ";" => {}
+                    "line_comment" | "block_comment" | ";" => {}
                     "function_declaration"
                     | "property_declaration"
                     | "class_declaration"
@@ -1616,7 +1676,9 @@ impl<'a> Unit<'a> {
                     );
                     out.blank();
                 }
-                ";" | "{" | "}" => {}
+                // Trivia nodes are named by tree-sitter but are not companion
+                // members and must not make an otherwise valid companion fail.
+                "line_comment" | "block_comment" | ";" | "{" | "}" => {}
                 _ => {
                     if member.is_named() {
                         self.diag_untranslatable(
@@ -1798,25 +1860,31 @@ impl<'a> Unit<'a> {
         out.close();
     }
 
-    /// Lower a bodyless secondary constructor that delegates directly to this
-    /// class's primary constructor. More complex shapes remain Kotlin: Java
-    /// cannot preserve Kotlin default/vararg delegation or constructor bodies
-    /// without a wider call-site and flow analysis.
+    /// Lower a secondary constructor with a direct `this(...)`/`super(...)`
+    /// delegation and, optionally, a simple assignment-only body. Java requires
+    /// the delegation call to be the constructor's first statement; bodies
+    /// with control flow, calls, defaults, or varargs remain Kotlin until a
+    /// wider flow and call-site analysis exists.
     fn transpile_secondary_constructor(
         &mut self,
         member: tree_sitter::Node,
         class_name: &str,
         out: &mut JavaOut,
     ) -> bool {
-        if kt::child(member, "function_body").is_some() {
+        let body = kt::child(member, "function_body").or_else(|| kt::child(member, "block"));
+        if body.is_some_and(|body| !self.is_safe_secondary_constructor_body(body)) {
             return false;
         }
         let Some(delegation) = kt::child(member, "constructor_delegation_call") else {
             return false;
         };
-        if !self.text(delegation).trim_start().starts_with("this") {
+        let delegation_target = if self.text(delegation).trim_start().starts_with("this") {
+            "this"
+        } else if self.text(delegation).trim_start().starts_with("super") {
+            "super"
+        } else {
             return false;
-        }
+        };
         let Some(params_node) = kt::child(member, "function_value_parameters") else {
             return false;
         };
@@ -1875,7 +1943,6 @@ impl<'a> Unit<'a> {
             }
             args.push(Expr { unit: self }.transpile(value));
         }
-        self.var_types = prior_var_types;
         out.open(format!(
             "public {}({})",
             class_name,
@@ -1885,10 +1952,47 @@ impl<'a> Unit<'a> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
-        out.line(format!("this({});", args.join(", ")));
+        out.line(format!("{}({});", delegation_target, args.join(", ")));
+        if let Some(body) = body {
+            let mut cursor = body.walk();
+            for stmt in body.children(&mut cursor) {
+                if stmt.is_named() {
+                    self.transpile_statement(stmt, out);
+                }
+            }
+        }
+        self.var_types = prior_var_types;
         out.close();
         out.blank();
         true
+    }
+
+    /// A deliberately narrow constructor-body subset: assignments to fields
+    /// on `this`, with a value that can be emitted unchanged in Java. This
+    /// preserves Java's required first-statement delegation invariant without
+    /// accepting control flow or Kotlin-specific call semantics.
+    fn is_safe_secondary_constructor_body(&self, body: tree_sitter::Node) -> bool {
+        if body.kind() != "block" {
+            return false;
+        }
+        body.children(&mut body.walk())
+            .filter(|stmt| stmt.is_named())
+            .all(|stmt| {
+                if stmt.kind() != "assignment" {
+                    return false;
+                }
+                let named: Vec<_> = stmt
+                    .children(&mut stmt.walk())
+                    .filter(|child| child.is_named())
+                    .collect();
+                let (Some(target), Some(value)) = (named.first(), named.get(1)) else {
+                    return false;
+                };
+                target.kind() == "navigation_expression"
+                    && self.text(*target).trim_start().starts_with("this.")
+                    && !self.text(*target).contains('(')
+                    && self.is_safe_secondary_constructor_argument(*value)
+            })
     }
 
     /// Delegated constructor arguments are deliberately narrower than the
@@ -1936,7 +2040,7 @@ impl<'a> Unit<'a> {
                     if !self.transpile_secondary_constructor(member, &class_name, out) {
                         self.diag_untranslatable(
                             member,
-                            "secondary constructor is not a bodyless direct `this(...)` delegation",
+                            "secondary constructor is not a direct `this(...)` or `super(...)` delegation with an empty or simple assignment-only body",
                         );
                     }
                 }

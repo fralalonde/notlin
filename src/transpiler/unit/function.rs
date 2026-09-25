@@ -161,7 +161,11 @@ impl<'a> Unit<'a> {
                             self.diag_approx(f, "Kotlin `external` emitted as JNI `native` method");
                             is_external = true;
                         }
-                        "operator" | "infix" | "tailrec" => {
+                        // `operator` changes Kotlin call syntax only. Its JVM
+                        // member name and signature are the declared method,
+                        // which Java emits directly without approximation.
+                        "operator" => {}
+                        "infix" | "tailrec" => {
                             self.diag_approx(
                                 f,
                                 format!("Kotlin function modifier `{}` has no Java counterpart; emitted as a plain method", word),

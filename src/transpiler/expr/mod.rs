@@ -16,6 +16,9 @@ impl<'a, 'u> Expr<'a, 'u> {
     pub fn transpile(&mut self, node: tree_sitter::Node) -> String {
         match node.kind() {
             "string_literal" => self.string_literal(node),
+            // Kotlin and Java use the same lexical form for character
+            // literals, including standard escapes such as `\\n` and `\\uXXXX`.
+            "character_literal" => self.unit.text(node).trim().to_string(),
             "number_literal" | "boolean_literal" | "hex_literal" | "long_literal"
             | "real_literal" => {
                 let raw = self.unit.text(node).trim().to_string();

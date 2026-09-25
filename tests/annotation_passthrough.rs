@@ -182,3 +182,38 @@ fn repeated_same_name_annotation_taints() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+/// A Kotlin annotation declaration becomes a Java annotation interface, and
+/// declarations using it can migrate in the same batch.
+#[test]
+fn kotlin_annotation_declaration_and_use_translate_together() {
+    let root = Path::new("tests/tmp_scratch_annotation_declaration");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("tag.kt"),
+        "package neutral.annotationdecl\n\
+         \n\
+         annotation class Tag(val value: String, val enabled: Boolean = true)\n",
+    )
+    .unwrap();
+    let stderr = run(root, &root.join("tag.kt"));
+    let tag = fs::read_to_string(root.join("Tag.java")).unwrap_or_default();
+    assert!(
+        tag.contains("public @interface Tag"),
+        "missing Java annotation type:\n{tag}"
+    );
+    assert!(
+        tag.contains("String value();"),
+        "missing annotation element:\n{tag}"
+    );
+    assert!(
+        tag.contains("boolean enabled() default true;"),
+        "missing Java default:\n{tag}"
+    );
+    assert!(
+        !stderr.contains("N04DC"),
+        "annotation declaration must not taint:\n{stderr}"
+    );
+    let _ = fs::remove_dir_all(root);
+}

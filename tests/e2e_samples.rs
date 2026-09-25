@@ -468,6 +468,30 @@ enum class Color(val rgb: Int) {
 }
 
 #[test]
+fn enum_comments_do_not_make_members_unsupported() {
+    let source = r#"enum class Phase {
+    // first state
+    START,
+    /* terminal state */
+    FINISH
+}"#;
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Phase.kt"]);
+    let (files, errors, warnings, _cov) =
+        notlin::transpiler::transpile(source, &PathBuf::from("Phase.kt"), &cli);
+    assert_eq!(errors, 0);
+    assert_eq!(warnings, 0, "enum comments are trivia, not members");
+    let phase = files
+        .iter()
+        .find(|(name, _)| name == "Phase.java")
+        .map(|(_, source)| source)
+        .expect("Phase.java emitted");
+    assert!(
+        phase.contains("START,") && phase.contains("FINISH"),
+        "{phase}"
+    );
+}
+
+#[test]
 fn complex_enum_taints_instead_of_emitting_broken_java() {
     // sealed modifiers, generic enums, and abstract members are beyond javac
     // enums — the declaration must NOT be emitted at all.
@@ -519,6 +543,27 @@ fn companion_object_members_become_statics() {
         !counter.contains("this.instances"),
         "static setter must not use this"
     );
+}
+
+#[test]
+fn companion_line_comments_do_not_make_members_unsupported() {
+    let source = r#"class Holder {
+    companion object {
+        // documentation kept in Kotlin only
+        val LIMIT = 7
+    }
+}"#;
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Holder.kt"]);
+    let (files, errors, warnings, _cov) =
+        notlin::transpiler::transpile(source, &PathBuf::from("Holder.kt"), &cli);
+    assert_eq!(errors, 0);
+    assert_eq!(warnings, 0, "a comment is not a companion member");
+    let holder = files
+        .iter()
+        .find(|(n, _)| n == "Holder.java")
+        .map(|(_, c)| c.as_str())
+        .expect("Holder.java");
+    assert!(holder.contains("static final int LIMIT = 7;"), "{holder}");
 }
 
 #[test]

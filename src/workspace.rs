@@ -611,6 +611,15 @@ impl SourceIndex {
         })
     }
 
+    pub fn annotation_is_selected(&self, name: &str, translation_roots: &[PathBuf]) -> bool {
+        self.files.iter().any(|file| {
+            self.is_selected(&file.path, translation_roots)
+                && file.declarations.iter().any(|declaration| {
+                    declaration.name == name && declaration.kind == DeclarationKind::Annotation
+                })
+        })
+    }
+
     pub fn has_kotlin_subtype(&self, target: &Declaration) -> bool {
         self.kotlin_subtypes.contains_key(&declaration_key(target))
     }

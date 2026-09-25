@@ -796,6 +796,12 @@ impl<'a, 'u> Expr<'a, 'u> {
                         })
                         .unwrap_or(false);
                     let base_stream_ready = base_java.ends_with(".stream()");
+                    // `collection.stream().filter { ... }` is already the
+                    // Java Stream API; preserve the direct member rather than
+                    // treating Kotlin's Iterable.filter as the receiver.
+                    if member == "filter" && base_stream_ready {
+                        return format!("{}.filter", base_java);
+                    }
                     let jm_first = |jm: &str| -> String {
                         // A mapped form that starts by opening a stream must
                         // not double-stream a receiver that already is one
@@ -1437,6 +1443,7 @@ fn kotlin_member_to_java(member: &str) -> Option<String> {
         "remove",
         "clear",
         "add",
+        "append",
     ];
     if SAFE.contains(&member) {
         return Some(member.to_string());

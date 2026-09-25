@@ -654,21 +654,24 @@ impl<'a, 'u> Expr<'a, 'u> {
                     b.to_string()
                 }
             };
-            // Arrays.stream(...) already IS a Stream — no .stream() tail.
-            let stream_base =
-                if base.starts_with("java.util.Arrays.stream") || base.ends_with(".stream()") {
-                    base.clone()
-                } else if self
-                    .unit
-                    .var_types
-                    .get(base.trim())
-                    .is_some_and(|t| t.starts_with("Map<"))
-                {
-                    // Kotlin maps stream over their ENTRIES (Map.Entry pairs).
-                    format!("{}.entrySet().stream()", base)
-                } else {
-                    format!("{}.stream()", base)
-                };
+            let is_direct_java_stream =
+                base.starts_with("java.util.Arrays.stream") || base.ends_with(".stream()");
+            // Arrays.stream(...) and a pre-existing `.stream()` are already
+            // Java Streams — no `.stream()` tail and no Kotlin collection-op
+            // approximation warning are needed.
+            let stream_base = if is_direct_java_stream {
+                base.clone()
+            } else if self
+                .unit
+                .var_types
+                .get(base.trim())
+                .is_some_and(|t| t.starts_with("Map<"))
+            {
+                // Kotlin maps stream over their ENTRIES (Map.Entry pairs).
+                format!("{}.entrySet().stream()", base)
+            } else {
+                format!("{}.stream()", base)
+            };
             let _ = &stream_base;
             let stream_fn = match member {
                 "map" | "mapNotNull" | "mapIndexed" => "map",
@@ -677,14 +680,16 @@ impl<'a, 'u> Expr<'a, 'u> {
                 "sorted" => "sorted",
                 other => other,
             };
-            self.unit.diags.warn_approx(
-                node,
-                self.unit.file,
-                format!(
-                    "collection op `.{member} {{...}}` approximated with Stream",
-                    member = member
-                ),
-            );
+            if !is_direct_java_stream {
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    format!(
+                        "collection op `.{member} {{...}}` approximated with Stream",
+                        member = member
+                    ),
+                );
+            }
             // joinToString(sep) -> collect(joining(sep)): the separator is
             // the first positional arg; other overloads (prefix/postfix/
             // limit/transform) degrade to joinToString-less collection with

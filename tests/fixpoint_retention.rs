@@ -58,13 +58,11 @@ fn clean_hub_and_implementor_translate_together() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// Hub + annotation-blocked implementor: `@KotlinOnly` is a Kotlin-declared
-/// annotation type (annotation class in the same workspace), so the
-/// implementor retains intrinsically AND the hub retains too — the
-/// old conservative behavior, now reached via the fixpoint instead of a
-/// blanket catch-all.
+/// Hub + a Java-representable Kotlin annotation: the annotation declaration,
+/// implementor, and hub all translate in one fixpoint. A marker annotation has
+/// a direct Java `@interface` representation and is not an intrinsic blocker.
 #[test]
-fn annotation_blocked_implementor_retains_its_hub() {
+fn marker_annotation_implementor_translates_with_hub() {
     let root = Path::new("tests/tmp_scratch_fixpoint_tainted");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -96,13 +94,17 @@ fn annotation_blocked_implementor_retains_its_hub() {
         .expect("run notlin");
     let stderr = String::from_utf8_lossy(&out.stderr);
     let speaker_java = fs::read_to_string(root.join("Speaker.java")).unwrap_or_default();
+    let parrot_java = fs::read_to_string(root.join("Parrot.java")).unwrap_or_default();
+    let annotation_java = fs::read_to_string(root.join("KotlinOnly.java")).unwrap_or_default();
     assert!(
-        speaker_java.is_empty(),
-        "hub of an intrinsically retained subtype must stay Kotlin, got:\n{speaker_java}"
+        !speaker_java.is_empty()
+            && !parrot_java.is_empty()
+            && annotation_java.contains("@interface KotlinOnly"),
+        "Java-representable annotation family must translate.\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("N7395"),
-        "expected the hub retention diagnostic:\n{stderr}"
+        !stderr.contains("N7395"),
+        "no retention diagnostic expected:\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }
