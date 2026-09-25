@@ -1186,7 +1186,18 @@ impl<'a, 'u> Expr<'a, 'u> {
 
     fn transpile_callee(&mut self, node: tree_sitter::Node) -> String {
         match node.kind() {
-            "identifier" => self.unit.text(node).to_string(),
+            "identifier" => {
+                let callee = self.unit.text(node).to_string();
+                // A bare call to a file-local top-level function that REMAINED
+                // Kotlin (in coverage.untranslated) cannot resolve in the
+                // translated Java — taint the calling declaration instead of
+                // emitting an uncompilable reference.
+                if self.unit.is_untranslated_file_function(&callee) {
+                    self.unit
+                        .diag_untranslatable(node, format!("call to `{callee}` resolves to a top-level function that remains Kotlin"));
+                }
+                callee
+            }
             "navigation_expression" => self.navigation_call(node),
             _ => self.transpile(node),
         }

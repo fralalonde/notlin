@@ -58,8 +58,9 @@ fn clean_hub_and_implementor_translate_together() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// Hub + annotation-blocked implementor: the implementor retains
-/// intrinsically (declaration annotation), so the hub retains too — the
+/// Hub + annotation-blocked implementor: `@KotlinOnly` is a Kotlin-declared
+/// annotation type (annotation class in the same workspace), so the
+/// implementor retains intrinsically AND the hub retains too — the
 /// old conservative behavior, now reached via the fixpoint instead of a
 /// blanket catch-all.
 #[test]
@@ -68,6 +69,13 @@ fn annotation_blocked_implementor_retains_its_hub() {
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
     fs::write(
+        root.join("mine.kt"),
+        "package neutral.fixpoint2\n\
+         \n\
+         annotation class KotlinOnly\n",
+    )
+    .unwrap();
+    fs::write(
         root.join("hub.kt"),
         "package neutral.fixpoint2\n\
          \n\
@@ -75,7 +83,7 @@ fn annotation_blocked_implementor_retains_its_hub() {
          \x20   fun speak(): String\n\
          }\n\
          \n\
-         @org.jetbrains.annotations.NotNull\n\
+         @KotlinOnly\n\
          class Parrot : Speaker {\n\
          \x20   override fun speak(): String = \"squawk\"\n\
          }\n",

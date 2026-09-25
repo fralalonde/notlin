@@ -25,6 +25,10 @@ pub enum DeclarationKind {
     Enum,
     Object,
     Record,
+    /// `annotation class` — Kotlin annotation type. Annotation USE sites on
+    /// declarations referencing an annotation-kind declaration stay Kotlin:
+    /// the Java side cannot reference a Kotlin-only annotation element.
+    Annotation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1451,8 +1455,28 @@ fn declaration_shape(
                         })
                         .unwrap_or(false)
                     };
+                let is_annotation = node
+                    .children(&mut node.walk())
+                    .any(|child| child.kind() == "modifiers")
+                    && {
+                        let mods = node
+                            .children(&mut node.walk())
+                            .find(|child| child.kind() == "modifiers");
+                        mods.map(|m| {
+                            m.children(&mut m.walk()).any(|sub| {
+                                sub.kind() == "class_modifier" && {
+                                    sub.children(&mut sub.walk())
+                                        .any(|kw| kw.kind() == "annotation")
+                                }
+                            })
+                        })
+                        .unwrap_or(false)
+                    };
                 (
-                    if is_interface {
+                    if is_annotation {
+                        // `annotation class` — Kotlin annotation TYPE.
+                        DeclarationKind::Annotation
+                    } else if is_interface {
                         DeclarationKind::Interface
                     } else if is_enum {
                         DeclarationKind::Enum

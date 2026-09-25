@@ -81,28 +81,52 @@ fn generic_variance_becomes_java_wildcards() {
 }
 
 #[test]
-fn standalone_annotation_retains_following_object() {
+fn standalone_annotation_passes_through_on_objects() {
+    // Superseded conservative behavior: a leading annotation used to taint
+    // the whole file (annotated_expression wrapper). `@Marker("x")` is
+    // Java-native (unresolvable in the index, no Kotlin-only arguments), so
+    // both objects translate with the annotation verbatim.
     let (files, errors) = transpile_src(
         "@Marker(\"x\")\nobject First\n@Marker(\"y\")\nobject Second\n",
         "AnnotatedObjects.kt",
     );
     assert_eq!(errors, 0);
-    assert!(!files.iter().any(|(name, _)| name == "First.java"));
-    assert!(!files.iter().any(|(name, _)| name == "Second.java"));
+    let first = files
+        .iter()
+        .find(|(name, _)| name == "First.java")
+        .map(|(_, source)| source)
+        .expect("First.java");
+    assert!(first.contains("@Marker(\"x\")"), "{first}");
+    assert!(files.iter().any(|(name, _)| name == "Second.java"));
 }
 
 #[test]
-fn annotated_interface_is_retained_in_kotlin() {
+fn annotated_interface_passes_annotation_through() {
+    // Superseded conservative behavior: an unresolvable annotation name used
+    // to taint the whole declaration (N04DC). Annotation passthrough now
+    // emits Java-native annotation text verbatim — `Marker` is not a
+    // Kotlin-declared annotation type in the index, and the arguments carry
+    // no Kotlin-only syntax, so both interfaces translate.
     let (files, errors) = transpile_src(
         "@Marker(value = \"x\")\ninterface Parent\ninterface Child : Parent\n",
         "AnnotatedInheritance.kt",
     );
     assert_eq!(errors, 0);
-    assert!(!files.iter().any(|(name, _)| name == "Parent.java"));
+    let parent = files
+        .iter()
+        .find(|(name, _)| name == "Parent.java")
+        .map(|(_, source)| source)
+        .expect("Parent.java");
+    assert!(parent.contains("@Marker(value = \"x\")"), "{parent}");
     assert!(files.iter().any(|(name, _)| name == "Child.java"));
 }
 #[test]
-fn in_place_migration_keeps_annotated_declaration_source() {
+fn in_place_migration_strips_annotated_declaration_source() {
+    // Superseded conservative behavior: the annotated interface used to stay
+    // in the .kt residue. With annotation passthrough the interface
+    // translates (annotation included). The retention-fixpoint planner (the
+    // CLI's workspace path) decides retention; a raw transpile_with_workspace
+    // call without a retained hint is deliberately the conservative catch-all.
     let root = std::env::temp_dir().join(format!("notlin-annotated-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
@@ -112,21 +136,30 @@ fn in_place_migration_keeps_annotated_declaration_source() {
 
     let index = notlin::workspace::SourceIndex::discover(&root).unwrap();
     let cli = notlin::cli::Cli::parse_from(["notlin", "--in-place", path.to_str().unwrap()]);
-    let (files, errors, _warnings, coverage) = notlin::transpiler::transpile_with_workspace(
-        source,
-        &path,
+    let plans = notlin::transpiler::fixpoint::plan_workspace(
+        &[(path.clone(), source.to_string())],
         &cli,
-        Some(&index),
+        &index,
         std::slice::from_ref(&root),
+        8,
     );
-    assert_eq!(errors, 0);
-    assert!(coverage.untranslated.iter().any(|name| name == "Parent"));
-    assert!(files.iter().any(|(name, _)| name == "Child.java"));
+    assert_eq!(plans.len(), 1);
+    let plan = &plans[0];
+    assert_eq!(plan.errors, 0);
+    assert!(
+        !plan
+            .coverage
+            .untranslated
+            .iter()
+            .any(|name| name == "Parent"),
+        "Parent must translate under the fixpoint: {:?}",
+        plan.coverage.untranslated
+    );
+    assert!(plan.java_files.iter().any(|(name, _)| name == "Child.java"));
 
-    notlin::migrate::migrate(&path, source, &coverage).unwrap();
-    let remaining = fs::read_to_string(&path).unwrap();
-    assert!(remaining.contains("interface Parent"), "{remaining}");
-    assert!(!remaining.contains("interface Child"), "{remaining}");
+    notlin::migrate::migrate(&path, source, &plan.coverage).unwrap();
+    // Both declarations translated, so migrate DELETES the source file.
+    assert!(!path.exists(), "fully translated source must be deleted");
     fs::remove_dir_all(root).unwrap();
 }
 #[test]

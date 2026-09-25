@@ -20,6 +20,24 @@ impl<'a> Unit<'a> {
             for c in n.children(&mut n.walk()) {
                 stack.push(c);
             }
+            // Top-level function names for `is_untranslated_file_function`:
+            // a translated declaration must not emit a bare call to a file
+            // function that remained Kotlin.
+            if n.kind() == "function_declaration"
+                && n.parent().is_some_and(|p| p.kind() == "source_file")
+                && let Some(nm) = kt::field(n, "name")
+            {
+                let fname = self.text(nm).to_string();
+                // A top-level function referenced by retained Kotlin source
+                // will itself remain Kotlin (the loose-decl pass runs after
+                // the type loop, too late for callee checks) — pre-mark it so
+                // translated bodies taint instead of emitting bare calls.
+                let retained = self.workspace_requires_top_level_retention(&fname);
+                if retained {
+                    self.retained_file_functions.insert(fname.clone());
+                }
+                self.top_level_functions.insert(fname);
+            }
             if n.kind() != "class_declaration" {
                 continue;
             }
@@ -167,6 +185,138 @@ impl<'a> Unit<'a> {
         f(self, out);
     }
 
+    /// Lower one declaration annotation to Java text, or None when the
+    /// annotation must stay in Kotlin. Java-native pass-through rules:
+    ///   - the annotation NAME resolves to a pre-existing Java declaration in
+    ///     the workspace index, OR the workspace is absent/unresolvable
+    ///     (single-file probes; the target build proves the classpath) —
+    ///   - the ARGUMENTS contain no Kotlin-only syntax: `::class` references,
+    ///     string templates, `[]` array arguments, lambdas, or named-value
+    ///     forms the annotation node renders with Kotlin spellings.
+    ///
+    /// The use-site target (`@get:` / `@field:`) is dropped: Java annotates
+    /// the element itself, and notlin's primary-constructor properties are
+    /// fields with Lombok accessors.
+    pub(crate) fn transpile_declaration_annotation(
+        &self,
+        node: tree_sitter::Node,
+    ) -> Option<String> {
+        // Wrapper shape: an annotated_expression node (grammar quirk) carries
+        // the annotation in a child plus, sometimes, a sibling
+        // parenthesized_expression holding the argument list
+        // (`@JsonSubTypes(...)`); when the arguments live INSIDE the
+        // annotation's own constructor_invocation (`@JsonTypeInfo(use = ...)`)
+        // the sibling is absent. Descend to the annotation for the parts and
+        // prefer the in-node argument text.
+        let (annotation_node, argument_text) = if node.kind() == "annotated_expression" {
+            let annotation = kt::child(node, "annotation");
+            let args = kt::child(node, "parenthesized_expression")
+                .map(|p| self.text(p).to_string())
+                .unwrap_or_default();
+            let in_node_args = annotation
+                .and_then(|a| kt::child(a, "constructor_invocation"))
+                .and_then(|a| kt::child(a, "value_arguments"))
+                .map(|a| self.text(a).to_string())
+                .unwrap_or_default();
+            let args = if in_node_args.is_empty() {
+                args
+            } else {
+                in_node_args
+            };
+            (annotation, args)
+        } else {
+            (
+                Some(node),
+                kt::child(node, "constructor_invocation")
+                    .and_then(|a| kt::child(a, "value_arguments"))
+                    .map(|a| self.text(a).to_string())
+                    .unwrap_or_default(),
+            )
+        };
+        let annotation_node = annotation_node?;
+        // The annotation name: the `constructor_invocation`'s `user_type`
+        // (handles `com.example.Mapping`); a bare `user_type` directly under
+        // the annotation node (no arguments, e.g. `@NotNull`) is the
+        // fallback. The use-site target child is skipped by kind.
+        let invocation_user_type = kt::child(annotation_node, "constructor_invocation")
+            .and_then(|a| kt::child(a, "user_type"));
+        let direct_user_type = annotation_node
+            .children(&mut annotation_node.walk())
+            .find(|c| matches!(c.kind(), "user_type" | "identifier"));
+        let name = invocation_user_type
+            .or(direct_user_type)
+            .map(|c| self.text(c).to_string())?;
+        // Kotlin-only argument shapes taint immediately — except a
+        // `Name::class` class literal, which rewrites to `Name.class` in Java
+        // when `Name` resolves to a Java-visible declaration (checked below);
+        // an unknown or Kotlin-only name keeps the taint.
+        if argument_text.contains("${")
+            || argument_text.contains('[')
+            || argument_text.contains('{')
+        {
+            return None;
+        }
+        if argument_text.contains("::class") {
+            let mut lowered = argument_text.clone();
+            for part in argument_text.split(['(', ',', ')']) {
+                let trimmed = part.trim();
+                if let Some(token) = trimmed.strip_suffix("::class") {
+                    let class_name = token.split_whitespace().next_back().unwrap_or(token);
+                    let simple = class_name.rsplit('.').next().unwrap_or(class_name);
+                    let java_visible = self.workspace.is_some_and(|ws| {
+                        ws.declarations().any(|d| {
+                            d.name == simple
+                                && d.kind != crate::workspace::DeclarationKind::Annotation
+                        })
+                    });
+                    if !java_visible {
+                        return None;
+                    }
+                    lowered = lowered.replace(
+                        &format!("{class_name}::class"),
+                        &format!("{class_name}.class"),
+                    );
+                }
+            }
+            if lowered.contains("::class") {
+                return None;
+            }
+            return Some(
+                format!(
+                    "@{name}{}",
+                    brace_wrap_unnamed_nested_annotations(&prefix_nested_annotations(&lowered))
+                )
+                .trim_end()
+                .to_string(),
+            );
+        }
+        // A workspace-provable Kotlin annotation type taints: the annotation
+        // declaration itself stays Kotlin (or translates separately, but the
+        // Java side cannot reference a Kotlin-only element).
+        if let Some(workspace) = self.workspace
+            && let Some(decl) = workspace
+                .declarations()
+                .find(|d| d.name == name && d.kind == crate::workspace::DeclarationKind::Annotation)
+        {
+            let _ = decl;
+            return None;
+        }
+        // Rebuild from the parts: a use-site target (`@get:X(...)` -> `@X(...)`)
+        // is dropped and the arguments ride on the bare name; the wrapper
+        // shape (annotated_expression) holds its arguments separately from
+        // the annotation node, so `text` is not usable there.
+        // Both shapes pass ONLY the argument list (never the annotation name)
+        // to the transforms: brace-wrapping the name would move it inside the
+        // braces.
+        let arguments =
+            brace_wrap_unnamed_nested_annotations(&prefix_nested_annotations(&argument_text));
+        let rebuilt = format!("@{name}{arguments}");
+        // Kotlin wildcard/star imports and `!` nullability assertions never
+        // appear here (parsed as value arguments), but a trailing semicolon
+        // or whitespace from multi-annotation lines would break Java.
+        Some(rebuilt.trim_end().to_string())
+    }
+
     fn workspace_requires_kotlin_retention(&self, name: &str) -> bool {
         let Some(workspace) = self.workspace else {
             return false;
@@ -240,12 +390,25 @@ impl<'a> Unit<'a> {
             .children(&mut decl.walk())
             .any(|c| c.kind() == "interface");
         let mut modifiers = String::new();
+        let mut annotations: Vec<String> = Vec::new();
+        // Java-native annotations hoisted from a preceding top-level
+        // annotated_expression wrapper (grammar quirk) ride first.
+        if let Some(hoisted) = self.hoisted_annotations.remove(&decl.id()) {
+            annotations.extend(hoisted);
+        }
         if let Some(mods) = kt::child(decl, "modifiers") {
             let mut cursor = mods.walk();
             for m in mods.children(&mut cursor) {
                 match m.kind() {
                     "annotation" => {
-                        self.diag_untranslatable(m, "declaration annotation is retained in Kotlin");
+                        if let Some(text) = self.transpile_declaration_annotation(m) {
+                            annotations.push(text);
+                        } else {
+                            self.diag_untranslatable(
+                                m,
+                                "declaration annotation is retained in Kotlin",
+                            );
+                        }
                     }
                     "class_modifier" => {
                         let mut inner = m.walk();
@@ -279,6 +442,31 @@ impl<'a> Unit<'a> {
                 }
             }
         }
+        // Kotlin permits repeating the same annotation on one declaration
+        // (a stack of `@X(...)` lines); plain Java needs `@Repeatable` on the
+        // annotation type, which notlin cannot verify — taint instead of
+        // emitting an uncompilable duplicate.
+        {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for annotation in &annotations {
+                let annotation_name = annotation
+                    .trim_start_matches('@')
+                    .split(['(', ' ', '\n'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if !seen.insert(annotation_name.clone()) {
+                    self.diag_untranslatable(
+                        decl,
+                        format!(
+                            "annotation {annotation_name} is repeated on this declaration; Java needs @Repeatable which cannot be verified"
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
         // visibility: Kotlin default = public; java default = package-private
         // We emit `public ` for Kotlin public (default) and nothing for private etc.
         let visibility = self.visibility_of(decl);
@@ -295,14 +483,21 @@ impl<'a> Unit<'a> {
         }
 
         if decl.kind() == "object_declaration" {
-            self.transpile_object(decl, &name, &visibility, out);
+            self.transpile_object(decl, &name, &visibility, &annotations, out);
             return;
         }
         if is_enum {
-            self.transpile_enum(decl, &name, &visibility, &modifiers, is_sealed, out);
+            self.transpile_enum(
+                decl,
+                &name,
+                &visibility,
+                &modifiers,
+                is_sealed,
+                &annotations,
+                out,
+            );
             return;
         }
-
         // primary constructor parameters -> fields + constructor
         // Class type parameters `class Gen<T : Bound>(...)` must be emitted or
         // field/ctor references to them won't resolve (P0 audit finding).
@@ -539,6 +734,11 @@ impl<'a> Unit<'a> {
             // Interfaces declared type parameters too (`interface
             // IActivityUpdatedEvent<T : Activity>`) — emit them or the
             // `T` references in extends/implies clauses won't resolve.
+            // Java-native declaration annotations pass through verbatim
+            // (collected during the modifiers scan above).
+            for annotation in &annotations {
+                out.line(annotation.clone());
+            }
             out.open(format!(
                 "{}{}interface {}{}{}",
                 visibility, modifiers, name, type_params, extends
@@ -620,6 +820,11 @@ impl<'a> Unit<'a> {
             out.line("@Data");
             out.line("@AllArgsConstructor");
             out.blank();
+            // Java-native declaration annotations pass through verbatim
+            // (collected during the modifiers scan above).
+            for annotation in &annotations {
+                out.line(annotation.clone());
+            }
             let tp = type_params.trim_end();
             out.open(format!(
                 "{}{}class {}{}{}",
@@ -720,6 +925,9 @@ impl<'a> Unit<'a> {
             // `data class FindQ<T : IObj>(...)` needs `record FindQ<T>(...)`
             // or every `T` reference inside fails to resolve.
             let tp = type_params.trim_end(); // "<T> " / ""
+            for annotation in &annotations {
+                out.line(annotation.clone());
+            }
             if extends.is_empty() {
                 out.open(format!(
                     "{}record {}{}({})",
@@ -817,6 +1025,11 @@ impl<'a> Unit<'a> {
                     out.line("@AllArgsConstructor");
                 }
                 out.blank();
+            }
+            // Java-native declaration annotations pass through verbatim
+            // (collected during the modifiers scan above).
+            for annotation in &annotations {
+                out.line(annotation.clone());
             }
             out.open(format!(
                 "{}{}{}{} {}{}{}{}",
@@ -991,6 +1204,7 @@ impl<'a> Unit<'a> {
     /// per-constant bodies the grammar can't even parse), and class modifiers
     /// like `sealed`. Plain supertypes are fine — Java enums may implement
     /// interfaces.
+    #[allow(clippy::too_many_arguments)]
     fn transpile_enum(
         &mut self,
         decl: tree_sitter::Node,
@@ -998,6 +1212,7 @@ impl<'a> Unit<'a> {
         visibility: &str,
         modifiers: &str,
         is_sealed: bool,
+        annotations: &[String],
         out: &mut JavaOut,
     ) {
         self.enum_types.insert(name.to_string());
@@ -1214,6 +1429,11 @@ impl<'a> Unit<'a> {
         let emit_entries_bridge = self
             .workspace
             .is_some_and(|workspace| workspace.has_enum_entries_consumer(name));
+        // Java-native declaration annotations pass through verbatim
+        // (collected during the modifiers scan above).
+        for annotation in annotations {
+            out.line(annotation.clone());
+        }
         out.open(format!("{}enum {}{}", visibility, name, implements));
         // constants
         out.line(entries.join(",\n"));
@@ -1445,6 +1665,7 @@ impl<'a> Unit<'a> {
         decl: tree_sitter::Node,
         name: &str,
         visibility: &str,
+        annotations: &[String],
         out: &mut JavaOut,
     ) {
         // Supertypes: `object Idle : State()` — the nested class must extend
@@ -1474,6 +1695,9 @@ impl<'a> Unit<'a> {
         } else {
             ""
         };
+        for annotation in annotations {
+            out.line(annotation.clone());
+        }
         out.open(format!(
             "{}{}final class {}{}",
             visibility, static_kw, name, obj_extends
@@ -1575,4 +1799,118 @@ impl<'a> Unit<'a> {
             }
         }
     }
+}
+
+/// After `@`-prefixing, Kotlin's auto-wrapped array form — unnamed top-level
+/// nested annotation invocations (`@JsonSubTypes(T(...), T(...))`) — must
+/// become a Java brace array literal (`{...}`) or javac rejects every element
+/// with "annotation values must be of the form 'name=value'". Named elements
+/// (`name = value`) and single simple values stay untouched.
+fn brace_wrap_unnamed_nested_annotations(prefixed: &str) -> String {
+    // The argument text arrives wrapped in its enclosing parentheses (from
+    // `value_arguments` or the wrapper's parenthesized_expression) — strip
+    // them so the top-level element scan sees the bare element list.
+    let trimmed = prefixed.trim();
+    let trimmed = if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        trimmed[1..trimmed.len() - 1].trim()
+    } else {
+        trimmed
+    };
+    // Already a brace array literal.
+    if trimmed.starts_with('{') {
+        return prefixed.to_string();
+    }
+    // Split the top-level elements at depth-0 commas.
+    let mut elements: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for character in trimmed.chars() {
+        match character {
+            '(' => {
+                depth += 1;
+                current.push(character);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(character);
+            }
+            '{' => {
+                depth += 1;
+                current.push(character);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                current.push(character);
+            }
+            ',' if depth == 0 => {
+                elements.push(current.clone());
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+    elements.push(current);
+    // Wrap only when EVERY top-level element is a nested annotation
+    // invocation (`@A.B(...)`): that is Kotlin's auto-wrapped array form
+    // (a single one included). Any named element (`name = value`) or simple
+    // value means the shape is already valid Java.
+    let all_nested_annotations = elements
+        .iter()
+        .all(|element| element.trim_start().starts_with('@'));
+    if !all_nested_annotations {
+        return prefixed.to_string();
+    }
+    // Wrap the element list in braces, keeping the enclosing parentheses:
+    // Java annotation array values are `@X({elem, elem})`.
+    format!("({{{trimmed}}})")
+}
+
+/// Java requires the `@` prefix on nested annotation types inside annotation
+/// arguments (`@JsonSubTypes.Type(value = X.class)`), while Kotlin omits it
+/// (`JsonSubTypes.Type(value = X::class)`). Walk the argument text and prefix
+/// `@` on every qualified identifier chain that starts a call — `A.B(` where
+/// the chain is preceded by nothing, `(`, `,`, `=`, or whitespace and not
+/// already `@`. Only qualified chains (containing `.`) are prefixed: a bare
+/// `name(` inside annotation values is not a nested annotation shape.
+fn prefix_nested_annotations(argument_text: &str) -> String {
+    if !argument_text.contains('(') {
+        return argument_text.to_string();
+    }
+    let mut result = String::with_capacity(argument_text.len() + 8);
+    let mut token_start: Option<usize> = None;
+    let bytes = argument_text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let character = bytes[index] as char;
+        let is_identifier_byte = character.is_alphabetic()
+            || character == '_'
+            || (character.is_ascii_digit() && token_start.is_some());
+        if is_identifier_byte || (character == '.' && token_start.is_some()) {
+            if token_start.is_none() {
+                token_start = Some(index);
+            }
+            result.push(character);
+            index += 1;
+            continue;
+        }
+        if character == '(' {
+            if let Some(start) = token_start {
+                let token = &argument_text[start..index];
+                let already_annotated =
+                    start > 0 && argument_text[..start].trim_end().ends_with('@');
+                if token.contains('.') && !already_annotated {
+                    let insert_at = result.len() - token.chars().count();
+                    result.insert(insert_at, '@');
+                }
+                token_start = None;
+            }
+            result.push('(');
+            index += 1;
+            continue;
+        }
+        token_start = None;
+        result.push(character);
+        index += 1;
+    }
+    result
 }

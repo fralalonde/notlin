@@ -129,6 +129,24 @@ pub struct Unit<'a> {
     /// subtype rule consults it (`has_retained_kotlin_subtype`) instead of
     /// retaining on every Kotlin subtype; None = conservative catch-all.
     pub(crate) retained_hint: Option<std::collections::HashSet<String>>,
+    /// node-id -> Java-native annotation texts hoisted from a preceding
+    /// top-level annotated_expression wrapper (grammar quirk: a leading
+    /// `@X("v") object T` parses the annotation outside the declaration).
+    /// Transpile_type_decl prepends them to the declaration's own annotations.
+    pub(crate) hoisted_annotations: std::collections::HashMap<usize, Vec<String>>,
+    /// node-id -> byte spans of the annotated_expression wrappers that
+    /// preceded the declaration, so end_decl strips the wrapper text alongside
+    /// the translated declaration (an unstripped wrapper dangles in the
+    /// residue and re-binds to the NEXT surviving declaration).
+    pub(crate) wrapper_spans: std::collections::HashMap<usize, Vec<(usize, usize)>>,
+    /// Simple names of TOP-LEVEL function declarations in this file, gathered
+    /// in the pre-pass: a translated declaration must not emit a bare call to
+    /// one that remained Kotlin.
+    pub(crate) top_level_functions: std::collections::HashSet<String>,
+    /// Top-level function names that WILL remain Kotlin (referenced by
+    /// retained Kotlin source), decided in the pre-pass — the loose-decl pass
+    /// runs after the type loop, so callee checks need this decision early.
+    pub(crate) retained_file_functions: std::collections::HashSet<String>,
 }
 
 /// Constructor-mode flags bundled for `Unit::new` (a plain value object
@@ -186,6 +204,10 @@ impl<'a> Unit<'a> {
             workspace_file: None,
             translation_roots: &[],
             retained_hint: None,
+            hoisted_annotations: std::collections::HashMap::new(),
+            wrapper_spans: std::collections::HashMap::new(),
+            top_level_functions: std::collections::HashSet::new(),
+            retained_file_functions: std::collections::HashSet::new(),
         }
     }
 
@@ -236,6 +258,21 @@ impl<'a> Unit<'a> {
                 self.coverage
                     .translated_spans
                     .push((node.start_byte(), node.end_byte()));
+                // A preceding annotated_expression wrapper (grammar quirk:
+                // `@X(...) decl` parses the annotation as a separate top-level
+                // node) belongs to this translated declaration — strip it too
+                // or it dangles in the residue and re-binds to the NEXT
+                // surviving declaration (kotlinc: "annotation is not
+                // repeatable" when the next decl carries the same annotation).
+                // Strip every annotated_expression wrapper that preceded this
+                // translated declaration (grammar quirk: `@X(...) decl` parses
+                // the annotation as a separate top-level node). An unstripped
+                // wrapper dangles in the residue and re-binds to the NEXT
+                // surviving declaration (kotlinc: "annotation is not
+                // repeatable" when that decl carries the same annotation).
+                if let Some(ranges) = self.wrapper_spans.remove(&node.id()) {
+                    self.coverage.translated_spans.extend(ranges);
+                }
             } else {
                 // stays in the .kt file; not counted as translated
                 self.coverage.translated.retain(|l| l != &label);
@@ -249,6 +286,17 @@ impl<'a> Unit<'a> {
             self.coverage.untranslated.push(label.to_string());
         }
         self.coverage.translated.retain(|l| l != label);
+    }
+
+    /// True when `name` is a top-level function declared in THIS file whose
+    /// declaration remained Kotlin (labeled untranslated). Bare calls to it
+    /// from translated declarations cannot resolve in Java.
+    pub(crate) fn is_untranslated_file_function(&self, name: &str) -> bool {
+        if self.retained_file_functions.contains(name) {
+            return true;
+        }
+        self.top_level_functions.contains(name)
+            && self.coverage.untranslated.iter().any(|l| l == name)
     }
 
     pub fn text<'t>(&self, node: tree_sitter::Node<'t>) -> &'t str
@@ -413,6 +461,12 @@ impl<'a> Unit<'a> {
         let mut decls: Vec<tree_sitter::Node> = Vec::new();
         let mut standalone_annotation_targets = std::collections::HashSet::new();
         let mut retain_next_declaration = false;
+        // Java-native annotations hoisted from top-level annotated_expression
+        // wrappers (grammar quirk) waiting for the next declaration.
+        let mut hoisted_annotations: Vec<String> = Vec::new();
+        // Byte ranges of wrappers seen since the last declaration; donated to
+        // the NEXT declaration so end_decl can strip them with it.
+        let mut wrapper_spans_for_next: Vec<(usize, usize)> = Vec::new();
 
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
@@ -430,20 +484,33 @@ impl<'a> Unit<'a> {
                 }
                 "shebang_line" | ";" | "line_comment" | "multiline_comment" | "block_comment" => {}
                 "annotated_expression" => {
-                    // An annotation wrapper may contain a declaration whose
-                    // annotation semantics are not representable in Java.
-                    // Retain the complete Kotlin construct rather than
-                    // dropping the declaration while translating siblings.
-                    self.diag_untranslatable(
-                        child,
-                        "annotated top-level declaration is retained in Kotlin",
-                    );
-                    if self.current_decl.is_none() {
-                        self.coverage
-                            .untranslated
-                            .push(format!("top-level@{}", child.start_byte()));
+                    // Grammar quirk: a leading top-level `@X("v") object T`
+                    // parses the annotation into a SEPARATE
+                    // annotated_expression (the object lands outside it).
+                    // Lower the annotation via the passthrough helper: when
+                    // it is Java-native, buffer the text and prepend it to
+                    // the NEXT declaration's annotations; when it carries
+                    // Kotlin-only syntax, retain as before. Either way the
+                    // wrapper byte span is remembered so end_decl can strip
+                    // it with the following declaration when THAT translates
+                    // (an unstripped wrapper dangles in the residue and
+                    // re-binds to the NEXT surviving declaration).
+                    wrapper_spans_for_next.push((child.start_byte(), child.end_byte()));
+                    match self.transpile_declaration_annotation(child) {
+                        Some(text) => hoisted_annotations.push(text),
+                        None => {
+                            self.diag_untranslatable(
+                                child,
+                                "annotated top-level declaration is retained in Kotlin",
+                            );
+                            if self.current_decl.is_none() {
+                                self.coverage
+                                    .untranslated
+                                    .push(format!("top-level@{}", child.start_byte()));
+                            }
+                            retain_next_declaration = true;
+                        }
                     }
-                    retain_next_declaration = true;
                 }
                 k if k.contains("declaration")
                     || k == "object_declaration"
@@ -454,6 +521,23 @@ impl<'a> Unit<'a> {
                     if retain_next_declaration {
                         standalone_annotation_targets.insert(child.id());
                         retain_next_declaration = false;
+                    }
+                    if !wrapper_spans_for_next.is_empty() {
+                        // Every wrapper preceding this declaration maps to it,
+                        // so end_decl can strip the whole group (Some hoists
+                        // AND None taints alike).
+                        let donated = std::mem::take(&mut wrapper_spans_for_next);
+                        self.wrapper_spans
+                            .entry(child.id())
+                            .or_default()
+                            .extend(donated);
+                    }
+                    if !hoisted_annotations.is_empty() {
+                        let drained = std::mem::take(&mut hoisted_annotations);
+                        self.hoisted_annotations
+                            .entry(child.id())
+                            .or_default()
+                            .extend(drained);
                     }
                     decls.push(child);
                 }
