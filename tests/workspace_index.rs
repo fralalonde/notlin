@@ -32,6 +32,51 @@ fn symlink_dir(target: &Path, link: &Path) -> bool {
 }
 
 #[test]
+fn workspace_selection_detects_when_every_kotlin_file_is_selected() {
+    let root = std::env::temp_dir().join(format!("notlin-all-selected-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("first")).unwrap();
+    fs::create_dir_all(root.join("second")).unwrap();
+    fs::write(root.join("first/One.kt"), "package sample\nclass One\n").unwrap();
+    fs::write(root.join("second/Two.kt"), "package sample\nclass Two\n").unwrap();
+
+    let index = SourceIndex::discover(&root).unwrap();
+
+    assert!(index.all_kotlin_selected(&[root.clone()]));
+    assert!(!index.all_kotlin_selected(&[root.join("first")]));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retained_supertype_mismatch_reports_conflicting_member_names() {
+    let root = std::env::temp_dir().join(format!("notlin-member-mismatch-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("contract.kt"),
+        "package neutral.mismatch\ninterface Contract { val entries: List<String> }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("implementation.kt"),
+        "package neutral.mismatch\nclass Implementation(override val entries: List<Int>) : Contract\n",
+    )
+    .unwrap();
+
+    let index = SourceIndex::discover(&root).unwrap();
+    let implementation = index
+        .declarations()
+        .find(|declaration| declaration.name == "Implementation")
+        .expect("implementation indexed");
+
+    assert_eq!(
+        index.retained_supertype_member_mismatches(&implementation.supertypes, "Implementation"),
+        vec!["entries"]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn workspace_discovery_ignores_unrelated_dangling_symlinks() {
     let root = std::env::temp_dir().join(format!("notlin-dangling-link-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
@@ -427,6 +472,43 @@ fn transpiler_retains_selected_base_with_residual_kotlin_subtype() {
     assert!(coverage.untranslated.iter().any(|name| name == "Base"));
     fs::remove_dir_all(root).unwrap();
 }
+#[test]
+fn child_interface_stays_kotlin_with_retained_kotlin_supertype() {
+    let root =
+        std::env::temp_dir().join(format!("notlin-retained-supertype-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("selected")).unwrap();
+    fs::create_dir_all(root.join("residual")).unwrap();
+    let child_path = root.join("selected/Leaf.kt");
+    fs::write(&child_path, "package sample\ninterface Leaf : Base\n").unwrap();
+    fs::write(
+        root.join("residual/Base.kt"),
+        "package sample\ninterface Base { fun consume(values: MutableIterable<Long>) }\n",
+    )
+    .unwrap();
+
+    let index = SourceIndex::discover(&root).unwrap();
+    let cli = Cli::parse_from(["notlin", "--in-place", child_path.to_str().unwrap()]);
+    let source = fs::read_to_string(&child_path).unwrap();
+    let (files, errors, warnings, coverage) = transpiler::transpile_with_workspace_hint(
+        &source,
+        &child_path,
+        &cli,
+        Some(&index),
+        &[root.join("selected")],
+        Some(std::collections::HashSet::from(["Base".to_string()])),
+        true,
+    );
+    assert_eq!(errors, 0);
+    assert!(
+        files.is_empty(),
+        "a Java child must not inherit the retained Kotlin ABI"
+    );
+    assert!(warnings > 0);
+    assert!(coverage.untranslated.iter().any(|name| name == "Leaf"));
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn detects_kotlin_subtypes_even_inside_translation_roots() {
     let root = std::env::temp_dir().join(format!("notlin-interface-{}", std::process::id()));

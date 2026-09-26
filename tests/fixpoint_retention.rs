@@ -58,6 +58,48 @@ fn clean_hub_and_implementor_translate_together() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn retained_enum_keeps_its_kotlin_supertype_in_all_roots_mode() {
+    let root = Path::new("tests/tmp_scratch_fixpoint_retained_enum");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("types.kt"),
+        "package neutral.fixpoint3\n\
+         \n\
+         interface Speaker {\n\
+         \x20   fun speak(): String\n\
+         }\n\
+         \n\
+         enum class Mood : Speaker {\n\
+         \x20   CALM;\n\
+         \x20   override fun speak(): String = \"calm\"\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("usage.kt"),
+        "package neutral.fixpoint3\nfun currentMood(): Mood = Mood.CALM\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.as_os_str())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "notlin failed:\n{stderr}");
+    let speaker_java = fs::read_to_string(root.join("Speaker.java")).unwrap_or_default();
+    assert!(
+        speaker_java.is_empty(),
+        "interface with an intrinsically retained Kotlin subtype must stay Kotlin; got:\n{speaker_java}\n{stderr}"
+    );
+    let types = fs::read_to_string(root.join("types.kt")).unwrap_or_default();
+    assert!(types.contains("interface Speaker") && types.contains("enum class Mood"));
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Hub + a Java-representable Kotlin annotation: the annotation declaration,
 /// implementor, and hub all translate in one fixpoint. A marker annotation has
 /// a direct Java `@interface` representation and is not an intrinsic blocker.

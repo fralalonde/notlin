@@ -80,10 +80,30 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         // Read every source up front; stdin ('-') cannot participate in a
         // multi-file fixpoint (no path to index), so it keeps the old path.
         if files.iter().all(|f| f.as_os_str() != "-") {
-            let sources: Vec<(PathBuf, String)> = files
-                .iter()
-                .map(|file| read_source(file).map(|source| (file.clone(), source)))
-                .collect::<Result<_, _>>()?;
+            // Tolerant read: a source discovered by collect_inputs can VANISH
+            // before read_source (a concurrent cleanup, an overlapping
+            // notlin run migrating the same tree, or an External editor).
+            // Skip it with a printed warning instead of aborting the whole
+            // workspace migration — the file stays Kotlin and the NEXT run
+            // sees it again if it reappears.
+            let mut sources: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
+            let mut missing = 0usize;
+            for file in &files {
+                match read_source(file) {
+                    Ok(source) => sources.push((file.clone(), source)),
+                    Err(reason) => {
+                        missing += 1;
+                        eprintln!(
+                            "{}",
+                            format!("warning: source unreadable, skipped: {reason}").yellow()
+                        );
+                    }
+                }
+            }
+            if sources.is_empty() && missing > 0 {
+                return Err("all input files disappeared before reading".into());
+            }
+            let files = sources.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>();
             let plans =
                 transpiler::fixpoint::plan_workspace(&sources, cli, &index, &translation_roots, 16);
             for plan in &plans {

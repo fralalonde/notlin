@@ -372,7 +372,7 @@ impl<'a> Unit<'a> {
                             .unwrap_or_else(|| "arg".to_string());
                         let pty = kt::child(*k, "user_type")
                             .or_else(|| kt::child(*k, "nullable_type"))
-                            .map(|t| kt::java_type_ann(t, self.source, self.annots))
+                            .map(|t| kt::java_parameter_type(t, self.source, self.annots))
                             .unwrap_or_else(|| "Object".to_string());
                         if is_vararg {
                             params.push(format!("{}... {}", pty, pname));

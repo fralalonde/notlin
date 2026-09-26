@@ -22,6 +22,56 @@ fn run(root: &Path, input: &Path) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
+/// An annotated declaration surrounded by other types must survive an
+/// in-place pass even when its annotation has a Kotlin class literal.
+#[test]
+fn annotated_interface_between_types_is_not_lost_on_migration() {
+    let root = Path::new("tests/tmp_scratch_anno_multi");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("Types.kt"),
+        r#"package neutral.mapping
+
+interface Plain {
+    val code: String
+}
+
+@TypeInfo(
+    use = TypeInfo.Id.NAME,
+    include = TypeInfo.As.PROPERTY,
+    property = "kind")
+@SubTypes(
+    SubTypes.Type(value = Leaf::class),
+    SubTypes.Type(value = Other::class)
+)
+interface Tagged {
+    val code: String
+    val fallback: String
+        get() = "none"
+}
+
+class Leaf
+class Other
+class Holder(val tag: Tagged)
+"#,
+    )
+    .unwrap();
+    let stderr = run(root, &root.join("Types.kt"));
+    let java = root.join("Tagged.java").exists();
+    let kotlin_source = fs::read_to_string(root.join("Types.kt")).unwrap_or_default();
+    let kotlin = kotlin_source.contains("interface Tagged");
+    assert!(java || kotlin, "annotated interface disappeared: {stderr}");
+    assert!(
+        kotlin_source.contains("@TypeInfo("),
+        "annotation must stay with retained interface: {kotlin_source}"
+    );
+    let leaf_java = fs::read_to_string(root.join("Leaf.java")).unwrap_or_default();
+    assert!(!leaf_java.contains("@TypeInfo"), "{leaf_java}");
+    assert!(!leaf_java.contains("@SubTypes"), "{leaf_java}");
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A single-property string annotation on a data class with no workspace
 /// index (single-file probe): no Kotlin-only argument, so it passes through
 /// verbatim and the class translates.

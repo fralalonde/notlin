@@ -28,6 +28,7 @@ pub fn map_type_name(kotlin_type: &str) -> &str {
         "MutableList" => "ArrayList",
         "MutableMap" => "HashMap",
         "MutableSet" => "HashSet",
+        "MutableIterable" => "Iterable",
         "Nothing" => "Void",
         "Unit" => "void",
         "Int" => "int",

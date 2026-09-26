@@ -129,6 +129,10 @@ pub struct Unit<'a> {
     /// subtype rule consults it (`has_retained_kotlin_subtype`) instead of
     /// retaining on every Kotlin subtype; None = conservative catch-all.
     pub(crate) retained_hint: Option<std::collections::HashSet<String>>,
+    /// Members whose generic return/field types must be erased in whole-
+    /// workspace mode to satisfy a residual Kotlin supertype contract.
+    /// Cleared for every declaration; never affects sibling declarations.
+    pub(crate) raw_member_types: std::collections::HashSet<String>,
     /// node-id -> Java-native annotation texts hoisted from a preceding
     /// top-level annotated_expression wrapper (grammar quirk: a leading
     /// `@X("v") object T` parses the annotation outside the declaration).
@@ -204,6 +208,7 @@ impl<'a> Unit<'a> {
             workspace_file: None,
             translation_roots: &[],
             retained_hint: None,
+            raw_member_types: std::collections::HashSet::new(),
             hoisted_annotations: std::collections::HashMap::new(),
             wrapper_spans: std::collections::HashMap::new(),
             top_level_functions: std::collections::HashSet::new(),
@@ -220,6 +225,31 @@ impl<'a> Unit<'a> {
         self.workspace_file = std::fs::canonicalize(self.file).ok();
         self.translation_roots = translation_roots;
         self
+    }
+
+    pub(crate) fn erased_member_type(&self, name: &str, ty: String) -> String {
+        if self.raw_member_types.contains(name) {
+            ty.split('<').next().unwrap_or(&ty).trim().to_string()
+        } else {
+            ty
+        }
+    }
+
+    fn annotated_interface_parsed_as_expression(&self, node: tree_sitter::Node) -> bool {
+        let mut pending = vec![node];
+        while let Some(wrapper) = pending.pop() {
+            for part in wrapper.children(&mut wrapper.walk()) {
+                if part.kind() == "annotated_expression" {
+                    pending.push(part);
+                } else if part.kind() == "infix_expression"
+                    && kt::child(part, "identifier")
+                        .is_some_and(|name| self.text(name) == "interface")
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn top_level_name(&self, decl: tree_sitter::Node<'_>) -> Option<String> {
@@ -460,6 +490,7 @@ impl<'a> Unit<'a> {
         let mut imports: Vec<String> = Vec::new();
         let mut decls: Vec<tree_sitter::Node> = Vec::new();
         let mut standalone_annotation_targets = std::collections::HashSet::new();
+        let mut file_jvm_name: Option<String> = None;
         let mut retain_next_declaration = false;
         // Java-native annotations hoisted from top-level annotated_expression
         // wrappers (grammar quirk) waiting for the next declaration.
@@ -483,7 +514,38 @@ impl<'a> Unit<'a> {
                     }
                 }
                 "shebang_line" | ";" | "line_comment" | "multiline_comment" | "block_comment" => {}
-                "annotated_expression" => {
+                "file_annotation" | "annotated_expression" => {
+                    // Kotlin NG can parse an annotated interface as an
+                    // annotated_expression containing an infix_expression
+                    // (`interface Name`) and a lambda_literal (its body),
+                    // rather than a class_declaration. This node owns source
+                    // beyond the annotation: never hoist it onto the next
+                    // type or strip it with that type. Keep the opaque region
+                    // in Kotlin until the grammar can expose its declaration.
+                    if child.kind() == "annotated_expression"
+                        && self.annotated_interface_parsed_as_expression(child)
+                    {
+                        self.diag_untranslatable(
+                            child,
+                            "annotated top-level expression contains an unparsed declaration; retained in Kotlin",
+                        );
+                        self.coverage
+                            .untranslated
+                            .push(format!("top-level@{}", child.start_byte()));
+                        wrapper_spans_for_next.clear();
+                        hoisted_annotations.clear();
+                        retain_next_declaration = false;
+                        continue;
+                    }
+                    let annotation = self.text(child).trim();
+                    if let Some(name) = annotation
+                        .strip_prefix("@file:JvmName(\"")
+                        .and_then(|tail| tail.split_once("\")").map(|(name, _)| name))
+                        .filter(|name| !name.is_empty())
+                    {
+                        file_jvm_name = Some(name.to_string());
+                        continue;
+                    }
                     // Grammar quirk: a leading top-level `@X("v") object T`
                     // parses the annotation into a SEPARATE
                     // annotated_expression (the object lands outside it).
@@ -612,7 +674,10 @@ impl<'a> Unit<'a> {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        if ws.retained_supertype_member_mismatch(&supers, &type_name) {
+                        if ws.retained_supertype_member_mismatch(&supers, &type_name)
+                            && !(ws.all_kotlin_selected(self.translation_roots)
+                                && self.retained_hint.is_some())
+                        {
                             self.diag_untranslatable(
                                 *decl,
                                 "class implements a retained Kotlin supertype whose abstract member return type is incompatible with the class's own member; Java return types must match exactly",
@@ -647,11 +712,12 @@ impl<'a> Unit<'a> {
             .collect();
 
         if !loose.is_empty() {
-            let mut file_class_name = self
-                .file
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Main".to_string());
+            let mut file_class_name = file_jvm_name.clone().unwrap_or_else(|| {
+                self.file
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Main".to_string())
+            });
             file_class_name = file_class_name
                 .chars()
                 .map(|c| if c == '-' || c == '.' { '_' } else { c })

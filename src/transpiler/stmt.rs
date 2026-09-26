@@ -314,11 +314,27 @@ impl<'a, 'u> Stmt<'a, 'u> {
             .children(&mut cursor)
             .filter(|c| c.is_named())
             .collect();
+        if let Some(expr) = exprs.first().copied()
+            && expr.kind() == "if_expression"
+            && expr
+                .children(&mut expr.walk())
+                .any(|child| child.kind() == "block")
+        {
+            self.transpile_return_if(expr, out);
+            return;
+        }
         let mut e = Expr { unit: self.unit };
         if exprs.is_empty() {
             out.line("return;");
         } else {
             let mut java = e.transpile(exprs[0]);
+            // `when_if_else` already emitted a statement-level if/else with
+            // returns when this `when` is the value of a return statement.
+            // Do not prepend `return` to that Java control-flow fragment.
+            if exprs[0].kind() == "when_expression" && java.trim_start().starts_with("if (") {
+                out.line(java);
+                return;
+            }
             if self.unit.current_function_name.as_deref() == Some("toString")
                 && !java.ends_with(".toString()")
                 && !java.starts_with('"')
@@ -346,6 +362,80 @@ impl<'a, 'u> Stmt<'a, 'u> {
             } else {
                 out.line(format!("return {};", java));
             }
+        }
+    }
+
+    fn transpile_return_if(&mut self, node: tree_sitter::Node, out: &mut JavaOut) {
+        let condition = kt::field(node, "condition");
+        let children: Vec<_> = node.children(&mut node.walk()).collect();
+        let else_index = children.iter().position(|child| child.kind() == "else");
+        let then_branch = condition
+            .and_then(|condition| {
+                children
+                    .iter()
+                    .position(|child| child.id() == condition.id())
+            })
+            .and_then(|condition_index| {
+                children[condition_index + 1..else_index.unwrap_or(children.len())]
+                    .iter()
+                    .find(|child| child.is_named() && !is_comment(**child))
+                    .copied()
+            });
+        let else_branch = else_index.and_then(|index| {
+            children[index + 1..]
+                .iter()
+                .find(|child| child.is_named() && !is_comment(**child))
+                .copied()
+        });
+        let Some(condition) = condition else {
+            self.unit
+                .diag_untranslatable(node, "return-if expression has no condition");
+            return;
+        };
+        let Some(then_value) = then_branch.and_then(return_branch_expression) else {
+            self.unit.diag_untranslatable(
+                node,
+                "return-if branches must each contain one supported expression",
+            );
+            return;
+        };
+        let Some(else_value) = else_branch.and_then(return_branch_expression) else {
+            self.unit.diag_untranslatable(
+                node,
+                "return-if branches must each contain one supported expression",
+            );
+            return;
+        };
+        if is_nested_control_flow(then_value) || is_nested_control_flow(else_value) {
+            self.unit.diag_untranslatable(
+                node,
+                "nested control flow in a return-if branch is not supported",
+            );
+            return;
+        }
+
+        let mut e = Expr { unit: self.unit };
+        let condition_java = e.transpile(condition);
+        out.open(format!("if ({})", condition_java));
+        self.emit_return_if_value(then_value, out);
+        out.close_then("else");
+        self.emit_return_if_value(else_value, out);
+        out.close();
+    }
+
+    fn emit_return_if_value(&mut self, value: tree_sitter::Node, out: &mut JavaOut) {
+        let mut e = Expr { unit: self.unit };
+        let java = fix_join_tail(&e.transpile(value));
+        if java.trim_start().starts_with("throw ") {
+            out.line(format!("{};", java));
+        } else if java.contains(".getConstructor(") {
+            out.open("try");
+            out.line(format!("return {};", java));
+            out.close_then("catch (Exception e)");
+            out.line("throw new RuntimeException(e);");
+            out.close();
+        } else {
+            out.line(format!("return {};", java));
         }
     }
 
@@ -734,6 +824,49 @@ impl<'a, 'u> Stmt<'a, 'u> {
             cond_java
         ));
     }
+}
+
+fn is_comment(node: tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "line_comment" | "block_comment" | "multiline_comment"
+    )
+}
+
+fn return_branch_expression(branch: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let statement = if branch.kind() == "block" {
+        let statements: Vec<_> = branch
+            .children(&mut branch.walk())
+            .filter(|child| child.is_named() && !is_comment(*child))
+            .collect();
+        if statements.len() != 1 {
+            return None;
+        }
+        statements[0]
+    } else {
+        branch
+    };
+    if statement.kind() == "return_expression" {
+        statement
+            .children(&mut statement.walk())
+            .find(|child| child.is_named())
+    } else {
+        Some(statement)
+    }
+}
+
+fn is_nested_control_flow(node: tree_sitter::Node) -> bool {
+    matches!(
+        node.kind(),
+        "if_expression"
+            | "when_expression"
+            | "lambda_literal"
+            | "block"
+            | "for_statement"
+            | "while_statement"
+            | "do_while_statement"
+            | "try_expression"
+    )
 }
 
 /// Single-statement loop body: the first named child after the condition

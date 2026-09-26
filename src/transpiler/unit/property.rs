@@ -184,14 +184,25 @@ impl<'a> Unit<'a> {
         } else {
             ""
         };
+        let is_jvm_field = kt::child(decl, "modifiers")
+            .map(|m| self.text(m).contains("JvmField"))
+            .unwrap_or(false);
+        let field_visibility = if is_const || is_jvm_field || owner == Some("__interface__") {
+            "public "
+        } else {
+            "private "
+        };
         if backing {
             let init_java = self.property_initializer(decl).map(|init| {
                 let mut e = Expr { unit: self };
                 e.transpile(init)
             });
             match init_java {
-                Some(java) => out.line(format!("private {}{} {} = {};", static_kw, ty, name, java)),
-                None => out.line(format!("private {}{} {};", static_kw, ty, name)),
+                Some(java) => out.line(format!(
+                    "{}{}{} {} = {};",
+                    field_visibility, static_kw, ty, name, java
+                )),
+                None => out.line(format!("{}{}{} {};", field_visibility, static_kw, ty, name)),
             }
         }
 

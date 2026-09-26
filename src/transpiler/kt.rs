@@ -34,6 +34,45 @@ pub fn text<'t>(node: tree_sitter::Node<'t>, source: &'t str) -> &'t str {
     node.utf8_text(source.as_bytes()).unwrap_or("")
 }
 
+pub fn java_parameter_type(node: tree_sitter::Node, source: &str, annots: AnnotationSet) -> String {
+    let java = java_type_ann(node, source, annots);
+    if node.kind() != "user_type" {
+        return java;
+    }
+    let name = text(node, source)
+        .split('<')
+        .next()
+        .unwrap_or_default()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if !matches!(name, "Iterable" | "MutableIterable") {
+        return java;
+    }
+    let Some(type_arguments) = child(node, "type_arguments") else {
+        return java;
+    };
+    let arguments: Vec<_> = type_arguments
+        .children(&mut type_arguments.walk())
+        .filter(|child| child.is_named())
+        .collect();
+    if arguments.len() != 1 {
+        return java;
+    }
+    let argument = arguments[0];
+    let argument_java = if argument.kind() == "type_projection" {
+        java_type_projection(argument, source)
+    } else {
+        java_type(argument, source)
+    };
+    if argument_java.starts_with('?') {
+        java
+    } else {
+        format!("Iterable<? extends {}>", argument_java)
+    }
+}
+
 /// Translate a Kotlin user_type / type node into Java source text.
 /// `mark_nullable` prefixes the result with the annotation set's @Nullable
 /// when the type is nullable (annotation-then-hope-for-the-best policy).
@@ -133,6 +172,7 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                 ("MutableList<", "ArrayList<"),
                 ("MutableMap<", "HashMap<"),
                 ("MutableSet<", "HashSet<"),
+                ("MutableIterable<", "Iterable<"),
             ] {
                 if let Some(stripped) = whole.strip_prefix(kt_name) {
                     return format!("{}{}", j_name, stripped);

@@ -308,18 +308,18 @@ impl SourceIndex {
     /// declares an abstract member whose Java-visible type conflicts with
     /// the class's own same-name member. Kotlin resolves such conflicts via
     /// fake overrides; Java cannot — the class must stay Kotlin.
-    pub fn retained_supertype_member_mismatch(
+    pub fn retained_supertype_member_mismatches(
         &self,
         supertypes: &[String],
         class_name: &str,
-    ) -> bool {
+    ) -> Vec<String> {
         // The class's own declaration, by name (first hit is this class in
         // its own file because the class-name is canonical in the index).
         let Some(own) = self
             .declarations()
             .find(|d| d.name == class_name && d.language == SourceLanguage::Kotlin)
         else {
-            return false;
+            return Vec::new();
         };
         // The own declaration's file resolves type names written in the
         // implementing class (imports/same-package rules apply there).
@@ -336,6 +336,7 @@ impl SourceIndex {
                     .to_string()
             })
             .collect();
+        let mut mismatches = Vec::new();
         while let Some(sup) = pending.pop() {
             let sup_base = sup
                 .split('<')
@@ -397,11 +398,44 @@ impl SourceIndex {
                     // Type strings are index-qualified names; conflicting
                     // here means Kotlin fake-override semantics are being
                     // relied on — unsupported in plain Java.
-                    return true;
+                    mismatches.push(m.name.clone());
                 }
             }
         }
-        false
+        mismatches.sort();
+        mismatches.dedup();
+        mismatches
+    }
+
+    pub fn has_retained_kotlin_supertype(
+        &self,
+        supertypes: &[String],
+        retained: &HashSet<String>,
+    ) -> bool {
+        supertypes.iter().any(|supertype| {
+            let name = supertype
+                .split('<')
+                .next()
+                .unwrap_or(supertype)
+                .trim()
+                .rsplit('.')
+                .next()
+                .unwrap_or_default();
+            retained.contains(name)
+                && self.declarations().any(|declaration| {
+                    declaration.name == name && declaration.language == SourceLanguage::Kotlin
+                })
+        })
+    }
+
+    pub fn retained_supertype_member_mismatch(
+        &self,
+        supertypes: &[String],
+        class_name: &str,
+    ) -> bool {
+        !self
+            .retained_supertype_member_mismatches(supertypes, class_name)
+            .is_empty()
     }
 
     /// The recorded return type of a METHOD named exactly `name`, searching
@@ -609,6 +643,11 @@ impl SourceIndex {
                 .ok()
                 .is_some_and(|canonical| path.starts_with(canonical))
         })
+    }
+
+    pub fn all_kotlin_selected(&self, translation_roots: &[PathBuf]) -> bool {
+        self.kotlin_files()
+            .all(|file| self.is_selected(&file.path, translation_roots))
     }
 
     pub fn annotation_is_selected(&self, name: &str, translation_roots: &[PathBuf]) -> bool {
@@ -1291,22 +1330,41 @@ fn parse_declarations(
         .parse(source, None)
         .ok_or_else(|| "source parse failed".to_string())?;
     let mut declarations = Vec::new();
-    let mut cursor = tree.root_node().walk();
-    for node in tree.root_node().children(&mut cursor) {
-        let Some((kind, name_node)) = declaration_shape(node, language) else {
-            continue;
-        };
-        let name = node_text(name_node, source)?;
-        declarations.push(Declaration {
-            name,
-            package: package.map(str::to_string),
-            language,
-            kind,
-            supertypes: supertypes(node, language, source),
-            members: members(node, language, source),
-            has_default_constructor_parameter: has_default_constructor_parameter(node, language),
-            type_params: type_param_names(node, source),
-        });
+    // Walk the whole tree so NESTED declarations (a class declared inside
+    // another class body) are indexed too: the retention fixpoint must see
+    // a nested Kotlin class's implements edge, or its supertype interface
+    // gets translated and the retained child can no longer override its
+    // properties (a Kotlin val cannot implement a Java-source getter).
+    let mut stack: Vec<tree_sitter::Node> = tree
+        .root_node()
+        .children(&mut tree.root_node().walk())
+        .collect();
+    stack.reverse();
+    while let Some(node) = stack.pop() {
+        if let Some((kind, name_node)) = declaration_shape(node, language) {
+            let name = node_text(name_node, source)?;
+            if !declarations.iter().any(|d: &Declaration| d.name == name) {
+                declarations.push(Declaration {
+                    name: name.clone(),
+                    package: package.map(str::to_string),
+                    language,
+                    kind,
+                    supertypes: supertypes(node, language, source),
+                    members: members(node, language, source),
+                    has_default_constructor_parameter: has_default_constructor_parameter(
+                        node, language,
+                    ),
+                    type_params: type_param_names(node, source),
+                });
+            }
+            for child in node.children(&mut node.walk()) {
+                stack.push(child);
+            }
+        } else {
+            for child in node.children(&mut node.walk()) {
+                stack.push(child);
+            }
+        }
     }
     let mut identifier_counts = HashMap::new();
     collect_identifier_counts(tree.root_node(), source, &mut identifier_counts);

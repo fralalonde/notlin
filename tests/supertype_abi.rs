@@ -1,3 +1,4 @@
+use notlin::workspace::SourceIndex;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -37,6 +38,58 @@ fn retained_supertype_abi_mismatch_taints() {
 /// Transitive mismatch: Holder implements Box, Box extends DeepBox, and the
 /// RETAINED DeepBox declares `items: List<Item>` while Holder has
 /// `List<ItemImpl>` — the conflict surfaces two hops away and must taint.
+#[test]
+fn whole_workspace_erases_only_conflicting_supertype_property_generics() {
+    let root = Path::new("tests/tmp_scratch_abi_whole");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("contract.kt"),
+        "package neutral.whole\n\ninterface Contract {\n    val entries: List<String>\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("implementation.kt"),
+        "package neutral.whole\n\ndata class Implementation(\n    override val entries: List<Int>,\n    val unchanged: List<Long>\n) : Contract\n",
+    )
+    .unwrap();
+
+    let selected_root = fs::canonicalize(root).unwrap();
+    let index = SourceIndex::discover(&selected_root).unwrap();
+    assert!(index.all_kotlin_selected(&[selected_root]));
+    let implementation = index
+        .declarations()
+        .find(|declaration| declaration.name == "Implementation")
+        .unwrap();
+    assert_eq!(
+        index.retained_supertype_member_mismatches(&implementation.supertypes, "Implementation"),
+        vec!["entries"]
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--lombok", "--in-place"])
+        .arg(root.to_str().unwrap())
+        .output()
+        .expect("run notlin");
+    assert!(
+        output.status.success(),
+        "notlin failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out_java = fs::read_to_string(root.join("Implementation.java")).unwrap_or_default();
+    assert!(
+        out_java.contains("private final List entries;"),
+        "conflicting property must erase generics, got:\n{out_java}"
+    );
+    assert!(
+        out_java.contains("private final List<Long> unchanged;"),
+        "unrelated property must preserve generics, got:\n{out_java}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn transitive_retained_supertype_abi_mismatch_taints() {
     let root = Path::new("tests/tmp_scratch_abi2");

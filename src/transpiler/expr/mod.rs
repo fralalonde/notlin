@@ -620,12 +620,8 @@ impl<'a, 'u> Expr<'a, 'u> {
     }
 
     fn if_expr(&mut self, node: tree_sitter::Node) -> String {
-        // if (c) a else b -> ternary (single-level)
-        self.unit.diags.warn_approx(
-            node,
-            self.unit.file,
-            "if-expression approximated as ternary",
-        );
+        // Supported simple `if` expressions lower directly to a Java ternary.
+        // Only malformed/complex shapes below emit an approximation warning.
         let mut cursor = node.walk();
         let kids: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
         // Condition: first named child between the `(` and `)` tokens —
@@ -700,6 +696,11 @@ impl<'a, 'u> Expr<'a, 'u> {
                 format!("({} ? {} : {})", c, a, b)
             }
             _ => {
+                self.unit.diags.warn_approx(
+                    node,
+                    self.unit.file,
+                    "if-expression shape could not be represented exactly as a Java ternary",
+                );
                 // Fallback: emit first/last named children as ternary arms
                 if let (Some(c), 1) = (cond, branches.len()) {
                     let a = self.transpile(branches[0]);

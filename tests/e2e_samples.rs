@@ -64,6 +64,28 @@ fn all_samples_parse_without_errors() {
 }
 
 #[test]
+fn file_jvm_name_controls_top_level_java_facade() {
+    let source = r#"@file:JvmName("LookupApi")
+
+package fixture
+
+fun parse(value: String): String = value
+"#;
+    let (files, errors) = transpile_src(source, "queries.kt");
+    assert_eq!(errors, 0);
+    let facade = files
+        .iter()
+        .find(|(name, _)| name == "LookupApi.java")
+        .map(|(_, content)| content)
+        .expect("@file:JvmName facade emitted");
+    assert!(facade.contains("public final class LookupApi"), "{facade}");
+    assert!(
+        facade.contains("static String parse(String value)"),
+        "{facade}"
+    );
+}
+
+#[test]
 fn generic_variance_becomes_java_wildcards() {
     let source = "interface Event\ninterface Registry { val eventType: Class<out Event> }\n";
     let (files, errors) = transpile_src(source, "Variance.kt");
@@ -409,11 +431,9 @@ fn lombok_flag_emits_mutable_data_class() {
         all.contains("private final String y;"),
         "val component is final"
     );
-    // hand-rolled boilerplate suppressed: Lombok owns accessors/ctor
-    assert!(
-        !all.contains("public int getX()"),
-        "@Data should own accessors"
-    );
+    // Lombok still owns equals/hashCode/toString and the ctor; accessors are
+    // emitted explicitly to keep the declared member visible to kotlinc's
+    // cross-language member resolution (see class.rs comment).
     assert!(
         !all.contains("public Point(int x, String y)"),
         "@AllArgsConstructor should own the ctor"
@@ -513,7 +533,7 @@ fn complex_enum_taints_instead_of_emitting_broken_java() {
 fn companion_object_members_become_statics() {
     let source = r#"class Counter {
     companion object {
-        val MAX = 100
+        const val MAX = 100
         fun create(): Counter = Counter()
         private var instances = 0
     }
@@ -531,7 +551,7 @@ fn companion_object_members_become_statics() {
         .find(|(n, _)| n == "Counter.java")
         .expect("Counter.java emitted")
         .1;
-    assert!(counter.contains("private static final int MAX = 100;"));
+    assert!(counter.contains("public static final int MAX = 100;"));
     assert!(counter.contains("public static int getMAX()"));
     assert!(counter.contains("public static Counter create()"));
     // private companion var -> private static field + private static accessors
@@ -542,6 +562,30 @@ fn companion_object_members_become_statics() {
     assert!(
         !counter.contains("this.instances"),
         "static setter must not use this"
+    );
+}
+
+#[test]
+fn jvm_field_companion_property_exposes_public_static_field() {
+    let source = r#"class Registry {
+    companion object {
+        @JvmField
+        val DEFAULT = 7
+    }
+}"#;
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Registry.kt"]);
+    let (files, errors, warnings, _cov) =
+        notlin::transpiler::transpile(source, &PathBuf::from("Registry.kt"), &cli);
+    assert_eq!(errors, 0);
+    assert_eq!(warnings, 0);
+    let registry = files
+        .iter()
+        .find(|(name, _)| name == "Registry.java")
+        .map(|(_, source)| source)
+        .expect("Registry.java emitted");
+    assert!(
+        registry.contains("public static final int DEFAULT = 7;"),
+        "{registry}"
     );
 }
 
@@ -564,6 +608,167 @@ fn companion_line_comments_do_not_make_members_unsupported() {
         .map(|(_, c)| c.as_str())
         .expect("Holder.java");
     assert!(holder.contains("static final int LIMIT = 7;"), "{holder}");
+}
+
+#[test]
+fn mutable_iterable_parameters_preserve_covariant_java_signature() {
+    let source = "interface Sink { fun removeAll(values: MutableIterable<Long>) }";
+    let (files, errors) = transpile_src(source, "Sink.kt");
+    assert_eq!(errors, 0);
+    let sink = files
+        .iter()
+        .find(|(name, _)| name == "Sink.java")
+        .map(|(_, source)| source)
+        .expect("Sink.java emitted");
+    assert!(
+        sink.contains("removeAll(Iterable<? extends Long> values)"),
+        "{sink}"
+    );
+}
+
+#[test]
+fn interface_default_method_with_if_body_emits_java_default() {
+    let source = r#"interface Keyed {
+    val base: String
+    val alias: String
+    fun getKey(): String {
+        return if (alias == "") base else "$base:$alias"
+    }
+}"#;
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Keyed.kt"]);
+    let (files, errors, warnings, _cov) =
+        notlin::transpiler::transpile(source, &PathBuf::from("Keyed.kt"), &cli);
+    assert_eq!(errors, 0);
+    assert_eq!(warnings, 0, "default interface method should translate");
+    let keyed = files
+        .iter()
+        .find(|(name, _)| name == "Keyed.java")
+        .map(|(_, source)| source)
+        .expect("Keyed.java emitted");
+    assert!(keyed.contains("default String getKey()"), "{keyed}");
+    assert!(
+        keyed.contains("return ("),
+        "expression-valued if should keep ternary lowering: {keyed}"
+    );
+}
+
+#[test]
+fn return_if_with_block_branches_emits_java_if_returns() {
+    let source = r#"interface Kind
+class SpecialKind : Kind
+class Resolver {
+    fun resolve(kind: Kind): String {
+        return if (kind is SpecialKind) {
+            "special"
+        } else {
+            "ordinary"
+        }
+    }
+}"#;
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Resolver.kt"]);
+    let (files, errors, warnings, _cov) =
+        notlin::transpiler::transpile(source, &PathBuf::from("Resolver.kt"), &cli);
+    let resolver = files
+        .iter()
+        .find(|(name, _)| name == "Resolver.java")
+        .map(|(_, source)| source)
+        .expect("Resolver.java emitted");
+    assert_eq!(errors, 0);
+    assert!(
+        resolver.contains("if (kind instanceof SpecialKind)"),
+        "{resolver}"
+    );
+    assert!(resolver.contains("return \"special\";"), "{resolver}");
+    assert!(resolver.contains("else {"), "{resolver}");
+    assert!(resolver.contains("return \"ordinary\";"), "{resolver}");
+    assert!(!resolver.contains("return if"), "{resolver}");
+    assert_eq!(warnings, 0, "fully recognized return-if should not warn");
+}
+
+#[test]
+fn return_if_ignores_comments_before_block_branches() {
+    let source = r#"class Resolver {
+    fun resolve(flag: Boolean): String {
+        return if (flag)
+            // first branch
+            { "yes" }
+        else
+            /* second branch */
+            { "no" }
+    }
+}"#;
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Resolver.kt"]);
+    let (files, errors, warnings, _cov) =
+        notlin::transpiler::transpile(source, &PathBuf::from("Resolver.kt"), &cli);
+    let resolver = files
+        .iter()
+        .find(|(name, _)| name == "Resolver.java")
+        .map(|(_, source)| source)
+        .expect("Resolver.java emitted");
+    assert_eq!(errors, 0);
+    assert_eq!(
+        warnings, 0,
+        "commented return-if should be supported: {resolver}"
+    );
+    assert!(resolver.contains("return \"yes\";"), "{resolver}");
+    assert!(resolver.contains("return \"no\";"), "{resolver}");
+}
+
+#[test]
+fn return_when_type_checks_emit_statement_level_branches() {
+    let source = r#"interface Kind
+class SpecialKind : Kind
+class Resolver {
+    fun resolve(kind: Kind): String {
+        return when (kind) {
+            is SpecialKind -> "special"
+            else -> "ordinary"
+        }
+    }
+}"#;
+    let (files, errors) = transpile_src(source, "Resolver.kt");
+    assert_eq!(errors, 0);
+    let resolver = files
+        .iter()
+        .find(|(name, _)| name == "Resolver.java")
+        .map(|(_, source)| source)
+        .expect("Resolver.java emitted");
+    assert!(
+        resolver.contains("if (kind instanceof SpecialKind)"),
+        "{resolver}"
+    );
+    assert!(resolver.contains("return \"special\";"), "{resolver}");
+    assert!(resolver.contains("else {"), "{resolver}");
+    assert!(resolver.contains("return \"ordinary\";"), "{resolver}");
+    assert!(!resolver.contains("return if"), "{resolver}");
+}
+
+#[test]
+fn interface_companion_val_emits_nested_holder() {
+    let source = r#"interface Contract {
+    companion object {
+        val PREFIX = "p"
+    }
+}"#;
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Contract.kt"]);
+    let (files, errors, warnings, _cov) =
+        notlin::transpiler::transpile(source, &PathBuf::from("Contract.kt"), &cli);
+    assert_eq!(errors, 0);
+    assert_eq!(warnings, 0, "safe interface companion should not taint");
+    let contract = files
+        .iter()
+        .find(|(name, _)| name == "Contract.java")
+        .map(|(_, source)| source)
+        .expect("Contract.java emitted");
+    assert!(
+        contract.contains("public static final String PREFIX = \"p\";"),
+        "{contract}"
+    );
+    assert!(!contract.contains("class Companion"), "{contract}");
+    assert!(
+        contract.contains("public static String getPREFIX()"),
+        "{contract}"
+    );
 }
 
 #[test]

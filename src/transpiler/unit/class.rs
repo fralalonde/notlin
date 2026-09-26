@@ -332,6 +332,12 @@ impl<'a> Unit<'a> {
         else {
             return false;
         };
+        if workspace.all_kotlin_selected(self.translation_roots) {
+            if let Some(retained) = self.retained_hint.as_ref() {
+                return target.kind == crate::workspace::DeclarationKind::Interface
+                    && workspace.has_retained_kotlin_subtype(target, retained);
+            }
+        }
         workspace.has_unselected_kotlin_subtype(target, self.translation_roots)
             // Subtype rule, two modes:
             // - No fixpoint hint (single-file mode): retain on ANY Kotlin
@@ -353,6 +359,9 @@ impl<'a> Unit<'a> {
             || (self.in_place
                 && workspace.inherits_retained_kotlin_property_interface(source_file, target))
             || workspace.property_smart_cast_used_by_kotlin(indexed_path, target)
+            || self.retained_hint.as_ref().is_some_and(|retained| {
+                workspace.has_retained_kotlin_supertype(&target.supertypes, retained)
+            })
     }
 
     /// A Kotlin companion `operator fun invoke` gives the enclosing type a
@@ -380,6 +389,7 @@ impl<'a> Unit<'a> {
     }
 
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
+        self.raw_member_types.clear();
         // `KClass<T>` type references lower to Java `Class<T>` (kt.rs /
         // types.rs interop mapping). That ABI change is only compatible
         // when no RESIDUAL Kotlin file consumes this declaration: a
@@ -507,6 +517,30 @@ impl<'a> Unit<'a> {
         let name = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_else(|| "Anonymous".to_string());
+        if let Some(workspace) = self.workspace {
+            if workspace.all_kotlin_selected(self.translation_roots) && self.retained_hint.is_some()
+            {
+                let supers: Vec<String> = kt::child(decl, "delegation_specifiers")
+                    .map(|dc| {
+                        let mut cursor = dc.walk();
+                        dc.children(&mut cursor)
+                            .filter(|specifier| specifier.kind() == "delegation_specifier")
+                            .map(|specifier| {
+                                specifier
+                                    .child_by_field_name("user_type")
+                                    .map(|ty| self.text(ty).trim().to_string())
+                                    .unwrap_or_else(|| self.text(specifier).trim().to_string())
+                            })
+                            .filter(|supertype| !supertype.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.raw_member_types = workspace
+                    .retained_supertype_member_mismatches(&supers, &name)
+                    .into_iter()
+                    .collect();
+            }
+        }
         let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
         if self.has_companion_operator_invoke(decl)
             && self
@@ -590,7 +624,14 @@ impl<'a> Unit<'a> {
                 type_params = format!("<{}> ", parts.join(", "));
             }
         }
-        let params = self.class_params(decl);
+        let params = self
+            .class_params(decl)
+            .into_iter()
+            .map(|(is_val, member_name, ty)| {
+                let ty = self.erased_member_type(&member_name, ty);
+                (is_val, member_name, ty)
+            })
+            .collect::<Vec<_>>();
 
         // superclass / interfaces
         // The grammar wraps each supertype in `delegation_specifier`
@@ -848,7 +889,11 @@ impl<'a> Unit<'a> {
                                 }
                             }
                         }
-                        ";" | "{" | "}" => {}
+                        "companion_object" => {
+                            self.transpile_interface_companion(member, out);
+                            out.blank();
+                        }
+                        "line_comment" | "block_comment" | ";" | "{" | "}" => {}
                         _ => {
                             if member.is_named() {
                                 self.diag_untranslatable(
@@ -885,12 +930,38 @@ impl<'a> Unit<'a> {
                 let final_kw = if *is_val { "final " } else { "" };
                 out.line(format!("private {}{} {};", final_kw, ftype, fname));
             }
+            // NOTLIN: emit explicit accessors mirroring the original Kotlin ABI.
+            // Relying on @Data's synthesized getters breaks cross-language member
+            // resolution: kotlinc (reading our generated Java via the kotlin
+            // lombok plugin) merges the implemented interface's @Nullable getter
+            // into the lookup and reports T? where the original Kotlin member was
+            // non-nullable, so call sites fail to typecheck. An explicit getter
+            // overrides synthesis and keeps the declared member visible.
             for (_, fname, ftype) in &params {
-                if ftype == "boolean" {
+                let acc = if ftype == "boolean" { "is" } else { "get" };
+                // @NotNull pins the getter's nullability to the (non-null)
+                // field: kotlinc otherwise merges the implemented interface's
+                // nullable property into the member lookup and reports T?
+                // (verified with the jlombok-probe fixture). A source
+                // annotation on the type (e.g. `@Nullable Boolean` from a
+                // `Boolean?` property) already states nullability — keep it
+                // verbatim instead of prepending ours.
+                let nullability = if ftype.starts_with('@') {
+                    String::new()
+                } else {
+                    "@NotNull ".to_string()
+                };
+                out.line(format!(
+                    "{}public {} {}{}() {{ return {}; }}",
+                    nullability, ftype, acc, capitalize(fname), fname
+                ));
+            }
+
+            for (is_val, fname, ftype) in &params {
+                if !*is_val && ftype != "boolean" {
                     out.line(format!(
-                        "public boolean get{}() {{ return {}; }}",
-                        capitalize(fname),
-                        fname
+                        "public void set{}({} {}) {{ this.{} = {}; }}",
+                        capitalize(fname), ftype, fname, fname, fname
                     ));
                 }
             }
@@ -2012,6 +2083,33 @@ impl<'a> Unit<'a> {
         }
     }
 
+    fn transpile_interface_companion(&mut self, companion: tree_sitter::Node, out: &mut JavaOut) {
+        let Some(body) = kt::child(companion, "class_body") else {
+            return;
+        };
+        let mut cursor = body.walk();
+        for member in body.children(&mut cursor) {
+            match member.kind() {
+                "property_declaration" => {
+                    self.transpile_property_opts(member, out, true, Some("__interface__"));
+                    out.blank();
+                }
+                "line_comment" | "block_comment" | ";" | "{" | "}" => {}
+                _ => {
+                    if member.is_named() {
+                        self.diag_untranslatable(
+                            member,
+                            format!(
+                                "interface companion member not supported: {}",
+                                member.kind()
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn transpile_class_body(&mut self, body: tree_sitter::Node, out: &mut JavaOut) {
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
@@ -2025,7 +2123,14 @@ impl<'a> Unit<'a> {
                     out.blank();
                 }
                 "companion_object" => {
-                    if let Some(cls) = kt::parent_of(body)
+                    let is_interface = kt::parent_of(body).is_some_and(|class| {
+                        class
+                            .children(&mut class.walk())
+                            .any(|child| child.kind() == "interface")
+                    });
+                    if is_interface {
+                        self.transpile_interface_companion(member, out);
+                    } else if let Some(cls) = kt::parent_of(body)
                         && let Some(name) = kt::field(cls, "name")
                     {
                         self.transpile_companion(member, self.text(name), out);
@@ -2173,5 +2278,28 @@ fn prefix_nested_annotations(argument_text: &str) -> String {
         result.push(character);
         index += 1;
     }
-    result
+    // A Kotlin argument list may end with a trailing comma
+    // (`@Anno(a = 1,)`); Java annotation arrays reject it — drop a comma
+    // immediately followed by the closing paren, across line breaks.
+    let mut cleaned = String::with_capacity(result.len());
+    let mut characters = result.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == ',' {
+            let mut lookahead = characters.clone();
+            let mut trimmed = String::new();
+            while let Some(&next) = lookahead.peek() {
+                if next.is_whitespace() {
+                    trimmed.push(next);
+                    lookahead.next();
+                } else {
+                    break;
+                }
+            }
+            if lookahead.peek() == Some(&')') {
+                continue; // drop the comma (and surrounding whitespace stays)
+            }
+        }
+        cleaned.push(character);
+    }
+    cleaned
 }
