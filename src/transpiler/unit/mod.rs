@@ -139,18 +139,11 @@ pub struct Unit<'src, 'tree> {
     /// once for every Java type emitted from that source.
     pub(crate) visible_typealiases: Vec<(String, String)>,
     pub(crate) translation_roots: &'src [PathBuf],
-    /// Cached for this translation: workspace selection is fixed for all
-    /// declarations in one Unit, so do not rescan every Kotlin source.
-    all_kotlin_selected: bool,
     /// Retention-fixpoint retained set from the caller (probe passes): names
     /// known to be retained in Kotlin for intrinsic reasons. When Some, the
     /// subtype rule consults it (`has_retained_kotlin_subtype`) instead of
     /// retaining on every Kotlin subtype; None = conservative catch-all.
     pub(crate) retained_hint: Option<&'src std::collections::HashSet<String>>,
-    /// Members whose generic return/field types must be erased in whole-
-    /// workspace mode to satisfy a residual Kotlin supertype contract.
-    /// Cleared for every declaration; never affects sibling declarations.
-    pub(crate) raw_member_types: std::collections::HashSet<String>,
     /// node-id -> Java-native annotation texts hoisted from a preceding
     /// top-level annotated_expression wrapper (grammar quirk: a leading
     /// `@X("v") object T` parses the annotation outside the declaration).
@@ -230,9 +223,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             workspace_file: None,
             visible_typealiases: Vec::new(),
             translation_roots: &[],
-            all_kotlin_selected: false,
             retained_hint: None,
-            raw_member_types: std::collections::HashSet::new(),
             hoisted_annotations: std::collections::HashMap::new(),
             wrapper_spans: std::collections::HashMap::new(),
             top_level_functions: std::collections::HashSet::new(),
@@ -245,14 +236,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         workspace: Option<&'src SourceIndex>,
         translation_roots: &'src [PathBuf],
     ) -> Self {
-        self.with_workspace_selection(workspace, translation_roots, None, None)
+        self.with_workspace_selection(workspace, translation_roots, None)
     }
 
     pub(crate) fn with_workspace_selection(
         mut self,
         workspace: Option<&'src SourceIndex>,
         translation_roots: &'src [PathBuf],
-        all_kotlin_selected: Option<bool>,
         workspace_file: Option<&Path>,
     ) -> Self {
         self.workspace = workspace;
@@ -263,18 +253,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             self.visible_typealiases = workspace.type_aliases_for(file);
         }
         self.translation_roots = translation_roots;
-        self.all_kotlin_selected = all_kotlin_selected.unwrap_or_else(|| {
-            workspace.is_some_and(|workspace| workspace.all_kotlin_selected(translation_roots))
-        });
         self
-    }
-
-    pub(crate) fn erased_member_type(&self, name: &str, ty: String) -> String {
-        if self.raw_member_types.contains(name) {
-            ty.split('<').next().unwrap_or(&ty).trim().to_string()
-        } else {
-            ty
-        }
     }
 
     pub(crate) fn lower_visible_typealiases(&self, java: &mut String) {
@@ -289,7 +268,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     |ch: Option<char>| !ch.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
                 if is_boundary(before) && is_boundary(after) {
                     lowered.push_str(&rest[..start]);
-                    lowered.push_str(&target);
+                    lowered.push_str(target);
                     rest = &rest[end..];
                 } else {
                     lowered.push_str(&rest[..end]);
@@ -416,10 +395,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         self.untranslated_names.contains(label)
     }
 
-    fn all_kotlin_selected(&self) -> bool {
-        self.all_kotlin_selected
-    }
-
     /// True when `name` is a top-level function declared in THIS file whose
     /// declaration remained Kotlin (labeled untranslated). Bare calls to it
     /// from translated declarations cannot resolve in Java.
@@ -476,6 +451,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             line: node.start_position().row + 1,
             col: node.start_position().column + 1,
         });
+    }
+
+    /// A declaration that has to stay Kotlin because residual Kotlin still
+    /// needs it: record it for the run-end table AND print the warning, both
+    /// from the same reason — so the code a human reads in the table row is
+    /// the code they can grep for in the log.
+    pub(crate) fn retain_decl(&mut self, decl: tree_sitter::Node, reason: &str) {
+        crate::diagnostics::record_retention(reason, self.file, decl.start_position().row + 1);
+        self.diag_untranslatable(decl, crate::diagnostics::retention_message(reason));
     }
 
     pub(crate) fn diag_approx(&mut self, node: tree_sitter::Node, msg: impl Into<String>) {
@@ -772,13 +756,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        if ws.retained_supertype_member_mismatch(&supers, &type_name)
-                            && !(self.all_kotlin_selected() && self.retained_hint.is_some())
-                        {
-                            self.diag_untranslatable(
-                                *decl,
-                                "class implements a retained Kotlin supertype whose abstract member return type is incompatible with the class's own member; Java return types must match exactly",
+                        let conflicts =
+                            ws.retained_supertype_member_mismatches(&supers, &type_name);
+                        if !conflicts.is_empty() {
+                            // Erasing the member to a raw type would make the
+                            // override compile, but a raw `List`/`Set` loses
+                            // its element type: JPA rejects it outright
+                            // ("declared with a raw type and has an explicit
+                            // targetEntity") and every generic consumer loses
+                            // the check. So the class stays Kotlin instead and
+                            // the conflict is reported for a human.
+                            let reason = format!(
+                                "a Kotlin supertype declares {} with a type Java cannot override exactly; erasing the type arguments would emit raw types, which JPA rejects",
+                                conflicts.join(", ")
                             );
+                            self.retain_decl(*decl, &reason);
                             self.end_decl();
                             continue;
                         }
@@ -949,6 +941,5 @@ mod tests {
         assert!(unit.is_untranslated("Second"));
         assert!(!unit.is_untranslated("Third"));
         assert_eq!(unit.coverage.untranslated, ["First", "Second"]);
-        assert!(!unit.all_kotlin_selected());
     }
 }

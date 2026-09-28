@@ -175,12 +175,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         owner.and_then(|owner_name| {
                             self.workspace.and_then(|ws| {
                                 let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
-                                let hit = ws.inherited_property_type_in_file(
-                                    declaring,
-                                    &owner_name,
-                                    &name,
-                                );
-                                hit
+
+                                ws.inherited_property_type_in_file(declaring, &owner_name, &name)
                             })
                         })
                     })

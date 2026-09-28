@@ -9,6 +9,7 @@
 
 use notlin::manual_marks::annotate_manual_spots;
 use notlin::workspace::SourceIndex;
+use std::path::Path;
 use std::path::PathBuf;
 
 fn fixture_root(tag: &str) -> PathBuf {
@@ -28,7 +29,7 @@ fn capitalize(s: &str) -> String {
         None => String::new(),
     }
 }
-fn index_at(root: &PathBuf, java_name: &str, prop: &str) -> SourceIndex {
+fn index_at(root: &Path, java_name: &str, prop: &str) -> SourceIndex {
     std::fs::write(
         root.join(format!("src/{java_name}.java")),
         format!(

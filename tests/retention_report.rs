@@ -2,11 +2,13 @@
 //! where. This is the report a human works from, so its grouping, ordering and
 //! N-codes are pinned here.
 
-use notlin::diagnostics::{clear_retention, record_retention, retention_report};
+use notlin::diagnostics::{
+    clear_retention, record_retention, retention_code, retention_message, retention_report,
+    warning_code,
+};
 use std::path::Path;
 
-const MIDDLE_DEFAULT: &str =
-    "its default-argument constructor leaves a middle parameter defaulted, which Java cannot express";
+const MIDDLE_DEFAULT: &str = "its default-argument constructor leaves a middle parameter defaulted, which Java cannot express";
 const NULLABLE_NARROWING: &str = "it narrows a nullable Kotlin property";
 const INTERFACE_SUBTYPE: &str = "an interface subtype is itself retained in Kotlin";
 const RETAINED_SUPERTYPE: &str = "one of its supertypes is retained in Kotlin";
@@ -53,12 +55,18 @@ fn report_groups_by_reason_with_counts_and_locations() {
     // Headline: totals split into human-actionable and cascade fallout.
     assert!(report.contains("6 declaration(s)"), "{report}");
     assert!(report.contains("4 need human input"), "{report}");
-    assert!(report.contains("2 follow a closed type hierarchy"), "{report}");
+    assert!(
+        report.contains("2 follow a closed type hierarchy"),
+        "{report}"
+    );
 
     // Reason codes are derived from the message, exactly as the diagnostics do.
     assert!(report.contains("N6101"), "middle-defaulted code: {report}");
     assert!(report.contains("N5FEA"), "interface-subtype code: {report}");
-    assert!(report.contains("NAB90"), "retained-supertype code: {report}");
+    assert!(
+        report.contains("NAB90"),
+        "retained-supertype code: {report}"
+    );
 
     // Counts and locations: `module: dir/file.kt (hits)`.
     assert!(report.contains("app-core: app/dto.kt (2)"), "{report}");
@@ -77,4 +85,31 @@ fn report_groups_by_reason_with_counts_and_locations() {
 fn no_report_without_retention() {
     clear_retention();
     assert!(retention_report().is_none());
+}
+
+/// The code a table row shows has to be the code the warning lines print: the
+/// table is only useful if a human can grep the log for the row they pick.
+#[test]
+fn table_codes_match_the_codes_the_warnings_print() {
+    clear_retention();
+    record_retention(
+        MIDDLE_DEFAULT,
+        Path::new("app-core/src/main/java/neutral/app/dto.kt"),
+        10,
+    );
+
+    let report = retention_report().expect("a report once a site is recorded");
+    let code = retention_code(MIDDLE_DEFAULT);
+    assert!(report.contains(&code), "table row code: {report}");
+    // The same code the warning lines carry: it comes from the diagnostic
+    // message, which is the table's message for the same reason.
+    assert_eq!(code, warning_code(&retention_message(MIDDLE_DEFAULT)));
+
+    // Generating the code from the BARE reason instead is the failure this
+    // pins: the table would show a code no warning line ever prints.
+    assert_ne!(
+        code,
+        warning_code(MIDDLE_DEFAULT),
+        "a bare-reason code must not be the table code"
+    );
 }

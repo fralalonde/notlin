@@ -294,19 +294,6 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                 result.push_str(&format!(".{}", member_name));
                             }
                         } else {
-                            {
-                                let ws_probe = self.unit.workspace.and_then(|w| {
-                                    w.find_static_property(&base_text, &member_name).map(|d| {
-                                        (
-                                            d.name.clone(),
-                                            d.language == crate::workspace::SourceLanguage::Kotlin,
-                                            d.members
-                                                .iter()
-                                                .any(|m| m.name == member_name && m.is_static),
-                                        )
-                                    })
-                                });
-                            }
                             let retained_kotlin_property = self
                                 .unit
                                 .retained_hint
@@ -825,7 +812,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         // reified_type_argument_rewrite consumes it and emits
         // `recv.member(ty.class)` (Kotlin inlined `T::class.java`).
         if raw_trimmed.contains('<') && !raw_trimmed.contains('(') && raw_trimmed.ends_with('>') {
-            let last_lt = raw_trimmed.rfind('<').map(|p| p).unwrap_or(0);
+            let last_lt = raw_trimmed.rfind('<').unwrap_or(0);
             let head = raw_trimmed[..last_lt].to_string();
             let ty_raw = raw_trimmed[last_lt + 1..raw_trimmed.len() - 1].to_string();
             let ty = ty_raw.trim().to_string();

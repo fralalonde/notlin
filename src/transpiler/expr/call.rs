@@ -1223,15 +1223,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                 let mut next = 0usize;
                                 for arg in std::mem::take(&mut ctor_args) {
                                     if let Some((name, value)) = arg.split_once(" = ") {
-                                        match names
-                                            .iter()
-                                            .position(|param| param == name.trim())
-                                        {
+                                        match names.iter().position(|param| param == name.trim()) {
                                             Some(index) => slots[index] = Some(value.to_string()),
                                             None => {
                                                 let last = slots.len().saturating_sub(1);
-                                                slots[next.min(last)] =
-                                                    Some(value.to_string());
+                                                slots[next.min(last)] = Some(value.to_string());
                                             }
                                         }
                                     } else {
@@ -1271,12 +1267,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                             d.has_default_constructor_parameter && arity(d) == ctor_args.len() + 1
                         });
                         let chosen = defaulting.or_else(|| candidates.first());
-                        if let Some(decl) = chosen {
-                            if decl.has_default_constructor_parameter
-                                && arity(decl) == ctor_args.len() + 1
-                            {
-                                ctor_args.push("null".to_string());
-                            }
+                        if let Some(decl) = chosen
+                            && decl.has_default_constructor_parameter
+                            && arity(decl) == ctor_args.len() + 1
+                        {
+                            ctor_args.push("null".to_string());
                         }
                     }
                     let base_name = callee_java.rsplit('.').next().unwrap_or("").to_string();

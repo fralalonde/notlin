@@ -42,7 +42,7 @@ fn workspace_selection_detects_when_every_kotlin_file_is_selected() {
 
     let index = SourceIndex::discover(&root).unwrap();
 
-    assert!(index.all_kotlin_selected(&[root.clone()]));
+    assert!(index.all_kotlin_selected(std::slice::from_ref(&root)));
     assert!(!index.all_kotlin_selected(&[root.join("first")]));
     fs::remove_dir_all(root).unwrap();
 }
@@ -495,9 +495,12 @@ fn child_interface_stays_kotlin_with_retained_kotlin_supertype() {
         &source,
         &child_path,
         &cli,
-        Some(&index),
-        &[root.join("selected")],
-        Some(&retained),
+        notlin::transpiler::WorkspaceScope {
+            index: Some(&index),
+            roots: &[root.join("selected")],
+            retained_hint: Some(&retained),
+            ..Default::default()
+        },
         true,
     );
     assert_eq!(errors, 0);
@@ -713,10 +716,7 @@ fn retains_defaulted_constructor_used_by_kotlin_caller() {
 
 #[test]
 fn translates_trailing_default_constructor_used_by_kotlin_caller() {
-    let root = std::env::temp_dir().join(format!(
-        "notlin-trailing-default-{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("notlin-trailing-default-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
     let provider = root.join("Configuration.kt");

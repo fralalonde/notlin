@@ -67,13 +67,14 @@ pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex)
         // P2: `<recv>.copy(` where recv's type is a translated Java class.
         if let Some(copy_at) = trimmed.find(".copy(") {
             let recv = trailing_ident(trimmed, copy_at);
-            if let Some(recv) = recv {
-                if let Some(ty) = binding.get(recv) {
-                    if is_translated_java_data_class(index, ty) {
-                        if let Some(rewritten) = rewrite_copy_call(trimmed, recv, ty, index) {
-                            copy_rewrites.push((i, rewritten));
-                        } else {
-                            insertions.push((
+            if let Some(recv) = recv
+                && let Some(ty) = binding.get(recv)
+                && is_translated_java_data_class(index, ty)
+            {
+                if let Some(rewritten) = rewrite_copy_call(trimmed, recv, ty, index) {
+                    copy_rewrites.push((i, rewritten));
+                } else {
+                    insertions.push((
                                 i,
                                 format!(
                                     "{MARKER} `{recv}.copy(...)` calls Kotlin copy() on Java class \
@@ -81,13 +82,11 @@ pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex)
                                      translation on the next run\n"
                                 ),
                             ));
-                        }
-                        continue;
-                    }
                 }
-                // Dataflow-free fallback: mark when ANY java data class member
-                // property named `recv` exists? Too noisy - skip.
+                continue;
             }
+            // Dataflow-free fallback: mark when ANY java data class member
+            // property named `recv` exists? Too noisy - skip.
         }
 
         // P1: `if (<chain> is Type)` where <chain>'s leaf property is a Java
@@ -277,55 +276,6 @@ fn trailing_ident(line: &str, offset: usize) -> Option<&str> {
     Some(ident)
 }
 
-/// Does the workspace contain a JAVA declaration named `ty` (a translated
-/// Kotlin data class) carrying a property member `prop`?
-fn java_class_has_property(index: &crate::workspace::SourceIndex, class: &str, prop: &str) -> bool {
-    // Java classes expose the property through bean accessors: `prop` matches
-    // property members directly OR `get<T>`/`is<T>` methods (the shape the
-    // workspace records for Java sources).
-    let getter = format!("get{}", capitalize(prop));
-    let isser = format!("is{}", capitalize(prop));
-    index.declarations().any(|d| {
-        d.name == class
-            && d.language == crate::workspace::SourceLanguage::Java
-            && d.kind == DeclarationKind::Class
-            && d.members.iter().any(|m| {
-                (m.kind == crate::workspace::MemberKind::Property && m.name == prop)
-                    || (m.kind == crate::workspace::MemberKind::Method
-                        && (m.name == getter || m.name == isser))
-            })
-    })
-}
-
-fn java_subtype_has_property(
-    index: &crate::workspace::SourceIndex,
-    supertype: &str,
-    prop: &str,
-) -> bool {
-    let getter = format!("get{}", capitalize(prop));
-    let isser = format!("is{}", capitalize(prop));
-    index.declarations().any(|d| {
-        d.language == crate::workspace::SourceLanguage::Java
-            && d.kind == DeclarationKind::Class
-            && d.supertypes
-                .iter()
-                .any(|ty| ty.rsplit('.').next() == Some(supertype))
-            && d.members.iter().any(|m| {
-                (m.kind == crate::workspace::MemberKind::Property && m.name == prop)
-                    || (m.kind == crate::workspace::MemberKind::Method
-                        && (m.name == getter || m.name == isser))
-            })
-    })
-}
-
-fn capitalize(input: &str) -> String {
-    let mut chars = input.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
 /// Whitelisted receiver types only - data-class copy ctor existence is not
 /// modelled yet, so P2 marks anything whose TYPE is a JAVA class that the
 /// workspace knows were formerly Kotlin data classes (kind Class, Java, and
@@ -437,17 +387,4 @@ fn decl_pairs(line: &str) -> Vec<(&str, &str)> {
         }
     }
     pairs
-}
-
-/// Any Java-translated class exposing `prop` through a bean getter.
-fn any_java_class_has_property(index: &crate::workspace::SourceIndex, prop: &str) -> bool {
-    index.declarations().any(|d| {
-        d.language == crate::workspace::SourceLanguage::Java
-            && d.kind == DeclarationKind::Class
-            && d.members.iter().any(|m| {
-                m.kind == crate::workspace::MemberKind::Method
-                    && (m.name == format!("get{}", capitalize(prop))
-                        || m.name == format!("is{}", capitalize(prop)))
-            })
-    })
 }

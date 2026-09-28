@@ -19,7 +19,7 @@
 //! fixpoint and terminates (bounded by the number of declarations).
 
 use crate::cli::Cli;
-use crate::transpiler::{parse_tree, transpile_with_tree_hint_selection};
+use crate::transpiler::{WorkspaceScope, parse_tree, transpile_with_tree_hint_selection};
 use crate::workspace::SourceIndex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -80,7 +80,6 @@ pub fn plan_workspace(
     let mut probe_files_per_pass = Vec::new();
     let mut retained: HashSet<String> = HashSet::new();
     let mut retained_delta: HashSet<String> = HashSet::new();
-    let all_kotlin_selected = index.all_kotlin_selected(translation_roots);
     // Trees are immutable. Parsing each source once avoids re-parsing it for
     // every retained-set probe and the final emitting translation.
     let trees: Vec<_> = files.iter().map(|(_, source)| parse_tree(source)).collect();
@@ -114,11 +113,12 @@ pub fn plan_workspace(
                 tree,
                 file,
                 cli,
-                Some(index),
-                translation_roots,
-                Some(&retained),
-                Some(all_kotlin_selected),
-                workspace_file.as_deref(),
+                WorkspaceScope {
+                    index: Some(index),
+                    roots: translation_roots,
+                    retained_hint: Some(&retained),
+                    indexed_path: workspace_file.as_deref(),
+                },
                 /*silent=*/ true,
             );
             if retention_traced(&trace, file) {
@@ -208,11 +208,12 @@ pub fn plan_workspace(
                     tree,
                     file,
                     cli,
-                    Some(index),
-                    translation_roots,
-                    Some(&retained),
-                    Some(all_kotlin_selected),
-                    workspace_file.as_deref(),
+                    WorkspaceScope {
+                        index: Some(index),
+                        roots: translation_roots,
+                        retained_hint: Some(&retained),
+                        indexed_path: workspace_file.as_deref(),
+                    },
                     /*silent=*/ false,
                 );
                 if retention_traced(&trace, file) {

@@ -35,11 +35,12 @@ fn retained_supertype_abi_mismatch_taints() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// Transitive mismatch: Holder implements Box, Box extends DeepBox, and the
-/// RETAINED DeepBox declares `items: List<Item>` while Holder has
-/// `List<ItemImpl>` — the conflict surfaces two hops away and must taint.
+/// Whole-workspace mismatch: the supertype declares `entries: List<String>`
+/// while the class has `List<Int>`. Java cannot override that without erasing
+/// the type arguments, and a raw `List` breaks JPA and every generic consumer,
+/// so the class must stay Kotlin rather than be emitted with raw generics.
 #[test]
-fn whole_workspace_erases_only_conflicting_supertype_property_generics() {
+fn whole_workspace_retains_class_whose_supertype_member_type_differs() {
     let root = Path::new("tests/tmp_scratch_abi_whole");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -56,7 +57,6 @@ fn whole_workspace_erases_only_conflicting_supertype_property_generics() {
 
     let selected_root = fs::canonicalize(root).unwrap();
     let index = SourceIndex::discover(&selected_root).unwrap();
-    assert!(index.all_kotlin_selected(&[selected_root]));
     let implementation = index
         .declarations()
         .find(|declaration| declaration.name == "Implementation")
@@ -78,14 +78,26 @@ fn whole_workspace_erases_only_conflicting_supertype_property_generics() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // The class stays Kotlin, and whatever Java does come out must never
+    // declare a raw collection: that is the shape JPA rejects outright.
     let out_java = fs::read_to_string(root.join("Implementation.java")).unwrap_or_default();
     assert!(
-        out_java.contains("private final List entries;"),
-        "conflicting property must erase generics, got:\n{out_java}"
+        !out_java.contains("List entries;"),
+        "conflicting property must not be emitted with a raw type, got:\n{out_java}"
     );
+
+    // The code on the warning line is the code of the run-end table row, so a
+    // human can grep the log for the row they picked out of the table.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning_code = stderr
+        .lines()
+        .find(|line| line.starts_with("warning:") && line.contains("a Kotlin supertype declares"))
+        .and_then(|line| line.rsplit('[').next())
+        .map(|tail| tail.trim_end_matches(']').to_string())
+        .unwrap_or_else(|| panic!("no mismatch warning in:\n{stderr}"));
     assert!(
-        out_java.contains("private final List<Long> unchanged;"),
-        "unrelated property must preserve generics, got:\n{out_java}"
+        stderr.contains(&format!("  {warning_code} ")),
+        "table row for {warning_code} missing:\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }

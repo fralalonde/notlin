@@ -39,7 +39,7 @@ fn translate(root: &std::path::PathBuf, provider: &std::path::Path) -> String {
         provider,
         &cli,
         Some(&index),
-        std::slice::from_ref(&root),
+        std::slice::from_ref(root),
     );
     files
         .iter()

@@ -69,7 +69,7 @@ impl Diagnostic {
             self.severity,
             self.message,
             self.warning_code(),
-            crate::paths::display(self.file),
+            crate::paths::display(&self.file),
             self.line,
             self.col,
         )
@@ -223,6 +223,13 @@ pub fn retention_message(reason: &str) -> String {
     format!("workspace Kotlin implementation requires this declaration to remain Kotlin: {reason}")
 }
 
+/// The code a retention site prints — on its warning line AND in the run-end
+/// table row that summarises it. Both must derive it from the same message,
+/// or the code a human reads in the table greps to nothing in the log.
+pub fn retention_code(reason: &str) -> String {
+    warning_code(&retention_message(reason))
+}
+
 /// A declaration that stayed Kotlin because residual Kotlin source still needs
 /// it: a Kotlin named-argument call cannot target a Java constructor, a Kotlin
 /// `val` cannot implement a Java-source getter, a Kotlin implementor cannot
@@ -230,8 +237,10 @@ pub fn retention_message(reason: &str) -> String {
 /// accepts or resolves — hence the run-end table.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RetentionSite {
-    /// Why the declaration was held back (`kotlin_retention_reason` text).
-    pub reason: &'static str,
+    /// Why the declaration was held back: either one of the fixed
+    /// `kotlin_retention_reason` texts, or a per-declaration reason naming the
+    /// members that conflict.
+    pub reason: String,
     /// Source file the declaration lives in.
     pub file: String,
     /// 1-based declaration line.
@@ -249,12 +258,12 @@ const CASCADE_REASONS: [&str; 2] = [
 /// Keyed by declaration site: a fixpoint reconsiders every declaration on every
 /// pass, so entries must collapse to one row per declaration — keeping the LAST
 /// reason, which is the one that survived to the end of the fixpoint.
-static RETENTION: Mutex<BTreeMap<(String, usize), &'static str>> = Mutex::new(BTreeMap::new());
+static RETENTION: Mutex<BTreeMap<(String, usize), String>> = Mutex::new(BTreeMap::new());
 
 /// Record a declaration held back from translation.
-pub fn record_retention(reason: &'static str, file: &Path, line: usize) {
+pub fn record_retention(reason: impl Into<String>, file: &Path, line: usize) {
     if let Ok(mut sites) = RETENTION.lock() {
-        sites.insert((crate::paths::display(file).to_string(), line), reason);
+        sites.insert((crate::paths::display(file), line), reason.into());
     }
 }
 
@@ -273,7 +282,7 @@ pub fn retention_sites() -> Vec<RetentionSite> {
             sites
                 .iter()
                 .map(|((file, line), reason)| RetentionSite {
-                    reason,
+                    reason: reason.clone(),
                     file: file.clone(),
                     line: *line,
                 })
@@ -322,10 +331,10 @@ pub fn retention_report() -> Option<String> {
         return None;
     }
 
-    let mut grouped: BTreeMap<&'static str, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     for site in &sites {
         *grouped
-            .entry(site.reason)
+            .entry(site.reason.clone())
             .or_default()
             .entry(shorten_file(&site.file))
             .or_insert(0) += 1;
@@ -333,7 +342,7 @@ pub fn retention_report() -> Option<String> {
 
     struct Row {
         code: String,
-        reason: &'static str,
+        reason: String,
         count: usize,
         cascade: bool,
         files: Vec<(String, usize)>,
@@ -346,8 +355,8 @@ pub fn retention_report() -> Option<String> {
             let mut files: Vec<(String, usize)> = files.into_iter().collect();
             files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             Row {
-                code: warning_code(&retention_message(reason)),
-                cascade: CASCADE_REASONS.contains(&reason),
+                code: retention_code(&reason),
+                cascade: CASCADE_REASONS.contains(&reason.as_str()),
                 reason,
                 count,
                 files,
@@ -411,7 +420,7 @@ pub fn retention_report() -> Option<String> {
             "  {:<6}  {:>5}  {:<width$}{marker}  {where_}\n",
             row.code,
             row.count,
-            shorten_reason(row.reason, reason_width),
+            shorten_reason(&row.reason, reason_width),
             width = reason_width
         ));
     }
@@ -424,10 +433,11 @@ pub fn retention_report() -> Option<String> {
         out.push_str("\n  every site:\n");
         for site in &sites {
             out.push_str(&format!(
-                "    {}:{}  {}\n",
+                "    {}:{}  [{}]  {}\n",
                 site.file,
                 site.line,
-                retention_message(site.reason)
+                retention_code(&site.reason),
+                retention_message(&site.reason)
             ));
         }
     }

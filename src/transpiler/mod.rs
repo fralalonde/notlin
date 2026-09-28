@@ -123,6 +123,19 @@ pub fn transpile(
     transpile_with_workspace(source, file, cli, None, &[])
 }
 
+/// Workspace facts a translation needs beyond the file on disk. They always
+/// travel together: the index that answers cross-file questions, the roots
+/// the user selected, the retained set produced by the retention fixpoint
+/// (probe passes only) and the indexed path of this file, which differs from
+/// its disk path when the file came out of the workspace index.
+#[derive(Clone, Copy, Default)]
+pub struct WorkspaceScope<'a> {
+    pub index: Option<&'a SourceIndex>,
+    pub roots: &'a [PathBuf],
+    pub retained_hint: Option<&'a std::collections::HashSet<String>>,
+    pub indexed_path: Option<&'a Path>,
+}
+
 /// Transpile one file with a source-level workspace index and selected roots.
 pub fn transpile_with_workspace(
     source: &str,
@@ -135,9 +148,11 @@ pub fn transpile_with_workspace(
         source,
         file,
         cli,
-        workspace,
-        translation_roots,
-        None,
+        WorkspaceScope {
+            index: workspace,
+            roots: translation_roots,
+            ..Default::default()
+        },
         /*silent=*/ true,
     )
 }
@@ -150,22 +165,11 @@ pub fn transpile_with_workspace_hint(
     source: &str,
     file: &Path,
     cli: &Cli,
-    workspace: Option<&SourceIndex>,
-    translation_roots: &[PathBuf],
-    retained_hint: Option<&std::collections::HashSet<String>>,
+    scope: WorkspaceScope<'_>,
     silent: bool,
 ) -> (Vec<(String, String)>, usize, usize, FileCoverage) {
     let tree = parse_tree(source);
-    transpile_with_tree_hint(
-        source,
-        &tree,
-        file,
-        cli,
-        workspace,
-        translation_roots,
-        retained_hint,
-        silent,
-    )
+    transpile_with_tree_hint(source, &tree, file, cli, scope, silent)
 }
 
 /// Translate one Kotlin source with a tree-sitter tree parsed by the caller.
@@ -176,23 +180,10 @@ pub fn transpile_with_tree_hint(
     tree: &tree_sitter::Tree,
     file: &Path,
     cli: &Cli,
-    workspace: Option<&SourceIndex>,
-    translation_roots: &[PathBuf],
-    retained_hint: Option<&std::collections::HashSet<String>>,
+    scope: WorkspaceScope<'_>,
     silent: bool,
 ) -> (Vec<(String, String)>, usize, usize, FileCoverage) {
-    transpile_with_tree_hint_selection(
-        source,
-        tree,
-        file,
-        cli,
-        workspace,
-        translation_roots,
-        retained_hint,
-        None,
-        None,
-        silent,
-    )
+    transpile_with_tree_hint_selection(source, tree, file, cli, scope, silent)
 }
 
 pub(crate) fn transpile_with_tree_hint_selection(
@@ -200,13 +191,13 @@ pub(crate) fn transpile_with_tree_hint_selection(
     tree: &tree_sitter::Tree,
     file: &Path,
     cli: &Cli,
-    workspace: Option<&SourceIndex>,
-    translation_roots: &[PathBuf],
-    retained_hint: Option<&std::collections::HashSet<String>>,
-    all_kotlin_selected: Option<bool>,
-    workspace_file: Option<&Path>,
+    scope: WorkspaceScope<'_>,
     silent: bool,
 ) -> (Vec<(String, String)>, usize, usize, FileCoverage) {
+    let workspace = scope.index;
+    let translation_roots = scope.roots;
+    let retained_hint = scope.retained_hint;
+    let workspace_file = scope.indexed_path;
     let profile = profile_enabled();
     let mut diags = Diagnostics::new();
     let annots = match cli.annotations {
@@ -230,12 +221,7 @@ pub(crate) fn transpile_with_tree_hint_selection(
                 in_place: cli.migrates_in_place(),
             },
         )
-        .with_workspace_selection(
-            workspace,
-            translation_roots,
-            all_kotlin_selected,
-            workspace_file,
-        );
+        .with_workspace_selection(workspace, translation_roots, workspace_file);
         unit.retained_hint = retained_hint;
         let java_files = unit.run(tree.root_node());
         let mut coverage = std::mem::take(&mut unit.coverage);

@@ -79,8 +79,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         .workspace_root
         .clone()
         .unwrap_or(std::env::current_dir().map_err(|e| format!("current directory: {e}"))?);
-    let workspace_root = std::fs::canonicalize(&workspace_root)
-        .map_err(|e| format!("workspace root {}: {e}", notlin::paths::display(workspace_root)))?;
+    let workspace_root = std::fs::canonicalize(&workspace_root).map_err(|e| {
+        format!(
+            "workspace root {}: {e}",
+            notlin::paths::display(&workspace_root)
+        )
+    })?;
     // Every path printed from here on — diagnostics, logs, the run summary,
     // the retention table — is relative to this root.
     notlin::paths::set_root(&workspace_root);
@@ -89,7 +93,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         "indexed {} Kotlin and {} Java files from {} ({} parsed, {} cached)",
         index.kotlin_files().count(),
         index.java_files().count(),
-        notlin::paths::display(workspace_root),
+        notlin::paths::display(&workspace_root),
         index_stats.parsed_files,
         index_stats.reused_files,
     );
@@ -170,16 +174,19 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 )?;
                 match &outcome {
                     migrate::MigrateOutcome::Deleted => {
-                        log::debug!("deleted {}", notlin::paths::display(plan.file));
+                        log::debug!("deleted {}", notlin::paths::display(&plan.file));
                     }
                     migrate::MigrateOutcome::Trimmed { remaining_bytes } => {
                         log::debug!(
                             "trimmed {} ({remaining_bytes} bytes remain)",
-                            notlin::paths::display(plan.file)
+                            notlin::paths::display(&plan.file)
                         );
                     }
                     migrate::MigrateOutcome::Untouched => {
-                        log::debug!("{}: no translated content; untouched", notlin::paths::display(plan.file));
+                        log::debug!(
+                            "{}: no translated content; untouched",
+                            notlin::paths::display(&plan.file)
+                        );
                     }
                 }
                 outcomes.push((plan.file.clone(), outcome));
@@ -242,15 +249,15 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                             .map_err(|e| format!("{}: {e}", notlin::paths::display(parent)))?;
                     }
                     let file = std::fs::File::create(&target)
-                        .map_err(|e| format!("{}: {e}", notlin::paths::display(target)))?;
+                        .map_err(|e| format!("{}: {e}", notlin::paths::display(&target)))?;
                     let mut writer = BufWriter::new(file);
                     writer
                         .write_all(content.as_bytes())
-                        .map_err(|e| format!("{}: {e}", notlin::paths::display(target)))?;
+                        .map_err(|e| format!("{}: {e}", notlin::paths::display(&target)))?;
                     writer
                         .flush()
-                        .map_err(|e| format!("{}: {e}", notlin::paths::display(target)))?;
-                    log::debug!("wrote {}", notlin::paths::display(target));
+                        .map_err(|e| format!("{}: {e}", notlin::paths::display(&target)))?;
+                    log::debug!("wrote {}", notlin::paths::display(&target));
                 }
                 java_written += java_files.len();
             }
@@ -290,7 +297,10 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                         );
                     }
                     migrate::MigrateOutcome::Untouched => {
-                        log::debug!("{}: no translated content; untouched", notlin::paths::display(file));
+                        log::debug!(
+                            "{}: no translated content; untouched",
+                            notlin::paths::display(file)
+                        );
                         // Orphan cleanup: a prior run may have generated Java
                         // outputs whose declarations this run retained in
                         // Kotlin. Generated outputs are marked with the
@@ -319,7 +329,10 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                                         && first_line.contains(&source_text)
                                     {
                                         let _ = std::fs::remove_file(&path);
-                                        log::info!("deleted orphan {}", notlin::paths::display(path));
+                                        log::info!(
+                                            "deleted orphan {}",
+                                            notlin::paths::display(&path)
+                                        );
                                     }
                                 }
                             }
@@ -404,15 +417,15 @@ fn write_java_files(
                         .map_err(|e| format!("{}: {e}", notlin::paths::display(parent)))?;
                 }
                 let out = std::fs::File::create(&target)
-                    .map_err(|e| format!("{}: {e}", notlin::paths::display(target)))?;
+                    .map_err(|e| format!("{}: {e}", notlin::paths::display(&target)))?;
                 let mut writer = BufWriter::new(out);
                 writer
                     .write_all(content.as_bytes())
-                    .map_err(|e| format!("{}: {e}", notlin::paths::display(target)))?;
+                    .map_err(|e| format!("{}: {e}", notlin::paths::display(&target)))?;
                 writer
                     .flush()
-                    .map_err(|e| format!("{}: {e}", notlin::paths::display(target)))?;
-                log::debug!("wrote {}", notlin::paths::display(target));
+                    .map_err(|e| format!("{}: {e}", notlin::paths::display(&target)))?;
+                log::debug!("wrote {}", notlin::paths::display(&target));
             }
         }
         None => {
@@ -486,8 +499,11 @@ fn migrate_file(
                     && first_line.contains(&source_text)
                 {
                     std::fs::remove_file(&path)
-                        .map_err(|error| format!("{}: {error}", notlin::paths::display(path)))?;
-                    log::info!("deleted stale generated output {}", notlin::paths::display(path));
+                        .map_err(|error| format!("{}: {error}", notlin::paths::display(&path)))?;
+                    log::info!(
+                        "deleted stale generated output {}",
+                        notlin::paths::display(&path)
+                    );
                 }
             }
         }
@@ -563,7 +579,8 @@ fn read_source(file: &Path) -> Result<String, String> {
             .read_to_string(&mut source)
             .map_err(|e| format!("stdin: {e}"))?;
     } else {
-        let input = std::fs::File::open(file).map_err(|e| format!("{}: {e}", notlin::paths::display(file)))?;
+        let input = std::fs::File::open(file)
+            .map_err(|e| format!("{}: {e}", notlin::paths::display(file)))?;
         BufReader::new(input)
             .read_to_string(&mut source)
             .map_err(|e| format!("{}: {e}", notlin::paths::display(file)))?;
@@ -611,20 +628,21 @@ fn walk_kotlin(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut stack = vec![dir.to_path_buf()];
     let mut visited_directories = HashSet::from([dir.to_path_buf()]);
     while let Some(directory) = stack.pop() {
-        let entries =
-            std::fs::read_dir(&directory).map_err(|e| format!("{}: {e}", notlin::paths::display(directory)))?;
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|e| format!("{}: {e}", notlin::paths::display(&directory)))?;
         for entry in entries {
-            let entry = entry.map_err(|e| format!("{}: {e}", notlin::paths::display(directory)))?;
+            let entry =
+                entry.map_err(|e| format!("{}: {e}", notlin::paths::display(&directory)))?;
             let path = entry.path();
             let is_kotlin = path.extension().is_some_and(|extension| extension == "kt");
             let metadata = match std::fs::metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(_) if !is_kotlin => continue,
-                Err(e) => return Err(format!("{}: {e}", notlin::paths::display(path))),
+                Err(e) => return Err(format!("{}: {e}", notlin::paths::display(&path))),
             };
             if metadata.is_dir() {
-                let canonical =
-                    std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", notlin::paths::display(path)))?;
+                let canonical = std::fs::canonicalize(&path)
+                    .map_err(|e| format!("{}: {e}", notlin::paths::display(&path)))?;
                 if visited_directories.insert(canonical.clone()) {
                     stack.push(canonical);
                 }

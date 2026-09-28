@@ -1,6 +1,6 @@
 use clap::Parser;
 use notlin::cli::Cli;
-use notlin::transpiler::{transpile_with_tree_hint, transpile_with_workspace_hint};
+use notlin::transpiler::{WorkspaceScope, transpile_with_tree_hint, transpile_with_workspace_hint};
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -16,14 +16,33 @@ fn pre_parsed_tree_matches_fresh_translation() {
     let cli = Cli::parse_from(["notlin", file.to_str().unwrap()]);
     let roots: Vec<PathBuf> = Vec::new();
 
-    let fresh = transpile_with_workspace_hint(source, file, &cli, None, &roots, None, true);
+    let fresh = transpile_with_workspace_hint(
+        source,
+        file,
+        &cli,
+        WorkspaceScope {
+            roots: &roots,
+            ..Default::default()
+        },
+        true,
+    );
 
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
         .unwrap();
     let tree = parser.parse(source, None).unwrap();
-    let reused = transpile_with_tree_hint(source, &tree, file, &cli, None, &roots, None, true);
+    let reused = transpile_with_tree_hint(
+        source,
+        &tree,
+        file,
+        &cli,
+        WorkspaceScope {
+            roots: &roots,
+            ..Default::default()
+        },
+        true,
+    );
 
     assert_eq!(reused.0, fresh.0);
     assert_eq!(reused.1, fresh.1);

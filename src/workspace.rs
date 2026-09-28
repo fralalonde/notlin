@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 
 // 5: `Declaration::constructor_param_count` (primary-constructor arity, not a
 // property count — companion members and body properties both inflate that).
-const CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 7;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -203,8 +203,8 @@ impl SourceIndex {
     }
 
     pub fn discover_with_stats(root: &Path) -> Result<(Self, IndexStats), String> {
-        let root =
-            fs::canonicalize(root).map_err(|error| format!("{}: {error}", crate::paths::display(root)))?;
+        let root = fs::canonicalize(root)
+            .map_err(|error| format!("{}: {error}", crate::paths::display(root)))?;
         let old_cache = load_cache(&root);
         let old_sources = old_cache
             .as_ref()
@@ -512,9 +512,9 @@ impl SourceIndex {
             if !self.is_selected(&file.path, translation_roots) {
                 return true;
             }
-            file.declarations.iter().any(|decl| {
-                retained.contains(&decl.name) && !(same_file && decl.name == name)
-            })
+            file.declarations
+                .iter()
+                .any(|decl| retained.contains(&decl.name) && !(same_file && decl.name == name))
         })
     }
 
@@ -532,6 +532,12 @@ impl SourceIndex {
         supertypes: &[String],
         class_name: &str,
     ) -> Vec<String> {
+        // A Kotlin supertype whose member has a DIFFERENT type cannot be
+        // implemented from Java at all: a parameterized override must match
+        // exactly, and erasing the type arguments to force it through would
+        // emit raw types (which JPA rejects and generic consumers lose). So a
+        // conflict here means the class stays Kotlin — whether or not the
+        // supertype itself is translated.
         // The class's own declaration, by name (first hit is this class in
         // its own file because the class-name is canonical in the index).
         let Some(own) = self
@@ -604,7 +610,10 @@ impl SourceIndex {
                     // bound — ANY implementing type satisfies it, so a text
                     // mismatch against the concrete class member is a false
                     // positive, not a fake-override ABI conflict.
-                    if sup_decl.type_params.contains(&sup_ty)
+                    if sup_decl
+                        .type_params
+                        .iter()
+                        .any(|param| param == sup_ty.trim_end_matches('?').trim())
                         || is_java_compatible_narrow(
                             self,
                             own_file,
@@ -889,10 +898,9 @@ impl SourceIndex {
                     .members
                     .iter()
                     .find(|m| m.kind == MemberKind::Property && m.name == prop)
+                    && let Some(t) = &member.type_name
                 {
-                    if let Some(t) = &member.type_name {
-                        return Some(t.clone());
-                    }
+                    return Some(t.clone());
                 }
                 pending.extend(parent.supertypes.iter().cloned());
             }
@@ -1404,17 +1412,6 @@ impl SourceIndex {
     }
 }
 
-/// Inverse of the Java getter-name mapping for a Kotlin property:
-/// `getId` -> `id`.
-fn property_for_getter(getter: &str) -> String {
-    let stripped = getter.strip_prefix("get").unwrap_or(getter);
-    let mut chars = stripped.chars();
-    match chars.next() {
-        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
 fn declaration_key(declaration: &Declaration) -> String {
     match &declaration.package {
         Some(package) => format!("{package}.{}", declaration.name),
@@ -1560,9 +1557,9 @@ fn scan_directory(
 ) -> Result<CachedDirectory, String> {
     let directory = root.join(relative);
     let mut directory_entries = fs::read_dir(&directory)
-        .map_err(|error| format!("{}: {error}", crate::paths::display(directory)))?
+        .map_err(|error| format!("{}: {error}", crate::paths::display(&directory)))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("{}: {error}", crate::paths::display(directory)))?;
+        .map_err(|error| format!("{}: {error}", crate::paths::display(&directory)))?;
     directory_entries.sort_by_key(|entry| entry.file_name());
 
     let mut entries = BTreeMap::new();
@@ -1572,7 +1569,7 @@ fn scan_directory(
         let path = entry.path();
         let file_type = entry
             .file_type()
-            .map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
+            .map_err(|error| format!("{}: {error}", crate::paths::display(&path)))?;
         if should_skip_directory(&name) && (file_type.is_dir() || file_type.is_symlink()) {
             continue;
         }
@@ -1585,7 +1582,7 @@ fn scan_directory(
             match fs::metadata(&path) {
                 Ok(metadata) => Some(metadata.file_type()),
                 Err(_) if source_language().is_none() => continue,
-                Err(error) => return Err(format!("{}: {error}", crate::paths::display(path))),
+                Err(error) => return Err(format!("{}: {error}", crate::paths::display(&path))),
             }
         } else {
             None
@@ -1596,8 +1593,8 @@ fn scan_directory(
             followed_type.as_ref().is_some_and(fs::FileType::is_file) || file_type.is_file();
 
         if is_directory {
-            let canonical_directory =
-                fs::canonicalize(&path).map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
+            let canonical_directory = fs::canonicalize(&path)
+                .map_err(|error| format!("{}: {error}", crate::paths::display(&path)))?;
             if !visited_directories.insert(canonical_directory) {
                 continue;
             }
@@ -1647,10 +1644,10 @@ fn scan_source(
     previous: Option<&CachedSource>,
     stats: &mut IndexStats,
 ) -> Result<CachedSource, String> {
-    let canonical_path =
-        fs::canonicalize(path).map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
+    let canonical_path = fs::canonicalize(path)
+        .map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
     let metadata = fs::metadata(&canonical_path)
-        .map_err(|error| format!("{}: {error}", crate::paths::display(canonical_path)))?;
+        .map_err(|error| format!("{}: {error}", crate::paths::display(&canonical_path)))?;
     let size = metadata.len();
     let modified_nanos = metadata
         .modified()
@@ -1660,7 +1657,7 @@ fn scan_source(
         .unwrap_or(0);
 
     let bytes = fs::read(&canonical_path)
-        .map_err(|error| format!("{}: {error}", crate::paths::display(canonical_path)))?;
+        .map_err(|error| format!("{}: {error}", crate::paths::display(&canonical_path)))?;
     let digest = *blake3::hash(&bytes).as_bytes();
     if let Some(previous) = previous
         && previous.digest == digest
@@ -1677,7 +1674,7 @@ fn scan_source(
     }
 
     let source = String::from_utf8(bytes)
-        .map_err(|error| format!("{}: {error}", crate::paths::display(canonical_path)))?;
+        .map_err(|error| format!("{}: {error}", crate::paths::display(&canonical_path)))?;
     let package = package_name(&source);
     let imports = import_names(&source);
     let (
@@ -2207,8 +2204,8 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 continue;
             };
             let type_node = parameter
-                .named_children(&mut parameter.walk())
-                .find(|child| matches!(child.kind(), "user_type" | "nullable_type"));
+                .child_by_field_name("type")
+                .or_else(|| first_type_node(parameter));
             result.push(Member {
                 name: node_text(name_node, source).unwrap_or_default(),
                 kind: MemberKind::Property,
@@ -2331,9 +2328,17 @@ fn member_from_node(
     })
 }
 
+/// First type node of a member declaration, for the layouts where the type
+/// carries no `type` field. Annotations are NOT types: `@JsonIgnore val id:
+/// String` holds a `user_type` of its own inside the annotation, and indexing
+/// that made every annotated member look like it declared the annotation's
+/// type — which then read as an ABI conflict against its supertype.
 fn first_type_node(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     if matches!(node.kind(), "nullable_type" | "user_type") {
         return Some(node);
+    }
+    if matches!(node.kind(), "annotation" | "modifiers") {
+        return None;
     }
     node.named_children(&mut node.walk())
         .find_map(first_type_node)
@@ -2368,6 +2373,11 @@ fn is_java_compatible_narrow(
     super_ty: &str,
     own_ty: &str,
 ) -> bool {
+    // Nullability is a Kotlin-only distinction: a non-null override of a
+    // nullable property is plain covariant narrowing in Java, so compare the
+    // types without their `?` marker.
+    let super_ty = super_ty.trim().trim_end_matches('?').trim();
+    let own_ty = own_ty.trim().trim_end_matches('?').trim();
     if super_ty == own_ty || super_ty == "Object" || super_ty == "Any" {
         return true;
     }
@@ -2377,12 +2387,16 @@ fn is_java_compatible_narrow(
     let (own_base, own_args) = split_generic(own_ty);
     if sup_base != own_base {
         // Covariant narrowing requires own to be a SUBTYPE of sup: walk own's
-        // supertype closure through the index.
-        return index
-            .resolve_kotlin_type_public(source_file, own_ty)
-            .is_some_and(|own_decl| {
-                index.supertype_closure_contains(source_file, own_decl, sup_base)
-            });
+        // supertype closure through the index. When the own type is not in the
+        // index at all, both sides are library types (`Number` overridden by
+        // `BigDecimal`) or builtins, where the index has nothing to say — and
+        // the source is valid Kotlin, so the override IS a subtype. Emitting it
+        // is the default; javac is the check. Claiming a conflict from absence
+        // of evidence retains declarations Java could have expressed.
+        let Some(own_decl) = index.resolve_kotlin_type_public(source_file, own_ty) else {
+            return true;
+        };
+        return index.supertype_closure_contains(source_file, own_decl, sup_base);
     }
     match (sup_args, own_args) {
         (None, _) => true, // raw sup type accepts any instantiation

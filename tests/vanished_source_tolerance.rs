@@ -35,7 +35,7 @@ fn vanished_source_is_skipped_not_fatal() {
         .unwrap();
     }
 
-    let mut child = Command::new(notlin())
+    let child = Command::new(notlin())
         .args([
             "--root",
             root.to_str().unwrap(),

@@ -419,9 +419,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // resolves an inherited member as a real override against a Kotlin
         // declaration, not against a Java default method.
         if hierarchy_closure()
-            && self.retained_hint.as_ref().is_some_and(|retained| {
-                workspace.has_retained_kotlin_subtype(target, retained)
-            })
+            && self
+                .retained_hint
+                .as_ref()
+                .is_some_and(|retained| workspace.has_retained_kotlin_subtype(target, retained))
         {
             return Some("a retained Kotlin declaration inherits from it");
         }
@@ -466,10 +467,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         None
     }
 
-    fn workspace_requires_kotlin_retention(&self, name: &str) -> bool {
-        self.kotlin_retention_reason(name).is_some()
-    }
-
     /// A Kotlin companion `operator fun invoke` gives the enclosing type a
     /// class-call ABI (`Type(...)`) that Java cannot represent: Kotlin binds
     /// that syntax to a Java constructor after migration, never to a static
@@ -495,7 +492,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
-        self.raw_member_types.clear();
         // `KClass<T>` type references lower to Java `Class<T>` (kt.rs /
         // types.rs interop mapping). That ABI change is only compatible
         // when no RESIDUAL Kotlin file consumes this declaration: a
@@ -663,29 +659,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     .or_insert_with(|| format!("get{}", capitalize(&property)));
             }
         }
-        if let Some(workspace) = self.workspace {
-            if self.all_kotlin_selected() && self.retained_hint.is_some() {
-                let supers: Vec<String> = kt::child(decl, "delegation_specifiers")
-                    .map(|dc| {
-                        let mut cursor = dc.walk();
-                        dc.children(&mut cursor)
-                            .filter(|specifier| specifier.kind() == "delegation_specifier")
-                            .map(|specifier| {
-                                specifier
-                                    .child_by_field_name("user_type")
-                                    .map(|ty| self.text(ty).trim().to_string())
-                                    .unwrap_or_else(|| self.text(specifier).trim().to_string())
-                            })
-                            .filter(|supertype| !supertype.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.raw_member_types = workspace
-                    .retained_supertype_member_mismatches(&supers, &name)
-                    .into_iter()
-                    .collect();
-            }
-        }
         let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
         if self.has_companion_operator_invoke(decl)
             && self.workspace.is_some_and(|workspace| {
@@ -710,11 +683,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return;
         }
         if let Some(reason) = self.kotlin_retention_reason(&name) {
-            crate::diagnostics::record_retention(reason, self.file, decl.start_position().row + 1);
-            self.diag_untranslatable(
-                decl,
-                &crate::diagnostics::retention_message(reason),
-            );
+            self.retain_decl(decl, reason);
             return;
         }
 
@@ -780,14 +749,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 type_params = format!("<{}> ", parts.join(", "));
             }
         }
-        let params = self
-            .class_params(decl)
-            .into_iter()
-            .map(|(is_property, is_mutable, member_name, ty)| {
-                let ty = self.erased_member_type(&member_name, ty);
-                (is_property, is_mutable, member_name, ty)
-            })
-            .collect::<Vec<_>>();
+        let params = self.class_params(decl);
         // Primary-constructor properties are emitted as Java getters too, but
         // they bypass transpile_property(). Register them before translating
         // any member body so a Kotlin implicit receiver (`parent.key`) does
@@ -1360,7 +1322,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         out.blank();
                         self.transpile_property(member, out);
                     } else if member.is_named()
-                        && !matches!(member.kind(), ";" | "{" | "}" | "line_comment" | "block_comment")
+                        && !matches!(
+                            member.kind(),
+                            ";" | "{" | "}" | "line_comment" | "block_comment"
+                        )
                     {
                         self.diag_untranslatable(
                             member,
@@ -1491,7 +1456,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             self.emit_jvm_overloads_primary_constructors(decl, &name, &params, out);
             // accessors (skipped under --lombok: @Data generates them)
             if !self.lombok {
-                for (is_property, is_mutable, fname, ftype) in &params {
+                for (_is_property, is_mutable, fname, ftype) in &params {
                     let cap = capitalize(fname);
                     out.open(format!("public {} get{}()", ftype, cap));
                     out.line(format!("return {};", fname));
@@ -1577,12 +1542,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // annotation named `Default`. Keep the marker the source wrote, and
         // supply it (fully qualified — the declaring file rarely imports it)
         // whenever the translation introduces the extra constructors.
-        if self.in_place && self.primary_constructor_has_defaults(decl) {
-            if let Some(marker) = self.workspace_constructor_marker() {
-                let simple = marker.rsplit('.').next().unwrap_or_default();
-                if !annotations.iter().any(|written| written.contains(simple)) {
-                    annotations.push(format!("@{marker}"));
-                }
+        if self.in_place
+            && self.primary_constructor_has_defaults(decl)
+            && let Some(marker) = self.workspace_constructor_marker()
+        {
+            let simple = marker.rsplit('.').next().unwrap_or_default();
+            if !annotations.iter().any(|written| written.contains(simple)) {
+                annotations.push(format!("@{marker}"));
             }
         }
         annotations
@@ -1619,9 +1585,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
         workspace
             .declarations_named("Default")
-            .find(|declaration| {
-                declaration.kind == crate::workspace::DeclarationKind::Annotation
-            })
+            .find(|declaration| declaration.kind == crate::workspace::DeclarationKind::Annotation)
             .and_then(|declaration| {
                 declaration
                     .package
@@ -2119,7 +2083,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.line(format!("private {}{} {};", final_kw, ftype, fname));
             }
             out.blank();
-            for (is_property, is_mutable, fname, ftype) in &params {
+            for (_is_property, is_mutable, fname, ftype) in &params {
                 let cap = capitalize(fname);
                 out.open(format!("public {} get{}()", ftype, cap));
                 out.line(format!("return {};", fname));
@@ -2718,7 +2682,11 @@ fn normalized_source_path(path: &std::path::Path) -> String {
 /// `Unit<Q : Quantity<Q>>`; javac instead reads the enclosing `Length` and
 /// rejects the type argument. Only the imported top-level FQN can be the
 /// intended target, so the import list is the resolver.
-fn qualify_shadowing_type_arguments(body: &str, own_names: &[String], imports: &[String]) -> String {
+fn qualify_shadowing_type_arguments(
+    body: &str,
+    own_names: &[String],
+    imports: &[String],
+) -> String {
     // A type declared by this very compilation unit outranks any import in
     // javac's resolution; Kotlin instead resolved the name to the import.
     // Each such collision needs the imported FQN spelled out.
@@ -2734,7 +2702,9 @@ fn qualify_shadowing_type_arguments(body: &str, own_names: &[String], imports: &
         let Some(last) = path.rsplit('.').next().filter(|last| !last.is_empty()) else {
             continue;
         };
-        if own_names.iter().any(|own| own.rsplit('.').next() == Some(last))
+        if own_names
+            .iter()
+            .any(|own| own.rsplit('.').next() == Some(last))
             && !shadows.iter().any(|(simple, _)| *simple == last)
         {
             shadows.push((last, path));
@@ -2750,9 +2720,7 @@ fn qualify_shadowing_type_arguments(body: &str, own_names: &[String], imports: &
         let byte = bytes[index];
         if byte.is_ascii_alphanumeric() || byte == b'_' {
             let mut end = index;
-            while end < bytes.len()
-                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
-            {
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
                 end += 1;
             }
             let word = &body[index..end];
@@ -2807,7 +2775,8 @@ fn import_is_referenced(import: &str, body: &str) -> bool {
     while let Some(index) = rest.find(simple) {
         let before = rest[..index].chars().next_back();
         let after = rest[index + simple.len()..].chars().next();
-        let boundary = |ch: Option<char>| ch.is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$'));
+        let boundary =
+            |ch: Option<char>| ch.is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$'));
         if boundary(before) && boundary(after) {
             return true;
         }

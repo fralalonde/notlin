@@ -64,9 +64,12 @@ fn retained_kotlin_interface_companion_reads_use_companion_getter() {
         consumer,
         &consumer_path,
         &cli,
-        Some(&index),
-        std::slice::from_ref(&root),
-        Some(&retained),
+        notlin::transpiler::WorkspaceScope {
+            index: Some(&index),
+            roots: std::slice::from_ref(&root),
+            retained_hint: Some(&retained),
+            ..Default::default()
+        },
         true,
     );
     assert_eq!(errors, 0);
