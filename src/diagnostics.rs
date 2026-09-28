@@ -1,6 +1,8 @@
 use colored::Colorize;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -67,7 +69,7 @@ impl Diagnostic {
             self.severity,
             self.message,
             self.warning_code(),
-            self.file.display(),
+            crate::paths::display(self.file),
             self.line,
             self.col,
         )
@@ -212,4 +214,222 @@ impl FileCoverage {
     pub fn is_partially_translated(&self) -> bool {
         !self.translated_spans.is_empty() && !self.untranslated.is_empty()
     }
+}
+
+/// Canonical message for a declaration held back because residual Kotlin needs
+/// it. Shared by the diagnostic and the run-end retention table so both agree
+/// on the reason text — and therefore on the derived N-code.
+pub fn retention_message(reason: &str) -> String {
+    format!("workspace Kotlin implementation requires this declaration to remain Kotlin: {reason}")
+}
+
+/// A declaration that stayed Kotlin because residual Kotlin source still needs
+/// it: a Kotlin named-argument call cannot target a Java constructor, a Kotlin
+/// `val` cannot implement a Java-source getter, a Kotlin implementor cannot
+/// implement a translated-away supertype's ABI. Each entry is work a human
+/// accepts or resolves — hence the run-end table.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RetentionSite {
+    /// Why the declaration was held back (`kotlin_retention_reason` text).
+    pub reason: &'static str,
+    /// Source file the declaration lives in.
+    pub file: String,
+    /// 1-based declaration line.
+    pub line: usize,
+}
+
+/// Secondary retention: the declaration stays Kotlin only because another one
+/// does, via a mechanically closed type hierarchy. Reported separately so the
+/// reasons a human can act on stay visible above the fallout.
+const CASCADE_REASONS: [&str; 2] = [
+    "one of its supertypes is retained in Kotlin",
+    "an interface subtype is itself retained in Kotlin",
+];
+
+/// Keyed by declaration site: a fixpoint reconsiders every declaration on every
+/// pass, so entries must collapse to one row per declaration — keeping the LAST
+/// reason, which is the one that survived to the end of the fixpoint.
+static RETENTION: Mutex<BTreeMap<(String, usize), &'static str>> = Mutex::new(BTreeMap::new());
+
+/// Record a declaration held back from translation.
+pub fn record_retention(reason: &'static str, file: &Path, line: usize) {
+    if let Ok(mut sites) = RETENTION.lock() {
+        sites.insert((crate::paths::display(file).to_string(), line), reason);
+    }
+}
+
+/// Forget every recorded site (tests start from a clean table).
+pub fn clear_retention() {
+    if let Ok(mut sites) = RETENTION.lock() {
+        sites.clear();
+    }
+}
+
+/// Everything recorded so far, ordered by file then declaration.
+pub fn retention_sites() -> Vec<RetentionSite> {
+    RETENTION
+        .lock()
+        .map(|sites| {
+            sites
+                .iter()
+                .map(|((file, line), reason)| RetentionSite {
+                    reason,
+                    file: file.clone(),
+                    line: *line,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `module: dir/file.kt` — enough to find the file without the package prefix.
+fn shorten_file(path: &str) -> String {
+    // The stored form is already the display form (relative to the translation
+    // root); this only drops the module's package path so the column stays a
+    // table row instead of a path dump.
+    let display = crate::paths::display(Path::new(path));
+    let parts: Vec<&str> = display.split('/').filter(|part| !part.is_empty()).collect();
+    match parts.len() {
+        0 => display,
+        1 => parts[0].to_string(),
+        _ => {
+            let tail = parts[parts.len() - 2..].join("/");
+            if parts.len() > 2 {
+                format!("{}: {}", parts[0], tail)
+            } else {
+                tail
+            }
+        }
+    }
+}
+
+fn shorten_reason(reason: &str, width: usize) -> String {
+    if reason.chars().count() <= width {
+        return reason.to_string();
+    }
+    let mut out: String = reason.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Run-end retention table: what stayed Kotlin, why, how much of it, and where.
+///
+/// `None` when nothing was held back. Set `NOTLIN_RETENTION_SITES` to append
+/// every individual site as `file:line`.
+pub fn retention_report() -> Option<String> {
+    let sites = retention_sites();
+    if sites.is_empty() {
+        return None;
+    }
+
+    let mut grouped: BTreeMap<&'static str, BTreeMap<String, usize>> = BTreeMap::new();
+    for site in &sites {
+        *grouped
+            .entry(site.reason)
+            .or_default()
+            .entry(shorten_file(&site.file))
+            .or_insert(0) += 1;
+    }
+
+    struct Row {
+        code: String,
+        reason: &'static str,
+        count: usize,
+        cascade: bool,
+        files: Vec<(String, usize)>,
+    }
+
+    let mut rows: Vec<Row> = grouped
+        .into_iter()
+        .map(|(reason, files)| {
+            let count = files.values().sum();
+            let mut files: Vec<(String, usize)> = files.into_iter().collect();
+            files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            Row {
+                code: warning_code(&retention_message(reason)),
+                cascade: CASCADE_REASONS.contains(&reason),
+                reason,
+                count,
+                files,
+            }
+        })
+        .collect();
+    // Human-actionable reasons first, then the cascade; within each, biggest.
+    rows.sort_by(|a, b| {
+        a.cascade
+            .cmp(&b.cascade)
+            .then(b.count.cmp(&a.count))
+            .then(a.code.cmp(&b.code))
+    });
+
+    let primary: usize = rows.iter().filter(|r| !r.cascade).map(|r| r.count).sum();
+    let cascade = sites.len() - primary;
+    let reason_width = rows
+        .iter()
+        .map(|r| r.reason.chars().count())
+        .max()
+        .unwrap_or(24)
+        .clamp(24, 64);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\nnotlin: kotlin kept — {} declaration(s), {} reason(s): {} need human input, {} follow a closed type hierarchy\n\n",
+        sites.len(),
+        rows.len(),
+        primary,
+        cascade
+    ));
+    out.push_str(&format!(
+        "  {:<6}  {:>5}  {:<width$}  {}\n",
+        "code",
+        "count",
+        "reason",
+        "where",
+        width = reason_width
+    ));
+    for row in &rows {
+        let shown: Vec<String> = row
+            .files
+            .iter()
+            .take(4)
+            .map(|(label, count)| {
+                if *count > 1 {
+                    format!("{label} ({count})")
+                } else {
+                    label.clone()
+                }
+            })
+            .collect();
+        let hidden = row.files.len().saturating_sub(shown.len());
+        let where_ = if hidden > 0 {
+            format!("{}, (+{hidden} file(s))", shown.join(", "))
+        } else {
+            shown.join(", ")
+        };
+        let marker = if row.cascade { "  (cascade)" } else { "" };
+        out.push_str(&format!(
+            "  {:<6}  {:>5}  {:<width$}{marker}  {where_}\n",
+            row.code,
+            row.count,
+            shorten_reason(row.reason, reason_width),
+            width = reason_width
+        ));
+    }
+    if primary > 0 {
+        out.push_str(&format!(
+            "\n  {primary} declaration(s) need a human decision; each one fixed releases its hierarchy.\n"
+        ));
+    }
+    if std::env::var_os("NOTLIN_RETENTION_SITES").is_some() {
+        out.push_str("\n  every site:\n");
+        for site in &sites {
+            out.push_str(&format!(
+                "    {}:{}  {}\n",
+                site.file,
+                site.line,
+                retention_message(site.reason)
+            ));
+        }
+    }
+    Some(out)
 }

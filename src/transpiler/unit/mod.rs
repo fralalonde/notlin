@@ -17,12 +17,12 @@ mod function;
 mod property;
 mod types_infer;
 
-pub(crate) use types_infer::primitive_array_factory;
+pub(crate) use types_infer::{instance_property_count, primitive_array_factory};
 
-pub struct Unit<'a> {
-    pub source: &'a str,
-    pub file: &'a Path,
-    pub diags: &'a mut Diagnostics,
+pub struct Unit<'src, 'tree> {
+    pub source: &'src str,
+    pub file: &'src Path,
+    pub diags: &'src mut Diagnostics,
     pub annots: AnnotationSet,
     pub untranslatable_as_error: bool,
     /// Assume Lombok on target classpath (--lombok): data classes emit as
@@ -33,15 +33,21 @@ pub struct Unit<'a> {
     pub in_place: bool,
     /// Per-file coverage: which declarations translated, which didn't.
     pub coverage: FileCoverage,
+    /// O(1) membership for untranslated declarations. Coverage keeps its
+    /// ordered Vec for migration output and diagnostics.
+    untranslated_names: std::collections::HashSet<String>,
     /// Name of the declaration currently being translated; diagnostics raised
     /// while this is Some are attributed to it for in-place migration policy.
-    pub(crate) current_decl: Option<tree_sitter::Node<'a>>,
+    pub(crate) current_decl: Option<tree_sitter::Node<'tree>>,
     /// node-id -> label for open declarations.
     pub(crate) decl_labels: std::collections::HashMap<usize, String>,
     /// identifier name -> Java type (from params and local decls in the
     /// current translation scope). Array params/locals map to `String[]`,
     /// `int[]`, ... so callers can special-case `.size` -> `.length`.
     pub var_types: std::collections::HashMap<String, String>,
+    /// Flow-sensitive Kotlin smart casts established by an early-return
+    /// negative type guard (`if (x !is T) return`). Cleared per function.
+    pub(crate) flow_smart_casts: std::collections::HashMap<String, String>,
     /// Extension functions declared in this file as statics: fn name ->
     /// Java receiver type. Call sites `x.f(...)` are rewritten to the
     /// static form `f(x, ...)` when the callee lands in this map
@@ -79,6 +85,7 @@ pub struct Unit<'a> {
     /// Name of the function whose body is currently being transpiled (used
     /// to detect self-setter field writes that must not re-enter `setX(...)`).
     pub(crate) current_function_name: Option<String>,
+
     /// Set by navigation_call when the member mapping already consumed the
     /// call args (joinToString) — call.rs must not append its own `(args)`.
     pub(crate) pending_full_call: bool,
@@ -108,6 +115,11 @@ pub struct Unit<'a> {
     /// qualified accessor form `SupName.super.getMember()`. Consumed (and
     /// cleared) by the next navigation member step.
     pub(crate) pending_super_owner: Option<String>,
+    /// Callee nav text of the shape `.member<ty>` — a generic type argument
+    /// written INSIDE the callee navigation (`context.get<T>()`). The call
+    /// node itself carries no type_arguments child, so navigation_call stashes
+    /// it here and call.rs's reified_type_argument_rewrite consumes it.
+    pub(crate) pending_callee_type_arg: Option<String>,
     /// data class name -> record component list `(type, name)` in declaration
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
@@ -121,14 +133,20 @@ pub struct Unit<'a> {
     /// referencing a before-or-after-declared property member lowers to
     /// the accessor (interfaces especially: `get() = activity`).
     pub(crate) self_getters: std::collections::HashMap<String, String>,
-    pub(crate) workspace: Option<&'a SourceIndex>,
+    pub(crate) workspace: Option<&'src SourceIndex>,
     pub(crate) workspace_file: Option<PathBuf>,
-    pub(crate) translation_roots: &'a [PathBuf],
+    /// Visible Kotlin typealiases, resolved once per source file instead of
+    /// once for every Java type emitted from that source.
+    pub(crate) visible_typealiases: Vec<(String, String)>,
+    pub(crate) translation_roots: &'src [PathBuf],
+    /// Cached for this translation: workspace selection is fixed for all
+    /// declarations in one Unit, so do not rescan every Kotlin source.
+    all_kotlin_selected: bool,
     /// Retention-fixpoint retained set from the caller (probe passes): names
     /// known to be retained in Kotlin for intrinsic reasons. When Some, the
     /// subtype rule consults it (`has_retained_kotlin_subtype`) instead of
     /// retaining on every Kotlin subtype; None = conservative catch-all.
-    pub(crate) retained_hint: Option<std::collections::HashSet<String>>,
+    pub(crate) retained_hint: Option<&'src std::collections::HashSet<String>>,
     /// Members whose generic return/field types must be erased in whole-
     /// workspace mode to satisfy a residual Kotlin supertype contract.
     /// Cleared for every declaration; never affects sibling declarations.
@@ -163,11 +181,11 @@ pub struct UnitOptions {
     pub in_place: bool,
 }
 
-impl<'a> Unit<'a> {
+impl<'src, 'tree> Unit<'src, 'tree> {
     pub fn new(
-        source: &'a str,
-        file: &'a Path,
-        diags: &'a mut Diagnostics,
+        source: &'src str,
+        file: &'src Path,
+        diags: &'src mut Diagnostics,
         annots: AnnotationSet,
         options: UnitOptions,
     ) -> Self {
@@ -181,9 +199,11 @@ impl<'a> Unit<'a> {
             commons_lang: options.commons_lang,
             in_place: options.in_place,
             coverage: FileCoverage::default(),
+            untranslated_names: std::collections::HashSet::new(),
             current_decl: None,
             decl_labels: std::collections::HashMap::new(),
             var_types: std::collections::HashMap::new(),
+            flow_smart_casts: std::collections::HashMap::new(),
             extension_fns: std::collections::HashMap::new(),
             ext_receiver_name: None,
             subclass_map: std::collections::HashMap::new(),
@@ -194,7 +214,9 @@ impl<'a> Unit<'a> {
             static_member_types: std::collections::HashMap::new(),
             pending_setter: false,
             current_function_name: None,
+
             pending_full_call: false,
+            pending_callee_type_arg: None,
             pending_generic_call: false,
             fn_rets: std::collections::HashMap::new(),
             pending_nav_text: None,
@@ -206,7 +228,9 @@ impl<'a> Unit<'a> {
             self_getters: std::collections::HashMap::new(),
             workspace: None,
             workspace_file: None,
+            visible_typealiases: Vec::new(),
             translation_roots: &[],
+            all_kotlin_selected: false,
             retained_hint: None,
             raw_member_types: std::collections::HashSet::new(),
             hoisted_annotations: std::collections::HashMap::new(),
@@ -217,13 +241,31 @@ impl<'a> Unit<'a> {
     }
 
     pub fn with_workspace(
+        self,
+        workspace: Option<&'src SourceIndex>,
+        translation_roots: &'src [PathBuf],
+    ) -> Self {
+        self.with_workspace_selection(workspace, translation_roots, None, None)
+    }
+
+    pub(crate) fn with_workspace_selection(
         mut self,
-        workspace: Option<&'a SourceIndex>,
-        translation_roots: &'a [PathBuf],
+        workspace: Option<&'src SourceIndex>,
+        translation_roots: &'src [PathBuf],
+        all_kotlin_selected: Option<bool>,
+        workspace_file: Option<&Path>,
     ) -> Self {
         self.workspace = workspace;
-        self.workspace_file = std::fs::canonicalize(self.file).ok();
+        self.workspace_file = workspace_file
+            .map(Path::to_path_buf)
+            .or_else(|| std::fs::canonicalize(self.file).ok());
+        if let (Some(workspace), Some(file)) = (workspace, self.workspace_file.as_deref()) {
+            self.visible_typealiases = workspace.type_aliases_for(file);
+        }
         self.translation_roots = translation_roots;
+        self.all_kotlin_selected = all_kotlin_selected.unwrap_or_else(|| {
+            workspace.is_some_and(|workspace| workspace.all_kotlin_selected(translation_roots))
+        });
         self
     }
 
@@ -232,6 +274,30 @@ impl<'a> Unit<'a> {
             ty.split('<').next().unwrap_or(&ty).trim().to_string()
         } else {
             ty
+        }
+    }
+
+    pub(crate) fn lower_visible_typealiases(&self, java: &mut String) {
+        for (alias, target) in &self.visible_typealiases {
+            let mut lowered = String::with_capacity(java.len());
+            let mut rest = java.as_str();
+            while let Some(start) = rest.find(alias.as_str()) {
+                let end = start + alias.len();
+                let before = rest[..start].chars().last();
+                let after = rest[end..].chars().next();
+                let is_boundary =
+                    |ch: Option<char>| !ch.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                if is_boundary(before) && is_boundary(after) {
+                    lowered.push_str(&rest[..start]);
+                    lowered.push_str(&target);
+                    rest = &rest[end..];
+                } else {
+                    lowered.push_str(&rest[..end]);
+                    rest = &rest[end..];
+                }
+            }
+            lowered.push_str(rest);
+            *java = lowered;
         }
     }
 
@@ -262,14 +328,42 @@ impl<'a> Unit<'a> {
     }
 
     fn workspace_requires_top_level_retention(&self, name: &str) -> bool {
+        self.referenced_by_surviving_kotlin(name)
+    }
+
+    /// Whether an enum's Kotlin `entries` ABI must survive the run. Readers
+    /// that only touch `E.entries` are served by the emitted `getEntries()`
+    /// bridge (see `enum_entries_retain.rs`), so they never force retention;
+    /// any OTHER Kotlin reference to the enum does.
+    fn enum_entries_abi_is_kotlin_bound(&self, name: &str) -> bool {
+        let Some(workspace) = self.workspace else {
+            return false;
+        };
+        workspace.has_external_kotlin_reference_by_name(name)
+    }
+
+    /// A Kotlin reference that survives the run: with a fixpoint hint only
+    /// references from declarations that THEMSELVES stay Kotlin keep the
+    /// referenced declaration in Kotlin — a file that translates away lowers
+    /// its own references in the same run. Without a hint (single-file mode)
+    /// nothing says what will translate later, so any Kotlin reference counts.
+    fn referenced_by_surviving_kotlin(&self, name: &str) -> bool {
         let Some(workspace) = self.workspace else {
             return false;
         };
         let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
-        workspace.has_kotlin_reference(indexed_path, name)
+        match self.retained_hint {
+            None => workspace.has_kotlin_reference(indexed_path, name),
+            Some(retained) => workspace.has_surviving_kotlin_reference(
+                indexed_path,
+                name,
+                retained,
+                self.translation_roots,
+            ),
+        }
     }
 
-    fn begin_decl(&mut self, node: tree_sitter::Node<'a>, label: String) {
+    fn begin_decl(&mut self, node: tree_sitter::Node<'tree>, label: String) {
         self.current_decl = Some(node);
         self.coverage.translated.push(label.clone());
         self.decl_labels.insert(node.id(), label);
@@ -283,7 +377,7 @@ impl<'a> Unit<'a> {
                 .get(&node.id())
                 .cloned()
                 .unwrap_or_default();
-            let tainted = self.coverage.untranslated.contains(&label);
+            let tainted = self.is_untranslated(&label);
             if !tainted {
                 self.coverage
                     .translated_spans
@@ -312,10 +406,18 @@ impl<'a> Unit<'a> {
     }
 
     pub(crate) fn taint_decl(&mut self, label: &str) {
-        if !self.coverage.untranslated.iter().any(|l| l == label) {
+        if self.untranslated_names.insert(label.to_string()) {
             self.coverage.untranslated.push(label.to_string());
         }
         self.coverage.translated.retain(|l| l != label);
+    }
+
+    fn is_untranslated(&self, label: &str) -> bool {
+        self.untranslated_names.contains(label)
+    }
+
+    fn all_kotlin_selected(&self) -> bool {
+        self.all_kotlin_selected
     }
 
     /// True when `name` is a top-level function declared in THIS file whose
@@ -325,14 +427,10 @@ impl<'a> Unit<'a> {
         if self.retained_file_functions.contains(name) {
             return true;
         }
-        self.top_level_functions.contains(name)
-            && self.coverage.untranslated.iter().any(|l| l == name)
+        self.top_level_functions.contains(name) && self.is_untranslated(name)
     }
 
-    pub fn text<'t>(&self, node: tree_sitter::Node<'t>) -> &'t str
-    where
-        'a: 't,
-    {
+    pub fn text(&self, node: tree_sitter::Node<'_>) -> &'src str {
         kt::text(node, self.source)
     }
 
@@ -403,7 +501,7 @@ impl<'a> Unit<'a> {
         ));
     }
 
-    fn kotlin_import_to_java(&self, node: tree_sitter::Node<'a>) -> String {
+    fn kotlin_import_to_java(&self, node: tree_sitter::Node<'tree>) -> String {
         let raw = self.text(node).trim();
         let path = raw
             .strip_prefix("import")
@@ -484,7 +582,7 @@ impl<'a> Unit<'a> {
         }
         self.enum_types.contains(parent_ty)
     }
-    pub fn run(&mut self, root: tree_sitter::Node<'a>) -> Vec<(String, String)> {
+    pub fn run(&mut self, root: tree_sitter::Node<'tree>) -> Vec<(String, String)> {
         // Collect top-level structure
         let mut package = String::new();
         let mut imports: Vec<String> = Vec::new();
@@ -638,18 +736,18 @@ impl<'a> Unit<'a> {
                         self.end_decl();
                         continue;
                     }
-                    // Preserve the existing conservative blocker for residual
-                    // Kotlin references beyond `E.entries`. Entries-only Java
-                    // or Kotlin consumers are handled by the emitted bridge.
+                    // The Kotlin `entries` ABI (`getEntries()`) has to survive
+                    // only while a declaration that will REMAIN Kotlin reads
+                    // `<Enum>.entries`: Java consumers are served by the
+                    // emitted `getEntries()` bridge, and a Kotlin consumer that
+                    // translates in this same run lowers its own read. Without
+                    // a fixpoint hint (single-file mode) any external Kotlin
+                    // mention is treated as a consumer.
                     let is_enum = kt::child(*decl, "enum_class_body").is_some();
-                    if is_enum
-                        && self
-                            .workspace
-                            .is_some_and(|ws| ws.has_external_kotlin_reference_by_name(&type_name))
-                    {
+                    if is_enum && self.enum_entries_abi_is_kotlin_bound(&type_name) {
                         self.diag_untranslatable(
                             *decl,
-                            "Kotlin enum `entries` ABI (`getEntries()`) is consumed by pre-existing Java code; enum remains Kotlin until the consumer migrates",
+                            "Kotlin enum `entries` ABI (`getEntries()`) is read by Kotlin that remains after this run; enum stays Kotlin to keep that read compiling",
                         );
                         self.end_decl();
                         continue;
@@ -675,8 +773,7 @@ impl<'a> Unit<'a> {
                             })
                             .unwrap_or_default();
                         if ws.retained_supertype_member_mismatch(&supers, &type_name)
-                            && !(ws.all_kotlin_selected(self.translation_roots)
-                                && self.retained_hint.is_some())
+                            && !(self.all_kotlin_selected() && self.retained_hint.is_some())
                         {
                             self.diag_untranslatable(
                                 *decl,
@@ -690,7 +787,7 @@ impl<'a> Unit<'a> {
                         unit.transpile_type_decl(*decl, out);
                     });
                     self.end_decl();
-                    if !self.coverage.untranslated.iter().any(|l| l == &type_name) {
+                    if !self.is_untranslated(&type_name) {
                         files.push((format!("{}.java", type_name), out.finish()));
                     } else {
                         log::info!(
@@ -770,7 +867,7 @@ impl<'a> Unit<'a> {
                     let label = self
                         .top_level_name(***d)
                         .unwrap_or_else(|| "<anonymous>".to_string());
-                    !self.coverage.untranslated.iter().any(|l| l == &label)
+                    !self.is_untranslated(&label)
                 })
                 .count();
             if clean_count > 0 {
@@ -809,6 +906,11 @@ impl<'a> Unit<'a> {
     }
 
     pub(crate) fn transpile_statement(&mut self, stmt: tree_sitter::Node, out: &mut JavaOut) {
+        // Comments are trivia, not code: a `//` line between two statements
+        // must never taint the enclosing declaration as untranslatable.
+        if matches!(stmt.kind(), "line_comment" | "block_comment") {
+            return;
+        }
         let mut s = Stmt { unit: self };
         s.transpile(stmt, out);
     }
@@ -819,5 +921,34 @@ pub fn capitalize(s: &str) -> String {
     match chars.next() {
         Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untranslated_membership_deduplicates_while_preserving_coverage_order() {
+        let source = "";
+        let file = Path::new("coverage.kt");
+        let mut diags = Diagnostics::new();
+        let mut unit = Unit::new(
+            source,
+            file,
+            &mut diags,
+            AnnotationSet::None,
+            UnitOptions::default(),
+        );
+
+        unit.taint_decl("First");
+        unit.taint_decl("Second");
+        unit.taint_decl("First");
+
+        assert!(unit.is_untranslated("First"));
+        assert!(unit.is_untranslated("Second"));
+        assert!(!unit.is_untranslated("Third"));
+        assert_eq!(unit.coverage.untranslated, ["First", "Second"]);
+        assert!(!unit.all_kotlin_selected());
     }
 }

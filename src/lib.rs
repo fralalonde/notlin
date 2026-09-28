@@ -5,6 +5,8 @@
 
 pub mod cli;
 pub mod diagnostics;
+pub mod manual_marks;
 pub mod migrate;
+pub mod paths;
 pub mod transpiler;
 pub mod workspace;

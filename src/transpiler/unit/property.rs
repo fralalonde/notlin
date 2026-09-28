@@ -6,7 +6,7 @@ use crate::transpiler::expr::Expr;
 use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
-impl<'a> Unit<'a> {
+impl<'src, 'tree> Unit<'src, 'tree> {
     pub(crate) fn transpile_property(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
         self.transpile_property_opts(decl, out, false, None)
     }
@@ -30,6 +30,7 @@ impl<'a> Unit<'a> {
         // getter body; the pending flag is only valid for the immediately
         // following navigation inside ONE expression.
         self.pending_super_owner = None;
+
         let is_val = kt::child(decl, "val").is_some();
         let vd = kt::child(decl, "variable_declaration");
         let name = vd
@@ -143,11 +144,57 @@ impl<'a> Unit<'a> {
         let ty = match ty {
             Some(t) => t,
             None => {
-                // inferred: from initializer expression (best-effort: Object unless literal)
-                let init = self.property_initializer(decl);
-                match init {
-                    Some(init_node) => self.infer_type(init_node),
-                    None => "Object".to_string(),
+                // OVERIDE rule: an `override val x` WITHOUT a declared type
+                // narrows the SUPERTYPE's declared type. Java getters cannot
+                // bridge (no erasure bridge like Kotlin's), so the inherited
+                // type wins over the initializer's erased inference —
+                // otherwise javac rejects `Object getX()` against
+                // `I getX()` with "return type not compatible".
+                let is_override = kt::child(decl, "modifiers")
+                    .map(|m| self.text(m).contains("override"))
+                    .unwrap_or(false);
+                let inherited = is_override
+                    .then(|| {
+                        // Enclosing class/interface name: current_decl may be
+                        // unset in interface-body translation; walking the
+                        // node's own ancestors is the reliable path.
+                        let mut current = kt::parent_of(decl);
+                        let mut owner: Option<String> = None;
+                        while let Some(node) = current {
+                            if matches!(
+                                node.kind(),
+                                "class_declaration"
+                                    | "interface_declaration"
+                                    | "object_declaration"
+                            ) {
+                                owner = kt::field(node, "name").map(|n| self.text(n).to_string());
+                                break;
+                            }
+                            current = kt::parent_of(node);
+                        }
+                        owner.and_then(|owner_name| {
+                            self.workspace.and_then(|ws| {
+                                let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
+                                let hit = ws.inherited_property_type_in_file(
+                                    declaring,
+                                    &owner_name,
+                                    &name,
+                                );
+                                hit
+                            })
+                        })
+                    })
+                    .flatten();
+                match inherited {
+                    Some(t) => t,
+                    None => {
+                        // inferred: from initializer expression (best-effort: Object unless literal)
+                        let init = self.property_initializer(decl);
+                        match init {
+                            Some(init_node) => self.infer_type(init_node),
+                            None => "Object".to_string(),
+                        }
+                    }
                 }
             }
         };
@@ -187,11 +234,16 @@ impl<'a> Unit<'a> {
         let is_jvm_field = kt::child(decl, "modifiers")
             .map(|m| self.text(m).contains("JvmField"))
             .unwrap_or(false);
-        let field_visibility = if is_const || is_jvm_field || owner == Some("__interface__") {
-            "public "
-        } else {
-            "private "
-        };
+        // Companion/object/top-level properties are emitted as Java statics.
+        // Residual Kotlin callers resolve `Owner.VALUE` as a static field, not
+        // through Notlin's generated Java getter, so the backing field must be
+        // public whenever it is static.
+        let field_visibility =
+            if is_const || is_jvm_field || make_static || owner == Some("__interface__") {
+                "public "
+            } else {
+                "private "
+            };
         if backing {
             let init_java = self.property_initializer(decl).map(|init| {
                 let mut e = Expr { unit: self };
@@ -272,6 +324,10 @@ impl<'a> Unit<'a> {
                         } else if c.is_named() && c.kind() != "=" {
                             let mut e = Expr { unit: self };
                             let java = e.transpile(c);
+                            // Reified-generic gate: `recv.get<T>()` — Kotlin
+                            // inlined `T::class.java`; the Java-visible ABI is
+                            // the `Class<T>` overload (`get(Ty.class)`).
+                            let java = crate::transpiler::expr::rewrite_reified_type_args(&java);
                             // A Nothing-typed body (e.g. `TODO(...)`) lowers
                             // to `throw ...` — that is a statement, not a
                             // value; `return throw ...;` would not compile.

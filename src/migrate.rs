@@ -152,13 +152,13 @@ pub fn migrate(
     coverage: &FileCoverage,
 ) -> Result<MigrateOutcome, String> {
     if coverage.translated_spans.is_empty() {
-        log::info!("{}: nothing translated; untouched", kt_path.display());
+        log::info!("{}: nothing translated; untouched", crate::paths::display(kt_path));
         return Ok(MigrateOutcome::Untouched);
     }
 
     if coverage.is_fully_translated() {
-        std::fs::remove_file(kt_path).map_err(|e| format!("{}: {e}", kt_path.display()))?;
-        log::info!("{}: fully translated; deleted", kt_path.display());
+        std::fs::remove_file(kt_path).map_err(|e| format!("{}: {e}", crate::paths::display(kt_path)))?;
+        log::info!("{}: fully translated; deleted", crate::paths::display(kt_path));
         return Ok(MigrateOutcome::Deleted);
     }
 
@@ -171,17 +171,17 @@ pub fn migrate(
             .all(|l| l.trim().is_empty() || l.trim_start().starts_with("//"))
     {
         // Only comment stubs remained — treat as fully translated.
-        std::fs::remove_file(kt_path).map_err(|e| format!("{}: {e}", kt_path.display()))?;
+        std::fs::remove_file(kt_path).map_err(|e| format!("{}: {e}", crate::paths::display(kt_path)))?;
         log::info!(
             "{}: fully translated after strip; deleted",
-            kt_path.display()
+            crate::paths::display(kt_path)
         );
         return Ok(MigrateOutcome::Deleted);
     }
-    std::fs::write(kt_path, &stripped).map_err(|e| format!("{}: {e}", kt_path.display()))?;
+    std::fs::write(kt_path, &stripped).map_err(|e| format!("{}: {e}", crate::paths::display(kt_path)))?;
     log::info!(
         "{}: trimmed to {} bytes (was {})",
-        kt_path.display(),
+        crate::paths::display(kt_path),
         stripped.len(),
         source.len()
     );

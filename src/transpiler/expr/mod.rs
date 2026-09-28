@@ -5,14 +5,32 @@ mod call;
 mod navigation;
 mod string;
 
+pub(crate) use navigation::rewrite_reified_type_args;
+
 use crate::transpiler::kt;
 use crate::transpiler::unit::Unit;
 
-pub struct Expr<'a, 'u> {
-    pub unit: &'a mut Unit<'u>,
+pub struct Expr<'a, 'src, 'tree> {
+    pub unit: &'a mut Unit<'src, 'tree>,
 }
 
-impl<'a, 'u> Expr<'a, 'u> {
+impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
+    /// Name of the enclosing class/interface/object while a nested property
+    /// getter or function body is being emitted.
+    pub(crate) fn enclosing_type_name(&self) -> Option<String> {
+        let mut current = self.unit.current_decl;
+        while let Some(node) = current {
+            if matches!(
+                node.kind(),
+                "class_declaration" | "interface_declaration" | "object_declaration"
+            ) {
+                return kt::field(node, "name").map(|name| self.unit.text(name).to_string());
+            }
+            current = node.parent();
+        }
+        None
+    }
+
     pub fn transpile(&mut self, node: tree_sitter::Node) -> String {
         match node.kind() {
             "string_literal" => self.string_literal(node),
@@ -44,7 +62,6 @@ impl<'a, 'u> Expr<'a, 'u> {
                 if self.unit.current_object.as_deref() == Some(name.as_str()) {
                     format!("{}.INSTANCE", name)
                 } else if !self.unit.var_types.contains_key(&name)
-                    && self.unit.var_types.is_empty()
                     && let Some(getter) = self.unit.self_getters.get(&name)
                 {
                     // Not a local/param in this scope: a bare identifier
@@ -66,6 +83,26 @@ impl<'a, 'u> Expr<'a, 'u> {
                         cap = first.to_uppercase().collect::<String>() + &cap[1..];
                     }
                     format!("this.get{}()", cap)
+                } else if self
+                    .unit
+                    .workspace
+                    .and_then(|w| w.object_declaration_named(&name))
+                    .is_some_and(|obj| {
+                        // An object-referencing identifier must lower to the
+                        // `Name.INSTANCE` singleton UNLESS the object stays
+                        // Kotlin (then the Kotlin type name remains a value).
+                        obj.name != self.unit.current_object.as_deref().unwrap_or("")
+                            && !self
+                                .unit
+                                .retained_hint
+                                .map(|r| match r {
+                                    x if x.is_empty() => false,
+                                    retained => retained.contains(&obj.name),
+                                })
+                                .unwrap_or(true)
+                    })
+                {
+                    format!("{}.INSTANCE", name)
                 } else {
                     name
                 }
@@ -127,7 +164,12 @@ impl<'a, 'u> Expr<'a, 'u> {
                 match target {
                     Some(t) => {
                         let t_java = self.transpile(t);
-                        format!("{} instanceof {}", t_java, ty)
+                        let check = format!("{} instanceof {}", t_java, ty);
+                        if self.unit.text(node).contains("!is") {
+                            format!("!({})", check)
+                        } else {
+                            check
+                        }
                     }
                     None => "false".to_string(),
                 }

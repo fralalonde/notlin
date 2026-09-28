@@ -30,7 +30,7 @@ pub fn parent_of<'t>(node: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t
 }
 
 /// Extract source text for a node.
-pub fn text<'t>(node: tree_sitter::Node<'t>, source: &'t str) -> &'t str {
+pub fn text<'s>(node: tree_sitter::Node<'_>, source: &'s str) -> &'s str {
     node.utf8_text(source.as_bytes()).unwrap_or("")
 }
 
@@ -212,6 +212,11 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                 None => text(node, source).to_string(),
             }
         }
+        "type_projection" => node
+            .children(&mut node.walk())
+            .find(|child| child.is_named())
+            .map(|inner| java_type(inner, source))
+            .unwrap_or_else(|| text(node, source).to_string()),
         "function_type" => {
             // `(params) -> R` has no Java counterpart -> functional interface
             // approximation: emit a Consumer/Function-shaped warning-free

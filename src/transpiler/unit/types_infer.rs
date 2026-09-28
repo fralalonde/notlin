@@ -3,7 +3,7 @@
 use super::Unit;
 use crate::transpiler::kt;
 
-impl<'a> Unit<'a> {
+impl<'src, 'tree> Unit<'src, 'tree> {
     /// Element type of a collection/array Java type (`List<X>` -> X, `X[]` ->
     /// X); exposed for destructuring-site extraction in stmt.rs.
     pub(crate) fn elem_type_of(&self, java_ty: &str) -> String {
@@ -436,6 +436,19 @@ impl<'a> Unit<'a> {
         let t = self.text(base).trim();
         t.ends_with("values()") && true
     }
+}
+
+/// Instance properties of a declaration, in the sense that matters for
+/// primary-constructor arity. Companion members are indexed on the owning
+/// declaration too (`@JvmField val NULL = Value()`), and counting those as
+/// constructor parameters makes a one-argument call look over-specified, so
+/// the omitted-trailing-default fill would be skipped and the generated Java
+/// would call a constructor arity that does not exist.
+pub(crate) fn instance_property_count(decl: &crate::workspace::Declaration) -> usize {
+    decl.members
+        .iter()
+        .filter(|m| m.kind == crate::workspace::MemberKind::Property && !m.is_static)
+        .count()
 }
 
 /// Kotlin primitive-array factories -> Java array type.

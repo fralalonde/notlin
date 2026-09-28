@@ -490,13 +490,14 @@ fn child_interface_stays_kotlin_with_retained_kotlin_supertype() {
     let index = SourceIndex::discover(&root).unwrap();
     let cli = Cli::parse_from(["notlin", "--in-place", child_path.to_str().unwrap()]);
     let source = fs::read_to_string(&child_path).unwrap();
+    let retained = std::collections::HashSet::from(["Base".to_string()]);
     let (files, errors, warnings, coverage) = transpiler::transpile_with_workspace_hint(
         &source,
         &child_path,
         &cli,
         Some(&index),
         &[root.join("selected")],
-        Some(std::collections::HashSet::from(["Base".to_string()])),
+        Some(&retained),
         true,
     );
     assert_eq!(errors, 0);
@@ -674,9 +675,12 @@ fn retains_defaulted_constructor_used_by_kotlin_caller() {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
     let provider = root.join("Configuration.kt");
+    // A default on a parameter that is FOLLOWED by one without a default is
+    // the only shape Java cannot express: trailing defaults become delegating
+    // overloads, a middle default cannot be skipped by a positional caller.
     fs::write(
         &provider,
-        "package sample\ndata class Configuration(val values: List<String> = emptyList())\n",
+        "package sample\ndata class Configuration(val values: List<String> = emptyList(), val name: String)\n",
     )
     .unwrap();
     fs::write(
@@ -705,6 +709,58 @@ fn retains_defaulted_constructor_used_by_kotlin_caller() {
             .any(|name| name == "Configuration")
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn translates_trailing_default_constructor_used_by_kotlin_caller() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-trailing-default-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let provider = root.join("Configuration.kt");
+    fs::write(
+        &provider,
+        "package sample\ndata class Configuration(val values: List<String> = emptyList())\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Consumer.kt"),
+        "package sample\nfun create() = Configuration()\n",
+    )
+    .unwrap();
+
+    let index = SourceIndex::discover(&root).unwrap();
+    let cli = Cli::parse_from(["notlin", "--in-place", provider.to_str().unwrap()]);
+    let source = fs::read_to_string(&provider).unwrap();
+    let (files, errors, _warnings, coverage) = transpiler::transpile_with_workspace(
+        &source,
+        &provider,
+        &cli,
+        Some(&index),
+        std::slice::from_ref(&root),
+    );
+    assert_eq!(errors, 0);
+    let java = files
+        .iter()
+        .find(|(name, _)| name == "Configuration.java")
+        .map(|(_, text)| text.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "a TRAILING default is expressible in Java as delegating overloads, so the class must translate; untranslated: {:?}",
+                coverage.untranslated
+            )
+        });
+    assert!(
+        java.contains("public Configuration()"),
+        "the omitted trailing argument must be exposed as a no-arg overload so Kotlin callers and Java call sites resolve:\n{java}"
+    );
+    assert!(
+        java.contains("this("),
+        "the overload must delegate to the full constructor with the declared default:\n{java}"
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -786,4 +842,31 @@ fn discovery_reports_missing_workspace_root() {
     let error = SourceIndex::discover(&PathBuf::from("definitely-missing-workspace"))
         .expect_err("missing roots must not silently produce an empty index");
     assert!(error.contains("definitely-missing-workspace"));
+}
+
+#[test]
+fn declarations_named_preserves_simple_name_collisions() {
+    let root = std::env::temp_dir().join(format!("notlin-name-collision-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("left")).unwrap();
+    fs::create_dir_all(root.join("right")).unwrap();
+    fs::write(
+        root.join("left/Contract.kt"),
+        "package left\ninterface Contract\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("right/Contract.kt"),
+        "package right\ninterface Contract\n",
+    )
+    .unwrap();
+
+    let index = SourceIndex::discover(&root).unwrap();
+    let packages: Vec<_> = index
+        .declarations_named("Contract")
+        .filter_map(|declaration| declaration.package.as_deref())
+        .collect();
+
+    assert_eq!(packages, ["left", "right"]);
+    fs::remove_dir_all(root).unwrap();
 }

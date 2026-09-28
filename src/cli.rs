@@ -47,12 +47,23 @@ pub struct Cli {
 
     /// Migration mode: strip translated declarations from the .kt files
     /// (deleting fully-translated ones). Implies writing Java next to input.
+    /// Directory inputs with no --out-dir use this mode automatically.
     #[arg(long)]
     pub in_place: bool,
 
     /// Verbose logging (-v debug, -vv trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+}
+
+impl Cli {
+    /// A directory input denotes a workspace migration. This keeps the common
+    /// `notlin --lombok --commons-lang .` invocation useful without requiring
+    /// a redundant flag, while a single file still writes to stdout unless an
+    /// output mode is selected explicitly.
+    pub fn migrates_in_place(&self) -> bool {
+        self.in_place || (self.out_dir.is_none() && self.input.iter().any(|input| input.is_dir()))
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]

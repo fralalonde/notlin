@@ -5,7 +5,7 @@ use crate::transpiler::expr::Expr;
 use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
-impl<'a> Unit<'a> {
+impl<'src, 'tree> Unit<'src, 'tree> {
     /// Name of the nearest enclosing class/interface declaration, if this
     /// function is a class-body member.
     fn enclosing_class_name(&self, decl: tree_sitter::Node) -> Option<String> {
@@ -40,15 +40,9 @@ impl<'a> Unit<'a> {
             .declared_return_node(decl)
             .map(|n| kt::java_type_ann(n, self.source, self.annots));
         // Any DECLARED supertype of the class declaring `fname`?
-        for decl_d in workspace.declarations() {
-            if decl_d.name != class_name {
-                continue;
-            }
+        for decl_d in workspace.declarations_named(&class_name) {
             for st in &decl_d.supertypes {
-                for iface in workspace.declarations() {
-                    if iface.name != *st {
-                        continue;
-                    }
+                for iface in workspace.declarations_named(st) {
                     for member in &iface.members {
                         if member.name == fname
                             && member.kind == crate::workspace::MemberKind::Method
@@ -127,6 +121,7 @@ impl<'a> Unit<'a> {
         // Exceptions re-seeded below: enum ctor params (fields visible to
         // every enum body method) and the current extension receiver.
         self.var_types.clear();
+        self.flow_smart_casts.clear();
         for (fname, fty) in std::mem::take(&mut self.pending_field_types) {
             self.var_types.insert(fname, fty);
         }
@@ -221,10 +216,37 @@ impl<'a> Unit<'a> {
                     if m.kind() == "type_parameter_modifiers" {
                         let txt = self.text(m).trim().to_string();
                         if txt.contains("reified") {
-                            self.diag_approx(
-                                m,
-                                "reified type parameter has no Java counterpart; emitted without it",
-                            );
+                            // A reified parameter only works if its ONE use
+                            // is `T::class.java` — the Java ABI then becomes
+                            // `Class<T>` explicitly passed at the call site.
+                            // Any other use (calling `T.class` in the body,
+                            // `T()` construction...) cannot exist in Java and
+                            // taints, because emitting `<T extends …> f()`
+                            // with a body using `T.class` is invalid Java.
+                            let type_name =
+                                id.map(|n| self.text(n).to_string()).unwrap_or_default();
+                            let body_uses_type_literal_elsewhere = self
+                                .text(decl)
+                                .contains(&format!("{}::class.java", type_name));
+                            let body_uses_param_in_any_way = self.text(decl).contains(&type_name);
+                            // The ONLY translatable use of a reified param is
+                            // exactly one `T::class.java` inlining; anything
+                            // beyond that (`as T`, construction, reflection on
+                            // T) taints the declaration.
+                            let uses_beyond_literal =
+                                body_uses_param_in_any_way && !body_uses_type_literal_elsewhere;
+                            if !uses_beyond_literal {
+                                self.diag_approx(
+                                    m,
+                                    "reified type parameter has no Java counterpart; emitted without it",
+                                );
+                            } else {
+                                self.diag_untranslatable(
+                                    decl,
+                                    "reified type parameter used beyond `T::class.java` inlining has no Java form; declaration retained in Kotlin",
+                                );
+                                return;
+                            }
                         } else if !txt.is_empty() {
                             self.diag_untranslatable(
                                 m,
@@ -316,6 +338,30 @@ impl<'a> Unit<'a> {
                                 Some("int")
                             } else if has_str && !has_num {
                                 Some("String")
+                            } else {
+                                None
+                            }
+                        }
+                        // `Type(...)` — an expression-bodied function that only
+                        // constructs a value still needs its return type: Kotlin
+                        // infers the constructed type, and defaulting to `void`
+                        // emits `return new Type(x);` inside a void method, which
+                        // javac rejects with "unexpected return value" and turns
+                        // every call site into "'void' type not allowed here".
+                        "call_expression" => {
+                            let text = self.text(be);
+                            let head = text.split('(').next().unwrap_or("").trim();
+                            let segment = head.rsplit('.').next().unwrap_or(head);
+                            let end = segment
+                                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .unwrap_or(segment.len());
+                            let name = &segment[..end];
+                            // Kotlin's `TODO()` is a function, not a type.
+                            if !name.is_empty()
+                                && name != "TODO"
+                                && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                            {
+                                Some(crate::transpiler::types::map_type_name(name))
                             } else {
                                 None
                             }
@@ -578,10 +624,23 @@ impl<'a> Unit<'a> {
                 // expression body: `= expr` -> `return expr;`
                 let mut e = Expr { unit: self };
                 let java = e.transpile(child);
-                out.line(format!(
-                    "return {};",
-                    crate::transpiler::stmt::fix_join_tail(&java)
-                ));
+                let java = crate::transpiler::stmt::fix_join_tail(&java);
+                let trimmed = java.trim_start();
+                // `= if (…) … else …` / `= when (…)` cannot become a ternary
+                // when the branches are blocks: the emitted text is then a
+                // STATEMENT whose branches already carry their own `return`.
+                // Prefixing another one yields `return if (…) { return …; }`,
+                // which is not Java at all.
+                let statement_shaped = matches!(child.kind(), "if_expression" | "when_expression")
+                    && (trimmed.starts_with("if (") || trimmed.starts_with("switch ("))
+                    && java.contains("return ");
+                if trimmed.starts_with("throw ") {
+                    out.line(format!("{};", java));
+                } else if statement_shaped {
+                    out.line(java);
+                } else {
+                    out.line(format!("return {};", java));
+                }
             }
         }
     }

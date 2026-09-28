@@ -3,8 +3,9 @@
 
 use super::Expr;
 use crate::transpiler::kt;
+use crate::transpiler::unit::capitalize;
 
-impl<'a, 'u> Expr<'a, 'u> {
+impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
         // Map/Iterable collection ops (`x.filterValues { .. }`,
         // `x.mapKeys { .. }`, `x.associateBy { .. }`) — Java has no such
@@ -108,7 +109,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                 };
                 class_name.and_then(|cn| {
                     self.unit.workspace.and_then(|ws| {
-                        ws.declarations().find(|dc| dc.name == cn).and_then(|dc| {
+                        ws.declarations_named(&cn).next().and_then(|dc| {
                             dc.supertypes
                                 .first()
                                 .map(|s| s.split('<').next().unwrap_or(s).trim().to_string())
@@ -143,7 +144,7 @@ impl<'a, 'u> Expr<'a, 'u> {
             });
             let translated = same_file_hit
                 || ws.is_some_and(|w| {
-                    w.declarations().any(|d| {
+                    w.declarations_named(&owner).any(|d| {
                         d.name == owner && d.language == crate::workspace::SourceLanguage::Java
                     })
                 });
@@ -158,6 +159,38 @@ impl<'a, 'u> Expr<'a, 'u> {
             }
         }
         let mut result = base.map(|b| self.transpile(b)).unwrap_or_default();
+        if let Some(base) = base
+            && base.kind() == "identifier"
+            && result == self.unit.text(base).trim()
+            && let Some(ty) = self.unit.flow_smart_casts.get(self.unit.text(base).trim())
+        {
+            result = format!("(({}) {})", ty, self.unit.text(base).trim());
+        }
+        // `transpile()` deliberately leaves identifiers present in `var_types`
+        // alone to preserve local/parameter shadowing. A property inherited
+        // through an interface supertype is nevertheless an implicit `this`
+        // receiver in Kotlin; recover that precise workspace fact here before
+        // appending the member access.
+        if let Some(base) = base
+            && base.kind() == "identifier"
+            && result == self.unit.text(base).trim()
+            && let Some(workspace) = self.unit.workspace
+            && let Some(name) = self.enclosing_type_name()
+        {
+            let declaring = self
+                .unit
+                .workspace_file
+                .as_deref()
+                .unwrap_or(self.unit.file);
+            let property = self.unit.text(base).trim();
+            if workspace
+                .inherited_property_names_in_file(declaring, &name)
+                .iter()
+                .any(|candidate| candidate == property)
+            {
+                result = format!("this.get{}()", capitalize(property));
+            }
+        }
         if let Some(owner) = super_owner
             && !result.starts_with(&owner)
         {
@@ -229,13 +262,99 @@ impl<'a, 'u> Expr<'a, 'u> {
                         let base_text = base
                             .map(|b| self.unit.text(b).trim().to_string())
                             .unwrap_or_default();
-                        if let Some(accessor) = self.unit.companion_members.get(&member_name) {
-                            // known companion member name: getter call
-                            let _ = &base_text;
+                        let accessor = self.unit.companion_members.get(&member_name).cloned();
+                        if let Some(accessor) = accessor {
+                            let jvm_field_owner = self
+                                .unit
+                                .workspace
+                                .and_then(|workspace| {
+                                    workspace.find_static_property(&base_text, &member_name)
+                                })
+                                .is_some_and(|owner| {
+                                    owner
+                                        .members
+                                        .iter()
+                                        .any(|m| m.name == member_name && m.is_jvm_field)
+                                });
 
-                            result.push_str(&format!(".{}", accessor));
+                            // Generated companion properties are public Java
+                            // statics. Read the field directly: the owner may
+                            // remain Kotlin. Kotlin interface companions then
+                            // expose the instance getter through `Companion`.
+                            let _ = &base_text;
+                            if !jvm_field_owner
+                                && self
+                                    .unit
+                                    .retained_hint
+                                    .as_ref()
+                                    .is_some_and(|retained| retained.contains(&base_text))
+                            {
+                                result.push_str(&format!(".Companion.{}", accessor));
+                            } else {
+                                result.push_str(&format!(".{}", member_name));
+                            }
                         } else {
-                            result.push_str(&format!(".{}", member_name));
+                            {
+                                let ws_probe = self.unit.workspace.and_then(|w| {
+                                    w.find_static_property(&base_text, &member_name).map(|d| {
+                                        (
+                                            d.name.clone(),
+                                            d.language == crate::workspace::SourceLanguage::Kotlin,
+                                            d.members
+                                                .iter()
+                                                .any(|m| m.name == member_name && m.is_static),
+                                        )
+                                    })
+                                });
+                            }
+                            let retained_kotlin_property = self
+                                .unit
+                                .retained_hint
+                                .as_ref()
+                                .is_some_and(|retained| retained.contains(&base_text))
+                                && self.unit.workspace.is_some_and(|workspace| {
+                                    workspace
+                                        .find_static_property(&base_text, &member_name)
+                                        .is_some_and(|owner| {
+                                            owner.language
+                                                == crate::workspace::SourceLanguage::Kotlin
+                                        })
+                                });
+                            if retained_kotlin_property {
+                                let static_member = {
+                                    self.unit
+                                        .workspace
+                                        .and_then(|workspace| {
+                                            workspace.find_static_property(&base_text, &member_name)
+                                        })
+                                        .is_some_and(|owner| {
+                                            owner.language
+                                                == crate::workspace::SourceLanguage::Kotlin
+                                                && owner.members.iter().any(|m| {
+                                                    m.name == member_name && m.is_jvm_field
+                                                })
+                                        })
+                                };
+                                if static_member {
+                                    // `@JvmField` companion val: a real Java
+                                    // static field on the owner — no
+                                    // `Companion.getMember()` bridge exists.
+                                    result.push_str(&format!(".{}", member_name));
+                                } else {
+                                    let cap = format!(
+                                        "{}{}",
+                                        member_name
+                                            .chars()
+                                            .next()
+                                            .map(|c| c.to_ascii_uppercase())
+                                            .unwrap_or_default(),
+                                        member_name.chars().skip(1).collect::<String>()
+                                    );
+                                    result.push_str(&format!(".Companion.get{}()", cap));
+                                }
+                            } else {
+                                result.push_str(&format!(".{}", member_name));
+                            }
                         }
                     } else {
                         // user-defined property read -> getter call; Pair/
@@ -283,6 +402,31 @@ impl<'a, 'u> Expr<'a, 'u> {
                             let first = raw.split('.').next().unwrap_or("").to_string();
                             if self.unit.enum_types.contains(first.as_str()) {
                                 return true;
+                            }
+                            if let Some(known_type) = self.unit.var_types.get(raw.as_str()) {
+                                let bare = known_type
+                                    .split('<')
+                                    .next()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .rsplit_once(' ')
+                                    .map(|(_, ty)| ty)
+                                    .unwrap_or(known_type)
+                                    .trim();
+                                return self.unit.enum_types.contains(bare)
+                                    || self.unit.workspace.is_some_and(|ws| {
+                                        let declaring = self
+                                            .unit
+                                            .workspace_file
+                                            .as_deref()
+                                            .unwrap_or(self.unit.file);
+                                        ws.source_file(declaring)
+                                            .and_then(|file| ws.resolve_type(file, bare))
+                                            .is_some_and(|declaration| {
+                                                declaration.kind
+                                                    == crate::workspace::DeclarationKind::Enum
+                                            })
+                                    });
                             }
                             // `this.getType().name` where getType() or
                             // `type` resolves to an indexed ENUM
@@ -334,8 +478,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                                                 // on many types (cross-file
                                                 // shadowing), so first-match is
                                                 // unreliable.
-                                                let mut hit: Option<Option<String>> =
-                                                    None;
+                                                let mut hit: Option<Option<String>> = None;
                                                 for cl in ws.declarations() {
                                                     for mm in &cl.members {
                                                         if mm.name != recv {
@@ -353,16 +496,13 @@ impl<'a, 'u> Expr<'a, 'u> {
                                                         let enum_typed = bare
                                                             .get(0..1)
                                                             .is_some_and(|c| {
-                                                                c.chars()
-                                                                    .next()
-                                                                    .is_some_and(|c| {
-                                                                        c.is_ascii_uppercase()
-                                                                    })
+                                                                c.chars().next().is_some_and(|c| {
+                                                                    c.is_ascii_uppercase()
+                                                                })
                                                             })
-                                                            && ws.declarations().any(|d| {
-                                                                d.name == bare
-                                                                    && d.kind
-                                                                        == crate::workspace::DeclarationKind::Enum
+                                                            && ws.declarations_named(&bare).any(|d| {
+                                                                d.kind
+                                                                    == crate::workspace::DeclarationKind::Enum
                                                             });
                                                         if enum_typed {
                                                             hit = Some(mm.type_name.clone());
@@ -379,10 +519,7 @@ impl<'a, 'u> Expr<'a, 'u> {
                                                     .next()
                                                     .is_some_and(|c| c.is_ascii_uppercase())
                                             }) {
-                                                ws.declarations().find_map(|cl| {
-                                                    if cl.name != owner {
-                                                        return None;
-                                                    }
+                                                ws.declarations_named(&owner).find_map(|cl| {
                                                     cl.members.iter().find_map(|mm| {
                                                         if mm.name == recv {
                                                             mm.type_name.clone()
@@ -398,10 +535,9 @@ impl<'a, 'u> Expr<'a, 'u> {
                                     })
                                     .map(|t| t.split('<').next().unwrap_or(&t).trim().to_string());
                                 if let Some(t) = ty
-                                    && ws.declarations().any(|d| {
-                                        d.name == t
-                                            && d.kind == crate::workspace::DeclarationKind::Enum
-                                    })
+                                    && ws
+                                        .declarations_named(&t)
+                                        .any(|d| d.kind == crate::workspace::DeclarationKind::Enum)
                                 {
                                     return true;
                                 }
@@ -479,19 +615,26 @@ impl<'a, 'u> Expr<'a, 'u> {
                                         .next()
                                         .unwrap_or(&t)
                                         .trim()
-                                        .trim_start_matches("@Nullable ")
+                                        .rsplit_once(' ')
+                                        .map(|(_, ty)| ty)
+                                        .unwrap_or(&t)
                                         .trim_end_matches("()")
                                         .to_string()
                                 })
                                 .and_then(|t0| {
                                     self.unit.workspace.and_then(|ws| {
-                                        ws.declarations()
-                                            .any(|d| {
-                                                d.name == t0
-                                                    && d.kind
-                                                        == crate::workspace::DeclarationKind::Enum
+                                        let declaring = self
+                                            .unit
+                                            .workspace_file
+                                            .as_deref()
+                                            .unwrap_or(self.unit.file);
+                                        ws.source_file(declaring)
+                                            .and_then(|file| ws.resolve_type(file, &t0))
+                                            .filter(|declaration| {
+                                                declaration.kind
+                                                    == crate::workspace::DeclarationKind::Enum
                                             })
-                                            .then_some(t0)
+                                            .map(|_| t0)
                                     })
                                 });
                             if enum_hit.is_some() {
@@ -555,13 +698,52 @@ impl<'a, 'u> Expr<'a, 'u> {
             if let Some(q) = raw.find('.') {
                 let (b, m) = raw.split_at(q);
                 let m = &m[1..];
-                let mut res = format!("{} != null ? {}.{} : null", b, b, m);
+                let m_java = rewrite_reified_type_args(m);
+                // Wrap in getters: every terminal simple-name segment in the
+                // chain that names a property reads through its accessor —
+                // cross-package Java field access must not exist.
+                let m_java = {
+                    let (head, tail) = m_java
+                        .rsplit_once('.')
+                        .map(|(h, t)| (h.to_string(), t.to_string()))
+                        .unwrap_or((String::new(), m_java.clone()));
+                    let last = tail.trim_end_matches("()");
+                    let builtin = matches!(
+                        last,
+                        "length"
+                            | "size"
+                            | "isEmpty"
+                            | "isNotEmpty"
+                            | "keys"
+                            | "values"
+                            | "entries"
+                            | "stream"
+                    );
+                    if !last.is_empty()
+                        && last.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                        && !builtin
+                        && !tail.contains('(')
+                    {
+                        if head.is_empty() {
+                            format!("get{}()", capitalize(last))
+                        } else {
+                            format!("{}.get{}()", head, capitalize(last))
+                        }
+                    } else {
+                        m_java
+                    }
+                };
+                let mut res = format!("{} != null ? {}.{} : null", b, b, m_java);
                 // if the member chain already carries an accessor method
                 // applied (getter etc.) the rewritten form here might be
                 // stale — leave the current result as-is; the ternary wrap
                 // only applies when the whole raw nav is what came out.
                 if result.contains(b) {
-                    res = format!("{} != null ? {} : null", b, result);
+                    res = format!(
+                        "{} != null ? {} : null",
+                        b,
+                        rewrite_reified_type_args(&result)
+                    );
                 }
                 result = res;
             }
@@ -605,6 +787,105 @@ impl<'a, 'u> Expr<'a, 'u> {
             // `this.x` inside an extension body refers to the receiver param.
             if raw_trimmed.starts_with("this.") {
                 raw_trimmed = format!("{}{}", r, &raw_trimmed[4..]);
+            }
+        }
+        if let Some(base) = node
+            .children(&mut node.walk())
+            .find(|child| child.is_named())
+            && base.kind() == "identifier"
+            && let Some(name) = self.enclosing_type_name()
+        {
+            let property = self.unit.text(base).trim();
+            let declaring = self
+                .unit
+                .workspace_file
+                .as_deref()
+                .unwrap_or(self.unit.file);
+            let inherited = self.unit.workspace.is_some_and(|ws| {
+                ws.inherited_property_names_in_file(declaring, &name)
+                    .iter()
+                    .any(|candidate| candidate == property)
+            });
+            let own_getter = self.unit.self_getters.get(property).cloned();
+            if inherited
+                || (!self.unit.var_types.contains_key(property)
+                    && self.unit.ext_receiver_name.is_none()
+                    && own_getter.is_some())
+            {
+                let getter = own_getter.unwrap_or_else(|| format!("get{}", capitalize(property)));
+                raw_trimmed = format!("this.{}(){}", getter, &raw_trimmed[property.len()..]);
+            }
+        }
+        // Reified-generic callee with the type argument INSIDE the callee
+        // navigation (`recv.get<T>()` parses as call(callee=nav
+        // `recv.get<T>`, args=()`). The nav node's raw text ends with
+        // `.member<ty>` and has NO `(` — the brackets belong to the callee
+        // text, not a `type_arguments` child anywhere call.rs can see. Stash
+        // the type argument and strip the brackets; call.rs's
+        // reified_type_argument_rewrite consumes it and emits
+        // `recv.member(ty.class)` (Kotlin inlined `T::class.java`).
+        if raw_trimmed.contains('<') && !raw_trimmed.contains('(') && raw_trimmed.ends_with('>') {
+            let last_lt = raw_trimmed.rfind('<').map(|p| p).unwrap_or(0);
+            let head = raw_trimmed[..last_lt].to_string();
+            let ty_raw = raw_trimmed[last_lt + 1..raw_trimmed.len() - 1].to_string();
+            let ty = ty_raw.trim().to_string();
+            let dot = head.rfind('.');
+            if let Some(dot) = dot
+                && !ty.is_empty()
+                && !ty.contains('<')
+                && !ty.contains(',')
+                && !ty.contains('*')
+                && ty
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            {
+                let member = head[dot + 1..].to_string();
+                if !member.is_empty() && member.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    self.unit.pending_callee_type_arg = Some(ty.clone());
+                    raw_trimmed = head;
+                }
+            }
+        }
+        // Reified-generic type argument on a member call: `recv.get<T>()`
+        // must lower to the Java-visible `Class<T>` ABI — `recv.get(T.class)`
+        // (Kotlin inlined `T::class.java` here). A `<…>` after `.` is not
+        // Java syntax; javac rejects it ("-> expected" / illegal token).
+        // The call may be mid-chain (`recv.get<T>().items`), so the check is
+        // positional: `<` directly after `.member`, `>()` directly after `>`.
+        if raw_trimmed.contains('<')
+            && raw_trimmed.contains('(')
+            && let Some(lt) = raw_trimmed.find('<')
+        {
+            let head = raw_trimmed[..lt].trim_end();
+            let tail = &raw_trimmed[lt + 1..];
+            let ty = tail.split('>').next().map(|s| s.trim().to_string());
+            if let Some(ty) = ty
+                && !ty.is_empty()
+                && !ty.contains('<')
+                && !ty.contains(',')
+                && !ty.contains('*')
+                && ty
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                && tail[ty.len() + 1..].starts_with("()")
+                && let Some(dot) = head.rfind('.')
+            {
+                let member = &head[dot + 1..];
+                let receiver = head[..dot].to_string();
+                if !member.is_empty()
+                    && !receiver.ends_with('.')
+                    && member.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        format!(
+                            "call `.{member}<{ty}>()` on a reified inline function lowered to `.{member}({ty}.class)` for the Class<T> ABI"
+                        ),
+                    );
+                    let rest = &tail[ty.len() + 3..];
+                    raw_trimmed = format!("{}.{}({}.class){}", receiver, member, ty, rest);
+                }
             }
         }
         // `…collect(toList()).joinToString(sep)` — the map arm terminated
@@ -739,17 +1020,25 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // lambda both belong here — assemble stream reduce
                     // immediately (call.rs must not re-emit).
                     if matches!(member.as_str(), "fold" | "foldIndexed") {
-                        let outer = node.parent().map(|mut p| {
+                        // The curried `fold(identity) { op }` lambda belongs to
+                        // the call this member is part of. Walking up without a
+                        // boundary finds an unrelated enclosing call instead —
+                        // `outer(1) { i -> plain(i).fold({ 0 }) }` has a
+                        // trailing lambda that merely CONTAINS this fold, and
+                        // re-transpiling it re-enters the fold: unbounded
+                        // recursion, stack overflow, whole run aborted. A
+                        // lambda body is therefore a hard stop.
+                        let outer = node.parent().and_then(|mut p| {
                             loop {
+                                if matches!(p.kind(), "lambda_literal" | "annotated_lambda") {
+                                    return None;
+                                }
                                 if p.kind() == "call_expression"
                                     && kt::child(p, "annotated_lambda").is_some()
                                 {
-                                    break p;
+                                    return Some(p);
                                 }
-                                p = match p.parent() {
-                                    Some(q) => q,
-                                    None => break p,
-                                };
+                                p = p.parent()?;
                             }
                         });
                         let inner = node.parent().filter(|p| p.kind() == "call_expression");
@@ -1487,7 +1776,7 @@ fn replace_whole_word(text: &str, word: &str, replacement: &str) -> String {
     out
 }
 
-impl<'a, 'u> Expr<'a, 'u> {
+impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     /// `map.filterValues { v -> pred }` / `map.mapKeys { k -> f }` — Java Map
     /// has no such members; lower through the entrySet stream.
     pub(crate) fn map_entry_op(
@@ -1591,4 +1880,86 @@ impl<'a, 'u> Expr<'a, 'u> {
             }
         }
     }
+}
+
+/// Textual rewrite of reified-generic call sites surviving verbatim in an
+/// assembled Java string: `.member<ty>(…)` -> `.member(ty.class)` (Kotlin
+/// inlined `T::class.java`; the Java-visible ABI is the `Class<T>` overload).
+/// Applied at safe-call/ternary reassembly points that bypass
+/// navigation_call/call.rs (their member chains are spliced from raw source
+/// text, where `<…>` brackets are untranslatable Java). Only single plain
+/// type arguments are rewritten; anything composite stays untouched.
+pub fn rewrite_reified_type_args(java: &str) -> String {
+    if !java.contains('<') {
+        return java.to_string();
+    }
+    let mut out = java.to_string();
+    let mut search_from = 0usize;
+    while let Some(lt_rel) = out[search_from..].find('<') {
+        let lt = search_from + lt_rel;
+        // member head must be `.name<`
+        let head = &out[..lt];
+        let Some(dot) = head.rfind('.') else {
+            search_from = lt + 1;
+            continue;
+        };
+        let member = &head[dot + 1..];
+        if member.is_empty()
+            || !member
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_')
+            // The preceding char before `.member` must be another dot or
+            // expression text — reject `a < b` comparisons (no dot-adjacent
+            // identifier).
+            || head[..dot]
+                .chars()
+                .next_back()
+                .map(|c| !(c.is_alphanumeric() || c == '_' || c == ')' || c == ']'))
+                .unwrap_or(true)
+        {
+            search_from = lt + 1;
+            continue;
+        }
+        let close_rel = match out[lt + 1..].find('>') {
+            Some(r) => r,
+            None => break,
+        };
+        let close = lt + 1 + close_rel;
+        let member_owned = member.to_string();
+        let ty = out[lt + 1..close].trim();
+        let ty_ok = !ty.is_empty()
+            && !ty.contains('<')
+            && !ty.contains(',')
+            && !ty.contains('*')
+            && ty.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            // call shape: `>` must be immediately followed by `(`
+            && out[close + 1..].starts_with('(');
+        if !ty_ok {
+            search_from = lt + 1;
+            continue;
+        }
+        let ty_owned = ty.to_string();
+        let dot = head.rfind('.').unwrap_or(0);
+        let prefix = out[..dot].to_string();
+        // Swallow the empty arg-pair `(…)` right after `>` — but ONLY the
+        // immediately-closing `()`: a later `)` belongs to an enclosing
+        // ternary/paren and must survive.
+        let mut after = close + 1;
+        if out[after..].starts_with('(') {
+            after += 1;
+            if out[after..].starts_with(')') {
+                after += 1;
+            }
+        }
+        let suffix = out[after..].to_string();
+        let suffix_len = suffix.len();
+        out = format!("{}.{}({}.class){}", prefix, member_owned, ty_owned, suffix);
+        // The rewrite deletes the angle brackets and the empty argument pair, so
+        // the string gets shorter than the cursor position derived from the old
+        // text; resuming from there slices past the end ("start byte index N is
+        // out of bounds") on any later iteration. Resume at the untouched
+        // suffix instead — a boundary that always exists.
+        search_from = out.len() - suffix_len;
+    }
+    out
 }

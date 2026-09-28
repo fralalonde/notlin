@@ -3,9 +3,9 @@
 
 use super::Expr;
 use crate::transpiler::kt;
-use crate::transpiler::unit::primitive_array_factory;
+use crate::transpiler::unit::{instance_property_count, primitive_array_factory};
 
-impl<'a, 'u> Expr<'a, 'u> {
+impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn call(&mut self, node: tree_sitter::Node) -> String {
         let mut cursor = node.walk();
         let kids: Vec<_> = node.children(&mut cursor).collect();
@@ -107,6 +107,16 @@ impl<'a, 'u> Expr<'a, 'u> {
             // real method) — detectability lives in the workspace.
             if matches!(member.as_str(), "plus" | "minus" | "times") {
                 let recv_text = self.unit.text(base);
+                if ["mapOf(", "mutableMapOf(", "hashMapOf("]
+                    .iter()
+                    .any(|prefix| recv_text.trim().starts_with(prefix))
+                {
+                    self.unit.diag_untranslatable(
+                        node,
+                        "Kotlin Map.plus on a map factory has no Java expression form; declaration retained in Kotlin",
+                    );
+                    return "null".to_string();
+                }
                 // Receiver type: local inference first, then the file-scoped
                 // property/getter lookup (bare `contexts`, `this.getContexts()`,
                 // etc.) — cross-file same-name properties must not win over
@@ -374,6 +384,43 @@ impl<'a, 'u> Expr<'a, 'u> {
             };
         }
 
+        // Implicit `copy(x = 1)` inside a data class targets `this`. Java
+        // records/classes have no Kotlin-generated copy member, so rebuild
+        // the current instance from its component accessors.
+        if callee_java == "copy"
+            && let Some(owner) = self.unit.current_decl.and_then(|decl| {
+                kt::field(decl, "name").map(|name| self.unit.text(name).trim().to_string())
+            })
+            && let Some(comps) = self.unit.data_components.get(&owner).cloned()
+        {
+            let mut replacements = std::collections::HashMap::<String, String>::new();
+            for arg in &args {
+                if let Some((name, value)) = arg.split_once(" = ") {
+                    replacements.insert(name.trim().to_string(), value.trim().to_string());
+                }
+            }
+            let values = comps
+                .iter()
+                .map(|(_, name)| {
+                    replacements.remove(name).unwrap_or_else(|| {
+                        if self.unit.lombok {
+                            let mut chars = name.chars();
+                            let cap = chars
+                                .next()
+                                .map(|first| {
+                                    first.to_uppercase().collect::<String>() + chars.as_str()
+                                })
+                                .unwrap_or_default();
+                            format!("this.get{}()", cap)
+                        } else {
+                            format!("this.{}()", name)
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            return format!("new {}({})", owner, values.join(", "));
+        }
+
         // `Receiver.copy(x = 1, z = 2)` on a data-class/record receiver:
         // Java records have no copy() — rebuild: `new Receiver(k, v, …)`
         // with named args substituted in declared component order.
@@ -441,6 +488,18 @@ impl<'a, 'u> Expr<'a, 'u> {
                     }
                 }
             }
+        }
+        // A qualified Kotlin `copy` whose data-class component schema is not
+        // available in this Unit cannot be faithfully reconstructed. Never
+        // emit Java's nonexistent `.copy(...)`; retaining the declaration is
+        // safer than a compilation failure. (The self-copy form above has a
+        // local schema and stays translatable.)
+        if callee_java.ends_with(".copy") {
+            self.unit.diag_untranslatable(
+                node,
+                "qualified Kotlin data-class `copy(...)` has no locally available component schema; declaration retained in Kotlin",
+            );
+            return "null".to_string();
         }
         // Collection slice ops on List receivers (Kotlin -> Java streams):
         // take(n) -> stream().limit(n).collect(toList());
@@ -659,13 +718,30 @@ impl<'a, 'u> Expr<'a, 'u> {
             // Arrays.stream(...) and a pre-existing `.stream()` are already
             // Java Streams — no `.stream()` tail and no Kotlin collection-op
             // approximation warning are needed.
+            let receiver_is_map = callee
+                .and_then(|callee| self.unit.nav_base_member(callee).map(|(base, _)| base))
+                .and_then(|base| {
+                    let property = self
+                        .unit
+                        .text(base)
+                        .trim()
+                        .trim_start_matches("this.")
+                        .trim_end_matches("()")
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or("");
+                    self.scope_property_type(property)
+                        .or_else(|| self.infer_operand_type(base))
+                })
+                .is_some_and(|ty| ty.starts_with("Map<"));
             let stream_base = if is_direct_java_stream {
                 base.clone()
-            } else if self
-                .unit
-                .var_types
-                .get(base.trim())
-                .is_some_and(|t| t.starts_with("Map<"))
+            } else if receiver_is_map
+                || self
+                    .unit
+                    .var_types
+                    .get(base.trim())
+                    .is_some_and(|t| t.starts_with("Map<"))
             {
                 // Kotlin maps stream over their ENTRIES (Map.Entry pairs).
                 format!("{}.entrySet().stream()", base)
@@ -1117,18 +1193,90 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // (`Owner.invoke(...)`), NOT a constructor — Java
                     // `new Surname(...)` does not compile.
                     let mut ctor_args = args.clone();
-                    if let Some(ws) = self.unit.workspace
-                        && let Some(decl) = ws.declarations().find(|d| d.name == callee_java)
-                    {
-                        let properties = decl
-                            .members
-                            .iter()
-                            .filter(|m| m.kind == crate::workspace::MemberKind::Property)
-                            .count();
-                        if decl.has_default_constructor_parameter
-                            && properties == ctor_args.len() + 1
-                        {
-                            ctor_args.push("null".to_string());
+                    if let Some(ws) = self.unit.workspace {
+                        let candidates: Vec<_> = ws
+                            .declarations()
+                            .filter(|d| d.name == callee_java)
+                            .collect();
+                        // Kotlin named arguments have no Java form
+                        // (`new MethodCall(name = "x", params = p)` is not
+                        // Java). Lower them to the callee's declared parameter
+                        // order; a parameter left out was relying on a Kotlin
+                        // default, which Java cannot express, so it is filled
+                        // with `null` and reported.
+                        if ctor_args.iter().any(|arg| arg.contains(" = ")) {
+                            let named: Vec<(&str, &str)> = ctor_args
+                                .iter()
+                                .filter_map(|arg| arg.split_once(" = "))
+                                .collect();
+                            let matched = candidates.iter().copied().find(|decl| {
+                                !decl.constructor_param_names.is_empty()
+                                    && named.iter().all(|(name, _)| {
+                                        decl.constructor_param_names
+                                            .iter()
+                                            .any(|param| param == name.trim())
+                                    })
+                            });
+                            if let Some(decl) = matched {
+                                let names = decl.constructor_param_names.clone();
+                                let mut slots: Vec<Option<String>> = vec![None; names.len()];
+                                let mut next = 0usize;
+                                for arg in std::mem::take(&mut ctor_args) {
+                                    if let Some((name, value)) = arg.split_once(" = ") {
+                                        match names
+                                            .iter()
+                                            .position(|param| param == name.trim())
+                                        {
+                                            Some(index) => slots[index] = Some(value.to_string()),
+                                            None => {
+                                                let last = slots.len().saturating_sub(1);
+                                                slots[next.min(last)] =
+                                                    Some(value.to_string());
+                                            }
+                                        }
+                                    } else {
+                                        while next < slots.len() && slots[next].is_some() {
+                                            next += 1;
+                                        }
+                                        if next < slots.len() {
+                                            slots[next] = Some(arg);
+                                            next += 1;
+                                        }
+                                    }
+                                }
+                                for (index, slot) in slots.iter_mut().enumerate() {
+                                    if slot.is_none() {
+                                        self.unit.diags.warn_approx(
+                                            node,
+                                            self.unit.file,
+                                            format!(
+                                                "named-argument call to `{}` omits `{}`: filled with `null` (Kotlin default not expressible in Java)",
+                                                callee_java, names[index]
+                                            ),
+                                        );
+                                        *slot = Some("null".to_string());
+                                    }
+                                }
+                                ctor_args = slots.into_iter().flatten().collect();
+                            }
+                        }
+                        let arity = |d: &crate::workspace::Declaration| {
+                            if d.constructor_param_count > 0 {
+                                d.constructor_param_count
+                            } else {
+                                instance_property_count(d)
+                            }
+                        };
+                        let defaulting = candidates.iter().find(|d| {
+                            d.has_default_constructor_parameter && arity(d) == ctor_args.len() + 1
+                        });
+                        let chosen = defaulting.or_else(|| candidates.first());
+                        if let Some(decl) = chosen {
+                            if decl.has_default_constructor_parameter
+                                && arity(decl) == ctor_args.len() + 1
+                            {
+                                ctor_args.push("null".to_string());
+                            }
                         }
                     }
                     let base_name = callee_java.rsplit('.').next().unwrap_or("").to_string();
@@ -1182,6 +1330,10 @@ impl<'a, 'u> Expr<'a, 'u> {
                     // joinToString style: callee mapping already emitted the
                     // full call with args — nothing to append.
                     callee_java
+                } else if let Some(rewritten) =
+                    self.reified_type_argument_rewrite(node, &callee_java, &args)
+                {
+                    rewritten
                 } else {
                     format!("{}({})", callee_java, args.join(", "))
                 }
@@ -1233,6 +1385,64 @@ impl<'a, 'u> Expr<'a, 'u> {
 
     fn type_arg_of(&self, call: tree_sitter::Node) -> Option<String> {
         kt::child(call, "type_arguments").map(|t| self.unit.text(t).to_string())
+    }
+
+    /// `recv.get<T>()` where the callee declared a single `reified T` type
+    /// parameter with NO other type parameters: Java has no counterpart for
+    /// the reified form; the Kotlin ABI that survives migration is the
+    /// `Class<T>` overload, so a call site must pass the type literal
+    /// explicitly (Kotlin inlined `T::class.java` at compile time).
+    fn reified_type_argument_rewrite(
+        &mut self,
+        call: tree_sitter::Node,
+        callee_java: &str,
+        args: &[String],
+    ) -> Option<String> {
+        if args.is_empty() {
+            // Only `get<T>()` (no args) maps to `get(T.class)`; with other
+            // args the arity mapping is ambiguous, conservatively untouched.
+            // The type argument may arrive two ways: a `type_arguments` child
+            // of the call node (direct callee) or stashed by navigation_call
+            // as `pending_callee_type_arg` (the brackets were swallowed into
+            // the callee nav text).
+            if let Some(type_args) = kt::child(call, "type_arguments")
+                .map(|t| self.unit.text(t).trim().to_string())
+                .or_else(|| self.unit.pending_callee_type_arg.take())
+            {
+                // single type argument name, no bounds/usage text
+                let text = type_args;
+                let inner = text
+                    .strip_prefix('<')
+                    .and_then(|t| t.strip_suffix('>'))
+                    .map(|t| t.trim().to_string());
+                if let Some(ty) = inner
+                    && !ty.contains('<')
+                    && !ty.contains(',')
+                    && !ty.contains('*')
+                    && ty
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                {
+                    // Type-literal form: `Ty.class` ( Java class literal).
+                    // Receiver text is the callee head before `.member(`.
+                    let (head, member) = callee_java
+                        .rsplit_once('.')
+                        .map(|(h, m)| (h.to_string(), m.to_string()))
+                        .unwrap_or_default();
+                    if !head.is_empty() && !member.is_empty() {
+                        self.unit.diags.warn_approx(
+                            call,
+                            self.unit.file,
+                            format!(
+                                "call `{member}<{ty}>()` on a reified inline function lowered to `{member}({ty}.class)` for the Class<T> ABI"
+                            ),
+                        );
+                        return Some(format!("{}.{}({}.class)", head, member, ty));
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn lambda(&mut self, node: tree_sitter::Node) -> String {

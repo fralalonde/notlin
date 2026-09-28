@@ -40,6 +40,31 @@ fn bodyless_secondary_constructor_delegates_to_primary() {
 }
 
 #[test]
+fn lombok_secondary_constructor_keeps_its_delegated_primary_constructor() {
+    let root = Path::new("tests/tmp_scratch_secondary_ctor_lombok");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("Token.kt"),
+        "package neutral.secondary\nclass Token(val id: String) {\n    constructor() : this(\"fallback\")\n}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.join("Token.kt"))
+        .output()
+        .expect("run notlin");
+    assert!(output.status.success(), "notlin failed: {output:?}");
+    let java = fs::read_to_string(root.join("Token.java")).unwrap();
+    assert!(
+        java.contains("public Token(String id)") && java.contains("this.id = id;"),
+        "a translated secondary constructor cannot rely on Lombok annotation processing:\n{java}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn bodyless_secondary_constructor_delegates_to_superclass() {
     let root = Path::new("tests/tmp_scratch_secondary_ctor_super");
     let _ = fs::remove_dir_all(root);

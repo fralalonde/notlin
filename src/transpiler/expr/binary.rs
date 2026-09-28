@@ -4,7 +4,7 @@
 use super::Expr;
 use crate::transpiler::kt;
 
-impl<'a, 'u> Expr<'a, 'u> {
+impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     fn known_primitive_operand(&self, node: tree_sitter::Node) -> bool {
         if node.kind() == "identifier" {
             self.unit
@@ -123,6 +123,10 @@ impl<'a, 'u> Expr<'a, 'u> {
                         (l_java.clone(), l_java.clone())
                     };
                     let _ = &base;
+                    // Reified-generic gate on the collapsed inner arm: the
+                    // safe-call lhs text was spliced from raw source, so
+                    // `recv.get<T>()` brackets can survive here.
+                    let inner = crate::transpiler::expr::rewrite_reified_type_args(&inner);
                     return format!("({} != null ? {} : {})", base, inner, r_java);
                 }
                 // Infix functions: and/or are keywords; others pass through
@@ -239,6 +243,18 @@ impl<'a, 'u> Expr<'a, 'u> {
                 } else {
                     java_op
                 };
+                // `mapOf(...) + other` and `other + mapOf(...)` are Kotlin
+                // Map.plus calls. A map factory's result type is syntactically
+                // known even when workspace inference cannot resolve the
+                // other operand (notably a companion static property). Never
+                // let that gap fall through to Java's nonexistent `.plus`.
+                if op == "+" && (self.is_map_factory_call(l) || self.is_map_factory_call(r)) {
+                    self.unit.diag_untranslatable(
+                        node,
+                        "Kotlin Map.plus involving mapOf/mutableMapOf has no Java expression form; declaration retained in Kotlin",
+                    );
+                    return "null".to_string();
+                }
                 let l_java = self.transpile(l);
                 let r_java = self.transpile(r);
                 // Operator overloads: if either operand is a user-class
@@ -352,7 +368,14 @@ impl<'a, 'u> Expr<'a, 'u> {
     }
 }
 
-impl<'a, 'u> Expr<'a, 'u> {
+impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
+    fn is_map_factory_call(&self, node: tree_sitter::Node) -> bool {
+        let text = self.unit.text(node).trim();
+        ["mapOf", "mutableMapOf", "hashMapOf"]
+            .iter()
+            .any(|name| text.starts_with(&format!("{name}(")))
+    }
+
     /// Detects the `callee < Type` binary shape produced when a generic call
     /// with a trailing lambda is parsed; returns the phantom type-argument
     /// text when shaped. Structural (no transpilation, no side effects).
@@ -416,9 +439,48 @@ impl<'a, 'u> Expr<'a, 'u> {
             }
             return Some(vt.clone());
         }
+        // An unqualified uppercase identifier inside a class (`DEFAULTS`)
+        // can be that class's companion property. It is not a local variable,
+        // and treating it as an unknown user type lets `DEFAULTS + other`
+        // become a nonexistent Java `.plus(...)` call. Resolve against the
+        // enclosing declaration before broad workspace-name fallbacks.
+        if t.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && let Some(ws) = self.unit.workspace
+            && let Some(owner) = self.unit.current_decl.and_then(|decl| {
+                kt::field(decl, "name").map(|name| self.unit.text(name).trim().to_string())
+            })
+            && let Some(declaration) = ws.find_static_property(&owner, &t)
+            && let Some(ty) = declaration.members.iter().find_map(|candidate| {
+                (candidate.name == t && candidate.kind == crate::workspace::MemberKind::Property)
+                    .then(|| candidate.type_name.clone())
+                    .flatten()
+            })
+        {
+            return Some(ty);
+        }
         // member access `x.getFoo()` / `getFoo()` / bare `foo`: the indexed
         // property type of the getter's backing field
         if let Some(ws) = self.unit.workspace {
+            // Qualified companion/static property (`Owner.DEFAULTS`) — its
+            // source declaration carries the actual property type. This is
+            // essential for `Owner.DEFAULTS + more`: without it Map.plus is
+            // mistaken for an arbitrary user-defined operator and emitted as
+            // a nonexistent Java `.plus(...)` call.
+            if node.kind() == "navigation_expression"
+                && let Some((owner, member)) = self.unit.nav_base_member(node)
+            {
+                let owner = self.unit.text(owner).trim();
+                if let Some(declaration) = ws.find_static_property(owner, &member)
+                    && let Some(ty) = declaration.members.iter().find_map(|candidate| {
+                        (candidate.name == member
+                            && candidate.kind == crate::workspace::MemberKind::Property)
+                            .then(|| candidate.type_name.clone())
+                            .flatten()
+                    })
+                {
+                    return Some(ty);
+                }
+            }
             let getter = t
                 .rsplit_once('.')
                 .map(|(_, last)| last.trim_end_matches("()").trim().to_string())
@@ -471,10 +533,42 @@ fn is_likely_primitive(expr_text: &str) -> bool {
         || t.ends_with('F')
 }
 
-/// True for Java primitive type names (as emitted by map_type_name).
+/// Operand types that are Java primitives once lowered. Kotlin's spelled
+/// numeric/boolean types (`Int`, `Double`, ...) and their boxed Java
+/// counterparts unbox at the use site, so `a * b` stays `a * b` root form —
+/// they are NOT user classes with `operator fun times`. Getting this wrong
+/// emits `amount.times(rate)` for a primitive product, which no Java
+/// compiler accepts.
 fn is_primitive_type(ty: &str) -> bool {
     matches!(
         ty,
         "int" | "long" | "short" | "byte" | "double" | "float" | "boolean" | "char"
+    ) || matches!(
+        ty,
+        "Int"
+            | "Long"
+            | "Short"
+            | "Byte"
+            | "Double"
+            | "Float"
+            | "Boolean"
+            | "Char"
+            | "Integer"
+            | "java.lang.Integer"
+            | "java.lang.Long"
+            | "java.lang.Short"
+            | "java.lang.Byte"
+            | "java.lang.Double"
+            | "java.lang.Float"
+            | "java.lang.Boolean"
+            | "java.lang.Character"
+            | "kotlin.Int"
+            | "kotlin.Long"
+            | "kotlin.Short"
+            | "kotlin.Byte"
+            | "kotlin.Double"
+            | "kotlin.Float"
+            | "kotlin.Boolean"
+            | "kotlin.Char"
     )
 }

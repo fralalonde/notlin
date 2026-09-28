@@ -7,7 +7,9 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const CACHE_VERSION: u32 = 2;
+// 5: `Declaration::constructor_param_count` (primary-constructor arity, not a
+// property count — companion members and body properties both inflate that).
+const CACHE_VERSION: u32 = 6;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -45,6 +47,10 @@ pub struct Member {
     pub kind: MemberKind,
     pub visibility: Option<String>,
     pub is_static: bool,
+    /// `@JvmField` companion/instance val: a real Java static field —
+    /// caller sites must emit `Owner.MEMBER`, never the `Companion`
+    /// accessor bridge that only exists for plain companion vals.
+    pub is_jvm_field: bool,
     pub type_name: Option<String>,
     pub is_nullable: bool,
 }
@@ -58,6 +64,27 @@ pub struct Declaration {
     pub supertypes: Vec<String>,
     pub members: Vec<Member>,
     pub has_default_constructor_parameter: bool,
+    /// Primary-constructor arity. Distinct from the number of `Property`
+    /// members: a companion contributes static members and a class body adds
+    /// properties that are not constructor parameters (`data class X(val a: T
+    /// = ...) { override val b: U get() = ... }` has arity 1, not 2). Call
+    /// sites fill omitted trailing defaults from this, so a wrong count
+    /// invents a constructor arity that does not exist.
+    #[serde(default)]
+    pub constructor_param_count: usize,
+    /// Primary-constructor parameter names in declaration order. Kotlin named
+    /// arguments (`MethodCall(name = "openport", params = p)`) have no Java
+    /// form, so call sites lower them to positional arguments — which requires
+    /// knowing the declared order to reorder rather than guess.
+    #[serde(default)]
+    pub constructor_param_names: Vec<String>,
+    /// A defaulted constructor parameter that is followed by one WITHOUT a
+    /// default. Trailing defaults are expressible in Java: the emitter writes
+    /// delegating overloads for every shorter arity. A non-trailing default is
+    /// not — a Java caller cannot skip a middle argument — so only this forces
+    /// the declaration to stay Kotlin for its callers' sake.
+    #[serde(default)]
+    pub has_non_trailing_default: bool,
     /// Type-parameter names in declaration order (`ICreateObjectCommand` ->
     /// `["T", "I"]`). Needed to distinguish a generic supertype member typed
     /// by its own parameter (`payload: T`) — Java-erasure compatible with
@@ -72,6 +99,10 @@ pub struct SourceFile {
     pub package: Option<String>,
     pub imports: Vec<String>,
     pub declarations: Vec<Declaration>,
+    /// Kotlin `typealias` declarations in this file: alias name -> target
+    /// type. Aliases are source-only and must be substituted before Java is
+    /// emitted; Java has no equivalent declaration form.
+    type_aliases: HashMap<String, String>,
     identifier_counts: HashMap<String, usize>,
     enum_entries_qualifiers: HashMap<String, usize>,
     smart_cast_properties: HashSet<String>,
@@ -87,6 +118,12 @@ pub struct SourceIndex {
     /// subtypes is retained, and simple-name collisions over-taint
     /// conservatively (fewer translations, never a wrong Java ABI).
     subtype_names: HashMap<String, Vec<String>>,
+    /// Simple declaration-name lookup preserving every collision. This avoids
+    /// repeated complete-workspace scans for name-based compatibility checks.
+    declaration_names: HashMap<String, Vec<(usize, usize)>>,
+    /// Exact indexed source paths. `source_file` retains its `paths_match`
+    /// fallback for equivalent-but-not-identical caller paths.
+    file_paths: HashMap<PathBuf, usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -167,7 +204,7 @@ impl SourceIndex {
 
     pub fn discover_with_stats(root: &Path) -> Result<(Self, IndexStats), String> {
         let root =
-            fs::canonicalize(root).map_err(|error| format!("{}: {error}", root.display()))?;
+            fs::canonicalize(root).map_err(|error| format!("{}: {error}", crate::paths::display(root)))?;
         let old_cache = load_cache(&root);
         let old_sources = old_cache
             .as_ref()
@@ -196,7 +233,22 @@ impl SourceIndex {
             files,
             kotlin_subtypes: HashMap::new(),
             subtype_names: HashMap::new(),
+            declaration_names: HashMap::new(),
+            file_paths: HashMap::new(),
         };
+        for (file_index, file) in index.files.iter().enumerate() {
+            index
+                .file_paths
+                .entry(file.path.clone())
+                .or_insert(file_index);
+            for (declaration_index, declaration) in file.declarations.iter().enumerate() {
+                index
+                    .declaration_names
+                    .entry(declaration.name.clone())
+                    .or_default()
+                    .push((file_index, declaration_index));
+            }
+        }
         let mut subtype_edges = Vec::new();
         let mut subtype_name_edges = Vec::new();
         for file in index.kotlin_files() {
@@ -249,8 +301,100 @@ impl SourceIndex {
             .filter(|file| file.language == SourceLanguage::Java)
     }
 
+    /// Top-level declaration simple names of one indexed source file — used
+    /// to detect a translated file's own names shadowing its single imports
+    /// (legal Kotlin, rejected by javac: "X is already defined in this
+    /// compilation unit").
+    pub fn decl_names_in_file(&self, path: &Path) -> Vec<String> {
+        self.source_file(path)
+            .map(|file| {
+                file.declarations
+                    .iter()
+                    .map(|decl| decl.name.as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn source_file(&self, path: &Path) -> Option<&SourceFile> {
+        if let Some(&file_index) = self.file_paths.get(path) {
+            return self.files.get(file_index);
+        }
         self.files.iter().find(|file| paths_match(&file.path, path))
+    }
+
+    /// Whether adding any simple declaration name to the retention set can
+    /// change this Kotlin file's retention coverage on a later fixpoint pass.
+    /// Matching deliberately uses simple names, mirroring the conservative
+    /// collision behavior of the existing retained-subtype/supertype checks.
+    pub fn retained_delta_can_affect(&self, file: &Path, delta: &HashSet<String>) -> bool {
+        let source_file = self.source_file(file).or_else(|| {
+            fs::canonicalize(file)
+                .ok()
+                .and_then(|canonical| self.source_file(&canonical))
+        });
+        let Some(source_file) = source_file else {
+            return false;
+        };
+        source_file.declarations.iter().any(|declaration| {
+            delta.contains(&declaration.name)
+                || declaration.supertypes.iter().any(|supertype| {
+                    let simple = supertype
+                        .split('<')
+                        .next()
+                        .unwrap_or(supertype)
+                        .trim()
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or_default();
+                    delta.contains(simple)
+                })
+                || (declaration.kind == DeclarationKind::Interface
+                    && self
+                        .subtype_names
+                        .get(&declaration.name)
+                        .is_some_and(|subtypes| {
+                            subtypes.iter().any(|subtype| delta.contains(subtype))
+                        }))
+        })
+    }
+
+    pub fn type_aliases_for(&self, file: &Path) -> Vec<(String, String)> {
+        let Some(using_file) = self.source_file(file) else {
+            return Vec::new();
+        };
+
+        let mut aliases = Vec::new();
+        for declaring_file in &self.files {
+            for (name, target) in &declaring_file.type_aliases {
+                let qualified = declaring_file
+                    .package
+                    .as_ref()
+                    .map(|package| format!("{package}.{name}"));
+                let visible = paths_match(&declaring_file.path, file)
+                    || qualified.as_ref().is_some_and(|qualified| {
+                        using_file.imports.iter().any(|import| import == qualified)
+                    })
+                    || using_file
+                        .package
+                        .as_ref()
+                        .zip(declaring_file.package.as_ref())
+                        .is_some_and(|(left, right)| left == right);
+                if !visible {
+                    continue;
+                }
+                let resolved = declaring_file
+                    .imports
+                    .iter()
+                    .find(|import| import.rsplit('.').next() == Some(target.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| target.clone());
+                aliases.push((name.clone(), resolved));
+            }
+        }
+        aliases.sort();
+        aliases.dedup_by(|left, right| left.0 == right.0);
+        aliases
     }
 
     pub fn has_kotlin_reference(&self, declaring_file: &Path, name: &str) -> bool {
@@ -271,6 +415,26 @@ impl SourceIndex {
     pub fn has_external_kotlin_reference(&self, declaring_file: &Path, name: &str) -> bool {
         self.kotlin_files().any(|file| {
             !paths_match(&file.path, declaring_file) && file.identifier_counts.contains_key(name)
+        })
+    }
+
+    /// A residual (retained) Kotlin file — not the declaring file —
+    /// references `name`. When the referenced declaration is a translated
+    /// object singleton, the plain-name expression in the residual source
+    /// would break, so callers retain the declaration.
+    pub fn has_retained_kotlin_reference(
+        &self,
+        declaring_file: &Path,
+        name: &str,
+        retained: &HashSet<String>,
+    ) -> bool {
+        self.kotlin_files().any(|file| {
+            !paths_match(&file.path, declaring_file)
+                && file.identifier_counts.get(name).copied().unwrap_or(0) > 0
+                && file
+                    .declarations
+                    .iter()
+                    .any(|decl| retained.contains(&decl.name))
         })
     }
 
@@ -297,6 +461,61 @@ impl SourceIndex {
 
     pub fn has_enum_entries_consumer(&self, owner: &str) -> bool {
         self.has_java_get_entries_consumer(owner) || self.has_kotlin_enum_entries_consumer(owner)
+    }
+
+    /// A Kotlin file that will SURVIVE this run reads `<owner>.entries`: only
+    /// such a consumer keeps the enum's Kotlin `entries` ABI alive. Java
+    /// consumers are served by the emitted `getEntries()` bridge, and Kotlin
+    /// files that translate away lower their own reads in the same run.
+    pub fn has_retained_kotlin_enum_entries_consumer(
+        &self,
+        owner: &str,
+        retained: &HashSet<String>,
+        translation_roots: &[PathBuf],
+    ) -> bool {
+        self.kotlin_files().any(|file| {
+            if !file.enum_entries_qualifiers.contains_key(owner) {
+                return false;
+            }
+            let declares_owner = file.declarations.iter().any(|decl| decl.name == owner);
+            if !self.is_selected(&file.path, translation_roots) {
+                // Outside the translation set: the whole file stays Kotlin.
+                return true;
+            }
+            file.declarations.iter().any(|decl| {
+                retained.contains(&decl.name) && !(declares_owner && decl.name == owner)
+            })
+        })
+    }
+
+    /// `name` is referenced by Kotlin that survives the run, so the referenced
+    /// ABI must survive with it. A file outside the translation set stays
+    /// Kotlin whole; inside it, only the declarations the fixpoint retains do.
+    /// The declaring file counts only through its OTHER retained declarations
+    /// (its references lower together with the declaration).
+    pub fn has_surviving_kotlin_reference(
+        &self,
+        declaring_file: &Path,
+        name: &str,
+        retained: &HashSet<String>,
+        translation_roots: &[PathBuf],
+    ) -> bool {
+        self.kotlin_files().any(|file| {
+            let references = file.identifier_counts.get(name).copied().unwrap_or(0);
+            if references == 0 {
+                return false;
+            }
+            let same_file = paths_match(&file.path, declaring_file);
+            if same_file && references <= 1 {
+                return false;
+            }
+            if !self.is_selected(&file.path, translation_roots) {
+                return true;
+            }
+            file.declarations.iter().any(|decl| {
+                retained.contains(&decl.name) && !(same_file && decl.name == name)
+            })
+        })
     }
 
     /// The recorded type of a property named exactly `prop` (lower-case
@@ -595,6 +814,92 @@ impl SourceIndex {
         })
     }
 
+    /// Non-static properties inherited by `type_name` in `declaring`'s import
+    /// context. Interface default bodies may read those properties through
+    /// Kotlin's implicit receiver even when the property is declared only on a
+    /// superinterface; Java must call `this.getProperty()`.
+    pub fn inherited_property_names_in_file(
+        &self,
+        declaring: &Path,
+        type_name: &str,
+    ) -> Vec<String> {
+        let _ = declaring;
+        let Some(declaration) = self.declarations_named(type_name).next() else {
+            return Vec::new();
+        };
+        let mut names = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut pending = declaration.supertypes.clone();
+        while let Some(supertype) = pending.pop() {
+            let simple = supertype
+                .split('<')
+                .next()
+                .unwrap_or(&supertype)
+                .trim()
+                .rsplit('.')
+                .next()
+                .unwrap_or_default();
+            if !visited.insert(simple.to_string()) {
+                continue;
+            }
+            for parent in self.declarations_named(simple) {
+                names.extend(
+                    parent
+                        .members
+                        .iter()
+                        .filter(|member| member.kind == MemberKind::Property && !member.is_static)
+                        .map(|member| member.name.clone()),
+                );
+                pending.extend(parent.supertypes.iter().cloned());
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// The Java type of a property `prop` inherited by `type_name` through
+    /// its supertype chain — the override-narrowing rule: a Kotlin
+    /// `override val x` WITHOUT a declared type must keep the supertype's
+    /// declared type (Java has no bridging getter; emitting the erased
+    /// initializer type instead `clashes with getX() in <super>` at javac).
+    pub fn inherited_property_type_in_file(
+        &self,
+        declaring: &Path,
+        type_name: &str,
+        prop: &str,
+    ) -> Option<String> {
+        let _ = declaring;
+        let declaration = self.declarations_named(type_name).next()?;
+        let mut visited = HashSet::new();
+        let mut pending = declaration.supertypes.clone();
+        while let Some(supertype) = pending.pop() {
+            let simple = supertype
+                .split('<')
+                .next()
+                .unwrap_or(&supertype)
+                .trim()
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if !visited.insert(simple.clone()) {
+                continue;
+            }
+            for parent in self.declarations_named(&simple) {
+                if let Some(member) = parent
+                    .members
+                    .iter()
+                    .find(|m| m.kind == MemberKind::Property && m.name == prop)
+                {
+                    if let Some(t) = &member.type_name {
+                        return Some(t.clone());
+                    }
+                }
+                pending.extend(parent.supertypes.iter().cloned());
+            }
+        }
+        None
+    }
+
     /// A workspace declaration owning a STATIC member `name` (companion
     /// object function/property owned by the declaration itself). The
     /// declaration's language tells the caller whether the callee is Java
@@ -628,9 +933,85 @@ impl SourceIndex {
             .next()
     }
 
+    /// Static companion property `member` owned by `owner`.
+    pub fn find_static_property(&self, owner: &str, member: &str) -> Option<&Declaration> {
+        self.declarations().find(|d| {
+            d.name == owner
+                && d.members
+                    .iter()
+                    .any(|m| m.name == member && m.kind == MemberKind::Property)
+        })
+    }
+
     pub fn declarations(&self) -> impl Iterator<Item = &Declaration> {
         self.files.iter().flat_map(|file| file.declarations.iter())
     }
+
+    /// Every declaration with this simple name, including collisions across
+    /// packages. This preserves the conservative semantics of name-based
+    /// workspace compatibility checks without re-scanning every declaration.
+    pub fn declarations_named(&self, name: &str) -> impl Iterator<Item = &Declaration> {
+        self.declaration_names.get(name).into_iter().flatten().map(
+            |&(file_index, declaration_index)| {
+                &self.files[file_index].declarations[declaration_index]
+            },
+        )
+    }
+    /// Whether `name` resolves to a Kotlin `object` declaration that Java
+    /// can also see (kind == Object). Java callers must reference the
+    /// singleton as `Name.INSTANCE` (a bare `Name` would attempt a
+    /// constructor call).
+    pub fn object_declaration_named(&self, name: &str) -> Option<&Declaration> {
+        self.declarations_named(name)
+            .find(|decl| decl.kind == crate::workspace::DeclarationKind::Object)
+    }
+
+    /// Java getter name generated for a Kotlin property `id` (`getId`)
+    /// inherited from a Kotlin supertype chain member FUNCTION with a
+    /// different return type. When such a member exists (e.g.
+    /// `fun getId(): LookupEntityId` in a base class), the translated
+    /// subtype must NOT synthesize its own getter for the same name: the
+    /// base function stands in as the getter and any synthesized getter
+    /// clashes on return type.
+    pub fn inherited_fun_getter_conflicts(
+        &self,
+        declaring_file: &Path,
+        decl_name: &str,
+        getter_name: &str,
+    ) -> bool {
+        let Some(source) = self.source_file(declaring_file) else {
+            return false;
+        };
+        let Some(target) = source.declarations.iter().find(|d| d.name == decl_name) else {
+            return false;
+        };
+        let mut queue: Vec<&Declaration> = Vec::new();
+        for supertype in &target.supertypes {
+            if let Some(next) = self.resolve_kotlin_type(source, supertype) {
+                queue.push(next);
+            }
+        }
+        let mut visited: HashSet<String> = HashSet::new();
+        while let Some(decl) = queue.pop() {
+            if !visited.insert(declaration_key(decl)) {
+                continue;
+            }
+            if decl
+                .members
+                .iter()
+                .any(|member| member.kind == MemberKind::Method && member.name == getter_name)
+            {
+                return true;
+            }
+            for supertype in &decl.supertypes {
+                if let Some(next) = self.resolve_kotlin_type(source, supertype) {
+                    queue.push(next);
+                }
+            }
+        }
+        false
+    }
+
     pub fn is_selected(&self, path: &Path, translation_roots: &[PathBuf]) -> bool {
         translation_roots.iter().any(|root| {
             if path.starts_with(root) {
@@ -662,7 +1043,6 @@ impl SourceIndex {
     pub fn has_kotlin_subtype(&self, target: &Declaration) -> bool {
         self.kotlin_subtypes.contains_key(&declaration_key(target))
     }
-
     /// Retention fixpoint seed: true when any simple-name Kotlin subtype of
     /// `target` is retained for an INTRINSIC reason (its own file taints
     /// under the current fixpoint pass, independent of the subtype rule).
@@ -737,6 +1117,7 @@ impl SourceIndex {
         &self,
         source_file: &SourceFile,
         target: &Declaration,
+        translation_roots: &[std::path::PathBuf],
     ) -> bool {
         let own_properties: HashSet<&str> = target
             .members
@@ -747,6 +1128,16 @@ impl SourceIndex {
         let mut inherited_properties = HashSet::new();
         for supertype in &target.supertypes {
             if let Some(declaration) = self.resolve_kotlin_type(source_file, supertype) {
+                // When the property-owning supertype itself translates in
+                // this run, its getter lowers into Java together with the
+                // implementor; no mixed-ABI collision exists. Retention is
+                // only needed when the interface remains Kotlin.
+                if self
+                    .declaration_source_file(declaration)
+                    .is_some_and(|file| self.is_selected(&file.path, translation_roots))
+                {
+                    continue;
+                }
                 self.collect_retained_interface_property_names(
                     declaration,
                     &mut HashSet::new(),
@@ -761,13 +1152,19 @@ impl SourceIndex {
             return true;
         }
 
-        self.has_retained_property_branch_collision(source_file, target, &mut HashSet::new())
+        self.has_retained_property_branch_collision(
+            source_file,
+            target,
+            translation_roots,
+            &mut HashSet::new(),
+        )
     }
 
     fn has_retained_property_branch_collision(
         &self,
         source_file: &SourceFile,
         declaration: &Declaration,
+        translation_roots: &[std::path::PathBuf],
         visited: &mut HashSet<String>,
     ) -> bool {
         if !visited.insert(declaration_key(declaration)) {
@@ -780,6 +1177,12 @@ impl SourceIndex {
             let Some(supertype) = self.resolve_kotlin_type(source_file, supertype) else {
                 continue;
             };
+            if self
+                .declaration_source_file(supertype)
+                .is_some_and(|file| self.is_selected(&file.path, translation_roots))
+            {
+                continue;
+            }
             let mut branch_properties = HashSet::new();
             self.collect_retained_interface_property_names(
                 supertype,
@@ -797,7 +1200,12 @@ impl SourceIndex {
 
         direct_supertypes.into_iter().any(|supertype| {
             self.declaration_source_file(supertype).is_some_and(|file| {
-                self.has_retained_property_branch_collision(file, supertype, visited)
+                self.has_retained_property_branch_collision(
+                    file,
+                    supertype,
+                    translation_roots,
+                    visited,
+                )
             })
         })
     }
@@ -996,6 +1404,17 @@ impl SourceIndex {
     }
 }
 
+/// Inverse of the Java getter-name mapping for a Kotlin property:
+/// `getId` -> `id`.
+fn property_for_getter(getter: &str) -> String {
+    let stripped = getter.strip_prefix("get").unwrap_or(getter);
+    let mut chars = stripped.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 fn declaration_key(declaration: &Declaration) -> String {
     match &declaration.package {
         Some(package) => format!("{package}.{}", declaration.name),
@@ -1141,9 +1560,9 @@ fn scan_directory(
 ) -> Result<CachedDirectory, String> {
     let directory = root.join(relative);
     let mut directory_entries = fs::read_dir(&directory)
-        .map_err(|error| format!("{}: {error}", directory.display()))?
+        .map_err(|error| format!("{}: {error}", crate::paths::display(directory)))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("{}: {error}", directory.display()))?;
+        .map_err(|error| format!("{}: {error}", crate::paths::display(directory)))?;
     directory_entries.sort_by_key(|entry| entry.file_name());
 
     let mut entries = BTreeMap::new();
@@ -1153,7 +1572,7 @@ fn scan_directory(
         let path = entry.path();
         let file_type = entry
             .file_type()
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+            .map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
         if should_skip_directory(&name) && (file_type.is_dir() || file_type.is_symlink()) {
             continue;
         }
@@ -1166,7 +1585,7 @@ fn scan_directory(
             match fs::metadata(&path) {
                 Ok(metadata) => Some(metadata.file_type()),
                 Err(_) if source_language().is_none() => continue,
-                Err(error) => return Err(format!("{}: {error}", path.display())),
+                Err(error) => return Err(format!("{}: {error}", crate::paths::display(path))),
             }
         } else {
             None
@@ -1178,7 +1597,7 @@ fn scan_directory(
 
         if is_directory {
             let canonical_directory =
-                fs::canonicalize(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                fs::canonicalize(&path).map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
             if !visited_directories.insert(canonical_directory) {
                 continue;
             }
@@ -1229,9 +1648,9 @@ fn scan_source(
     stats: &mut IndexStats,
 ) -> Result<CachedSource, String> {
     let canonical_path =
-        fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        fs::canonicalize(path).map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
     let metadata = fs::metadata(&canonical_path)
-        .map_err(|error| format!("{}: {error}", canonical_path.display()))?;
+        .map_err(|error| format!("{}: {error}", crate::paths::display(canonical_path)))?;
     let size = metadata.len();
     let modified_nanos = metadata
         .modified()
@@ -1241,7 +1660,7 @@ fn scan_source(
         .unwrap_or(0);
 
     let bytes = fs::read(&canonical_path)
-        .map_err(|error| format!("{}: {error}", canonical_path.display()))?;
+        .map_err(|error| format!("{}: {error}", crate::paths::display(canonical_path)))?;
     let digest = *blake3::hash(&bytes).as_bytes();
     if let Some(previous) = previous
         && previous.digest == digest
@@ -1258,11 +1677,16 @@ fn scan_source(
     }
 
     let source = String::from_utf8(bytes)
-        .map_err(|error| format!("{}: {error}", canonical_path.display()))?;
+        .map_err(|error| format!("{}: {error}", crate::paths::display(canonical_path)))?;
     let package = package_name(&source);
     let imports = import_names(&source);
-    let (declarations, identifier_counts, enum_entries_qualifiers, smart_cast_properties) =
-        parse_declarations(&source, language, package.as_deref())?;
+    let (
+        declarations,
+        type_aliases,
+        identifier_counts,
+        enum_entries_qualifiers,
+        smart_cast_properties,
+    ) = parse_declarations(&source, language, package.as_deref())?;
     stats.parsed_files += 1;
     Ok(CachedSource {
         size,
@@ -1274,6 +1698,7 @@ fn scan_source(
             package,
             imports,
             declarations,
+            type_aliases,
             identifier_counts,
             enum_entries_qualifiers,
             smart_cast_properties,
@@ -1308,6 +1733,7 @@ fn import_names(source: &str) -> Vec<String> {
 /// declaration tree (factored out of a tuple so the signature stays legible).
 type ParseDeclarations = (
     Vec<Declaration>,
+    HashMap<String, String>,
     HashMap<String, usize>,
     HashMap<String, usize>,
     HashSet<String>,
@@ -1330,6 +1756,7 @@ fn parse_declarations(
         .parse(source, None)
         .ok_or_else(|| "source parse failed".to_string())?;
     let mut declarations = Vec::new();
+    let mut type_aliases = HashMap::new();
     // Walk the whole tree so NESTED declarations (a class declared inside
     // another class body) are indexed too: the retention fixpoint must see
     // a nested Kotlin class's implements edge, or its supertype interface
@@ -1341,9 +1768,24 @@ fn parse_declarations(
         .collect();
     stack.reverse();
     while let Some(node) = stack.pop() {
+        if language == SourceLanguage::Kotlin && node.kind() == "type_alias" {
+            let alias = node.child_by_field_name("type");
+            let target = node
+                .children(&mut node.walk())
+                .find(|child| child.kind() == "user_type");
+            if let (Some(alias), Some(target)) = (alias, target)
+                && let (Ok(alias), Ok(target)) = (
+                    alias.utf8_text(source.as_bytes()),
+                    target.utf8_text(source.as_bytes()),
+                )
+            {
+                type_aliases.insert(alias.to_string(), target.to_string());
+            }
+        }
         if let Some((kind, name_node)) = declaration_shape(node, language) {
             let name = node_text(name_node, source)?;
             if !declarations.iter().any(|d: &Declaration| d.name == name) {
+                let ctor_params = constructor_param_names(node, language, source);
                 declarations.push(Declaration {
                     name: name.clone(),
                     package: package.map(str::to_string),
@@ -1352,6 +1794,11 @@ fn parse_declarations(
                     supertypes: supertypes(node, language, source),
                     members: members(node, language, source),
                     has_default_constructor_parameter: has_default_constructor_parameter(
+                        node, language,
+                    ),
+                    constructor_param_count: ctor_params.len(),
+                    constructor_param_names: ctor_params,
+                    has_non_trailing_default: has_non_trailing_default_constructor_parameter(
                         node, language,
                     ),
                     type_params: type_param_names(node, source),
@@ -1381,6 +1828,7 @@ fn parse_declarations(
     }
     Ok((
         declarations,
+        type_aliases,
         identifier_counts,
         enum_entries_qualifiers,
         smart_cast_properties,
@@ -1463,6 +1911,93 @@ fn collect_identifier_counts(
     for child in node.named_children(&mut node.walk()) {
         collect_identifier_counts(child, source, counts);
     }
+}
+
+/// Primary-constructor parameter names in declaration order. Used to lower
+/// Kotlin named arguments positionally (`MethodCall(name = "x", params = p)`
+/// has no Java form) and, via the length, as the constructor arity a call site
+/// may fill omitted trailing defaults from. Only a real constructor parameter
+/// counts: a companion contributes static members and a class body adds
+/// properties that are not parameters (`data class X(val a: T = d) { override
+/// val b: U get() = ... }` has arity 1, not 2).
+fn constructor_param_names(
+    node: tree_sitter::Node<'_>,
+    language: SourceLanguage,
+    source: &str,
+) -> Vec<String> {
+    if language != SourceLanguage::Kotlin {
+        return Vec::new();
+    }
+    let Some(constructor) = node.child_by_field_name("primary_constructor").or_else(|| {
+        node.children(&mut node.walk())
+            .find(|child| child.kind() == "primary_constructor")
+    }) else {
+        return Vec::new();
+    };
+    let Some(parameters) = constructor
+        .children(&mut constructor.walk())
+        .find(|child| child.kind() == "class_parameters")
+    else {
+        return Vec::new();
+    };
+    parameters
+        .named_children(&mut parameters.walk())
+        .filter(|parameter| parameter.kind() == "class_parameter")
+        .filter_map(|parameter| {
+            if let Some(name_node) = parameter
+                .named_children(&mut parameter.walk())
+                .find(|child| child.kind() == "identifier")
+                && let Ok(name) = node_text(name_node, source)
+            {
+                return Some(name.to_string());
+            }
+            // Fall back to the raw parameter text before the `:`/`=`.
+            let text = node_text(parameter, source).ok()?;
+            let name: String = text
+                .trim_start_matches("override ")
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+fn has_non_trailing_default_constructor_parameter(
+    node: tree_sitter::Node<'_>,
+    language: SourceLanguage,
+) -> bool {
+    if language != SourceLanguage::Kotlin {
+        return false;
+    }
+    let Some(constructor) = node.child_by_field_name("primary_constructor").or_else(|| {
+        node.children(&mut node.walk())
+            .find(|child| child.kind() == "primary_constructor")
+    }) else {
+        return false;
+    };
+    let Some(parameters) = constructor
+        .children(&mut constructor.walk())
+        .find(|child| child.kind() == "class_parameters")
+    else {
+        return false;
+    };
+    let defaulted: Vec<bool> = parameters
+        .named_children(&mut parameters.walk())
+        .filter(|parameter| parameter.kind() == "class_parameter")
+        .map(|parameter| {
+            parameter
+                .children(&mut parameter.walk())
+                .any(|child| child.kind() == "=")
+        })
+        .collect();
+    // A default is unexpressible in Java only when a later parameter has none:
+    // trailing defaults become delegating overloads, middle ones cannot.
+    defaulted
+        .iter()
+        .enumerate()
+        .any(|(index, has_default)| *has_default && defaulted[index + 1..].iter().any(|d| !d))
 }
 
 fn has_default_constructor_parameter(
@@ -1569,6 +2104,13 @@ fn declaration_shape(
         (SourceLanguage::Java, "record_declaration") => node
             .child_by_field_name("name")
             .map(|name| (DeclarationKind::Record, name)),
+        // A Java `@interface` is an annotation TYPE. Without it the index has
+        // no `Annotation` declaration for annotations that were always Java,
+        // and rules that key on one (e.g. the `Default` constructor marker
+        // MapStruct consumes) silently find nothing.
+        (SourceLanguage::Java, "annotation_type_declaration") => node
+            .child_by_field_name("name")
+            .map(|name| (DeclarationKind::Annotation, name)),
         _ => None,
     }
 }
@@ -1672,6 +2214,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 kind: MemberKind::Property,
                 visibility: None,
                 is_static: false,
+                is_jvm_field: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
                 is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
             });
@@ -1771,6 +2314,8 @@ fn member_from_node(
             .trim()
             .to_string()
     });
+    let is_static = modifiers.split_whitespace().any(|word| word == "static");
+    let is_jvm_field = modifiers.contains("JvmField");
     Some(Member {
         name: if name.is_empty() {
             "<init>".to_string()
@@ -1779,7 +2324,8 @@ fn member_from_node(
         },
         kind,
         visibility,
-        is_static: modifiers.split_whitespace().any(|word| word == "static"),
+        is_static,
+        is_jvm_field,
         type_name,
         is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
     })

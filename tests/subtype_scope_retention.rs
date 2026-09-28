@@ -48,7 +48,7 @@ fn interface_with_only_selected_kotlin_subtypes_translate_via_fixpoint() {
         "clean hub and implementor in one selection must both translate.\nstderr:\n{stderr}"
     );
     assert!(
-        !stderr.contains("N7395"),
+        !stderr.contains("remain Kotlin"),
         "selected-subtype retention must not fire:\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
@@ -92,7 +92,7 @@ fn interface_with_unselected_kotlin_subtype_still_retained() {
         "hub with an UNSELECTED Kotlin subtype must stay Kotlin, got:\n{speaker_java}"
     );
     assert!(
-        stderr.contains("N7395"),
+        stderr.contains("remain Kotlin"),
         "expected the retention diagnostic, stderr:\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);

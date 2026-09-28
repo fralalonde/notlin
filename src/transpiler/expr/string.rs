@@ -2,7 +2,7 @@
 
 use super::Expr;
 
-impl<'a, 'u> Expr<'a, 'u> {
+impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn string_literal(&mut self, node: tree_sitter::Node) -> String {
         // Walk the grammar's own children. Two forms:
         //  - `${expr}`: a real `interpolation` node — transpile its expression
@@ -95,7 +95,7 @@ impl<'a, 'u> Expr<'a, 'u> {
     }
 }
 
-impl<'a, 'u> Expr<'a, 'u> {
+impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     /// Transpile a bare identifier spliced by string interpolation with the
     /// same rules as a real `identifier` expression node: property accessors
     /// on the implicit `this` (`"...$name..." -> "..." + this.getName()`).
@@ -104,7 +104,6 @@ impl<'a, 'u> Expr<'a, 'u> {
             return format!("{}.INSTANCE", ident);
         }
         if !self.unit.var_types.contains_key(ident)
-            && self.unit.var_types.is_empty()
             && let Some(getter) = self.unit.self_getters.get(ident)
         {
             return format!("this.{}()", getter);

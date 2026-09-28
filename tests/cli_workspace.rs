@@ -60,6 +60,33 @@ fn explicit_target_directory_is_transpiled() {
 }
 
 #[test]
+fn directory_input_migrates_in_place_without_extra_flags() {
+    let root =
+        std::env::temp_dir().join(format!("notlin-directory-migrate-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("Sample.kt"), "package sample\nclass Sample\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .current_dir(&root)
+        .arg("--root")
+        .arg(&root)
+        .arg(&target)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(target.join("Sample.java").is_file());
+    assert!(!target.join("Sample.kt").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn default_run_emits_only_the_final_summary() {
     let root = std::env::temp_dir().join(format!("notlin-quiet-cli-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);

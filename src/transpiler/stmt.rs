@@ -4,11 +4,11 @@ use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 use crate::transpiler::unit::Unit;
 
-pub struct Stmt<'a, 'u> {
-    pub unit: &'a mut Unit<'u>,
+pub struct Stmt<'a, 'src, 'tree> {
+    pub unit: &'a mut Unit<'src, 'tree>,
 }
 
-impl<'a, 'u> Stmt<'a, 'u> {
+impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
     pub fn transpile(&mut self, stmt: tree_sitter::Node, out: &mut JavaOut) {
         match stmt.kind() {
             "property_declaration" => self.transpile_local_property(stmt, out),
@@ -26,6 +26,10 @@ impl<'a, 'u> Stmt<'a, 'u> {
                 // List.joinToString doesn't exist in Java, so swap the pair
                 // for a single joining(sep) collect.
                 let java = fix_join_tail(&java);
+                // Reified-generic call sites that survived every assembly
+                // path verbatim (`recv.get<T>()`): lower to the Class<T> ABI
+                // here as the last textual gate.
+                let java = crate::transpiler::expr::rewrite_reified_type_args(&java);
                 out.line(format!("{};", java));
             }
             "block" => {
@@ -71,6 +75,8 @@ impl<'a, 'u> Stmt<'a, 'u> {
                         out.line(format!("if ({}) {} else {};", cond, a, b));
                     }
                 } else if !java.is_empty() {
+                    // Same reified text gate as the call arm above.
+                    let java = crate::transpiler::expr::rewrite_reified_type_args(&java);
                     // Emitted fragments may already carry a trailing `;`
                     // (if/else lifters) — avoid `;;`.
                     let jt = java.trim_end().trim_end_matches(';');
@@ -342,6 +348,8 @@ impl<'a, 'u> Stmt<'a, 'u> {
                 java.push_str(".toString()");
             }
             let java = fix_join_tail(&java);
+            // Reified-generic gate: `recv.get<T>()` -> `recv.get(T.class)`.
+            let java = crate::transpiler::expr::rewrite_reified_type_args(&java);
             // A Nothing-typed return expression (e.g. `TODO(...)`) lowers to
             // `throw ...` — a statement, not a value. Emit it bare.
             if java.trim_start().starts_with("throw ") {
@@ -480,11 +488,51 @@ impl<'a, 'u> Stmt<'a, 'u> {
                 "true".to_string()
             });
 
+        // Kotlin narrows a repeated property expression after `if (value is T)`.
+        // Java does not: its accessor call keeps the declared return type. Keep
+        // the condition unchanged and cast matching accesses emitted in this
+        // branch only, so `holder.value.key` becomes
+        // `((T) holder.value()).getKey()`.
+        let smart_cast = cond.and_then(|c| {
+            let c = unwrap_parens(c);
+            if c.kind() != "is_expression" {
+                return None;
+            }
+            let mut cursor = c.walk();
+            let named: Vec<_> = c
+                .children(&mut cursor)
+                .filter(|child| child.is_named())
+                .collect();
+            let target = named.first().copied()?;
+            let ty = named.get(1).copied()?;
+            let target_java = {
+                let mut e = Expr { unit: self.unit };
+                e.transpile(target)
+            };
+            let ty_java = kt::java_type(ty, self.unit.source);
+            Some((target_java, ty_java))
+        });
+        let negative_return_guard = cond
+            .filter(|c| self.unit.text(unwrap_parens(*c)).contains("!is"))
+            .zip(blocks.first().copied())
+            .filter(|(_, body)| self.unit.text(*body).trim_start().starts_with("return"))
+            .and_then(|_| smart_cast.clone());
+
         out.open(format!("if ({})", cond_java));
         if let Some(b) = blocks.first() {
+            let body_start = out.buf.len();
             self.transpile_body(*b, out);
+            if let Some((target_java, ty_java)) = smart_cast {
+                let body = out.buf[body_start..].to_string();
+                let narrowed = format!("(({}) {})", ty_java, target_java);
+                out.buf.truncate(body_start);
+                out.buf.push_str(&body.replace(&target_java, &narrowed));
+            }
         }
         out.close();
+        if let Some((target_java, ty_java)) = negative_return_guard {
+            self.unit.flow_smart_casts.insert(target_java, ty_java);
+        }
 
         // else / else-if
         let else_idx = children.iter().position(|c| c.kind() == "else");

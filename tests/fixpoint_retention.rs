@@ -8,6 +8,7 @@
 //! target builds failed on 5499 kotlinc errors because subtypes retained by
 //! unrelated rules were suddenly implementing translated-away interfaces.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -46,7 +47,7 @@ fn clean_hub_and_implementor_translate_together() {
         "clean hub and implementor must both translate.\nstderr:\n{stderr}"
     );
     assert!(
-        !stderr.contains("N7395"),
+        !stderr.contains("remain Kotlin"),
         "no retention diagnostic expected:\n{stderr}"
     );
     // Both were stripped from the .kt source.
@@ -145,8 +146,31 @@ fn marker_annotation_implementor_translates_with_hub() {
         "Java-representable annotation family must translate.\nstderr:\n{stderr}"
     );
     assert!(
-        !stderr.contains("N7395"),
+        !stderr.contains("remain Kotlin"),
         "no retention diagnostic expected:\n{stderr}"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn retained_delta_rechecks_only_reverse_dependency_files() {
+    let root = Path::new("tests/tmp_scratch_fixpoint_dependencies");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    let hub = root.join("hub.kt");
+    let retained = root.join("retained.kt");
+    let child = root.join("child.kt");
+    let unrelated = root.join("unrelated.kt");
+    fs::write(&hub, "interface Hub\n").unwrap();
+    fs::write(&retained, "interface Retained : Hub\n").unwrap();
+    fs::write(&child, "class Child : Retained\n").unwrap();
+    fs::write(&unrelated, "class Unrelated\n").unwrap();
+
+    let index = notlin::workspace::SourceIndex::discover(root).unwrap();
+    let delta = HashSet::from(["Retained".to_string()]);
+    assert!(index.retained_delta_can_affect(&hub, &delta));
+    assert!(index.retained_delta_can_affect(&retained, &delta));
+    assert!(index.retained_delta_can_affect(&child, &delta));
+    assert!(!index.retained_delta_can_affect(&unrelated, &delta));
     let _ = fs::remove_dir_all(root);
 }
