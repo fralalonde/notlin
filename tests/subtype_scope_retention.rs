@@ -6,6 +6,7 @@
 //! interface and fail) — that case is covered by has_unselected_kotlin_subtype
 //! and the retained-property fake-override rules.
 
+use notlin::diagnostics::RetentionKind;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -92,7 +93,7 @@ fn interface_with_unselected_kotlin_subtype_still_retained() {
         "hub with an UNSELECTED Kotlin subtype must stay Kotlin, got:\n{speaker_java}"
     );
     assert!(
-        stderr.contains("remain Kotlin"),
+        stderr.contains(RetentionKind::SubtypeOutsideTranslationSet.summary()),
         "expected the retention diagnostic, stderr:\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);

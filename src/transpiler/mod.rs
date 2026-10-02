@@ -243,6 +243,7 @@ pub(crate) fn transpile_with_tree_hint_selection(
             file: file.to_path_buf(),
             line,
             col,
+            code: None,
         });
     }
     if tree.root_node().has_error() {

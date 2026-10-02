@@ -1,5 +1,5 @@
 use colored::Colorize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -57,6 +57,10 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub kind: DiagnosticKind,
     pub message: String,
+    /// Set when the code must not depend on the message: a retention warning
+    /// names the specific element it blocked on, but its code identifies the
+    /// blocker TYPE, so it is the same code the run-end table row shows.
+    pub code: Option<String>,
     pub file: PathBuf,
     pub line: usize,
     pub col: usize,
@@ -76,7 +80,9 @@ impl Diagnostic {
     }
 
     pub fn warning_code(&self) -> String {
-        warning_code(&self.message)
+        self.code
+            .clone()
+            .unwrap_or_else(|| warning_code(&self.message))
     }
 }
 
@@ -111,6 +117,7 @@ impl Diagnostics {
             file: file.to_path_buf(),
             line: node.start_position().row + 1,
             col: node.start_position().column + 1,
+            code: None,
         });
     }
 
@@ -129,6 +136,7 @@ impl Diagnostics {
             file: file.to_path_buf(),
             line: node.start_position().row + 1,
             col: node.start_position().column + 1,
+            code: None,
         });
     }
 
@@ -166,6 +174,7 @@ impl Diagnostics {
             file: file.to_path_buf(),
             line: node.start_position().row + 1,
             col: node.start_position().column + 1,
+            code: None,
         });
     }
 
@@ -178,6 +187,7 @@ impl Diagnostics {
             file: file.to_path_buf(),
             line: node.start_position().row + 1,
             col: node.start_position().column + 1,
+            code: None,
         });
     }
 }
@@ -216,18 +226,138 @@ impl FileCoverage {
     }
 }
 
+/// Every way a declaration can be held back — as a TYPE, not as a message.
+///
+/// The code identifies the blocker kind: it is derived from [`Self::summary`],
+/// which never carries parameters, so one kind is one code and one summary row
+/// no matter how many declarations or which elements it covers. [`Self::detail`]
+/// is the parameterized text that names the specific element for the
+/// per-declaration warning line and the `NOTLIN_RETENTION_SITES` dump.
+///
+/// Adding a variant is the only way to add a blocker type: a reason that
+/// reaches the table as free text would hash to a code per parameter value,
+/// which is exactly the fragmentation this enum removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RetentionKind {
+    /// A Kotlin subtype sits outside the translation set, so the supertype
+    /// cannot move without breaking it.
+    SubtypeOutsideTranslationSet,
+    /// The declaration is an interface with a retained Kotlin implementor.
+    InterfaceSubtypeRetained,
+    /// A retained Kotlin declaration inherits from it.
+    RetainedInheritor,
+    /// A caller omits a defaulted constructor parameter and no delegating
+    /// overload can supply it: the pattern collides with another constructor
+    /// after erasure, the default expression names a parameter the pattern does
+    /// not supply, or the call shape could not be read. A middle default nobody
+    /// omits is NOT this blocker — Java is given it by inlining the literal or by
+    /// an overload for the exact pattern.
+    MiddleDefaultParameter,
+    /// A retained Kotlin file references it by plain name.
+    ReferencedFromRetainedKotlin,
+    /// It narrows a nullable Kotlin property a Kotlin supertype declares.
+    NullableNarrowing,
+    /// It inherits a property interface that stays Kotlin.
+    RetainedPropertyInterface,
+    /// Retained Kotlin smart-casts one of its properties.
+    SmartCast,
+    /// One of its supertypes stays Kotlin.
+    RetainedSupertype,
+    /// A Kotlin supertype declares members with types Java cannot override
+    /// exactly; erasing them would emit raw types, which JPA rejects.
+    SupertypeMemberType,
+}
+
+impl RetentionKind {
+    /// All kinds, for tests and for anything that needs to enumerate the
+    /// vocabulary rather than discover it from a run.
+    pub const ALL: [RetentionKind; 10] = [
+        RetentionKind::SubtypeOutsideTranslationSet,
+        RetentionKind::InterfaceSubtypeRetained,
+        RetentionKind::RetainedInheritor,
+        RetentionKind::MiddleDefaultParameter,
+        RetentionKind::ReferencedFromRetainedKotlin,
+        RetentionKind::NullableNarrowing,
+        RetentionKind::RetainedPropertyInterface,
+        RetentionKind::SmartCast,
+        RetentionKind::RetainedSupertype,
+        RetentionKind::SupertypeMemberType,
+    ];
+
+    /// The non-parameterized description: the summary row for this kind, and
+    /// the text its code is derived from.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::SubtypeOutsideTranslationSet => "a Kotlin subtype is outside the translation set",
+            Self::InterfaceSubtypeRetained => "an interface subtype is itself retained in Kotlin",
+            Self::RetainedInheritor => "a retained Kotlin declaration inherits from it",
+            Self::MiddleDefaultParameter => {
+                "a caller omits a default argument that cannot be lowered to Java"
+            }
+
+            Self::ReferencedFromRetainedKotlin => "referenced by name from retained Kotlin",
+            Self::NullableNarrowing => "narrows a nullable Kotlin property",
+            Self::RetainedPropertyInterface => "inherits a retained Kotlin property interface",
+            Self::SmartCast => "retained Kotlin smart-casts one of its properties",
+            Self::RetainedSupertype => "one of its supertypes is retained in Kotlin",
+            Self::SupertypeMemberType => {
+                "a Kotlin supertype declares a member with a type Java cannot override exactly"
+            }
+        }
+    }
+
+    /// The parameterized text template: the same blocker type, naming the
+    /// specific element this declaration was blocked on (the members in
+    /// conflict, the supertype, ...). Kinds with nothing to name return their
+    /// summary unchanged.
+    pub fn detail(self, params: &[String]) -> String {
+        match self {
+            Self::SupertypeMemberType if !params.is_empty() => format!(
+                "a Kotlin supertype declares {} with a type Java cannot override exactly; erasing the type arguments would emit raw types, which JPA rejects",
+                params.join(", ")
+            ),
+            Self::MiddleDefaultParameter if !params.is_empty() => format!(
+                "no delegating overload can serve the default-argument omission: {}",
+                params.join("; ")
+            ),
+            _ => self.summary().to_string(),
+        }
+    }
+
+    /// True for kinds that can only fire because another declaration is
+    /// retained: fallout nobody can fix directly. The live signal is a site's
+    /// recorded `blockers`; this is the fallback for a site whose blockers
+    /// could not be resolved, so it still cannot be read as human work.
+    pub fn is_cascade(self) -> bool {
+        matches!(
+            self,
+            Self::InterfaceSubtypeRetained
+                | Self::RetainedInheritor
+                | Self::ReferencedFromRetainedKotlin
+                | Self::RetainedPropertyInterface
+                | Self::RetainedSupertype
+        )
+    }
+
+    /// The stable code for this blocker type — on the warning line, in the
+    /// site dump, and in the summary row: one kind, one code.
+    pub fn code(self) -> String {
+        warning_code(&retention_message(self.summary()))
+    }
+}
+
 /// Canonical message for a declaration held back because residual Kotlin needs
 /// it. Shared by the diagnostic and the run-end retention table so both agree
 /// on the reason text — and therefore on the derived N-code.
 pub fn retention_message(reason: &str) -> String {
-    format!("workspace Kotlin implementation requires this declaration to remain Kotlin: {reason}")
+    format!("retained: {reason}")
 }
 
 /// The code a retention site prints — on its warning line AND in the run-end
 /// table row that summarises it. Both must derive it from the same message,
 /// or the code a human reads in the table greps to nothing in the log.
-pub fn retention_code(reason: &str) -> String {
-    warning_code(&retention_message(reason))
+pub fn retention_code(kind: RetentionKind) -> String {
+    kind.code()
 }
 
 /// A declaration that stayed Kotlin because residual Kotlin source still needs
@@ -237,33 +367,62 @@ pub fn retention_code(reason: &str) -> String {
 /// accepts or resolves — hence the run-end table.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RetentionSite {
-    /// Why the declaration was held back: either one of the fixed
-    /// `kotlin_retention_reason` texts, or a per-declaration reason naming the
-    /// members that conflict.
-    pub reason: String,
+    /// Which blocker TYPE held the declaration back. The code and the summary
+    /// row come from here, so the vocabulary is fixed and one kind is one row.
+    pub kind: RetentionKind,
+    /// What the kind was instantiated with: the conflicting members, and
+    /// anything else the parameterized text names. Empty for kinds that name
+    /// nothing. Detail only — never part of the code or the summary row.
+    pub params: Vec<String>,
     /// Source file the declaration lives in.
     pub file: String,
     /// 1-based declaration line.
     pub line: usize,
+    /// Simple name of the declaration — the node the blame graph is built on.
+    pub name: String,
+    /// The retained declarations this one waits for. EMPTY means the blocker is
+    /// intrinsic: a fact about the source that no other translation can clear,
+    /// which is what makes its kind a root a human can act on. Non-empty means
+    /// the declaration is fallout, and its reason is one a human cannot fix —
+    /// only the roots behind these names can be.
+    pub blockers: Vec<String>,
 }
 
-/// Secondary retention: the declaration stays Kotlin only because another one
-/// does, via a mechanically closed type hierarchy. Reported separately so the
-/// reasons a human can act on stay visible above the fallout.
-const CASCADE_REASONS: [&str; 2] = [
-    "one of its supertypes is retained in Kotlin",
-    "an interface subtype is itself retained in Kotlin",
-];
+/// One recorded site, before it is handed out as a [`RetentionSite`].
+#[derive(Clone)]
+struct Recorded {
+    kind: RetentionKind,
+    params: Vec<String>,
+    name: String,
+    blockers: Vec<String>,
+}
 
 /// Keyed by declaration site: a fixpoint reconsiders every declaration on every
 /// pass, so entries must collapse to one row per declaration — keeping the LAST
-/// reason, which is the one that survived to the end of the fixpoint.
-static RETENTION: Mutex<BTreeMap<(String, usize), String>> = Mutex::new(BTreeMap::new());
+/// kind, which is the one that survived to the end of the fixpoint.
+static RETENTION: Mutex<BTreeMap<(String, usize), Recorded>> = Mutex::new(BTreeMap::new());
 
-/// Record a declaration held back from translation.
-pub fn record_retention(reason: impl Into<String>, file: &Path, line: usize) {
+/// Record a declaration held back from translation: the blocker kind, the
+/// parameters that name the specific element, and the retained declarations it
+/// waits on (`blockers`).
+pub fn record_retention(
+    kind: RetentionKind,
+    params: &[String],
+    file: &Path,
+    line: usize,
+    name: &str,
+    blockers: &[String],
+) {
     if let Ok(mut sites) = RETENTION.lock() {
-        sites.insert((crate::paths::display(file), line), reason.into());
+        sites.insert(
+            (crate::paths::display(file), line),
+            Recorded {
+                kind,
+                params: params.to_vec(),
+                name: name.to_string(),
+                blockers: blockers.to_vec(),
+            },
+        );
     }
 }
 
@@ -281,10 +440,13 @@ pub fn retention_sites() -> Vec<RetentionSite> {
         .map(|sites| {
             sites
                 .iter()
-                .map(|((file, line), reason)| RetentionSite {
-                    reason: reason.clone(),
+                .map(|((file, line), recorded)| RetentionSite {
+                    kind: recorded.kind,
+                    params: recorded.params.clone(),
                     file: file.clone(),
                     line: *line,
+                    name: recorded.name.clone(),
+                    blockers: recorded.blockers.clone(),
                 })
                 .collect()
         })
@@ -331,42 +493,99 @@ pub fn retention_report() -> Option<String> {
         return None;
     }
 
-    let mut grouped: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut grouped: BTreeMap<RetentionKind, BTreeMap<String, usize>> = BTreeMap::new();
+    // The blame graph: which retained declarations each one waits on, plus how
+    // many sites each name covers. Blockers MERGE on a name collision (the
+    // retained set is name-keyed anyway), which can only make a declaration
+    // harder to release — never easier — so the counts stay conservative.
+    let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut sites_per_name: BTreeMap<String, usize> = BTreeMap::new();
+    // Kinds with at least one site that has no blocker at all. A kind whose
+    // every site has blockers is fallout, however its text reads.
+    let mut intrinsic: BTreeSet<RetentionKind> = BTreeSet::new();
     for site in &sites {
         *grouped
-            .entry(site.reason.clone())
+            .entry(site.kind)
             .or_default()
             .entry(shorten_file(&site.file))
             .or_insert(0) += 1;
+        *sites_per_name.entry(site.name.clone()).or_insert(0) += 1;
+        graph
+            .entry(site.name.clone())
+            .or_default()
+            .extend(site.blockers.iter().cloned());
+        if site.blockers.is_empty() {
+            intrinsic.insert(site.kind);
+        }
     }
 
     struct Row {
+        kind: RetentionKind,
         code: String,
-        reason: String,
         count: usize,
         cascade: bool,
+        /// Translations that FOLLOW once this root kind is fixed, on top of its
+        /// own row: every declaration whose blockers all sit inside this kind's
+        /// shadow. `None` for fallout rows.
+        blocking: Option<usize>,
+        /// How many declarations sit downstream of this root kind at all — its
+        /// shadow, whether or not another kind also holds part of it. `None`
+        /// for fallout rows.
+        holds: Option<usize>,
         files: Vec<(String, usize)>,
     }
 
     let mut rows: Vec<Row> = grouped
         .into_iter()
-        .map(|(reason, files)| {
+        .map(|(kind, files)| {
             let count = files.values().sum();
             let mut files: Vec<(String, usize)> = files.into_iter().collect();
             files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let cascade = !intrinsic.contains(&kind) || kind.is_cascade();
             Row {
-                code: retention_code(&reason),
-                cascade: CASCADE_REASONS.contains(&reason.as_str()),
-                reason,
+                code: retention_code(kind),
+                cascade,
+                kind,
                 count,
+                blocking: None,
+                holds: None,
                 files,
             }
         })
         .collect();
-    // Human-actionable reasons first, then the cascade; within each, biggest.
+
+    // What each ROOT kind holds back, two ways: `holds` is everything
+    // downstream of it, `blocking` is what translates when ONLY that kind is
+    // fixed — a declaration waiting on two roots follows from neither, and
+    // crediting it to both would promise work the fix does not deliver.
+    let mut names_by_kind: BTreeMap<RetentionKind, Vec<String>> = BTreeMap::new();
+    for site in &sites {
+        if site.blockers.is_empty() {
+            names_by_kind
+                .entry(site.kind)
+                .or_default()
+                .push(site.name.clone());
+        }
+    }
+    for row in rows.iter_mut().filter(|row| !row.cascade) {
+        let seeds = names_by_kind.remove(&row.kind).unwrap_or_default();
+        let follows = downstream(&seeds, &graph, &sites_per_name, /*all_blockers=*/ true);
+        let shadow = downstream(
+            &seeds,
+            &graph,
+            &sites_per_name,
+            /*all_blockers=*/ false,
+        );
+        row.blocking = Some(follows.saturating_sub(row.count));
+        row.holds = Some(shadow.saturating_sub(row.count));
+    }
+    // Root blockers first — biggest gain at the top — then the fallout, which
+    // nobody can fix directly.
     rows.sort_by(|a, b| {
         a.cascade
             .cmp(&b.cascade)
+            .then(b.blocking.unwrap_or(0).cmp(&a.blocking.unwrap_or(0)))
+            .then(b.holds.unwrap_or(0).cmp(&a.holds.unwrap_or(0)))
             .then(b.count.cmp(&a.count))
             .then(a.code.cmp(&b.code))
     });
@@ -375,23 +594,25 @@ pub fn retention_report() -> Option<String> {
     let cascade = sites.len() - primary;
     let reason_width = rows
         .iter()
-        .map(|r| r.reason.chars().count())
+        .map(|r| r.kind.summary().chars().count())
         .max()
         .unwrap_or(24)
         .clamp(24, 64);
 
     let mut out = String::new();
     out.push_str(&format!(
-        "\nnotlin: kotlin kept — {} declaration(s), {} reason(s): {} need human input, {} follow a closed type hierarchy\n\n",
+        "\nnotlin: kotlin kept — {} declaration(s), {} blocker type(s): {} need human input, {} follow a closed type hierarchy\n\n",
         sites.len(),
         rows.len(),
         primary,
         cascade
     ));
     out.push_str(&format!(
-        "  {:<6}  {:>5}  {:<width$}  {}\n",
+        "  {:<6}  {:>5}  {:>8}  {:>8}  {:<width$}  {}\n",
         "code",
-        "count",
+        "root",
+        "holds",
+        "blocking",
         "reason",
         "where",
         width = reason_width
@@ -416,30 +637,88 @@ pub fn retention_report() -> Option<String> {
             shown.join(", ")
         };
         let marker = if row.cascade { "  (cascade)" } else { "" };
+        let column = |value: Option<usize>| match value {
+            Some(value) => value.to_string(),
+            None => "-".to_string(),
+        };
+        let holds = column(row.holds);
+        let blocking = column(row.blocking);
         out.push_str(&format!(
-            "  {:<6}  {:>5}  {:<width$}{marker}  {where_}\n",
+            "  {:<6}  {:>5}  {:>8}  {:>8}  {:<width$}{marker}  {where_}\n",
             row.code,
             row.count,
-            shorten_reason(&row.reason, reason_width),
+            holds,
+            blocking,
+            shorten_reason(row.kind.summary(), reason_width),
             width = reason_width
         ));
     }
     if primary > 0 {
         out.push_str(&format!(
-            "\n  {primary} declaration(s) need a human decision; each one fixed releases its hierarchy.\n"
+            "\n  {primary} declaration(s) are root blockers. `holds` = declarations left Kotlin behind that kind; `blocking` = how many of them follow from fixing that kind alone. What several roots share follows only when they are fixed together, so no single row can claim it.\n"
         ));
     }
     if std::env::var_os("NOTLIN_RETENTION_SITES").is_some() {
         out.push_str("\n  every site:\n");
         for site in &sites {
+            let waits = if site.blockers.is_empty() {
+                String::new()
+            } else {
+                format!("  waits on: {}", site.blockers.join(", "))
+            };
             out.push_str(&format!(
-                "    {}:{}  [{}]  {}\n",
+                "    {}:{}  [{}]  {}: {}{}\n",
                 site.file,
                 site.line,
-                retention_code(&site.reason),
-                retention_message(&site.reason)
+                site.kind.code(),
+                site.name,
+                retention_message(&site.kind.detail(&site.params)),
+                waits
             ));
         }
     }
     Some(out)
+}
+
+/// Declarations downstream of `seeds` through the blame edges, started from
+/// `seeds` and grown until nothing follows. With `all_blockers`, a declaration
+/// follows only when EVERY declaration it waits on has (what fixing `seeds`
+/// alone translates); without, when ANY has (the shadow the reason casts, even
+/// where another reason holds part of it). Returns the number of retained SITES
+/// reached — a simple name can cover more than one declaration.
+fn downstream(
+    seeds: &[String],
+    graph: &BTreeMap<String, BTreeSet<String>>,
+    sites_per_name: &BTreeMap<String, usize>,
+    all_blockers: bool,
+) -> usize {
+    let mut reached: BTreeSet<&str> = seeds.iter().map(String::as_str).collect();
+    loop {
+        let mut grew = false;
+        for (name, blockers) in graph {
+            if blockers.is_empty() || reached.contains(name.as_str()) {
+                continue;
+            }
+            let follows = if all_blockers {
+                blockers
+                    .iter()
+                    .all(|blocker| reached.contains(blocker.as_str()))
+            } else {
+                blockers
+                    .iter()
+                    .any(|blocker| reached.contains(blocker.as_str()))
+            };
+            if follows {
+                reached.insert(name.as_str());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    reached
+        .iter()
+        .map(|name| sites_per_name.get(*name).copied().unwrap_or(0))
+        .sum()
 }

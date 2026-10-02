@@ -9,10 +9,34 @@ use std::time::UNIX_EPOCH;
 
 // 5: `Declaration::constructor_param_count` (primary-constructor arity, not a
 // property count — companion members and body properties both inflate that).
-const CACHE_VERSION: u32 = 7;
+// 8: `SourceFile::smart_cast_sites` / `SourceFile::bindings` — the retained-Kotlin
+// smart-cast boundary now carries the site shapes and the file's own name->type
+// table instead of a bare property-name set.
+const CACHE_VERSION: u32 = 10;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberConflictClass {
+    Exact,
+    JavaCovariantReturn,
+    SupertypeTypeParameter,
+    InvariantGenericConflict,
+    UnrelatedReturnTypes,
+    UnknownType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberConflict {
+    pub member_name: String,
+    pub kind: MemberKind,
+    pub supertype: String,
+    pub inherited_type: String,
+    pub implementation_type: String,
+    pub classification: MemberConflictClass,
+    legacy_mismatch: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceLanguage {
@@ -79,17 +103,114 @@ pub struct Declaration {
     #[serde(default)]
     pub constructor_param_names: Vec<String>,
     /// A defaulted constructor parameter that is followed by one WITHOUT a
-    /// default. Trailing defaults are expressible in Java: the emitter writes
-    /// delegating overloads for every shorter arity. A non-trailing default is
-    /// not — a Java caller cannot skip a middle argument — so only this forces
-    /// the declaration to stay Kotlin for its callers' sake.
+    /// default. Not a blocker by itself: a caller that omits it needs a shape
+    /// Java can express, either by inlining a language-neutral literal into the
+    /// call ([`CtorCall`] evidence) or by a delegating overload the emitter
+    /// writes for the omission pattern ([`SourceIndex::ctor_omission_evidence`]).
+    /// Only a pattern that is actually used by a caller AND cannot be lowered
+    /// that way keeps the declaration in Kotlin.
     #[serde(default)]
     pub has_non_trailing_default: bool,
+    /// Raw Kotlin text of each primary-constructor parameter's default, in
+    /// declaration order (`None` where the parameter has no default).
+    ///
+    /// A caller that omits a parameter needs that default at the call site: a
+    /// language-neutral literal is written straight into the argument list
+    /// (`new Example(first, 10, last)`), and anything else needs a delegating
+    /// overload the emitter writes. The text stays raw Kotlin — a literal reads
+    /// the same in both languages — and a default that names another parameter
+    /// is recognisable from it, which is what makes a pattern unlowerable.
+    #[serde(default)]
+    pub constructor_param_defaults: Vec<Option<String>>,
+    /// Parameter types of each SECONDARY constructor, one entry per
+    /// `constructor(...)` in declaration order (`constructor(quantity: Number,
+    /// unit: ItemUnit)` -> `["Number", "ItemUnit"]`).
+    ///
+    /// A call written with as many arguments as one of these is a
+    /// secondary-constructor call: the primary constructor's parameters are not
+    /// involved, so the call is not evidence that any of them can be omitted —
+    /// reading it as such retained declarations whose callers were never
+    /// omitting anything. Empty for a type with no secondary constructor, which
+    /// is exactly when an unmatchable call shape stays unreadable.
+    #[serde(default)]
+    pub secondary_ctors: Vec<Vec<String>>,
     /// Type-parameter names in declaration order (`ICreateObjectCommand` ->
     /// `["T", "I"]`). Needed to distinguish a generic supertype member typed
     /// by its own parameter (`payload: T`) — Java-erasure compatible with
     /// any implementing type — from a genuinely different concrete type.
     pub type_params: Vec<String>,
+}
+
+impl Declaration {
+    /// The primary constructor's parameter names as a call site sees them.
+    ///
+    /// Where the source states them (`constructor_param_names`), those. A Java
+    /// record or a Lombok-annotated class has no constructor *declaration* — the
+    /// generated one takes the instance state in declaration order — so the
+    /// state stands in. Empty when neither is available, which leaves a call
+    /// site's named arguments unmapped rather than guessed at.
+    pub fn ctor_param_names_or_state(&self) -> Vec<String> {
+        if !self.constructor_param_names.is_empty() {
+            return self.constructor_param_names.clone();
+        }
+        if self.language != SourceLanguage::Java {
+            return Vec::new();
+        }
+        self.members
+            .iter()
+            .filter(|member| {
+                !member.is_static && matches!(member.kind, MemberKind::Field | MemberKind::Property)
+            })
+            .map(|member| member.name.clone())
+            .collect()
+    }
+}
+
+/// A constructor call as one source file writes it: enough to resolve which
+/// primary-constructor parameters the caller left out, without re-parsing the
+/// file later.
+///
+/// Only a bare, capitalized callee is recorded: `Outer.Inner(...)` and
+/// `Factory(...)` are indistinguishable from a companion `invoke` factory at
+/// this granularity, and a false pattern would only cost an unused overload —
+/// whereas a missed one could translate a declaration whose caller no longer
+/// compiles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtorCall {
+    /// Callee simple name as written (`Example`).
+    pub callee: String,
+    /// Positional arguments, which Kotlin requires to come first.
+    pub positional: usize,
+    /// Named arguments, in written order.
+    pub named: Vec<String>,
+    /// An argument whose shape could not be read (a spread, or a positional
+    /// argument after a named one). The call's omission set is unknown, so it
+    /// cannot certify that a declaration is safe to translate.
+    pub unknown: bool,
+    /// 1-based line, for the report.
+    pub line: usize,
+}
+
+/// Which parameters callers leave out of one declaration's primary
+/// constructor, and whether any call shape could not be read.
+///
+/// Kotlin allows any subset of defaulted parameters to be omitted (by name);
+/// Java expresses a shape with a delegating overload. This is the evidence that
+/// separates the two: an omission pattern nobody uses costs nothing, so a
+/// declaration with a middle default is only retained when a caller really
+/// omits one in a way the emitter cannot serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CtorOmissionEvidence {
+    /// Omitted parameter index sets, deduplicated and sorted, each one a shape
+    /// some caller actually uses.
+    pub patterns: Vec<Vec<usize>>,
+    /// Some caller names its arguments. Java has no named arguments, so such a
+    /// call site has to be lowered to positional order wherever it survives as
+    /// Kotlin.
+    pub named_callers: bool,
+    /// Calls to this name whose argument shape could not be resolved, as
+    /// `file:line`. An unreadable caller may omit anything.
+    pub unresolvable: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +226,43 @@ pub struct SourceFile {
     type_aliases: HashMap<String, String>,
     identifier_counts: HashMap<String, usize>,
     enum_entries_qualifiers: HashMap<String, usize>,
+    /// Property names a smart cast in this file narrows, whatever the shape.
     smart_cast_properties: HashSet<String>,
+    /// Every smart cast in this file, with the shape and whether the rewrite
+    /// pass can repair it — the retained-Kotlin smart-cast boundary's evidence.
+    smart_cast_sites: Vec<crate::smart_cast::SmartCastSite>,
+    /// Name -> simple type name from this file's OWN declarations. Resolves a
+    /// smart-cast receiver to the declaration whose property a translation
+    /// would move to Java.
+    bindings: HashMap<String, String>,
+    /// Constructor calls this file makes, as written. A declaration with a
+    /// middle default is only retained when a caller really omits one in a
+    /// shape the emitter cannot serve, so the shapes have to be recorded where
+    /// they are written rather than guessed from a name mention.
+    #[serde(default)]
+    ctor_calls: Vec<CtorCall>,
+}
+
+impl SourceFile {
+    /// Constructor calls this file makes, as written.
+    pub fn ctor_calls(&self) -> &[CtorCall] {
+        &self.ctor_calls
+    }
+
+    /// Every smart cast this file performs, with its shape.
+    pub fn smart_cast_sites(&self) -> &[crate::smart_cast::SmartCastSite] {
+        &self.smart_cast_sites
+    }
+
+    /// Property names this file's smart casts narrow.
+    pub fn smart_cast_properties(&self) -> &HashSet<String> {
+        &self.smart_cast_properties
+    }
+
+    /// `name -> simple type` from this file's own declarations.
+    pub fn bindings(&self) -> &HashMap<String, String> {
+        &self.bindings
+    }
 }
 
 #[derive(Debug, Default)]
@@ -121,6 +278,11 @@ pub struct SourceIndex {
     /// Simple declaration-name lookup preserving every collision. This avoids
     /// repeated complete-workspace scans for name-based compatibility checks.
     declaration_names: HashMap<String, Vec<(usize, usize)>>,
+    /// Constructor calls by callee simple name: `name -> [(file, call)]`.
+    /// Derived from the files' recorded calls whenever the index is built (never
+    /// cached): a declaration's omission evidence is then one lookup instead of a
+    /// workspace scan per declaration.
+    ctor_uses: HashMap<String, Vec<(usize, usize)>>,
     /// Exact indexed source paths. `source_file` retains its `paths_match`
     /// fallback for equivalent-but-not-identical caller paths.
     file_paths: HashMap<PathBuf, usize>,
@@ -234,6 +396,7 @@ impl SourceIndex {
             kotlin_subtypes: HashMap::new(),
             subtype_names: HashMap::new(),
             declaration_names: HashMap::new(),
+            ctor_uses: HashMap::new(),
             file_paths: HashMap::new(),
         };
         for (file_index, file) in index.files.iter().enumerate() {
@@ -241,6 +404,13 @@ impl SourceIndex {
                 .file_paths
                 .entry(file.path.clone())
                 .or_insert(file_index);
+            for (call_index, call) in file.ctor_calls().iter().enumerate() {
+                index
+                    .ctor_uses
+                    .entry(call.callee.clone())
+                    .or_default()
+                    .push((file_index, call_index));
+            }
             for (declaration_index, declaration) in file.declarations.iter().enumerate() {
                 index
                     .declaration_names
@@ -287,6 +457,85 @@ impl SourceIndex {
             stats.cache_written = save_cache(&root, &new_cache);
         }
         Ok((index, stats))
+    }
+
+    /// Which primary-constructor parameters callers leave out of `target`'s
+    /// constructor, and whether any call shape could not be read.
+    ///
+    /// Name-keyed: a `Foo(...)` is attributed to every declaration named `Foo`,
+    /// because a call site's target is resolved by name at this granularity.
+    /// Over-attributing costs at most an unused delegating overload;
+    /// under-attributing would translate a declaration whose caller no longer
+    /// compiles.
+    pub fn ctor_omission_evidence(&self, target: &Declaration) -> CtorOmissionEvidence {
+        let mut evidence = CtorOmissionEvidence::default();
+        let names = &target.constructor_param_names;
+        if names.is_empty() {
+            return evidence;
+        }
+        let defaults = &target.constructor_param_defaults;
+        for (file_index, call_index) in self.ctor_uses.get(&target.name).into_iter().flatten() {
+            let Some(file) = self.files.get(*file_index) else {
+                continue;
+            };
+            let Some(call) = file.ctor_calls().get(*call_index) else {
+                continue;
+            };
+            let site = format!("{}:{}", file.path.display(), call.line);
+            if call.unknown {
+                evidence.unresolvable.push(site);
+                continue;
+            }
+            if !call.named.is_empty() {
+                evidence.named_callers = true;
+            }
+            let mut filled: Vec<usize> = (0..call.positional).collect();
+            let mut resolved = call.positional <= names.len();
+            for name in &call.named {
+                match names.iter().position(|param| param == name) {
+                    Some(index) => filled.push(index),
+                    None => resolved = false,
+                }
+            }
+            if !resolved {
+                evidence.unresolvable.push(site);
+                continue;
+            }
+            let omitted: Vec<usize> = (0..names.len())
+                .filter(|index| !filled.contains(index))
+                .collect();
+            // A caller that omits a parameter with no default is not a
+            // primary-constructor omission at all: a positional call shorter than
+            // the primary constructor is a SECONDARY constructor's — the emitted
+            // Java keeps those, and the declaration's own defaults are not
+            // involved, so the call certifies nothing either way. The secondary
+            // constructor has to match the call's ARITY to explain it: a class
+            // that merely declares some other overload does not make an
+            // arbitrary shape readable, and treating it as readable would drop
+            // evidence for a call site that really can no longer compile.
+            // Without a match the shape is genuinely unreadable (a companion
+            // `invoke`, a typealias, or a call this resolution missed), and an
+            // unreadable caller may omit anything.
+            if omitted
+                .iter()
+                .any(|index| !defaults.get(*index).is_some_and(Option::is_some))
+            {
+                let written = call.positional + call.named.len();
+                if !target
+                    .secondary_ctors
+                    .iter()
+                    .any(|params| params.len() == written)
+                {
+                    evidence.unresolvable.push(site);
+                }
+                continue;
+            }
+            if !omitted.is_empty() && !evidence.patterns.contains(&omitted) {
+                evidence.patterns.push(omitted);
+            }
+        }
+        evidence.patterns.sort();
+        evidence
     }
 
     pub fn kotlin_files(&self) -> impl Iterator<Item = &SourceFile> {
@@ -428,14 +677,38 @@ impl SourceIndex {
         name: &str,
         retained: &HashSet<String>,
     ) -> bool {
-        self.kotlin_files().any(|file| {
-            !paths_match(&file.path, declaring_file)
-                && file.identifier_counts.get(name).copied().unwrap_or(0) > 0
-                && file
-                    .declarations
+        !self
+            .retained_kotlin_referencers(declaring_file, name, retained)
+            .is_empty()
+    }
+
+    /// Which retained declarations reference `name` from another Kotlin file —
+    /// the blame edges behind the retained-reference reason. The declaration
+    /// stays Kotlin only while one of these does, so the run-end report
+    /// credits their root reasons with it.
+    pub fn retained_kotlin_referencers(
+        &self,
+        declaring_file: &Path,
+        name: &str,
+        retained: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for file in self.kotlin_files() {
+            if paths_match(&file.path, declaring_file)
+                || file.identifier_counts.get(name).copied().unwrap_or(0) == 0
+            {
+                continue;
+            }
+            names.extend(
+                file.declarations
                     .iter()
-                    .any(|decl| retained.contains(&decl.name))
-        })
+                    .filter(|decl| retained.contains(&decl.name))
+                    .map(|decl| decl.name.clone()),
+            );
+        }
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// A pre-existing Java source file references `<Owner>.getEntries()` —
@@ -532,6 +805,25 @@ impl SourceIndex {
         supertypes: &[String],
         class_name: &str,
     ) -> Vec<String> {
+        let mut mismatches: Vec<String> = self
+            .retained_supertype_member_conflicts(supertypes, class_name)
+            .into_iter()
+            .filter(|conflict| conflict.legacy_mismatch)
+            .map(|conflict| conflict.member_name)
+            .collect();
+        mismatches.sort();
+        mismatches.dedup();
+        mismatches
+    }
+
+    /// Classify same-name inherited members before projecting them onto the
+    /// conservative legacy retention decision. This keeps uncertainty visible
+    /// without changing which declarations N5258 retains.
+    pub fn retained_supertype_member_conflicts(
+        &self,
+        supertypes: &[String],
+        class_name: &str,
+    ) -> Vec<MemberConflict> {
         // A Kotlin supertype whose member has a DIFFERENT type cannot be
         // implemented from Java at all: a parameterized override must match
         // exactly, and erasing the type arguments to force it through would
@@ -561,7 +853,7 @@ impl SourceIndex {
                     .to_string()
             })
             .collect();
-        let mut mismatches = Vec::new();
+        let mut conflicts = Vec::new();
         while let Some(sup) = pending.pop() {
             let sup_base = sup
                 .split('<')
@@ -602,37 +894,36 @@ impl SourceIndex {
                     .members
                     .iter()
                     .find(|om| om.name == m.name && om.kind == m.kind)
-                    && own_m.type_name.as_deref() != Some(sup_ty.as_str())
+                    && let Some(own_ty) = own_m.type_name.as_deref()
                 {
-                    // A supertype member typed by one of the SUPERTYPE's own
-                    // type parameters (`interface IObjectCommand<T, I> {
-                    // val payload: T }`) erases in Java to the parameter's
-                    // bound — ANY implementing type satisfies it, so a text
-                    // mismatch against the concrete class member is a false
-                    // positive, not a fake-override ABI conflict.
-                    if sup_decl
-                        .type_params
-                        .iter()
-                        .any(|param| param == sup_ty.trim_end_matches('?').trim())
-                        || is_java_compatible_narrow(
-                            self,
-                            own_file,
-                            &sup_ty,
-                            own_m.type_name.as_deref().unwrap_or(""),
-                        )
-                    {
-                        continue;
-                    }
-                    // Type strings are index-qualified names; conflicting
-                    // here means Kotlin fake-override semantics are being
-                    // relied on — unsupported in plain Java.
-                    mismatches.push(m.name.clone());
+                    conflicts.push(MemberConflict {
+                        member_name: m.name.clone(),
+                        kind: m.kind,
+                        supertype: sup_decl.name.clone(),
+                        inherited_type: sup_ty.clone(),
+                        implementation_type: own_ty.to_string(),
+                        classification: classify_member_conflict(
+                            self, own_file, sup_decl, &sup_ty, own_ty,
+                        ),
+                        legacy_mismatch: own_ty != sup_ty
+                            && !sup_decl
+                                .type_params
+                                .iter()
+                                .any(|param| param == sup_ty.trim_end_matches('?').trim())
+                            && !is_java_compatible_narrow(self, own_file, &sup_ty, own_ty),
+                    });
                 }
             }
         }
-        mismatches.sort();
-        mismatches.dedup();
-        mismatches
+        conflicts.sort_by(|left, right| {
+            (&left.member_name, &left.supertype, &left.inherited_type).cmp(&(
+                &right.member_name,
+                &right.supertype,
+                &right.inherited_type,
+            ))
+        });
+        conflicts.dedup();
+        conflicts
     }
 
     pub fn has_retained_kotlin_supertype(
@@ -640,20 +931,45 @@ impl SourceIndex {
         supertypes: &[String],
         retained: &HashSet<String>,
     ) -> bool {
-        supertypes.iter().any(|supertype| {
-            let name = supertype
-                .split('<')
-                .next()
-                .unwrap_or(supertype)
-                .trim()
-                .rsplit('.')
-                .next()
-                .unwrap_or_default();
-            retained.contains(name)
-                && self.declarations().any(|declaration| {
-                    declaration.name == name && declaration.language == SourceLanguage::Kotlin
-                })
-        })
+        !self
+            .retained_kotlin_supertype_names(supertypes, retained)
+            .is_empty()
+    }
+
+    /// Which of a declaration's supertypes are retained Kotlin declarations —
+    /// the blame edges behind `one of its supertypes is retained in Kotlin`.
+    /// The declaration stays Kotlin while any of them does, so the run-end
+    /// report credits their root reasons with it. Name extraction is the same
+    /// expression the boolean check has always used: the two must not disagree
+    /// about which supertype they are looking at.
+    pub fn retained_kotlin_supertype_names(
+        &self,
+        supertypes: &[String],
+        retained: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = supertypes
+            .iter()
+            .map(|supertype| {
+                supertype
+                    .split('<')
+                    .next()
+                    .unwrap_or(supertype)
+                    .trim()
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or_default()
+            })
+            .filter(|name| {
+                retained.contains(*name)
+                    && self.declarations().any(|declaration| {
+                        declaration.name == *name && declaration.language == SourceLanguage::Kotlin
+                    })
+            })
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     pub fn retained_supertype_member_mismatch(
@@ -1048,6 +1364,37 @@ impl SourceIndex {
         })
     }
 
+    /// True when anything in the workspace declares `name` as a supertype, in
+    /// EITHER language. A class emitted `final` that something extends is a
+    /// hard error in both compilers ("cannot inherit from final class"), so a
+    /// declaration that is extended must stay open in the Java output even
+    /// when Kotlin's own default would have made it final.
+    pub fn has_subtype_named(&self, name: &str) -> bool {
+        if self
+            .subtype_names
+            .get(name)
+            .is_some_and(|names| !names.is_empty())
+        {
+            return true;
+        }
+        // The reverse map is built for the retention fixpoint and may cover
+        // Kotlin only; hand-written Java in the workspace can extend a
+        // translated class too, and javac would reject the result.
+        self.declarations().any(|declaration| {
+            declaration.supertypes.iter().any(|supertype| {
+                supertype
+                    .split('<')
+                    .next()
+                    .unwrap_or(supertype)
+                    .trim()
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or_default()
+                    == name
+            })
+        })
+    }
+
     pub fn has_kotlin_subtype(&self, target: &Declaration) -> bool {
         self.kotlin_subtypes.contains_key(&declaration_key(target))
     }
@@ -1060,11 +1407,37 @@ impl SourceIndex {
         target: &Declaration,
         retained: &HashSet<String>,
     ) -> bool {
+        !self
+            .retained_kotlin_subtype_names(target, retained)
+            .is_empty()
+    }
+
+    /// Which simple-name Kotlin subtypes of `target` are retained — the blame
+    /// edges behind both subtype-based reasons. `target` stays Kotlin while any
+    /// of them does, so the run-end report credits the roots of these names
+    /// with `target` too. Shallow (direct subtype edges): the report walks the
+    /// graph it builds from these to get the transitive fallout.
+    pub fn retained_kotlin_subtype_names(
+        &self,
+        target: &Declaration,
+        retained: &HashSet<String>,
+    ) -> Vec<String> {
         let key = declaration_key(target);
         let target_name = key.rsplit_once('.').map(|(_, n)| n).unwrap_or(&key);
-        self.subtype_names
+        let mut names: Vec<String> = self
+            .subtype_names
             .get(target_name)
-            .is_some_and(|subtypes| subtypes.iter().any(|s| retained.contains(s)))
+            .map(|subtypes| {
+                subtypes
+                    .iter()
+                    .filter(|subtype| retained.contains(*subtype))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names.dedup();
+        names
     }
     pub fn has_unselected_kotlin_subtype(
         &self,
@@ -1096,6 +1469,55 @@ impl SourceIndex {
                         && file.smart_cast_properties.contains(&member.name)
                 })
         })
+    }
+
+    /// True when every retained-Kotlin smart cast that depends on one of
+    /// `target`'s properties is a site the rewrite pass can repair — so
+    /// translating `target` cannot break its residual callers, and the
+    /// smart-cast retention reason does not have to fire.
+    ///
+    /// Conservative by construction. A site only counts once its receiver
+    /// RESOLVES: an unresolvable receiver could be `target`, so it keeps the
+    /// declaration in Kotlin (`None` below) rather than betting on a rewrite
+    /// that would never fire. A site that resolves to `target` counts only when
+    /// its shape is supported; sites that resolve to a different declaration are
+    /// somebody else's boundary and are ignored.
+    pub fn smart_cast_rewrites_cover(&self, declaring_file: &Path, target: &Declaration) -> bool {
+        let properties: HashSet<&str> = target
+            .members
+            .iter()
+            .filter(|member| member.kind == MemberKind::Property && !member.is_static)
+            .map(|member| member.name.as_str())
+            .collect();
+        let mut covered = false;
+        for file in self.kotlin_files() {
+            if paths_match(&file.path, declaring_file)
+                || file
+                    .identifier_counts
+                    .get(&target.name)
+                    .is_none_or(|count| *count == 0)
+            {
+                continue;
+            }
+            for site in &file.smart_cast_sites {
+                // A site nothing depends on cannot break when the owner moves:
+                // a single getter call narrows nothing that needs narrowing.
+                if !properties.contains(site.property.as_str()) || !site.needs_repair() {
+                    continue;
+                }
+                match file.bindings.get(&site.receiver) {
+                    Some(owner) if owner == &target.name => {
+                        if !site.repairable {
+                            return false;
+                        }
+                        covered = true;
+                    }
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        }
+        covered
     }
 
     pub fn narrows_nullable_kotlin_property(
@@ -1683,6 +2105,9 @@ fn scan_source(
         identifier_counts,
         enum_entries_qualifiers,
         smart_cast_properties,
+        smart_cast_sites,
+        bindings,
+        ctor_calls,
     ) = parse_declarations(&source, language, package.as_deref())?;
     stats.parsed_files += 1;
     Ok(CachedSource {
@@ -1699,6 +2124,9 @@ fn scan_source(
             identifier_counts,
             enum_entries_qualifiers,
             smart_cast_properties,
+            smart_cast_sites,
+            bindings,
+            ctor_calls,
         },
     })
 }
@@ -1734,6 +2162,9 @@ type ParseDeclarations = (
     HashMap<String, usize>,
     HashMap<String, usize>,
     HashSet<String>,
+    Vec<crate::smart_cast::SmartCastSite>,
+    HashMap<String, String>,
+    Vec<CtorCall>,
 );
 
 fn parse_declarations(
@@ -1798,6 +2229,8 @@ fn parse_declarations(
                     has_non_trailing_default: has_non_trailing_default_constructor_parameter(
                         node, language,
                     ),
+                    constructor_param_defaults: constructor_param_defaults(node, language, source),
+                    secondary_ctors: secondary_constructor_param_types(node, language, source),
                     type_params: type_param_names(node, source),
                 });
             }
@@ -1819,16 +2252,37 @@ fn parse_declarations(
         language,
         &mut enum_entries_qualifiers,
     );
-    let mut smart_cast_properties = HashSet::new();
-    if language == SourceLanguage::Kotlin {
-        collect_smart_cast_properties(tree.root_node(), source, &mut smart_cast_properties);
-    }
+    // Smart-cast sites are collected once and the property-name set is derived
+    // from them, so the retention decision and the rewrite pass read the same
+    // evidence. The index's own tree is reused: a second parse of every Kotlin
+    // file would double indexing cost for evidence this pass already has.
+    let (smart_cast_sites, bindings) = if language == SourceLanguage::Kotlin {
+        (
+            crate::smart_cast::sites_in(&tree, source),
+            crate::smart_cast::bindings_in(&tree, source),
+        )
+    } else {
+        (Vec::new(), HashMap::new())
+    };
+    let smart_cast_properties = smart_cast_sites
+        .iter()
+        .map(|site| site.property.clone())
+        .collect();
+    let mut ctor_calls = if language == SourceLanguage::Kotlin {
+        collect_ctor_calls(&tree, source)
+    } else {
+        Vec::new()
+    };
+    ctor_calls.shrink_to_fit();
     Ok((
         declarations,
         type_aliases,
         identifier_counts,
         enum_entries_qualifiers,
         smart_cast_properties,
+        smart_cast_sites,
+        bindings,
+        ctor_calls,
     ))
 }
 
@@ -1874,27 +2328,6 @@ fn collect_enum_entries_qualifiers(
     }
 }
 
-fn collect_smart_cast_properties(
-    node: tree_sitter::Node<'_>,
-    source: &str,
-    properties: &mut HashSet<String>,
-) {
-    if node.kind() == "is_expression"
-        && let Some(left) = node.child_by_field_name("left")
-        && left.kind() == "navigation_expression"
-        && let Some(property) = left
-            .named_children(&mut left.walk())
-            .filter(|child| child.kind() == "identifier")
-            .last()
-        && let Ok(name) = property.utf8_text(source.as_bytes())
-    {
-        properties.insert(name.to_string());
-    }
-    for child in node.named_children(&mut node.walk()) {
-        collect_smart_cast_properties(child, source, properties);
-    }
-}
-
 fn collect_identifier_counts(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -1910,6 +2343,54 @@ fn collect_identifier_counts(
     }
 }
 
+/// Parameter type texts of each Kotlin SECONDARY constructor of `node`, in
+/// declaration order — one entry per `constructor(...)`; empty for a type that
+/// declares none.
+///
+/// A call written with as many arguments as one of these resolves to that
+/// constructor, so it is no evidence about the primary constructor's defaults.
+/// Types are recorded, but matching is by count: the index has no subtype
+/// relation, so comparing `BigDecimal` against a `Number` parameter by name
+/// would reject a real secondary call and read it as unreadable again.
+fn secondary_constructor_param_types(
+    node: tree_sitter::Node<'_>,
+    language: SourceLanguage,
+    source: &str,
+) -> Vec<Vec<String>> {
+    if language != SourceLanguage::Kotlin {
+        return Vec::new();
+    }
+    let Some(body) = node.child_by_field_name("body").or_else(|| {
+        node.children(&mut node.walk())
+            .find(|child| child.kind() == "class_body")
+    }) else {
+        return Vec::new();
+    };
+    body.children(&mut body.walk())
+        .filter(|member| member.kind() == "secondary_constructor")
+        .map(|constructor| {
+            match constructor.child_by_field_name("parameters").or_else(|| {
+                constructor
+                    .children(&mut constructor.walk())
+                    .find(|child| child.kind() == "function_value_parameters")
+            }) {
+                Some(parameters) => parameters
+                    .children(&mut parameters.walk())
+                    .filter(|child| child.kind() == "parameter")
+                    .map(|parameter| {
+                        parameter
+                            .child_by_field_name("type")
+                            .or_else(|| first_type_node(parameter))
+                            .and_then(|node| node_text(node, source).ok())
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }
+        })
+        .collect()
+}
+
 /// Primary-constructor parameter names in declaration order. Used to lower
 /// Kotlin named arguments positionally (`MethodCall(name = "x", params = p)`
 /// has no Java form) and, via the length, as the constructor arity a call site
@@ -1923,7 +2404,7 @@ fn constructor_param_names(
     source: &str,
 ) -> Vec<String> {
     if language != SourceLanguage::Kotlin {
-        return Vec::new();
+        return java_constructor_param_names(node, source);
     }
     let Some(constructor) = node.child_by_field_name("primary_constructor").or_else(|| {
         node.children(&mut node.walk())
@@ -1957,6 +2438,77 @@ fn constructor_param_names(
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
             (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// A Java class's constructor parameters, from the declaration with the most of
+/// them: a class emitted with delegating overloads carries one per shorter
+/// arity, and the longest is the canonical constructor the others delegate to.
+/// Kotlin named arguments are lowered against it. A record or a
+/// Lombok-annotated class has no declaration at all — `ParameterCount` falls
+/// back to the class's instance state, which the generated constructor takes in
+/// declaration order.
+fn java_constructor_param_names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let body = node.child_by_field_name("body").unwrap_or(node);
+    let mut best: Vec<String> = Vec::new();
+    for member in body.named_children(&mut body.walk()) {
+        if member.kind() != "constructor_declaration" {
+            continue;
+        }
+        let Some(parameters) = member.child_by_field_name("parameters") else {
+            continue;
+        };
+        let names: Vec<String> = parameters
+            .named_children(&mut parameters.walk())
+            .filter(|child| child.kind() == "formal_parameter")
+            .filter_map(|parameter| parameter.child_by_field_name("name"))
+            .filter_map(|name| node_text(name, source).ok())
+            .collect();
+        if names.len() > best.len() {
+            best = names;
+        }
+    }
+    best
+}
+
+/// Raw default text per primary-constructor parameter, in declaration order
+/// (`None` where the parameter has no default). Kotlin only: a Java source states
+/// no defaults anywhere, so there is nothing for a call site to inline.
+///
+/// The extraction lives with the repair pass
+/// (`crate::ctor_defaults::class_param_default_texts`), which needs the same text
+/// to decide what an omitted argument can be replaced with.
+fn constructor_param_defaults(
+    node: tree_sitter::Node<'_>,
+    language: SourceLanguage,
+    source: &str,
+) -> Vec<Option<String>> {
+    if language != SourceLanguage::Kotlin {
+        return Vec::new();
+    }
+    crate::ctor_defaults::class_param_default_texts(node, source)
+}
+
+/// Constructor calls this file makes, in the compact form the planner reads.
+///
+/// The detection rule lives with the repair pass
+/// (`crate::ctor_defaults::call_sites`) so the index and the rewrite never
+/// disagree about what a call shape is: a shape the index missed would leave a
+/// caller with no constructor to land on.
+fn collect_ctor_calls(tree: &tree_sitter::Tree, source: &str) -> Vec<CtorCall> {
+    crate::ctor_defaults::call_sites_in(tree, source)
+        .into_iter()
+        .map(|site| CtorCall {
+            callee: site.callee,
+            positional: site.args.iter().filter(|arg| arg.name.is_none()).count(),
+            named: site
+                .args
+                .iter()
+                .filter_map(|arg| arg.name.clone())
+                .collect(),
+            unknown: site.unknown,
+            line: site.line,
         })
         .collect()
 }
@@ -2177,6 +2729,33 @@ fn type_param_names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
 
 fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) -> Vec<Member> {
     let mut result = Vec::new();
+    // A Java record carries its state in the header, not the body: each component
+    // is a final field whose accessor is named exactly like it. Translating the
+    // owner of a Kotlin property turns the read into that accessor call, so the
+    // index has to see the components or the owner looks property-less.
+    if language == SourceLanguage::Java
+        && node.kind() == "record_declaration"
+        && let Some(parameters) = node.child_by_field_name("parameters")
+    {
+        for parameter in parameters
+            .named_children(&mut parameters.walk())
+            .filter(|parameter| parameter.kind() == "formal_parameter")
+        {
+            let Some(name_node) = parameter.child_by_field_name("name") else {
+                continue;
+            };
+            let type_node = parameter.child_by_field_name("type");
+            result.push(Member {
+                name: node_text(name_node, source).unwrap_or_default(),
+                kind: MemberKind::Field,
+                visibility: None,
+                is_static: false,
+                is_jvm_field: false,
+                type_name: type_node.and_then(|node| node_text(node, source).ok()),
+                is_nullable: false,
+            });
+        }
+    }
     if language == SourceLanguage::Kotlin
         && let Some(parameters) = node
             .children(&mut node.walk())
@@ -2282,10 +2861,19 @@ fn member_from_node(
         }
         _ => return None,
     };
+    // A Kotlin `secondary_constructor` has no name node — it takes the class's
+    // name. Only the fallback below turns that into `<init>`, but the member
+    // itself must still be recorded: "does this type declare another
+    // constructor" is what decides whether an unreadable call shape is
+    // explainable, and what keeps a delegating overload from duplicating the
+    // secondary's signature. Reading a missing name as "not a member" silently
+    // dropped every Kotlin secondary constructor from the index.
     let name = name_node
         .map(|node| node_text(node, source))
         .transpose()
-        .ok()??;
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let modifiers = node
         .child_by_field_name("modifiers")
         .or_else(|| {
@@ -2328,6 +2916,23 @@ fn member_from_node(
     })
 }
 
+/// The JVM getter Kotlin generates for a property: `id` -> `getId`. A property
+/// whose own name already reads `isX` keeps it (`val isActive: Boolean` has
+/// `isActive()`, not `getIsActive()`), which is why this cannot be a plain
+/// `format!("get{}", capitalize(name))`.
+pub fn property_accessor_name(property: &str) -> String {
+    if let Some(rest) = property.strip_prefix("is")
+        && rest.chars().next().is_some_and(char::is_uppercase)
+    {
+        return property.to_string();
+    }
+    let mut chars = property.chars();
+    match chars.next() {
+        Some(first) => format!("get{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
 /// First type node of a member declaration, for the layouts where the type
 /// carries no `type` field. Annotations are NOT types: `@JsonIgnore val id:
 /// String` holds a `user_type` of its own inside the annotation, and indexing
@@ -2361,54 +2966,123 @@ fn node_text(node: tree_sitter::Node<'_>, source: &str) -> Result<String, String
         .map_err(|error| format!("invalid source text: {error}"))
 }
 
-/// A Java member may NARROW a supertype member's return type when the own
-/// type is a Java SUBTYPE of the supertype's type: covariant return types
-/// are legal in Java for both classes and interfaces (JLS 8.4.5). Equal
-/// names, `Object`/`Any`, and type-parameter members always qualify.
-/// Everything else (unrelated types, invariant generics like
-/// `List<A>` vs `List<B>`) is a mismatch.
 fn is_java_compatible_narrow(
     index: &SourceIndex,
     source_file: &SourceFile,
     super_ty: &str,
     own_ty: &str,
 ) -> bool {
-    // Nullability is a Kotlin-only distinction: a non-null override of a
-    // nullable property is plain covariant narrowing in Java, so compare the
-    // types without their `?` marker.
     let super_ty = super_ty.trim().trim_end_matches('?').trim();
     let own_ty = own_ty.trim().trim_end_matches('?').trim();
     if super_ty == own_ty || super_ty == "Object" || super_ty == "Any" {
         return true;
     }
-    // Invariant generics: `List<A>` only satisfies `List<A>` (wildcards are
-    // not emitted by the transpiler today).
-    let (sup_base, sup_args) = split_generic(super_ty);
+    let (super_base, super_args) = split_generic(super_ty);
     let (own_base, own_args) = split_generic(own_ty);
-    if sup_base != own_base {
-        // Covariant narrowing requires own to be a SUBTYPE of sup: walk own's
-        // supertype closure through the index. When the own type is not in the
-        // index at all, both sides are library types (`Number` overridden by
-        // `BigDecimal`) or builtins, where the index has nothing to say — and
-        // the source is valid Kotlin, so the override IS a subtype. Emitting it
-        // is the default; javac is the check. Claiming a conflict from absence
-        // of evidence retains declarations Java could have expressed.
+    if super_base != own_base {
         let Some(own_decl) = index.resolve_kotlin_type_public(source_file, own_ty) else {
             return true;
         };
-        return index.supertype_closure_contains(source_file, own_decl, sup_base);
+        return member_supertype_closure_contains(index, source_file, own_decl, super_base);
     }
-    match (sup_args, own_args) {
-        (None, _) => true, // raw sup type accepts any instantiation
+    match (super_args, own_args) {
+        (None, _) => true,
         (Some(_), None) => false,
-        (Some(sup), Some(own)) => {
-            // Generics are INVARIANT in Java: a nested argument must match
-            // exactly (`List<ItemImpl>` does not satisfy `List<Item>`, even
-            // though ItemImpl is an Item). Only the TOP-LEVEL narrowing is
-            // covariant.
-            sup.len() == own.len() && sup.iter().zip(own.iter()).all(|(s, o)| s == o)
+        (Some(super_args), Some(own_args)) => {
+            super_args.len() == own_args.len()
+                && super_args
+                    .iter()
+                    .zip(own_args.iter())
+                    .all(|(super_arg, own_arg)| super_arg == own_arg)
         }
     }
+}
+
+fn classify_member_conflict(
+    index: &SourceIndex,
+    source_file: &SourceFile,
+    super_decl: &Declaration,
+    super_ty: &str,
+    own_ty: &str,
+) -> MemberConflictClass {
+    let super_ty = super_ty.trim().trim_end_matches('?').trim();
+    let own_ty = own_ty.trim().trim_end_matches('?').trim();
+    if super_ty == own_ty {
+        return MemberConflictClass::Exact;
+    }
+    if super_decl.type_params.iter().any(|param| param == super_ty) {
+        return MemberConflictClass::SupertypeTypeParameter;
+    }
+
+    let (super_base, super_args) = split_generic(super_ty);
+    let (own_base, own_args) = split_generic(own_ty);
+    if super_base == own_base {
+        return match (super_args, own_args) {
+            (Some(super_args), Some(own_args))
+                if super_args.len() != own_args.len()
+                    || super_args
+                        .iter()
+                        .zip(own_args.iter())
+                        .any(|(super_arg, own_arg)| super_arg != own_arg) =>
+            {
+                MemberConflictClass::InvariantGenericConflict
+            }
+            (Some(_), None) => MemberConflictClass::InvariantGenericConflict,
+            _ => MemberConflictClass::Exact,
+        };
+    }
+    if super_base == "Object" || super_base == "Any" {
+        return MemberConflictClass::JavaCovariantReturn;
+    }
+
+    let Some(own_decl) = index.resolve_kotlin_type_public(source_file, own_ty) else {
+        return MemberConflictClass::UnknownType;
+    };
+    if member_supertype_closure_contains(index, source_file, own_decl, super_base) {
+        MemberConflictClass::JavaCovariantReturn
+    } else {
+        MemberConflictClass::UnrelatedReturnTypes
+    }
+}
+
+fn member_supertype_closure_contains(
+    index: &SourceIndex,
+    source_file: &SourceFile,
+    declaration: &Declaration,
+    target_base: &str,
+) -> bool {
+    let mut visited = HashSet::new();
+    let mut pending = vec![declaration];
+    while let Some(current) = pending.pop() {
+        if !visited.insert(declaration_key(current)) {
+            continue;
+        }
+        let current_file = index
+            .declaration_source_file(current)
+            .unwrap_or(source_file);
+        for supertype in &current.supertypes {
+            let base = supertype
+                .trim()
+                .trim_end_matches('?')
+                .split('<')
+                .next()
+                .unwrap_or("")
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if base == target_base {
+                return true;
+            }
+            if let Some(next) = index.resolve_type(current_file, supertype) {
+                pending.push(next);
+            }
+        }
+    }
+    false
 }
 
 /// `Map<String, List<Foo>>` -> (`Map`, Some(["String", "List<Foo>"])).

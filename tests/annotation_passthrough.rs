@@ -101,8 +101,14 @@ fn java_native_annotation_passes_through_without_index() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// A Kotlin-declared annotation type used on a declaration: the annotation
-/// type itself is Kotlin (annotation class), so the use stays in Kotlin.
+/// An UNTRANSLATED Kotlin annotation type retains the declaration that uses it.
+/// Not because javac could not name the annotation — a Kotlin `annotation
+/// class` compiles to a Java `@interface` on the same module's classpath — but
+/// because this rule stands in for "this declaration's surroundings are not
+/// translated either". Verification tried letting it through: on the real
+/// target it un-tied classes whose bodies Java cannot express yet and produced
+/// 96 distinct javac errors. See tests/annotation_preserved.rs for the shapes
+/// that ARE preserved (a translated annotation type, and array arguments).
 #[test]
 fn kotlin_annotation_type_taints_declaration() {
     let root = Path::new("tests/tmp_scratch_anno_kt");
@@ -127,7 +133,7 @@ fn kotlin_annotation_type_taints_declaration() {
     let java = fs::read_to_string(root.join("UsesMine.java")).unwrap_or_default();
     assert!(
         java.is_empty(),
-        "declaration using a Kotlin annotation type must stay Kotlin, got:\n{java}"
+        "declaration using an untranslated Kotlin annotation type must stay Kotlin, got:\n{java}"
     );
     assert!(
         stderr.contains("N04DC"),
@@ -136,14 +142,16 @@ fn kotlin_annotation_type_taints_declaration() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// Kotlin-only annotation arguments taint: `::class` references, string
-/// templates, `[]` array args, and lambda arguments are not Java syntax.
+/// Kotlin-only annotation arguments still taint, because Java cannot express
+/// them: an unresolvable `::class` reference, a string template, and a lambda.
+/// (An `[]` array argument used to be listed here — it is NOT Kotlin-only:
+/// Java spells it `{a, b}` and notlin lowers it, so the class translates with
+/// the annotation intact. See tests/annotation_preserved.rs.)
 #[test]
 fn kotlin_only_annotation_arguments_taint() {
     for (name, arg) in [
         ("kclass", "using = com.example.Hand::class"),
         ("template", "\"v = ${'$'}{value}\""),
-        ("array", "[\"a\", \"b\"]"),
         ("lambda", "mapper = { it.toString() }"),
     ] {
         let root = Path::new("tests/tmp_scratch_anno_arg");

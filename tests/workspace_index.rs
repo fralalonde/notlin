@@ -2,7 +2,7 @@ use clap::Parser;
 use filetime::{FileTime, set_file_mtime};
 use notlin::cli::Cli;
 use notlin::transpiler;
-use notlin::workspace::{SourceIndex, SourceLanguage};
+use notlin::workspace::{MemberConflictClass, SourceIndex, SourceLanguage};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -69,9 +69,105 @@ fn retained_supertype_mismatch_reports_conflicting_member_names() {
         .find(|declaration| declaration.name == "Implementation")
         .expect("implementation indexed");
 
+    let classifications =
+        index.retained_supertype_member_conflicts(&implementation.supertypes, "Implementation");
+    assert_eq!(classifications.len(), 1);
+    assert_eq!(classifications[0].member_name, "entries");
+    assert_eq!(
+        classifications[0].classification,
+        MemberConflictClass::InvariantGenericConflict
+    );
     assert_eq!(
         index.retained_supertype_member_mismatches(&implementation.supertypes, "Implementation"),
         vec!["entries"]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retained_supertype_members_have_structured_compatibility_classes() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-member-classifications-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    for (file, source) in [
+        (
+            "exact.kt",
+            "package neutral.classification\ninterface ExactContract { val exact: String }\nclass ExactImplementation(override val exact: String) : ExactContract\n",
+        ),
+        (
+            "covariant.kt",
+            "package neutral.classification\nopen class Base\nclass Child : Base()\ninterface CovariantContract { val covariant: Base }\nclass CovariantImplementation(override val covariant: Child) : CovariantContract\n",
+        ),
+        (
+            "generic.kt",
+            "package neutral.classification\ninterface GenericContract<T> { val generic: T }\nclass GenericImplementation(override val generic: String) : GenericContract<String>\n",
+        ),
+        (
+            "unrelated.kt",
+            "package neutral.classification\nclass Left\nclass Right\ninterface UnrelatedContract { val unrelated: Left }\nclass UnrelatedImplementation(override val unrelated: Right) : UnrelatedContract\n",
+        ),
+        (
+            "unknown.kt",
+            "package neutral.classification\ninterface UnknownContract { val unknown: ExternalBase }\nclass UnknownImplementation(override val unknown: ExternalChild) : UnknownContract\n",
+        ),
+    ] {
+        fs::write(root.join(file), source).unwrap();
+    }
+
+    let index = SourceIndex::discover(&root).unwrap();
+    let classification = |class_name: &str| {
+        let declaration = index
+            .declarations()
+            .find(|declaration| declaration.name == class_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{class_name} was not indexed; declarations: {:?}",
+                    index
+                        .declarations()
+                        .map(|declaration| declaration.name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        index
+            .retained_supertype_member_conflicts(&declaration.supertypes, class_name)
+            .into_iter()
+            .next()
+            .unwrap()
+            .classification
+    };
+
+    assert_eq!(
+        classification("ExactImplementation"),
+        MemberConflictClass::Exact
+    );
+    assert_eq!(
+        classification("CovariantImplementation"),
+        MemberConflictClass::JavaCovariantReturn
+    );
+    let covariant = index
+        .declarations()
+        .find(|declaration| declaration.name == "CovariantImplementation")
+        .unwrap();
+    assert!(
+        index
+            .retained_supertype_member_mismatches(&covariant.supertypes, "CovariantImplementation")
+            .is_empty(),
+        "a Java-compatible covariant return must not become an N5258 root"
+    );
+    assert_eq!(
+        classification("GenericImplementation"),
+        MemberConflictClass::SupertypeTypeParameter
+    );
+    assert_eq!(
+        classification("UnrelatedImplementation"),
+        MemberConflictClass::UnrelatedReturnTypes
+    );
+    assert_eq!(
+        classification("UnknownImplementation"),
+        MemberConflictClass::UnknownType
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -801,7 +897,10 @@ fn retains_non_null_property_override_of_nullable_kotlin_contract() {
 }
 
 #[test]
-fn retains_property_smart_cast_boundary_used_by_kotlin() {
+fn translates_property_smart_cast_owner_repaired_by_the_rewrite_pass() {
+    // Retained Kotlin that smart-casts a property no longer has to keep the
+    // property's OWNER in Kotlin: the rewrite pass binds the read into a local
+    // first, so the owner's translation costs the caller nothing.
     let root = std::env::temp_dir().join(format!("notlin-smart-cast-{}", std::process::id()));
     let selected = root.join("selected");
     let residue = root.join("residue");
@@ -817,6 +916,50 @@ fn retains_property_smart_cast_boundary_used_by_kotlin() {
     fs::write(
         residue.join("Consumer.kt"),
         "package sample\nfun render(holder: Holder): String {\n    if (holder.payload is Detail) return holder.payload.text\n    return \"\"\n}\n",
+    )
+    .unwrap();
+
+    let index = SourceIndex::discover(&root).unwrap();
+    let cli = Cli::parse_from(["notlin", "--in-place", selected_path.to_str().unwrap()]);
+    let source = fs::read_to_string(&selected_path).unwrap();
+    let (files, errors, _warnings, coverage) = transpiler::transpile_with_workspace(
+        &source,
+        &selected_path,
+        &cli,
+        Some(&index),
+        std::slice::from_ref(&selected),
+    );
+    assert_eq!(errors, 0);
+    assert!(files.iter().any(|(name, _)| name == "Holder.java"));
+    assert!(
+        !coverage.untranslated.iter().any(|name| name == "Holder"),
+        "the smart-cast boundary no longer retains the property owner: {:?}",
+        coverage.untranslated
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retains_property_smart_cast_the_rewrite_pass_cannot_reach() {
+    // The receiver is a chain the pass cannot resolve to an owner, so nothing
+    // proves the rewrite would fire: the property owner stays Kotlin rather than
+    // becoming Java under a caller that would then fail to compile.
+    let root =
+        std::env::temp_dir().join(format!("notlin-smart-cast-unreach-{}", std::process::id()));
+    let selected = root.join("selected");
+    let residue = root.join("residue");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&selected).unwrap();
+    fs::create_dir_all(&residue).unwrap();
+    let selected_path = selected.join("Holder.kt");
+    fs::write(
+        &selected_path,
+        "package sample\ninterface Value\nclass Detail(val text: String) : Value\ndata class Holder(val payload: Value)\n",
+    )
+    .unwrap();
+    fs::write(
+        residue.join("Consumer.kt"),
+        "package sample\nfun render(holder: Holder, items: List<Holder>): String {\n    for (item in items) {\n        if (item.payload is Detail) return item.payload.text\n    }\n    return holder.payload.toString()\n}\n",
     )
     .unwrap();
 

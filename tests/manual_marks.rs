@@ -152,8 +152,12 @@ fn marker_insertion_preserves_crlf_and_terminal_newline() {
     assert!(bytes.ends_with(b"\x0d\x0a"));
 }
 
+/// A receiver the file's own declarations do not type is left alone: the rewrite
+/// pass only repairs a site whose OWNER it can prove, and the retention decision
+/// keeps that owner's translation honest. Guessing here would rewrite Kotlin that
+/// was never broken (or miss one that was).
 #[test]
-fn repeated_property_smart_cast_rewrites_without_java_index_evidence() {
+fn unresolvable_receiver_is_left_to_the_retention_rule() {
     let root = fixture_root("unrelated-getter");
     let kt = root.join("src/consumer.kt");
     std::fs::write(
@@ -167,8 +171,50 @@ fn repeated_property_smart_cast_rewrites_without_java_index_evidence() {
     .unwrap();
     let index = index_at(&root, "Node", "data");
 
+    assert_eq!(annotate_manual_spots(&kt, &index), 0);
+    let text = std::fs::read_to_string(&kt).unwrap();
+    assert!(text.contains("other.data"), "{text}");
+}
+
+/// The same site IS repaired once the index shows the receiver's owner translated
+/// to Java — the boundary this pass exists for.
+#[test]
+fn translated_owner_resolves_the_receiver_and_binds_the_read() {
+    let root = fixture_root("translated-owner");
+    let kt = root.join("src/consumer.kt");
+    std::fs::write(
+        &kt,
+        "fun remove(other: Node) {\n\
+         \x20   if(other.data is Basket) {\n\
+         \x20       return drop(other.data.items)\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let index = index_at(&root, "Node", "data");
+
     assert_eq!(annotate_manual_spots(&kt, &index), 1);
     let text = std::fs::read_to_string(&kt).unwrap();
-    assert!(text.contains("val data = other.data"));
-    assert!(text.contains("drop(data.items)"));
+    assert!(text.contains("val data = other.data"), "{text}");
+    assert!(text.contains("if(data is Basket)"), "{text}");
+    assert!(text.contains("drop(data.items)"), "{text}");
+}
+
+/// A property owner still in Kotlin needs no repair: its property is a Kotlin
+/// property, which smart-casts exactly as it did before the migration.
+#[test]
+fn owner_still_in_kotlin_is_not_touched() {
+    let root = fixture_root("kotlin-owner");
+    let kt = root.join("src/consumer.kt");
+    let source = "fun remove(node: Holder) {\n\
+         \x20   if(node.data is Basket) {\n\
+         \x20       return drop(node.data.items)\n\
+         \x20   }\n\
+         }\n";
+    std::fs::write(&kt, source).unwrap();
+    std::fs::write(root.join("src/Holder.kt"), "class Holder(val data: Any)\n").unwrap();
+    let index = SourceIndex::discover(&root).unwrap();
+
+    assert_eq!(annotate_manual_spots(&kt, &index), 0);
+    assert_eq!(std::fs::read_to_string(&kt).unwrap(), source);
 }

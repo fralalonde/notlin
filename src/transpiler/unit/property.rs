@@ -7,6 +7,38 @@ use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    /// Does the enclosing class body declare a method of this name? Such a
+    /// declaration suppresses the generated accessor (it would collide in
+    /// Java), which decides where a `@get:` annotation has to live.
+    fn class_declares_method(&self, decl: tree_sitter::Node, method: &str) -> bool {
+        let Some(body) = kt::parent_of(decl).filter(|parent| parent.kind() == "class_body") else {
+            return false;
+        };
+        let mut cursor = body.walk();
+        body.children(&mut cursor)
+            .filter(|member| member.kind() == "function_declaration")
+            .any(|member| kt::field(member, "name").is_some_and(|name| self.text(name) == method))
+    }
+
+    /// Does this property emit a backing FIELD? A destructuring property never
+    /// does — `transpile_property_opts` returns before the field site for it —
+    /// and a property with a custom getter and no initializer/setter is
+    /// computed on the fly. Everything else (plain `val`/`var`, `by lazy`) gets
+    /// one.
+    ///
+    /// Shared with the JPA no-arg constructor (`jpa_instance_field_defaults`),
+    /// which must assign exactly the fields this predicate admits: a field this
+    /// says no to is not emitted, and assigning it would not compile.
+    pub(crate) fn property_emits_backing_field(&self, decl: tree_sitter::Node) -> bool {
+        if kt::child(decl, "multi_variable_declaration").is_some() {
+            return false;
+        }
+        let initializer = kt::child(decl, "initializer");
+        let setter_body = kt::child(decl, "setter").and_then(|s| kt::child(s, "function_body"));
+        let getter = kt::child(decl, "getter");
+        initializer.is_some() || setter_body.is_some() || getter.is_none()
+    }
+
     pub(crate) fn transpile_property(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
         self.transpile_property_opts(decl, out, false, None)
     }
@@ -138,7 +170,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
         let getter = kt::child(decl, "getter");
         let setter = kt::child(decl, "setter");
-        let initializer = kt::child(decl, "initializer"); // hmm: may not exist; handle '=' expr below
 
         // Determine the type: declared or inferred from initializer
         let ty = match ty {
@@ -210,7 +241,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // Field (skip if it's purely a getter property with no backing field use;
         // we can't tell yet, so emit backing field unless there's no initializer
         // and no setter and a custom getter — heuristic).
-        let backing = initializer.is_some() || setter_body.is_some() || getter.is_none();
+        let backing = self.property_emits_backing_field(decl);
         // `const val` -> static final; otherwise static only when requested
         // (companion/top-level/object properties).
         let is_const = kt::child(decl, "modifiers")
@@ -240,7 +271,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             } else {
                 "private "
             };
+        // Kotlin writes annotations on the property; Java needs them on the
+        // element they describe. A `@get:` target says GETTER, and that is
+        // honoured only when this emitter actually writes one: a class body
+        // that declares its own `getX()` suppresses the generated getter (they
+        // would collide), and then the annotation stays on the FIELD rather
+        // than disappearing.
+        let (mut field_annotations, mut getter_annotations) = self.annotation_split(decl);
+        if self.class_declares_method(decl, &format!("get{}", capitalize(&name))) {
+            field_annotations.append(&mut getter_annotations);
+        }
+
         if backing {
+            for annotation in &field_annotations {
+                out.line(annotation.clone());
+            }
             let init_java = self.property_initializer(decl).map(|init| {
                 let mut e = Expr { unit: self };
                 e.transpile(init)
@@ -298,6 +343,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let has_setter_method = conflicts.contains(&setter_name);
 
         if !has_getter_method {
+            for annotation in &getter_annotations {
+                out.line(annotation.clone());
+            }
             out.open(format!(
                 "{}{}{} get{}()",
                 visibility,

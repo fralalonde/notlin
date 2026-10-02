@@ -236,6 +236,11 @@ fn basic_class_produces_expected_types() {
     let registry = &files.iter().find(|(n, _)| n == "Registry.java").unwrap().1;
     assert!(registry.contains("public static final Registry INSTANCE"));
     assert!(registry.contains("static final List<String> items"));
+    assert!(
+        registry.contains("items.add(item);") || registry.contains("Registry.items.add(item);"),
+        "object method must access its static property without an instance getter: {registry}"
+    );
+    assert!(!registry.contains("this.getItems()"), "{registry}");
 }
 
 #[test]
@@ -1005,6 +1010,61 @@ fn class_body_properties_emit_accessors_not_records() {
     assert!(vec.contains("public record Vec2(int x, int y)"));
     assert!(vec.contains("public double getLength()"));
     assert!(vec.contains("public int dot(Vec2 o)"));
+}
+
+#[test]
+fn record_component_implicit_reads_use_record_accessors() {
+    let source = r#"data class Currency(val code: String, val rate: Double) {
+    fun convert(amount: Int) = amount * rate
+    val display get() = code + rate
+}"#;
+    let (files, errors) = transpile_src(source, "Currency.kt");
+    assert_eq!(errors, 0);
+    let currency = files
+        .iter()
+        .find(|(name, _)| name == "Currency.java")
+        .map(|(_, content)| content)
+        .expect("record emitted");
+    assert!(
+        currency.contains("public record Currency(String code, double rate)"),
+        "{currency}"
+    );
+    assert!(currency.contains("amount * this.rate()"), "{currency}");
+    assert!(currency.contains("this.code() + this.rate()"), "{currency}");
+    assert!(!currency.contains("this.getRate()"), "{currency}");
+    assert!(!currency.contains("this.getCode()"), "{currency}");
+}
+
+#[test]
+fn lombok_data_class_implicit_reads_use_bean_accessors() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-lombok-data-accessors-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source = r#"data class Entry @JvmOverloads constructor(
+    val value: String,
+    val active: Boolean,
+    val suffix: String? = null
+) {
+    fun isActive(): Boolean {
+        return active
+    }
+}
+"#;
+    fs::write(root.join("Entry.kt"), source).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(&root)
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "notlin failed:\n{stderr}");
+    let entry = fs::read_to_string(root.join("Entry.java")).expect("Entry.java");
+    assert!(entry.contains("return this.getActive();"), "{entry}");
+    assert!(!entry.contains("this.active()"), "{entry}");
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

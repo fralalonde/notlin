@@ -1201,9 +1201,18 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         // Kotlin named arguments have no Java form
                         // (`new MethodCall(name = "x", params = p)` is not
                         // Java). Lower them to the callee's declared parameter
-                        // order; a parameter left out was relying on a Kotlin
-                        // default, which Java cannot express, so it is filled
-                        // with `null` and reported.
+                        // order. A parameter the caller omits is served by the
+                        // default itself when it is a literal that reads the same
+                        // in Java (`new Example(first, 10, last)`), and otherwise
+                        // by the delegating overload the emitter writes for that
+                        // exact omission pattern (N87CB).
+                        let arity = |d: &crate::workspace::Declaration| {
+                            if d.constructor_param_count > 0 {
+                                d.constructor_param_count
+                            } else {
+                                instance_property_count(d)
+                            }
+                        };
                         if ctor_args.iter().any(|arg| arg.contains(" = ")) {
                             let named: Vec<(&str, &str)> = ctor_args
                                 .iter()
@@ -1240,38 +1249,35 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                         }
                                     }
                                 }
-                                for (index, slot) in slots.iter_mut().enumerate() {
-                                    if slot.is_none() {
-                                        self.unit.diags.warn_approx(
-                                            node,
-                                            self.unit.file,
-                                            format!(
-                                                "named-argument call to `{}` omits `{}`: filled with `null` (Kotlin default not expressible in Java)",
-                                                callee_java, names[index]
-                                            ),
-                                        );
-                                        *slot = Some("null".to_string());
-                                    }
-                                }
-                                ctor_args = slots.into_iter().flatten().collect();
+                                let (lowered, left_to_overload) =
+                                    crate::ctor_defaults::lower_call_args(
+                                        &slots,
+                                        &decl.constructor_param_defaults,
+                                    );
+                                debug_assert!(
+                                    left_to_overload.is_empty() || !slots.is_empty(),
+                                    "an omission always leaves a pattern behind"
+                                );
+                                ctor_args = lowered;
                             }
-                        }
-                        let arity = |d: &crate::workspace::Declaration| {
-                            if d.constructor_param_count > 0 {
-                                d.constructor_param_count
-                            } else {
-                                instance_property_count(d)
-                            }
-                        };
-                        let defaulting = candidates.iter().find(|d| {
-                            d.has_default_constructor_parameter && arity(d) == ctor_args.len() + 1
-                        });
-                        let chosen = defaulting.or_else(|| candidates.first());
-                        if let Some(decl) = chosen
-                            && decl.has_default_constructor_parameter
-                            && arity(decl) == ctor_args.len() + 1
-                        {
-                            ctor_args.push("null".to_string());
+                        } else if let Some(decl) = candidates.iter().find(|d| {
+                            d.has_default_constructor_parameter
+                                && !d.constructor_param_defaults.is_empty()
+                                && arity(d) > ctor_args.len()
+                        }) {
+                            // A positional call that stops early: Kotlin fills the
+                            // missing trailing parameters from their defaults. The
+                            // ones that are literals go into the call; the rest are
+                            // dropped onto the delegating overload written for this
+                            // pattern.
+                            let mut slots: Vec<Option<String>> =
+                                ctor_args.iter().cloned().map(Some).collect();
+                            slots.resize(arity(decl), None);
+                            let (lowered, _) = crate::ctor_defaults::lower_call_args(
+                                &slots,
+                                &decl.constructor_param_defaults,
+                            );
+                            ctor_args = lowered;
                         }
                     }
                     let base_name = callee_java.rsplit('.').next().unwrap_or("").to_string();

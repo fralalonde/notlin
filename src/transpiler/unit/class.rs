@@ -2,7 +2,7 @@
 
 use super::Unit;
 use super::capitalize;
-use crate::diagnostics::DiagnosticKind;
+use crate::diagnostics::{DiagnosticKind, RetentionKind};
 use crate::transpiler::expr::Expr;
 use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
@@ -228,7 +228,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // imports; user-declared lombok imports (Lombok-flagged source) may
         // already provide some — add only what's missing, exactly once.
         if self.lombok {
-            for want in ["lombok.Data", "lombok.AllArgsConstructor"] {
+            for want in [
+                "lombok.Data",
+                "lombok.Value",
+                "lombok.AllArgsConstructor",
+                "lombok.EqualsAndHashCode",
+            ] {
                 if !imports.iter().any(|i| i == want) {
                     block.push_str(&format!("import {};\n", want));
                 }
@@ -311,9 +316,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // `Name::class` class literal, which rewrites to `Name.class` in Java
         // when `Name` resolves to a Java-visible declaration (checked below);
         // an unknown or Kotlin-only name keeps the taint.
+        // `[` is Kotlin's array literal, and it IS Java-expressible
+        // (`{a, b}`) — but lowering it is not free. On the real target the 12
+        // declarations retained solely for an array argument turned out to have
+        // bodies Java cannot express yet (calls to accessors of retained Kotlin
+        // classes, `log` fields, constructor arities): 96 distinct javac
+        // errors. The annotation is only preserved once those classes are
+        // translatable, so `[` keeps tainting until then.
         if argument_text.contains("${")
             || argument_text.contains('[')
             || argument_text.contains('{')
+            || argument_text.contains("-> ")
         {
             return None;
         }
@@ -351,9 +364,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 .to_string(),
             );
         }
-        // A workspace-provable Kotlin annotation type taints: the annotation
-        // declaration itself stays Kotlin (or translates separately, but the
-        // Java side cannot reference a Kotlin-only element).
+        // An unselected Kotlin annotation type retains its declaration. The
+        // original reason recorded here — "the Java side cannot reference a
+        // Kotlin-only element" — is not sound: a Kotlin `annotation class`
+        // compiles to a Java `@interface` on the same module's classpath, so
+        // javac can name it.
+        //
+        // The clause is kept because the conservative behaviour is the measured
+        // one: this rule is one of several standing in for "this declaration's
+        // surroundings are not translated", and in this corpus removing it
+        // changed nothing observable (the 96 javac errors seen while probing
+        // were traced to the array-literal case, not to this clause). Loosening
+        // it needs its own measurement on a compiling tree, not an argument.
         if let Some(workspace) = self.workspace
             && workspace.declarations_named(&name).any(|decl| {
                 decl.name == name && decl.kind == crate::workspace::DeclarationKind::Annotation
@@ -381,7 +403,25 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// Why this declaration cannot be translated away, or `None` when it can.
     /// The reason is part of the diagnostic so a run log is greppable by
     /// cause, not just by "retained".
-    fn kotlin_retention_reason(&self, name: &str) -> Option<&'static str> {
+    ///
+    /// The pair is (blocker KIND, params): the kind is one of the fixed
+    /// vocabulary entries in `RetentionKind` — it yields the stable code and
+    /// the summary row — and params instantiate that kind's template with the
+    /// specific element (the conflicting members, ...). The second half is the
+    /// BLOCKERS: the retained declarations that have to translate first for
+    /// this one to follow. Empty means the blocker is intrinsic — a fact about
+    /// the source no other translation can clear — which is what makes it a
+    /// root cause in the run-end report; a non-empty list makes this
+    /// declaration fallout, to be credited to the roots behind those names
+    /// rather than to a human.
+    fn kotlin_retention_reason(
+        &self,
+        name: &str,
+        decl: tree_sitter::Node<'_>,
+    ) -> Option<(RetentionKind, Vec<String>, Vec<String>)> {
+        // Returns `(kind, params, blockers)`: `params` instantiate the kind's
+        // detail template (the specific blocked element a human has to look at),
+        // `blockers` name the retained declarations this one waits on.
         let workspace = self.workspace?;
         let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
         let source_file = workspace.source_file(indexed_path)?;
@@ -390,7 +430,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .iter()
             .find(|declaration| declaration.name == name)?;
         if workspace.has_unselected_kotlin_subtype(target, self.translation_roots) {
-            return Some("a Kotlin subtype is outside the translation set");
+            return Some((
+                RetentionKind::SubtypeOutsideTranslationSet,
+                Vec::new(),
+                Vec::new(),
+            ));
         }
         // Subtype rule, two modes:
         // - No fixpoint hint (single-file mode): retain on ANY Kotlin
@@ -401,14 +445,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         //   supertype (enum entries ABI, KClass...). Monotone: seeds
         //   (intrinsically tainted decls) never shrink, so iteration
         //   reaches the least fixpoint.
-        if hierarchy_closure()
-            && target.kind == crate::workspace::DeclarationKind::Interface
-            && match self.retained_hint.as_ref() {
-                Some(retained) => workspace.has_retained_kotlin_subtype(target, retained),
+        if hierarchy_closure() && target.kind == crate::workspace::DeclarationKind::Interface {
+            let blockers = self.retained_subtypes(workspace, target);
+            let retains = match self.retained_hint.as_ref() {
+                Some(_) => !blockers.is_empty(),
                 None => workspace.has_kotlin_subtype(target),
+            };
+            if retains {
+                return Some((
+                    RetentionKind::InterfaceSubtypeRetained,
+                    Vec::new(),
+                    blockers,
+                ));
             }
-        {
-            return Some("an interface subtype is itself retained in Kotlin");
         }
         // Closed hierarchy, downward half: a retained Kotlin declaration must
         // not inherit from a supertype that was translated away. Only a Kotlin
@@ -424,12 +473,46 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 .as_ref()
                 .is_some_and(|retained| workspace.has_retained_kotlin_subtype(target, retained))
         {
-            return Some("a retained Kotlin declaration inherits from it");
+            return Some((
+                RetentionKind::RetainedInheritor,
+                Vec::new(),
+                self.retained_subtypes(workspace, target),
+            ));
         }
-        if target.has_non_trailing_default && self.referenced_by_surviving_kotlin(name) {
-            return Some(
-                "its default-argument constructor leaves a middle parameter defaulted, which Java cannot express",
-            );
+        // Constructor default arguments (N87CB). A default on a middle
+        // parameter is not a blocker by itself — what decides is whether a caller
+        // omits one in a shape Java can be given. Java expresses an omission by
+        // writing a language-neutral literal into the call, or by a delegating
+        // overload for the exact pattern a call site uses; only a pattern the
+        // emitter cannot write keeps the declaration in Kotlin.
+        if target.has_default_constructor_parameter {
+            let evidence = workspace.ctor_omission_evidence(target);
+            if let Some(reason) = self.ctor_default_plan(decl, target).blocked {
+                return Some((
+                    RetentionKind::MiddleDefaultParameter,
+                    vec![reason],
+                    Vec::new(),
+                ));
+            }
+            if let Some(site) = evidence.unresolvable.first() {
+                return Some((
+                    RetentionKind::MiddleDefaultParameter,
+                    vec![format!(
+                        "a caller's argument shape could not be read at {site}"
+                    )],
+                    Vec::new(),
+                ));
+            }
+            if !self.in_place && evidence.named_callers {
+                return Some((
+                    RetentionKind::MiddleDefaultParameter,
+                    vec![
+                        "a caller names arguments and this run rewrites no retained Kotlin"
+                            .to_string(),
+                    ],
+                    Vec::new(),
+                ));
+            }
         }
         // A translated Java object singleton cannot be referenced by
         // plain name from residual Kotlin (no companion object), so an
@@ -439,10 +522,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 workspace.has_retained_kotlin_reference(indexed_path, name, retained)
             })
         {
-            return Some("it is referenced by name from retained Kotlin");
+            return Some((
+                RetentionKind::ReferencedFromRetainedKotlin,
+                Vec::new(),
+                self.retained_hint
+                    .as_ref()
+                    .map(|retained| {
+                        workspace.retained_kotlin_referencers(indexed_path, name, retained)
+                    })
+                    .unwrap_or_default(),
+            ));
         }
         if workspace.narrows_nullable_kotlin_property(source_file, target) {
-            return Some("it narrows a nullable Kotlin property");
+            return Some((RetentionKind::NullableNarrowing, Vec::new(), Vec::new()));
         }
         if self.retained_hint.is_some()
             && self.in_place
@@ -452,19 +544,64 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 self.translation_roots,
             )
         {
-            return Some("it inherits a retained Kotlin property interface");
+            return Some((
+                RetentionKind::RetainedPropertyInterface,
+                Vec::new(),
+                self.retained_supertypes(workspace, target),
+            ));
         }
-        if workspace.property_smart_cast_used_by_kotlin(indexed_path, target) {
-            return Some("retained Kotlin smart-casts one of its properties");
+        // Retained Kotlin that smart-casts one of its properties does not have
+        // to keep the owner in Kotlin: the rewrite pass binds the property read
+        // into a local first, and a local `val` smart-casts freely. Only a site
+        // the rewrite pass cannot repair (an unsupported shape, or a receiver
+        // whose owner it cannot prove) keeps the owner here. Not in place, the
+        // rewrite pass never runs, so nothing is repaired and the owner stays.
+        if self.in_place
+            && workspace.property_smart_cast_used_by_kotlin(indexed_path, target)
+            && !workspace.smart_cast_rewrites_cover(indexed_path, target)
+        {
+            return Some((RetentionKind::SmartCast, Vec::new(), Vec::new()));
         }
         if hierarchy_closure()
             && self.retained_hint.as_ref().is_some_and(|retained| {
                 workspace.has_retained_kotlin_supertype(&target.supertypes, retained)
             })
         {
-            return Some("one of its supertypes is retained in Kotlin");
+            return Some((
+                RetentionKind::RetainedSupertype,
+                Vec::new(),
+                self.retained_supertypes(workspace, target),
+            ));
         }
         None
+    }
+
+    /// Retained Kotlin subtypes of `target`, by simple name — the blame edges
+    /// behind the subtype-based retention reasons. Empty without a fixpoint
+    /// hint: the run-end table is built from the hinted final pass, and the
+    /// unhinted single-file mode has no retained set to attribute against.
+    fn retained_subtypes(
+        &self,
+        workspace: &crate::workspace::SourceIndex,
+        target: &crate::workspace::Declaration,
+    ) -> Vec<String> {
+        self.retained_hint
+            .as_ref()
+            .map(|retained| workspace.retained_kotlin_subtype_names(target, retained))
+            .unwrap_or_default()
+    }
+
+    /// Retained Kotlin supertypes of `target`, by simple name — the blame edges
+    /// behind the supertype-based retention reasons.
+    fn retained_supertypes(
+        &self,
+        workspace: &crate::workspace::SourceIndex,
+        target: &crate::workspace::Declaration,
+    ) -> Vec<String> {
+        self.retained_hint
+            .as_ref()
+            .map(|retained| workspace.retained_kotlin_supertype_names(&target.supertypes, retained))
+            .unwrap_or_default()
     }
 
     /// A Kotlin companion `operator fun invoke` gives the enclosing type a
@@ -520,6 +657,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
         let mut is_data = false;
         let mut is_sealed = false;
+        // Kotlin `open`: the class is subclassable, so the Java form must NOT
+        // be final. `open` itself is not Java and must not be emitted.
+        let mut is_open = false;
+        let mut is_explicit_final = false;
         let mut is_enum = false;
         let mut is_annotation = false;
         let is_fun_interface = decl
@@ -558,11 +699,29 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                 "data" => is_data = true,
                                 "open" | "abstract" | "sealed" => {
                                     let word = self.text(cm).trim();
-                                    if word == "sealed" {
-                                        is_sealed = true;
+                                    match word {
+                                        // `sealed`/`abstract` are Java words;
+                                        // they are emitted as-is.
+                                        "sealed" => is_sealed = true,
+                                        // `open` has no Java keyword. Its Java
+                                        // form is a class WITHOUT `final`
+                                        // (see the final_kw rule below), so the
+                                        // flag is recorded and the word is
+                                        // never emitted — `open class` is not
+                                        // Java.
+                                        "open" => {
+                                            is_open = true;
+                                            continue;
+                                        }
+                                        _ => {}
                                     }
-                                    modifiers.push_str(word);
-                                    modifiers.push(' ');
+                                    // Guarded: the same keyword can arrive as
+                                    // either node kind depending on the grammar,
+                                    // and `abstract abstract class` is not Java.
+                                    if !modifiers.contains(word) {
+                                        modifiers.push_str(word);
+                                        modifiers.push(' ');
+                                    }
                                 }
                                 "enum" => is_enum = true,
                                 "annotation" => is_annotation = true,
@@ -577,8 +736,42 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             }
                         }
                     }
-                    "visibility_modifier" | "inheritance_modifier" => {
+                    "visibility_modifier" => {
                         // handled below via text
+                    }
+                    "inheritance_modifier" => {
+                        // Kotlin's inheritance keywords parse as their OWN node
+                        // kind, not as `class_modifier` children:
+                        //  - `open` means subclassable, and Java expresses that
+                        //    as the ABSENCE of `final` (see the final_kw rule
+                        //    below). `open` is not a Java keyword and must never
+                        //    be emitted.
+                        //  - `abstract`/`sealed` are Java words, emitted as-is
+                        //    (`sealed`'s own handling drops it when no subclass
+                        //    is known in this file).
+                        //  - `final` is Kotlin's default, which the Java form
+                        //    states explicitly anyway; recording the keyword
+                        //    itself matters because the source is authoritative
+                        //    (see the final_kw rule below).
+                        for word in self.text(m).split_whitespace() {
+                            match word {
+                                "open" => is_open = true,
+                                "final" => is_explicit_final = true,
+                                "sealed" => {
+                                    is_sealed = true;
+                                    if !modifiers.contains("sealed") {
+                                        modifiers.push_str("sealed ");
+                                    }
+                                }
+                                // Guarded: the same keyword can arrive as
+                                // either node kind depending on the grammar,
+                                // and `abstract abstract class` is not Java.
+                                "abstract" if !modifiers.contains("abstract") => {
+                                    modifiers.push_str("abstract ");
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -644,8 +837,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     && let Some(identifier) = kt::child(variable, "identifier")
                 {
                     let property = self.text(identifier).to_string();
-                    self.self_getters
-                        .insert(property.clone(), format!("get{}", capitalize(&property)));
+                    let is_static = kt::parent_of(member)
+                        .is_some_and(|parent| parent.kind() == "class_body")
+                        && kt::parent_of(member)
+                            .and_then(kt::parent_of)
+                            .is_some_and(|parent| parent.kind() == "object_declaration");
+                    if !is_static {
+                        self.self_getters
+                            .insert(property.clone(), format!("get{}", capitalize(&property)));
+                    }
                 }
             }
         }
@@ -682,8 +882,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             );
             return;
         }
-        if let Some(reason) = self.kotlin_retention_reason(&name) {
-            self.retain_decl(decl, reason);
+        if let Some((kind, params, blockers)) = self.kotlin_retention_reason(&name, decl) {
+            self.retain_decl(decl, &name, kind, &params, &blockers);
             return;
         }
 
@@ -955,6 +1155,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         } else {
             "class"
         };
+        // Kotlin's `kotlin-jpa` plugin gives @Entity/@Embeddable/
+        // @MappedSuperclass classes a zero-argument constructor so the ORM can
+        // instantiate them. The Kotlin source never spells that constructor
+        // out, so the Java form has to be synthesized here.
+        let jpa_no_arg = annotations.iter().any(|a| is_jpa_no_arg_annotation(a));
 
         if is_interface {
             // Interfaces declared type parameters too (`interface
@@ -1071,10 +1276,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             // the user-defined one already in the body.
             && !self.class_body_defines_lombok_generated(decl)
         {
-            // --lombok: data class -> @Data class with mutable fields
-            // (@Data generates equals/hashCode/toString/getters/setters;
-            // var properties keep their setters semantically).
-            out.line("@Data");
+            // --lombok: a data class is a VALUE type. All-`val` properties
+            // become Lombok's immutable `@Value` (private final fields,
+            // getters, equals/hashCode/toString, all-args constructor, and no
+            // setters), which is what Kotlin's data class actually is. A
+            // writable `var` — or any body instance field, whose presence
+            // changes the constructor arity `@Value`'s implied
+            // all-args constructor would settle on — keeps mutable `@Data`.
+            out.line(self.data_class_lombok_annotation(
+                decl,
+                params.iter().all(|(_, is_mutable, _, _)| !*is_mutable),
+            ));
+            self.emit_lombok_equals_call_super(decl, out);
             out.blank();
             // Java-native declaration annotations pass through verbatim
             // (collected during the modifiers scan above).
@@ -1092,6 +1305,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
                 // final val fields: @Data omits the setter automatically
                 let final_kw = if !*is_mutable { "final " } else { "" };
+                // Kotlin writes persistence and metadata annotations on the
+                // constructor property; the Java side must carry them on the
+                // FIELD, which is the element the ORM reads.
+                // This path emits no explicit getter (Lombok generates the
+                // accessors), so a `@get:` annotation has nowhere better to go
+                // than the field it is written on.
+                for annotation in self
+                    .param_annotations(decl, fname)
+                    .into_iter()
+                    .chain(self.param_getter_annotations(decl, fname))
+                {
+                    out.line(annotation);
+                }
                 out.line(format!("private {}{} {};", final_kw, ftype, fname));
             }
             out.blank();
@@ -1185,6 +1411,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
             self.emit_jvm_overloads_primary_constructors(decl, &name, &params, out);
+            if jpa_no_arg {
+                self.emit_jpa_no_arg_constructor(decl, &name, &params, superclass.is_some(), out);
+            }
             out.blank();
             if let Some(body) = kt::child(decl, "class_body") {
                 self.transpile_class_body(body, out);
@@ -1255,6 +1484,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     tp.trim_end(),
                     comps.join(", ")
                 ));
+                if jpa_no_arg {
+                    self.emit_jpa_no_arg_record_constructor(decl, &name, &params, out);
+                }
             } else {
                 let inner = if extends.is_empty() {
                     format!("{}final class {}{}", visibility, name, tp)
@@ -1281,6 +1513,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         continue;
                     }
                     let final_kw = if !*is_mutable { "final " } else { "" };
+                    // Kotlin writes persistence and metadata annotations on the
+                    // constructor property; the Java side must carry them on the
+                    // FIELD, which is the element the ORM reads.
+                    for annotation in self.param_annotations(decl, fname) {
+                        out.line(annotation);
+                    }
                     out.line(format!("private {}{} {};", final_kw, ftype, fname));
                 }
                 out.blank();
@@ -1299,9 +1537,23 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     }
                 }
                 out.close();
+                if jpa_no_arg {
+                    self.emit_jpa_no_arg_constructor(
+                        decl,
+                        &name,
+                        &params,
+                        superclass.is_some(),
+                        out,
+                    );
+                }
                 out.blank();
                 for (_, _, fname, ftype) in &params {
                     let cap = capitalize(fname);
+                    // `@get:`-targeted annotations belong on the generated
+                    // getter, which this path emits.
+                    for annotation in self.param_getter_annotations(decl, fname) {
+                        out.line(annotation);
+                    }
                     out.open(format!("public {} get{}()", ftype, cap));
                     out.line(format!("return {};", fname));
                     out.close();
@@ -1334,7 +1586,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     }
                 }
             }
-            // A record's canonical constructor is its only implicit one, but
+            // A record's canonical constructor is its only implicit one,
             // extra constructors may delegate to it with `this(...)`. Kotlin
             // callers omit trailing defaults, so a translated record needs the
             // same delegating overloads a plain class gets — without them the
@@ -1344,18 +1596,45 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         } else {
             // Java places type params after the class name: `class Name<T>`.
             let tp = type_params.trim_end(); // "<T>" or "" (no space needed before '{')
-            // Subclasses of a file-sealed type must be final in Java (Kotlin
-            // classes are final by default unless open/abstract/sealed).
-            let final_kw = if is_sealed || modifiers.contains("abstract") {
+            // Kotlin classes are final by DEFAULT; Java's default is the
+            // opposite. Emitting an ordinary Kotlin class as a plain Java class
+            // silently grants an extensibility the source never had, so the
+            // faithful Java form is `final`. Deliberate opt-outs, in order:
+            //  - a subclass of a FILE-sealed type: Java requires a permitted
+            //    subtype to be final, sealed or non-sealed;
+            //  - the source says so (`open`/`abstract`/`sealed`);
+            //  - something in the workspace extends it: both compilers reject
+            //    inheriting a final class, so any subclass not visible here
+            //    would turn this into an error at the other end;
+            //  - a persistence class, which the ORM subclasses at runtime for
+            //    lazy proxies. Such a Kotlin source is `open` only via the
+            //    all-open plugin, so there is no `open` token in the AST to
+            //    tell us and `final` fails at STARTUP, not at compile time.
+            //
+            // An EXPLICIT `final` in the source outranks every opt-out below
+            // and is never traded away: valid Kotlin cannot extend a `final`
+            // class at all, so "something extends it" is a false positive (or
+            // a stray Java file that was already broken, which silently
+            // un-finaling the class would hide), and a `final` persistence
+            // class is one the all-open plugin did NOT open, i.e. not proxied.
+            // Dropping the keyword would hand callers an extensibility the
+            // Kotlin source explicitly refused them.
+            let sealed_parent = superclass
+                .as_ref()
+                .is_some_and(|parent| self.sealed_types.contains(parent));
+            let final_kw = if sealed_parent || is_explicit_final {
+                "final "
+            } else if is_sealed
+                || is_open
+                || modifiers.contains("abstract")
+                || self
+                    .workspace
+                    .is_some_and(|workspace| workspace.has_subtype_named(&name))
+                || annotations.iter().any(|a| is_orm_proxied_annotation(a))
+            {
                 ""
-            } else if let Some(sp) = &superclass {
-                if self.sealed_types.contains(sp) {
-                    "final "
-                } else {
-                    ""
-                }
             } else {
-                ""
+                "final "
             };
             // --lombok: hand-rolled accessors/equals/hashCode/toString become
             // Lombok annotations placed BEFORE the class declaration.
@@ -1366,7 +1645,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             // Lombok would demand `(site, zone, …)` and every caller using the
             // Kotlin arity stops compiling. Emit the explicit ctor instead —
             // the body properties keep their inline initializers as fields.
-            let lombok_all_args_is_faithful = !self.class_body_declares_instance_fields(decl);
+            //
+            // The JPA no-arg constructor is a second reason never to lean on
+            // Lombok here: Lombok generates NO constructor at all once the
+            // class declares one (measured with lombok 1.18.42: @Data +
+            // @AllArgsConstructor beside an explicit `public T()` yields only
+            // that one), so relying on the synthesized all-args ctor would
+            // silently DELETE it and break every call site — the explicit ctor
+            // has to be written beside the no-arg one.
+            let lombok_supplies_all_args =
+                !jpa_no_arg && !self.class_body_declares_instance_fields(decl);
             if self.lombok
                 && !params.is_empty()
                 // Lombok would generate a second equals/hashCode/toString
@@ -1374,12 +1662,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 && !self.class_body_defines_lombok_generated(decl)
             {
                 out.line("@Data");
+                self.emit_lombok_equals_call_super(decl, out);
                 // @AllArgsConstructor's synthesized ctor collides with the
                 // explicit super-forwarding ctor emitted below — only
                 // annotate when the explicit one is not being written.
                 if super_ctor_args.is_none()
                     && !has_secondary_constructor
-                    && lombok_all_args_is_faithful
+                    && lombok_supplies_all_args
                 {
                     out.line("@AllArgsConstructor");
                 }
@@ -1400,6 +1689,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     continue;
                 }
                 let final_kw = if !*is_mutable { "final " } else { "" };
+                // Kotlin writes persistence and metadata annotations on the
+                // constructor property; the Java side must carry them on the
+                // FIELD, which is the element the ORM reads.
+                // The getter below is emitted only when this is NOT --lombok
+                // (`accessors (skipped under --lombok: @Data generates
+                // them)`), so under Lombok a `@get:` annotation has nowhere
+                // to land and must stay on the field it is written on:
+                // dropping it would lose the very metadata the ORM reads.
+                let mut annotations = self.param_annotations(decl, fname);
+                if self.lombok {
+                    annotations.extend(self.param_getter_annotations(decl, fname));
+                }
+                for annotation in annotations {
+                    out.line(annotation);
+                }
                 out.line(format!("private {}{} {};", final_kw, ftype, fname));
             }
             if !params.is_empty() {
@@ -1432,7 +1736,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.blank();
             }
             if !params.is_empty()
-                && (!self.lombok || has_secondary_constructor || !lombok_all_args_is_faithful)
+                && (!self.lombok || has_secondary_constructor || !lombok_supplies_all_args)
                 && super_ctor_args.is_none()
             {
                 for annotation in &ctor_annotations {
@@ -1454,10 +1758,26 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.blank();
             }
             self.emit_jvm_overloads_primary_constructors(decl, &name, &params, out);
+            if jpa_no_arg {
+                self.emit_jpa_no_arg_constructor(decl, &name, &params, superclass.is_some(), out);
+            }
             // accessors (skipped under --lombok: @Data generates them)
             if !self.lombok {
-                for (_is_property, is_mutable, fname, ftype) in &params {
+                for (is_property, is_mutable, fname, ftype) in &params {
+                    // A plain constructor parameter is not a property: Kotlin
+                    // declares no member for it, so an emitted accessor would
+                    // read a field that was never written (`return x;` ->
+                    // "cannot find symbol x"; for a name that shadows an
+                    // inherited property, "id has private access in Base").
+                    if !*is_property {
+                        continue;
+                    }
                     let cap = capitalize(fname);
+                    // `@get:`-targeted annotations belong on the generated
+                    // getter, which this path emits.
+                    for annotation in self.param_getter_annotations(decl, fname) {
+                        out.line(annotation);
+                    }
                     out.open(format!("public {} get{}()", ftype, cap));
                     out.line(format!("return {};", fname));
                     out.close();
@@ -1598,6 +1918,104 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// with inline initializers; they are NOT primary-constructor parameters.
     /// Lombok's @AllArgsConstructor covers every field, so it only matches the
     /// Kotlin constructor when the body adds no field of its own.
+    /// Lombok's annotation for a translated Kotlin data class: `@Value` when
+    /// nothing is writable, `@Data` as soon as something is.
+    ///
+    /// Kotlin's `data class X(val a: T)` is an immutable value type, and
+    /// `@Value` is its faithful Java form. A `var` property makes the Java
+    /// object writable, which only `@Data` serves. A body instance field also
+    /// forces `@Data`: `@Value` implies `@AllArgsConstructor` over EVERY field,
+    /// so the constructor arity Kotlin callers use would change.
+    fn data_class_lombok_annotation(
+        &self,
+        decl: tree_sitter::Node,
+        ctor_props_all_final: bool,
+    ) -> &'static str {
+        if ctor_props_all_final && !self.class_body_declares_instance_fields(decl) {
+            "@Value"
+        } else {
+            "@Data"
+        }
+    }
+
+    /// Lombok's generated `equals`/`hashCode` cover this class's own fields
+    /// only. A value type with a superclass must fold the inherited state in —
+    /// and without the call Lombok warns "generating equals/hashCode
+    /// implementation but without a call to superclass" on every such class.
+    ///
+    /// The predicate is `superclass_name`, which only matches a delegation
+    /// specifier shaped like `: Base(...)`, i.e. a real class supertype —
+    /// interfaces take no parentheses. Keying on the emitted `extends` text
+    /// instead would catch interface-only classes and buy the opposite
+    /// complaint, Lombok's "supercall to java.lang.Object is pointless".
+    fn emit_lombok_equals_call_super(&self, decl: tree_sitter::Node<'tree>, out: &mut JavaOut) {
+        if self.superclass_name(decl).is_some() {
+            out.line("@EqualsAndHashCode(callSuper = true)");
+        }
+    }
+
+    /// Annotations written on one declaration, split by what Java can do with
+    /// them: a `@get:`-targeted annotation belongs on the generated getter when
+    /// the emitter writes one, and everything else on the field. The use-site
+    /// prefix itself is dropped either way — Java annotates the element, and
+    /// `@JsonProperty` is not Java syntax.
+    pub(crate) fn annotation_split(&self, node: tree_sitter::Node) -> (Vec<String>, Vec<String>) {
+        let mut field = Vec::new();
+        let mut getter = Vec::new();
+        // Annotations sit under `modifiers`, but walk the subtree so the
+        // grammar's exact nesting cannot matter.
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            let mut cursor = current.walk();
+            for child in current.children(&mut cursor) {
+                if child.kind() == "annotation" {
+                    if let Some(text) = self.transpile_declaration_annotation(child) {
+                        if use_site_target(self.text(child)) == Some("get") {
+                            getter.push(text);
+                        } else {
+                            field.push(text);
+                        }
+                    }
+                } else {
+                    stack.push(child);
+                }
+            }
+        }
+        (field, getter)
+    }
+
+    /// The `class_parameter` for a primary-constructor property, by name.
+    fn param_node(
+        &self,
+        decl: tree_sitter::Node<'tree>,
+        property: &str,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        let parameters = kt::child(decl, "primary_constructor")
+            .and_then(|ctor| kt::child(ctor, "class_parameters"))?;
+        let mut cursor = parameters.walk();
+        parameters
+            .children(&mut cursor)
+            .filter(|child| child.kind() == "class_parameter")
+            .find(|child| {
+                kt::child(*child, "identifier").is_some_and(|name| self.text(name) == property)
+            })
+    }
+
+    /// Annotations for a constructor property that belong on the FIELD.
+    fn param_annotations(&self, decl: tree_sitter::Node, property: &str) -> Vec<String> {
+        self.param_node(decl, property)
+            .map(|parameter| self.annotation_split(parameter).0)
+            .unwrap_or_default()
+    }
+
+    /// Annotations for a constructor property that belong on the GETTER —
+    /// `@get:`-targeted ones, which say so themselves.
+    fn param_getter_annotations(&self, decl: tree_sitter::Node, property: &str) -> Vec<String> {
+        self.param_node(decl, property)
+            .map(|parameter| self.annotation_split(parameter).1)
+            .unwrap_or_default()
+    }
+
     fn class_body_declares_instance_fields(&self, decl: tree_sitter::Node) -> bool {
         let Some(body) = kt::child(decl, "class_body") else {
             return false;
@@ -1676,6 +2094,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                     file: self.file.to_path_buf(),
                                     line: cp.start_position().row + 1,
                                     col: cp.start_position().column + 1,
+                                    code: None,
                                 });
                                 "Object".to_string()
                             }
@@ -1741,35 +2160,106 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .unwrap_or_default()
     }
 
-    /// `@JvmOverloads` exposes Java overloads for every omitted trailing
-    /// primary-constructor default. The Kotlin annotation itself has no Java
-    /// counterpart, so emit the overloads that express its ABI instead.
-    fn emit_jvm_overloads_primary_constructors(
-        &mut self,
-        decl: tree_sitter::Node,
-        name: &str,
-        params: &[(bool, bool, String, String)],
-        out: &mut JavaOut,
-    ) {
-        let has_jvm_overloads = kt::child(decl, "primary_constructor")
+    /// `@JvmOverloads` on the primary constructor: the annotation that asks
+    /// for Java overloads of the omitted trailing defaults.
+    fn primary_constructor_has_jvm_overloads(&self, decl: tree_sitter::Node) -> bool {
+        kt::child(decl, "primary_constructor")
             .and_then(|constructor| kt::child(constructor, "modifiers"))
             .is_some_and(|modifiers| {
                 modifiers
                     .children(&mut modifiers.walk())
                     .filter(|node| node.kind() == "annotation")
                     .any(|annotation| self.text(annotation).contains("JvmOverloads"))
-            });
-        // In an in-place workspace migration, translated declarations coexist
-        // with retained Kotlin. Kotlin default arguments are not Java
-        // overloads, so retained callers otherwise fail to compile against the
-        // generated Java class. Emit the same delegating overloads at that
-        // boundary; ordinary file translation preserves Kotlin's original ABI
-        // unless it explicitly requested @JvmOverloads.
-        let preserve_residual_kotlin_calls = self.in_place;
-        if (!has_jvm_overloads && !preserve_residual_kotlin_calls) || params.is_empty() {
+            })
+    }
+
+    /// The declaration the index holds for `name` in this file, when there is
+    /// one. The retention rule and the emitter both read the INDEX's record of
+    /// the constructor — parameter names, default texts — instead of re-reading
+    /// the syntax, so the two cannot disagree about what a call site's shape is.
+    fn indexed_target(&self, name: &str) -> Option<&crate::workspace::Declaration> {
+        let workspace = self.workspace?;
+        let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
+        let source_file = workspace.source_file(indexed_path)?;
+        source_file
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+    }
+
+    /// Whether the delegating overloads for this declaration's default
+    /// arguments can be written, and which omission patterns need one.
+    ///
+    /// Reads the index's omission evidence for the declaration: a pattern no
+    /// caller uses costs nothing, so only the shapes call sites actually write
+    /// become constructors. `blocked` is why none can be written.
+    fn ctor_default_plan(
+        &self,
+        decl: tree_sitter::Node<'_>,
+        target: &crate::workspace::Declaration,
+    ) -> crate::ctor_defaults::CtorDefaultPlan {
+        let defaults = &target.constructor_param_defaults;
+        // The ladder is what the emitter writes for Kotlin's own positional ABI
+        // (any in-place run) or for an explicit `@JvmOverloads`; the plan must
+        // not write it twice.
+        let ladder = if self.in_place || self.primary_constructor_has_jvm_overloads(decl) {
+            crate::ctor_defaults::trailing_patterns(defaults)
+        } else {
+            Vec::new()
+        };
+        let patterns = self
+            .workspace
+            .map(|workspace| workspace.ctor_omission_evidence(target).patterns)
+            .unwrap_or_default();
+        let param_types = crate::ctor_defaults::class_param_types(decl, self.source);
+        crate::ctor_defaults::plan_ctor_defaults(&crate::ctor_defaults::CtorShape {
+            param_names: &target.constructor_param_names,
+            defaults,
+            param_types: &param_types,
+            patterns: &patterns,
+            ladder: &ladder,
+            has_secondary_constructor: target
+                .members
+                .iter()
+                .any(|member| member.kind == crate::workspace::MemberKind::Constructor),
+        })
+    }
+
+    /// `@JvmOverloads` exposes Java overloads for every omitted trailing
+    /// primary-constructor default. The Kotlin annotation itself has no Java
+    /// counterpart, so emit the overloads that express its ABI instead.
+    ///
+    /// Two sets of overloads are written, and only these:
+    ///
+    /// - the trailing ladder, for `@JvmOverloads` or an in-place run: Kotlin's
+    ///   own positional constructor ABI, which a retained caller may use;
+    /// - one overload per omission pattern a call site actually writes
+    ///   ([`Self::ctor_default_plan`]) — a named-argument call omitting a middle
+    ///   parameter, or one whose default cannot be written into the call.
+    ///
+    /// Never every subset: a declaration whose defaults no caller omits gets no
+    /// overloads at all.
+    fn emit_jvm_overloads_primary_constructors(
+        &mut self,
+        decl: tree_sitter::Node<'_>,
+        name: &str,
+        params: &[(bool, bool, String, String)],
+        out: &mut JavaOut,
+    ) {
+        if params.is_empty() {
             return;
         }
-
+        // Only a defaulted parameter can be delegated, and only a call site that
+        // omits one needs an overload. Without either there is nothing to write —
+        // and nothing to lower, which matters because lowering a default
+        // expression can carry diagnostics.
+        let ladder_requested = self.in_place || self.primary_constructor_has_jvm_overloads(decl);
+        let has_defaults = self
+            .indexed_target(name)
+            .is_some_and(|target| target.has_default_constructor_parameter);
+        if !has_defaults && !ladder_requested {
+            return;
+        }
         // Kotlin primary-constructor default expressions run before an instance
         // exists. Seed the constructor parameters as locals while lowering so
         // `label` stays `label`, rather than becoming `this.getLabel()`.
@@ -1782,38 +2272,258 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         );
         let defaults = self.class_param_defaults(decl);
         self.var_types = prior_var_types;
-        let trailing_defaults = defaults
-            .iter()
-            .rev()
-            .take_while(|value| value.is_some())
-            .count();
-        if trailing_defaults == 0 {
-            return;
+        let mut patterns = if self.in_place || self.primary_constructor_has_jvm_overloads(decl) {
+            crate::ctor_defaults::trailing_patterns(&defaults)
+        } else {
+            Vec::new()
+        };
+        if let Some(target) = self.indexed_target(name) {
+            let plan = self.ctor_default_plan(decl, target);
+            if plan.blocked.is_none() {
+                patterns.extend(plan.overloads);
+            }
         }
-        let first_omitted = params.len() - trailing_defaults;
-        for omitted in 1..=trailing_defaults {
-            let kept = params.len() - omitted;
-            let signature = params[..kept]
-                .iter()
-                .map(|(_, _, param_name, param_type)| format!("{} {}", param_type, param_name))
+        for pattern in &patterns {
+            // Defensive: a pattern the index derived must line up with the
+            // parameters the emitter lowered, and every omitted parameter must
+            // have a lowered default to delegate with.
+            if pattern.iter().any(|index| *index >= params.len())
+                || pattern
+                    .iter()
+                    .any(|index| defaults.get(*index).is_none_or(Option::is_none))
+            {
+                continue;
+            }
+            let signature = (0..params.len())
+                .filter(|index| !pattern.contains(index))
+                .map(|index| {
+                    let (_, _, param_name, param_type) = &params[index];
+                    format!("{param_type} {param_name}")
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let values = params[..kept]
-                .iter()
-                .map(|(_, _, param_name, _)| param_name.clone())
-                .chain(
-                    defaults[kept..]
-                        .iter()
-                        .map(|value| value.clone().expect("trailing constructor default")),
-                )
+            let values = (0..params.len())
+                .map(|index| {
+                    if pattern.contains(&index) {
+                        defaults[index]
+                            .clone()
+                            .unwrap_or_else(|| "null".to_string())
+                    } else {
+                        params[index].2.clone()
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
-            debug_assert!(kept >= first_omitted);
             out.blank();
             out.open(format!("public {}({})", name, signature));
             out.line(format!("this({});", values));
             out.close();
         }
+    }
+
+    /// Whether the emitter writes a zero-argument constructor for this class
+    /// for a reason OTHER than the JPA rule: every primary-constructor
+    /// parameter has a default and the delegating overloads are being written
+    /// (`@JvmOverloads`, or an in-place run that keeps Kotlin's default
+    /// arguments callable). Kotlin has that constructor too — so the JPA rule
+    /// must not add a second one, and its body (a `this(...)` delegation) is
+    /// the one Kotlin's own bytecode holds.
+    fn emits_zero_arg_constructor_overload(
+        &self,
+        decl: tree_sitter::Node,
+        params: &[(bool, bool, String, String)],
+        all_params_defaulted: bool,
+    ) -> bool {
+        !params.is_empty()
+            && all_params_defaulted
+            && (self.in_place || self.primary_constructor_has_jvm_overloads(decl))
+    }
+
+    /// An explicit `constructor()` (zero parameters) already gives the class
+    /// the constructor JPA needs. Measured: with one declared, kotlinc's
+    /// no-arg plugin emits exactly one zero-argument constructor (the declared
+    /// one delegating to the primary), not two.
+    fn declares_zero_arg_secondary_constructor(&self, decl: tree_sitter::Node) -> bool {
+        let Some(body) = kt::child(decl, "class_body") else {
+            return false;
+        };
+        body.children(&mut body.walk())
+            .filter(|member| member.kind() == "secondary_constructor")
+            .any(
+                |constructor| match kt::child(constructor, "function_value_parameters") {
+                    Some(parameters) => !parameters
+                        .children(&mut parameters.walk())
+                        .any(|child| child.kind() == "parameter"),
+                    None => true,
+                },
+            )
+    }
+
+    /// (field name, JVM default literal) for every instance field the class
+    /// emitter writes for `decl`: the primary-constructor properties, plus the
+    /// class-body properties that emit a backing field AND declare their type.
+    ///
+    /// A body property whose type is only inferred is skipped: property.rs
+    /// resolves those through a cross-file/inherited-type path this pass does
+    /// not reproduce, and guessing a primitive wrong would emit `null` into an
+    /// `int` field. Skipping costs fidelity (that field keeps its Java
+    /// initializer where the plugin's constructor would leave it default);
+    /// guessing costs the compile.
+    ///
+    /// The field predicate is SHARED with property.rs — a property that emits
+    /// no field must not be assigned here.
+    fn jpa_instance_field_defaults(
+        &mut self,
+        decl: tree_sitter::Node,
+        params: &[(bool, bool, String, String)],
+    ) -> Vec<(String, String)> {
+        let mut fields: Vec<(String, String)> = params
+            .iter()
+            .filter(|(is_property, _, _, _)| *is_property)
+            .map(|(_, _, name, java_type)| {
+                (name.clone(), jvm_default_literal(java_type).to_string())
+            })
+            .collect();
+        let Some(body) = kt::child(decl, "class_body") else {
+            return fields;
+        };
+        let mut cursor = body.walk();
+        let members: Vec<tree_sitter::Node> = body.children(&mut cursor).collect();
+        for member in members {
+            if member.kind() != "property_declaration" || !self.property_emits_backing_field(member)
+            {
+                continue;
+            }
+            let Some(variable) = kt::child(member, "variable_declaration") else {
+                continue;
+            };
+            let declared =
+                kt::child(variable, "user_type").or_else(|| kt::child(variable, "nullable_type"));
+            let (Some(declared), Some(identifier)) = (declared, kt::child(variable, "identifier"))
+            else {
+                continue;
+            };
+            let java_type = kt::java_type_ann(declared, self.source, self.annots);
+            fields.push((
+                self.text(identifier).to_string(),
+                jvm_default_literal(&java_type).to_string(),
+            ));
+        }
+        fields
+    }
+
+    /// Kotlin's `kotlin-jpa` plugin (= the `no-arg` plugin with the JPA
+    /// preset) adds a zero-argument constructor to every @Entity/@Embeddable/
+    /// @MappedSuperclass class, so the ORM can instantiate it by reflection.
+    /// Nothing in the source spells that constructor out, and the flag that
+    /// turns it on lives in the BUILD FILE — not in the AST — so the Java side
+    /// has to synthesize it from the annotation alone.
+    ///
+    /// Measured on the reference module's own bytecode (kotlinc 2.3.21 +
+    /// `org.jetbrains.kotlin.plugin.jpa`, `javap -p -c` on the compiled
+    /// entities):
+    ///
+    /// ```text
+    /// public AuthenticatedConnectorRefEntity();
+    ///   Code: aload_0
+    ///         invokespecial .../NameLookupEntity."<init>":()V
+    ///         return
+    /// ```
+    ///
+    /// Three properties of that constructor decide the Java emission:
+    ///   * it is `public` (NOT synthetic), so Java source may call it;
+    ///   * it runs NO property initializer and no `init` block: the fields come
+    ///     out at their JVM defaults, even when the source initializes them
+    ///     (`WorkView.items` is null, not an empty list; `WorkEntity.status` is
+    ///     null, not `CREATED`). That is the plugin's default
+    ///     (`invokeInitializers = false`);
+    ///   * it forwards to `super()` with NO arguments, so the superclass must
+    ///     itself be zero-arg constructible. kotlinc enforces that — `error:
+    ///     zero-argument constructor was not found in the superclass` — and a
+    ///     JPA superclass gets its constructor from this SAME rule, which is
+    ///     why the emitted `super()` resolves for `: NameLookupEntity(id,
+    ///     lookupId)` even though those arguments do not exist in a
+    ///     zero-argument constructor.
+    ///
+    /// Java has no synthetic constructor and does not clear a field on its own,
+    /// so the faithful form is an explicit constructor: `super()`, then every
+    /// instance field assigned its type's default. `final` fields force the
+    /// question — an empty constructor body would not compile.
+    fn emit_jpa_no_arg_constructor(
+        &mut self,
+        decl: tree_sitter::Node,
+        name: &str,
+        params: &[(bool, bool, String, String)],
+        has_class_supertype: bool,
+        out: &mut JavaOut,
+    ) {
+        if params.is_empty() || self.declares_zero_arg_secondary_constructor(decl) {
+            return;
+        }
+        let defaults = self.class_param_defaults(decl);
+        let all_defaulted = defaults.len() == params.len()
+            && !defaults.is_empty()
+            && defaults.iter().all(|default| default.is_some());
+        if self.emits_zero_arg_constructor_overload(decl, params, all_defaulted) {
+            return;
+        }
+        if !out.buf.ends_with("\n\n") {
+            out.blank();
+        }
+        out.open(format!("public {}()", name));
+        if all_defaulted {
+            // Kotlin gives this class a no-argument constructor of its own
+            // (every parameter defaulted), and THAT one delegates to the
+            // primary constructor — so its initializers do run. Reproduce
+            // Kotlin's constructor, not the plugin's field-clearing form.
+            let values: Vec<String> = defaults.into_iter().flatten().collect();
+            out.line(format!("this({});", values.join(", ")));
+        } else {
+            if has_class_supertype {
+                out.line("super();");
+            }
+            for (field, literal) in self.jpa_instance_field_defaults(decl, params) {
+                out.line(format!("this.{} = {};", field, literal));
+            }
+        }
+        out.close();
+    }
+
+    /// The record form of the same constructor. A record's components are
+    /// `final`, so a body that assigns them itself does not exist — the
+    /// constructor has to delegate to the canonical one (`this(...)`), passing
+    /// each component its type's default. That is the same instance Kotlin's
+    /// plugin constructor produces: no initializer runs, so a `val name:
+    /// String` component is null and an `Int` component is 0.
+    fn emit_jpa_no_arg_record_constructor(
+        &mut self,
+        decl: tree_sitter::Node,
+        name: &str,
+        params: &[(bool, bool, String, String)],
+        out: &mut JavaOut,
+    ) {
+        if params.is_empty() || self.declares_zero_arg_secondary_constructor(decl) {
+            return;
+        }
+        let defaults = self.class_param_defaults(decl);
+        let all_defaulted = defaults.len() == params.len()
+            && !defaults.is_empty()
+            && defaults.iter().all(|default| default.is_some());
+        if self.emits_zero_arg_constructor_overload(decl, params, all_defaulted) {
+            return;
+        }
+        let values: Vec<String> = if all_defaulted {
+            defaults.into_iter().flatten().collect()
+        } else {
+            params
+                .iter()
+                .map(|(_, _, _, java_type)| jvm_default_literal(java_type).to_string())
+                .collect()
+        };
+        out.blank();
+        out.open(format!("public {}()", name));
+        out.line(format!("this({});", values.join(", ")));
+        out.close();
     }
 
     /// `enum class` -> native Java enum. Constants become enum constants;
@@ -2080,11 +2790,22 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     continue;
                 }
                 let final_kw = if !*is_mutable { "final " } else { "" };
+                // Kotlin writes persistence and metadata annotations on the
+                // constructor property; the Java side must carry them on the
+                // FIELD, which is the element the ORM reads.
+                for annotation in self.param_annotations(decl, fname) {
+                    out.line(annotation);
+                }
                 out.line(format!("private {}{} {};", final_kw, ftype, fname));
             }
             out.blank();
             for (_is_property, is_mutable, fname, ftype) in &params {
                 let cap = capitalize(fname);
+                // `@get:`-targeted annotations belong on the generated
+                // getter, which this path emits.
+                for annotation in self.param_getter_annotations(decl, fname) {
+                    out.line(annotation);
+                }
                 out.open(format!("public {} get{}()", ftype, cap));
                 out.line(format!("return {};", fname));
                 out.close();
@@ -2864,8 +3585,27 @@ fn prefix_nested_annotations(argument_text: &str) -> String {
     let mut token_start: Option<usize> = None;
     let bytes = argument_text.as_bytes();
     let mut index = 0usize;
+    // A `Name(` inside a STRING literal is text, not a nested annotation:
+    // `@Anno(name = "a(b)")` must not come out as `"@a(b)"`.
+    let mut in_string = false;
     while index < bytes.len() {
         let character = bytes[index] as char;
+        if character == '"' {
+            in_string = !in_string;
+            token_start = None;
+            result.push(character);
+            index += 1;
+            continue;
+        }
+        if in_string {
+            result.push(character);
+            index += 1;
+            if character == '\\' && index < bytes.len() {
+                result.push(bytes[index] as char);
+                index += 1;
+            }
+            continue;
+        }
         let is_identifier_byte = character.is_alphabetic()
             || character == '_'
             || (character.is_ascii_digit() && token_start.is_some());
@@ -2882,7 +3622,13 @@ fn prefix_nested_annotations(argument_text: &str) -> String {
                 let token = &argument_text[start..index];
                 let already_annotated =
                     start > 0 && argument_text[..start].trim_end().ends_with('@');
-                if token.contains('.') && !already_annotated {
+                // Any `Name(` in an annotation argument is a nested annotation:
+                // Java has no constructor calls or method calls there, only
+                // constants and annotations. Kotlin writes the nested form
+                // WITHOUT the `@`, so it has to be added — a bare `Index(...)`
+                // left as-is is javac's "annotation value must be an
+                // annotation".
+                if !already_annotated {
                     let insert_at = result.len() - token.chars().count();
                     result.insert(insert_at, '@');
                 }
@@ -2913,7 +3659,7 @@ fn prefix_nested_annotations(argument_text: &str) -> String {
                     break;
                 }
             }
-            if lookahead.peek() == Some(&')') {
+            if matches!(lookahead.peek(), Some(&')') | Some(&'}')) {
                 continue; // drop the comma (and surrounding whitespace stays)
             }
         }
@@ -2923,6 +3669,81 @@ fn prefix_nested_annotations(argument_text: &str) -> String {
 }
 
 /// Java reserved identifiers that cannot name a field or parameter.
+/// A persistence annotation whose classes the ORM must be able to subclass at
+/// runtime for lazy proxies. `final` forbids that, and the failure is at
+/// STARTUP rather than compile time — Kotlin marks such sources `open` via the
+/// all-open plugin, leaving no `open` token in the AST for us to read.
+/// The use-site target of an annotation (`@get:Foo` -> `get`), or `None` when
+/// it has none. Kotlin lets an annotation say which element it belongs to;
+/// dropping the prefix is required (Java has no such syntax) but dropping the
+/// TARGET is a decision, not a detail.
+fn use_site_target(annotation: &str) -> Option<&str> {
+    let rest = annotation.trim_start().strip_prefix('@')?;
+    let target = rest.split(':').next()?;
+    if rest.contains(':') && !target.is_empty() && target.chars().all(|c| c.is_ascii_alphabetic()) {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// The simple name of an annotation as it reached the emitted Java text:
+/// `@jakarta.persistence.Entity` -> `Entity`, `@Type(IEnumerationType::class)`
+/// -> `Type`.
+fn annotation_simple_name(annotation: &str) -> &str {
+    annotation
+        .trim_start_matches('@')
+        .split('(')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+}
+
+fn is_orm_proxied_annotation(annotation: &str) -> bool {
+    matches!(
+        annotation_simple_name(annotation),
+        "Entity" | "MappedSuperclass"
+    )
+}
+
+/// The no-arg trigger set of Kotlin's `kotlin-jpa` plugin — the `no-arg`
+/// plugin with the JPA preset, which annotates exactly these three
+/// annotations with "needs a zero-argument constructor".
+fn is_jpa_no_arg_annotation(annotation: &str) -> bool {
+    matches!(
+        annotation_simple_name(annotation),
+        "Entity" | "Embeddable" | "MappedSuperclass"
+    )
+}
+
+/// The value a Java field of this declared type holds when no constructor
+/// assigns it: the zero literal for a primitive, `null` for everything else
+/// (references, arrays, boxed primitives, type variables). A leading
+/// annotation (`@Nullable Boolean`) is not part of the type name, and a
+/// generic/array suffix cannot turn a reference type into a primitive.
+fn jvm_default_literal(java_type: &str) -> &'static str {
+    let trimmed = java_type.trim();
+    let bare = match trimmed.strip_prefix('@') {
+        Some(rest) => rest.split_once(' ').map(|(_, ty)| ty.trim()).unwrap_or(""),
+        None => trimmed,
+    };
+    let head = bare.split(['<', '[']).next().unwrap_or(bare).trim();
+    match head {
+        "boolean" => "false",
+        "char" => "'\\0'",
+        "byte" => "(byte) 0",
+        "short" => "(short) 0",
+        "int" => "0",
+        "long" => "0L",
+        "float" => "0.0f",
+        "double" => "0.0",
+        _ => "null",
+    }
+}
+
 fn java_reserved(word: &str) -> bool {
     matches!(
         word,

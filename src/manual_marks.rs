@@ -11,30 +11,49 @@
 //! spot already carrying the marker is never re-annotated.
 //!
 //! Two detections ship today:
-//!   * receiver-binding for `is` smart-casts: `if (x.data is T)` reads the
-//!     underlying Java property twice, and Kotlin's smart-cast does not
-//!     flow across getter calls - a local `val` binding fixes it;
+//!   * receiver-binding for smart casts over a property whose OWNER this run
+//!     translated to Java (`crate::smart_cast`): the property read is bound into
+//!     a local, so Kotlin's flow analysis keeps the narrowing across the Java
+//!     getter boundary. Applied silently — it is semantics-preserving, not a
+//!     request for the user to edit anything;
 //!   * `copy(...)` calls on Kotlin `copy()` of a Java-translated data
 //!     class: Java classes have no `copy()`, the fix is the Java copy/
-//!     with-constructor form.
+//!     with-constructor form. That one is prose, so it becomes a
+//!     `NOTLIN-MANUAL` comment.
 
-use crate::workspace::DeclarationKind;
+use crate::workspace::{DeclarationKind, MemberKind, SourceLanguage};
 use std::fs;
 use std::path::Path;
 
 const MARKER: &str = "NOTLIN-MANUAL:";
 
-/// Scan the retained .kt text and insert `NOTLIN-MANUAL` comment lines where
-/// the workspace shows the referenced declaration is Java-translated.
-/// Returns the number of new markers inserted.
+/// Scan the retained .kt text and repair what the migration can repair by
+/// itself (smart casts over translated property owners), then insert
+/// `NOTLIN-MANUAL` comment lines where only a user edit unlocks more.
+/// Returns the number of changes made.
 pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex) -> usize {
-    let Ok(source) = fs::read_to_string(path) else {
+    let Ok(original) = fs::read_to_string(path) else {
         return 0;
     };
 
+    // The smart-cast repair runs first: it inserts binding lines, and every
+    // pass below must see the text it produced (its own idempotency included).
+    let (source, smart_cast_rewrites) =
+        crate::smart_cast::rewrite(&original, &|owner, property| {
+            translated_property_owner(index, owner, property)
+        });
+
+    // A named-argument constructor call cannot target a Java constructor at all,
+    // and a parameter the caller omits is served by the delegating overload the
+    // emitter wrote for that exact pattern (N87CB). Both are lowered to the
+    // positional Java shape here — only for a declaration this run translated:
+    // one that stayed Kotlin still has nameable parameters and real defaults.
+    let (source, ctor_default_rewrites) = crate::ctor_defaults::rewrite(&source, &|callee| {
+        translated_constructor_params(index, callee)
+    });
+
     let mut insertions: Vec<(usize, String)> = Vec::new(); // (line_index_before_0, comment)
     let mut copy_rewrites: Vec<(usize, String)> = Vec::new();
-    let mut rewrites: Vec<(usize, usize, String)> = Vec::new(); // (condition line, body end, local name)
     let lines: Vec<&str> = source.lines().collect();
 
     // In-file binding tables: `val item: OrderLineItem`, `item: OrderLineItem`
@@ -88,53 +107,13 @@ pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex)
             // Dataflow-free fallback: mark when ANY java data class member
             // property named `recv` exists? Too noisy - skip.
         }
-
-        // P1: `if (<chain> is Type)` where <chain>'s leaf property is a Java
-        // getter-derived property of a translated class.
-        let is_pos = match trimmed.find(" is ") {
-            Some(p) => p,
-            None => continue,
-        };
-        let before = &trimmed[..is_pos];
-        let if_pos = match before.rfind("if") {
-            Some(p) => p,
-            None => continue,
-        };
-        let chain = before[if_pos + 2..].trim().trim_start_matches('(');
-        let Some(dot) = chain.rfind('.') else {
-            continue;
-        };
-        let (base, prop) = (chain[..dot].trim(), chain[dot + 1..].trim());
-        if base.is_empty() || prop.is_empty() {
-            continue;
-        }
-        // Binding a repeated property read is semantics-preserving and fixes
-        // Kotlin smart-cast invalidation for Java getters. Do this generic
-        // syntactic repair even when the lightweight workspace index cannot
-        // recover the receiver's erased/generic type.
-        // The body reads the same chain again - stale smart-cast territory.
-        let chain_lit = chain.to_string();
-        let body_repeats = lines
-            .iter()
-            .skip(i + 1)
-            .take(30)
-            .take_while(|l| !l.trim_start().starts_with('}'))
-            .any(|l| l.contains(&chain_lit));
-        if body_repeats {
-            let local = prop.to_string();
-            let end = i
-                + 1
-                + lines
-                    .iter()
-                    .skip(i + 1)
-                    .take(30)
-                    .take_while(|l| !l.trim_start().starts_with('}'))
-                    .count();
-            rewrites.push((i, end, local));
-        }
     }
 
-    if insertions.is_empty() && copy_rewrites.is_empty() && rewrites.is_empty() {
+    if insertions.is_empty()
+        && copy_rewrites.is_empty()
+        && smart_cast_rewrites == 0
+        && ctor_default_rewrites == 0
+    {
         return 0;
     }
 
@@ -154,49 +133,7 @@ pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex)
             out.push_str(line_ending);
             continue;
         }
-        if let Some((_, _, local)) = rewrites.iter().find(|(at, _, _)| *at == i) {
-            let trimmed = line.trim_start();
-            if let Some(is_pos) = trimmed.find(" is ") {
-                let before = &trimmed[..is_pos];
-                if let Some(if_pos) = before.rfind("if") {
-                    let chain = before[if_pos + 2..]
-                        .trim()
-                        .trim_start_matches('(')
-                        .trim_end();
-                    let indent = &line[..line.len() - trimmed.len()];
-                    out.push_str(indent);
-                    out.push_str("val ");
-                    out.push_str(local);
-                    out.push_str(" = ");
-                    out.push_str(chain);
-                    out.push_str(line_ending);
-                    let replacement = trimmed.replacen(chain, local, 1);
-                    out.push_str(indent);
-                    out.push_str(&replacement);
-                    out.push_str(line_ending);
-                    continue;
-                }
-            }
-        }
-        let line = if let Some((at, _end, local)) =
-            rewrites.iter().find(|(at, end, _)| i > *at && i <= *end)
-        {
-            let condition = lines[*at].trim_start();
-            if let Some(pos) = condition.find(" is ") {
-                let b = &condition[..pos];
-                if let Some(ip) = b.rfind("if") {
-                    let chain = b[ip + 2..].trim().trim_start_matches('(').trim_end();
-                    let replaced = line.replace(chain, local);
-                    // body line rewritten in-place
-                    out.push_str(&replaced);
-                    out.push_str(line_ending);
-                    continue;
-                }
-            }
-            line
-        } else {
-            line
-        };
+        let line = *line;
         if let Some((_, comment)) = insertions.iter().find(|(line, _)| *line == i) {
             let indent_len = line.len() - line.trim_start().len();
             // Byte-boundary safe: leading whitespace only, but guard anyway.
@@ -214,7 +151,50 @@ pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex)
         }
     }
     fs::write(path, out).ok();
-    insertions.len() + copy_rewrites.len() + rewrites.len()
+    insertions.len() + copy_rewrites.len() + smart_cast_rewrites + ctor_default_rewrites
+}
+
+/// The emitted Java constructor's parameter names for `callee`, when this run
+/// translated the declaration. `None` leaves a call site alone, which is what a
+/// declaration that stayed Kotlin (or that this pass cannot see) needs.
+fn translated_constructor_params(
+    index: &crate::workspace::SourceIndex,
+    callee: &str,
+) -> Option<Vec<String>> {
+    index
+        .declarations()
+        .find(|declaration| {
+            declaration.name == callee && declaration.language == SourceLanguage::Java
+        })
+        .map(|declaration| declaration.ctor_param_names_or_state())
+        .filter(|params| !params.is_empty())
+}
+
+/// True when `owner` names a declaration this run translated to Java and carries
+/// `property` — as a field, or through the getter Kotlin will now resolve the
+/// property read to. An owner still in Kotlin needs no repair: its property is
+/// still a Kotlin property, which smart-casts as before.
+fn translated_property_owner(
+    index: &crate::workspace::SourceIndex,
+    owner: &str,
+    property: &str,
+) -> bool {
+    let accessor = crate::workspace::property_accessor_name(property);
+    let boolean_accessor = format!(
+        "is{}{}",
+        property.chars().next().unwrap_or('_').to_uppercase(),
+        property.chars().skip(1).collect::<String>()
+    );
+    index.declarations().any(|declaration| {
+        declaration.name == owner
+            && declaration.language == SourceLanguage::Java
+            && declaration.members.iter().any(|member| {
+                (matches!(member.kind, MemberKind::Property | MemberKind::Field)
+                    && member.name == property)
+                    || member.name == accessor
+                    || member.name == boolean_accessor
+            })
+    })
 }
 
 /// Rewrite a named single-field copy call only when the generated Java class

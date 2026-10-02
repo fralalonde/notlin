@@ -169,10 +169,16 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
             let whole = out.trim();
             for (kt_name, j_name) in [
                 ("KClass<", "Class<"),
-                ("MutableList<", "ArrayList<"),
-                ("MutableMap<", "HashMap<"),
-                ("MutableSet<", "HashSet<"),
+                // Kotlin's Mutable* collections ARE the java.util interfaces
+                // at the JVM level; see `map_type_name`.
+                ("MutableList<", "List<"),
+                ("MutableMap<", "Map<"),
+                ("MutableSet<", "Set<"),
+                ("MutableCollection<", "Collection<"),
                 ("MutableIterable<", "Iterable<"),
+                ("MutableIterator<", "Iterator<"),
+                ("MutableListIterator<", "ListIterator<"),
+                ("MutableMap.MutableEntry<", "Map.Entry<"),
             ] {
                 if let Some(stripped) = whole.strip_prefix(kt_name) {
                     return format!("{}{}", j_name, stripped);

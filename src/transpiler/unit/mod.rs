@@ -4,7 +4,7 @@
 //! submodules hold emission/inference; this file keeps the `Unit` state,
 //! the coverage/taint machinery and top-level orchestration.
 
-use crate::diagnostics::{DiagnosticKind, Diagnostics, FileCoverage, warning_code};
+use crate::diagnostics::{DiagnosticKind, Diagnostics, FileCoverage, RetentionKind, warning_code};
 use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 use crate::transpiler::stmt::Stmt;
@@ -410,6 +410,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     pub fn diag_untranslatable(&mut self, node: tree_sitter::Node, msg: impl Into<String>) {
+        self.diag_untranslatable_coded(node, msg, None);
+    }
+
+    /// As [`Self::diag_untranslatable`], but with an explicit code instead of
+    /// one hashed from the message. A retention warning names the specific
+    /// element it blocked on — so its message varies per declaration — while
+    /// its code has to identify the blocker TYPE: that is what keeps the code
+    /// a human greps for in the log identical to the run-end table row, and the
+    /// table a worklist instead of a per-declaration dump.
+    pub fn diag_untranslatable_coded(
+        &mut self,
+        node: tree_sitter::Node,
+        msg: impl Into<String>,
+        code: Option<String>,
+    ) {
         let sev = if self.untranslatable_as_error {
             crate::diagnostics::Severity::Error
         } else {
@@ -447,6 +462,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             severity: sev,
             kind: DiagnosticKind::Untranslatable,
             message,
+            code,
             file: self.file.to_path_buf(),
             line: node.start_position().row + 1,
             col: node.start_position().column + 1,
@@ -455,11 +471,32 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
     /// A declaration that has to stay Kotlin because residual Kotlin still
     /// needs it: record it for the run-end table AND print the warning, both
-    /// from the same reason — so the code a human reads in the table row is
-    /// the code they can grep for in the log.
-    pub(crate) fn retain_decl(&mut self, decl: tree_sitter::Node, reason: &str) {
-        crate::diagnostics::record_retention(reason, self.file, decl.start_position().row + 1);
-        self.diag_untranslatable(decl, crate::diagnostics::retention_message(reason));
+    /// from the same kind — so the code a human reads in the table row is the
+    /// code they can grep for in the log. `params` instantiate the kind's
+    /// detail template (the specific blocked element); `blockers` names the
+    /// retained declarations this one waits on, so the table can credit a root
+    /// kind with the whole cascade it holds back.
+    pub(crate) fn retain_decl(
+        &mut self,
+        decl: tree_sitter::Node,
+        name: &str,
+        kind: RetentionKind,
+        params: &[String],
+        blockers: &[String],
+    ) {
+        crate::diagnostics::record_retention(
+            kind,
+            params,
+            self.file,
+            decl.start_position().row + 1,
+            name,
+            blockers,
+        );
+        self.diag_untranslatable_coded(
+            decl,
+            crate::diagnostics::retention_message(&kind.detail(params)),
+            Some(kind.code()),
+        );
     }
 
     pub(crate) fn diag_approx(&mut self, node: tree_sitter::Node, msg: impl Into<String>) {
@@ -765,12 +802,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             // ("declared with a raw type and has an explicit
                             // targetEntity") and every generic consumer loses
                             // the check. So the class stays Kotlin instead and
-                            // the conflict is reported for a human.
-                            let reason = format!(
-                                "a Kotlin supertype declares {} with a type Java cannot override exactly; erasing the type arguments would emit raw types, which JPA rejects",
-                                conflicts.join(", ")
+                            // the conflict is reported for a human. The
+                            // conflicting members travel as PARAMS: one kind,
+                            // one code, however many member lists turn up.
+                            self.retain_decl(
+                                *decl,
+                                &type_name,
+                                RetentionKind::SupertypeMemberType,
+                                &conflicts,
+                                &[],
                             );
-                            self.retain_decl(*decl, &reason);
                             self.end_decl();
                             continue;
                         }

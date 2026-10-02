@@ -19,16 +19,29 @@ impl AnnotationSet {
 }
 
 /// Map a Kotlin type name to its Java equivalent where they differ.
+///
+/// Kotlin's `Mutable*` collections are the same JVM types as the read-only
+/// ones (`MutableList<T>` and `List<T>` both erase to `java.util.List`), so
+/// their Java form is the java.util INTERFACE. Emitting the implementation
+/// instead (`ArrayList`, `HashMap`, `HashSet`) changed the signature a Java
+/// override has to reproduce — a Kotlin interface member declared
+/// `fun addAll(items: MutableList<T>)` is `List` in the descriptor, and no
+/// Java method taking `ArrayList` overrides it — and leaked a concrete type
+/// into every emitted API. `MutableCollection`/`MutableIterator` had no entry
+/// at all and reached Java as Kotlin names, which does not compile.
 pub fn map_type_name(kotlin_type: &str) -> &str {
     match kotlin_type {
         "Any" => "Object",
         // Kotlin KClass surfaces as java.lang.Class through the JVM
         // interop boundary — a Java `KClass` reference never resolves.
         "KClass" => "Class",
-        "MutableList" => "ArrayList",
-        "MutableMap" => "HashMap",
-        "MutableSet" => "HashSet",
+        "MutableList" => "List",
+        "MutableMap" => "Map",
+        "MutableSet" => "Set",
+        "MutableCollection" => "Collection",
         "MutableIterable" => "Iterable",
+        "MutableIterator" => "Iterator",
+        "MutableListIterator" => "ListIterator",
         "Nothing" => "Void",
         "Unit" => "void",
         "Int" => "int",

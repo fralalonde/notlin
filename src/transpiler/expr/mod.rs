@@ -61,6 +61,21 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
                 if self.unit.current_object.as_deref() == Some(name.as_str()) {
                     format!("{}.INSTANCE", name)
+                } else if !self.unit.lombok
+                    && !self.unit.var_types.contains_key(&name)
+                    && self.enclosing_type_name().is_some_and(|owner| {
+                        self.unit
+                            .data_components
+                            .get(&owner)
+                            .is_some_and(|components| {
+                                components.iter().any(|(_, component)| component == &name)
+                            })
+                    })
+                {
+                    // A data class is emitted as a Java record. Its implicit
+                    // component reads use `component()`, not JavaBean
+                    // `getComponent()` accessors.
+                    format!("this.{}()", name)
                 } else if !self.unit.var_types.contains_key(&name)
                     && let Some(getter) = self.unit.self_getters.get(&name)
                 {
