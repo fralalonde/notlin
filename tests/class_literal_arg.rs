@@ -69,9 +69,11 @@ fn unknown_class_literal_in_annotation_taints() {
         java.is_empty(),
         "unknown ::class must taint the declaration, got:\n{java}"
     );
+    let kotlin = fs::read_to_string(root.join("s.kt")).unwrap_or_default();
     assert!(
-        stderr.contains("N04DC"),
-        "expected the annotation retention diagnostic:\n{stderr}"
+        kotlin.contains("// NOTLIN: N04DC declaration annotation is retained in Kotlin")
+            && kotlin.contains("interface Bad"),
+        "expected retained interface and in-source annotation blocker:\n{kotlin}\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }

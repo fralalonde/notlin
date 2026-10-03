@@ -33,9 +33,12 @@ fn companion_invoke_type_stays_kotlin_for_external_kotlin_callers() {
         root.join("Factory.kt").exists(),
         "companion-invoke class was translated despite a residual Kotlin caller:\n{stderr}"
     );
+    let kotlin = fs::read_to_string(root.join("Factory.kt")).unwrap_or_default();
     assert!(
-        stderr.contains("companion operator `invoke`"),
-        "missing ABI retention diagnostic:\n{stderr}"
+        kotlin.contains(
+            "// NOTLIN: NC82C companion operator `invoke` is consumed by residual Kotlin"
+        ) && kotlin.contains("class Factory"),
+        "missing in-source ABI retention diagnostic:\n{kotlin}\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }

@@ -159,9 +159,11 @@ fn secondary_constructor_with_complex_delegation_argument_stays_kotlin() {
         root.join("Token.kt").exists(),
         "complex delegated argument was emitted as Java:\n{stderr}"
     );
+    let kotlin = fs::read_to_string(root.join("Token.kt")).unwrap_or_default();
     assert!(
-        stderr.contains("direct `this(...)` or `super(...)` delegation with an empty or simple assignment-only body"),
-        "missing conservative secondary-constructor diagnostic:\n{stderr}"
+        kotlin.contains("// NOTLIN: NE5A7 secondary constructor is not a direct `this(...)` or `super(...)` delegation with an empty or simple assignment-only body")
+            && kotlin.contains("constructor(parts: Array<String>)"),
+        "missing in-source conservative secondary-constructor diagnostic:\n{kotlin}\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }

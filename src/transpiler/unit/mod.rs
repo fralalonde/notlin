@@ -453,9 +453,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // the diagnostic node's byte offset — migrate.rs emits these comments
         // in --in-place residue when the surrounding declaration is stripped.
         let message: String = msg.into();
+        let blocker_code = code.clone().unwrap_or_else(|| warning_code(&message));
         self.coverage.blockers.push((
             node.start_byte(),
-            format!("// NOTLIN: {} {}\n", warning_code(&message), message),
+            format!("// NOTLIN: {blocker_code} {message}\n"),
         ));
 
         self.diags.push(crate::diagnostics::Diagnostic {

@@ -76,11 +76,45 @@ pub(crate) fn parse_tree(source: &str) -> tree_sitter::Tree {
     parser
         .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
         .expect("failed to load kotlin grammar");
-    let tree = parser.parse(source, None).expect("parse failed");
+    let normalized = source_without_notlin_markers(source);
+    let tree = parser.parse(&*normalized, None).expect("parse failed");
     if profile {
         record_profile(&PROFILE_PARSE_NS, started.elapsed());
     }
     tree
+}
+
+/// Residue markers are Notlin metadata, not Kotlin syntax. The Kotlin grammar
+/// can bind a comment inserted between annotations as an `annotated_expression`
+/// boundary, changing which annotations belong to the following declaration on
+/// the next invocation. Blank marker bytes while preserving every byte offset
+/// and newline so AST nodes still slice the original source correctly.
+fn source_without_notlin_markers(source: &str) -> std::borrow::Cow<'_, str> {
+    if !source
+        .lines()
+        .any(|line| line.trim_start().starts_with("// NOTLIN:"))
+    {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut bytes = source.as_bytes().to_vec();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| start + offset)
+            .unwrap_or(bytes.len());
+        let line = &source[start..end];
+        if line.trim_start().starts_with("// NOTLIN:") {
+            for byte in &mut bytes[start..end] {
+                if *byte != b'\r' {
+                    *byte = b' ';
+                }
+            }
+        }
+        start = end.saturating_add(1);
+    }
+    std::borrow::Cow::Owned(String::from_utf8(bytes).expect("marker blanking preserves UTF-8"))
 }
 
 fn render_node(node: tree_sitter::Node, source: &str, depth: usize, out: &mut String) {

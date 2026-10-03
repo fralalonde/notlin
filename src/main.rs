@@ -3,11 +3,106 @@ use colored::Colorize;
 use notlin::cli::{Cli, UntranslatableMode};
 use notlin::migrate::{self, MigrateOutcome};
 use notlin::transpiler;
-use notlin::workspace::SourceIndex;
-use std::collections::HashSet;
+use notlin::workspace::{SourceIndex, SourceLanguage, SourceOverlay};
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+fn progress_start(phase: &str, detail: impl std::fmt::Display) {
+    let label = format!("{phase:<11}");
+    eprintln!(
+        "  {} {}{}",
+        "◇".cyan(),
+        label.bold(),
+        detail.to_string().bright_black()
+    );
+}
+
+fn progress_activity(phase: &str, detail: impl std::fmt::Display) {
+    let label = format!("{phase:<11}");
+    eprintln!(
+        "  {} {}{}",
+        "·".bright_black(),
+        label.bold(),
+        detail.to_string().bright_black()
+    );
+}
+
+fn progress_done(phase: &str, detail: impl std::fmt::Display) {
+    let label = format!("{phase:<11}");
+    eprintln!(
+        "  {} {}{}",
+        "✓".green(),
+        label.bold(),
+        detail.to_string().bright_black()
+    );
+}
+
+fn item_count(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+fn print_run_summary(
+    file_count: usize,
+    total_errors: usize,
+    total_warnings: usize,
+    java_written: usize,
+    outcomes: &[(PathBuf, MigrateOutcome)],
+    failed: bool,
+) {
+    let deleted = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Deleted))
+        .count();
+    let trimmed = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Trimmed { .. }))
+        .count();
+    let untouched = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Untouched))
+        .count();
+
+    eprintln!();
+    eprintln!("{}", "notlin summary".bold());
+    eprintln!(
+        "  {} {:<11} {}",
+        "├─".bright_black(),
+        "sources".bold(),
+        format!("{file_count} processed").bright_black()
+    );
+    eprintln!(
+        "  {} {:<11} {}",
+        "├─".bright_black(),
+        "java".bold(),
+        format!("{java_written} written").bright_black()
+    );
+    if !outcomes.is_empty() {
+        eprintln!(
+            "  {} {:<11} {}",
+            "├─".bright_black(),
+            "migration".bold(),
+            format!("{deleted} deleted · {trimmed} trimmed · {untouched} untouched").bright_black()
+        );
+    }
+    eprintln!(
+        "  {} {:<11} {}",
+        "├─".bright_black(),
+        "diagnostics".bold(),
+        format!("{total_errors} errors · {total_warnings} warnings").bright_black()
+    );
+    eprintln!(
+        "  {} {:<11} {}",
+        "└─".bright_black(),
+        "result".bold(),
+        if failed {
+            "failed".red().bold()
+        } else {
+            "success".green().bold()
+        }
+    );
+}
 
 fn main() -> ExitCode {
     // Kotlin sources nest deeply — chained builders, large `when` subjects,
@@ -40,6 +135,7 @@ fn run_cli() -> ExitCode {
             1 => log::LevelFilter::Debug,
             _ => log::LevelFilter::Trace,
         })
+        .format(|buffer, record| writeln!(buffer, "  {} {}", "│".bright_black(), record.args()))
         .init();
     log::debug!("cli: {:?}", cli);
 
@@ -88,7 +184,19 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     // Every path printed from here on — diagnostics, logs, the run summary,
     // the retention table — is relative to this root.
     notlin::paths::set_root(&workspace_root);
+    eprintln!("{}", "notlin".bold());
+    progress_start("index", "scanning workspace");
     let (index, index_stats) = SourceIndex::discover_with_stats(&workspace_root)?;
+    progress_done(
+        "index",
+        format!(
+            "{} · {} · {} parsed · {} cached",
+            item_count(index.kotlin_files().count(), "Kotlin file", "Kotlin files"),
+            item_count(index.java_files().count(), "Java file", "Java files"),
+            index_stats.parsed_files,
+            index_stats.reused_files
+        ),
+    );
     log::debug!(
         "indexed {} Kotlin and {} Java files from {} ({} parsed, {} cached)",
         index.kotlin_files().count(),
@@ -111,12 +219,20 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             })
             .collect::<Result<Vec<_>, _>>()?
     };
+    progress_start("input", "discovering Kotlin sources");
     let files = collect_inputs(&cli.input)?;
-    if files.is_empty() {
-        return Err("no input files given (positional <INPUT>..., or use - for stdin)".into());
-    }
+    progress_done(
+        "input",
+        format!("{} selected", item_count(files.len(), "source", "sources")),
+    );
     let stdout = std::io::stdout();
     let mut stdout = BufWriter::new(stdout.lock());
+    if files.is_empty() {
+        if !cli.input.is_empty() && cli.input.iter().all(|input| input.is_dir()) {
+            return finish_run(cli, 0, 0, 0, 0, &[], &mut stdout);
+        }
+        return Err("no input files given (positional <INPUT>..., or use - for stdin)".into());
+    }
 
     let mut total_errors = 0usize;
     let mut total_warnings = 0usize;
@@ -156,49 +272,224 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 return Err("all input files disappeared before reading".into());
             }
             let files = sources.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>();
-            let plans =
-                transpiler::fixpoint::plan_workspace(&sources, cli, &index, &translation_roots, 16);
-            for plan in &plans {
-                total_errors += plan.errors;
-                total_warnings += plan.warnings;
-                java_written += plan.java_files.len();
-                write_java_files(cli, &plan.file, &plan.java_files, &mut stdout)?;
-                let outcome = migrate_file(
-                    cli,
-                    &plan.file,
-                    &plan.source,
-                    plan.errors,
-                    plan.warnings,
-                    &plan.coverage,
-                    &plan.java_files,
-                )?;
-                match &outcome {
-                    migrate::MigrateOutcome::Deleted => {
-                        log::debug!("deleted {}", notlin::paths::display(&plan.file));
-                    }
-                    migrate::MigrateOutcome::Trimmed { remaining_bytes } => {
-                        log::debug!(
-                            "trimmed {} ({remaining_bytes} bytes remain)",
-                            notlin::paths::display(&plan.file)
-                        );
-                    }
-                    migrate::MigrateOutcome::Untouched => {
-                        log::debug!(
-                            "{}: no translated content; untouched",
-                            notlin::paths::display(&plan.file)
-                        );
+            progress_start(
+                "plan",
+                format!("resolving {}", item_count(files.len(), "source", "sources")),
+            );
+            let mut virtual_sources = sources.clone();
+            let mut cumulative: HashMap<PathBuf, (PathBuf, String, String)> = HashMap::new();
+            let declaration_count = index
+                .kotlin_files()
+                .map(|f| f.declarations.len())
+                .sum::<usize>();
+            let limit = declaration_count.saturating_mul(2).max(16);
+            let mut converged_plans = None;
+            let mut converged_round = 0usize;
+            let mut retained_seed: Option<HashSet<String>> = None;
+            let profile_speculation = std::env::var_os("NOTLIN_PROFILE").is_some();
+            for round in 1..=limit {
+                notlin::diagnostics::clear_retention();
+                let mut overlays = Vec::new();
+                for (path, _) in &sources {
+                    if !virtual_sources.iter().any(|(current, _)| current == path) {
+                        overlays.push(SourceOverlay::Delete { path: path.clone() });
                     }
                 }
-                outcomes.push((plan.file.clone(), outcome));
+                for (path, source) in &virtual_sources {
+                    if let Some((_, original_source)) = sources.iter().find(|(p, _)| p == path)
+                        && source != original_source
+                    {
+                        overlays.push(SourceOverlay::Replace {
+                            path: path.clone(),
+                            language: SourceLanguage::Kotlin,
+                            source: source.clone(),
+                        });
+                    }
+                }
+                for (path, (_, source, _)) in &cumulative {
+                    overlays.push(SourceOverlay::Replace {
+                        path: path.clone(),
+                        language: SourceLanguage::Java,
+                        source: source.clone(),
+                    });
+                }
+                let current_index = index.with_overlays(&overlays)?;
+                let planned = if let Some(seed) = &retained_seed {
+                    transpiler::fixpoint::plan_workspace_warm(
+                        &virtual_sources,
+                        cli,
+                        &current_index,
+                        &translation_roots,
+                        cli.max_retention_passes,
+                        false,
+                        seed,
+                    )?
+                } else {
+                    transpiler::fixpoint::plan_workspace_state(
+                        &virtual_sources,
+                        cli,
+                        &current_index,
+                        &translation_roots,
+                        cli.max_retention_passes,
+                        false,
+                    )?
+                };
+                retained_seed = Some(planned.roots);
+                let plans = planned.plans;
+                let mut next = virtual_sources.clone();
+                let cumulative_before = cumulative.clone();
+                let strict = matches!(cli.untranslatable, UntranslatableMode::Error);
+                for plan in &plans {
+                    let blocked = strict && (plan.errors > 0 || plan.warnings > 0);
+                    if blocked {
+                        continue;
+                    }
+                    match migrate::propose_speculative_migration(&plan.source, &plan.coverage) {
+                        migrate::MigrationProposal::Untouched => {}
+                        migrate::MigrationProposal::Delete => {
+                            next.retain(|(p, _)| p != &plan.file);
+                        }
+                        migrate::MigrationProposal::Rewrite(text) => {
+                            if let Some(item) = next.iter_mut().find(|(p, _)| p == &plan.file) {
+                                item.1 = text;
+                            }
+                        }
+                    }
+                    for (name, content) in &plan.java_files {
+                        let target = plan.file.parent().unwrap_or(Path::new(".")).join(name);
+                        let key = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+                        if let Some((origin, old, _)) = cumulative.get(&key)
+                            && origin != &plan.file
+                            && old != content
+                        {
+                            return Err(format!(
+                                "generated Java path conflict: {}",
+                                notlin::paths::display(&target)
+                            ));
+                        }
+                        cumulative.insert(key, (plan.file.clone(), content.clone(), name.clone()));
+                    }
+                }
+                if profile_speculation {
+                    log_speculative_changes(
+                        round,
+                        &virtual_sources,
+                        &next,
+                        &cumulative_before,
+                        &cumulative,
+                        cli.verbose > 0,
+                    );
+                }
+                progress_activity(
+                    "plan",
+                    format!(
+                        "pass {round} · {} · {} ready",
+                        item_count(next.len(), "Kotlin source remains", "Kotlin sources remain"),
+                        item_count(cumulative.len(), "Java output", "Java outputs")
+                    ),
+                );
+                if next == virtual_sources && cumulative == cumulative_before {
+                    converged_round = round;
+                    converged_plans = Some(plans);
+                    break;
+                }
+                virtual_sources = next;
+            }
+            let Some(final_plans) = converged_plans else {
+                return Err(format!(
+                    "workspace migration did not converge within {limit} speculative rounds"
+                ));
+            };
+            progress_done(
+                "plan",
+                format!(
+                    "converged in {} · {}",
+                    item_count(converged_round, "pass", "passes"),
+                    item_count(cumulative.len(), "Java output", "Java outputs")
+                ),
+            );
+            progress_start("write", "applying the converged migration");
+            let mut final_map: HashMap<_, _> = virtual_sources.iter().cloned().collect();
+            for plan in &final_plans {
+                match migrate::propose_migration(&plan.source, &plan.coverage) {
+                    migrate::MigrationProposal::Untouched => {}
+                    migrate::MigrationProposal::Delete => {
+                        final_map.remove(&plan.file);
+                    }
+                    migrate::MigrationProposal::Rewrite(text) => {
+                        final_map.insert(plan.file.clone(), text);
+                    }
+                }
+            }
+            for plan in &final_plans {
+                log::debug!(
+                    "planned {}: {} Java output(s), {} declaration(s) translated, {} retained",
+                    notlin::paths::display(&plan.file),
+                    plan.java_files.len(),
+                    plan.coverage.translated.len(),
+                    plan.coverage.untranslated.len()
+                );
+                total_errors += plan.errors;
+                total_warnings += plan.warnings;
+            }
+            let mut emitted_by_origin: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+            for (origin, _, name) in cumulative.values() {
+                emitted_by_origin
+                    .entry(origin.clone())
+                    .or_default()
+                    .insert(name.clone());
+            }
+            for (path, (origin, content, name)) in &cumulative {
+                let _ = path;
+                log::debug!(
+                    "planned {}: Java output {name}",
+                    notlin::paths::display(origin)
+                );
+                write_java_files(cli, origin, &[(name.clone(), content.clone())], &mut stdout)?;
+                java_written += 1;
+            }
+            if cli.out_dir.is_none() {
+                for (path, _) in &sources {
+                    remove_stale_generated_outputs(
+                        path,
+                        emitted_by_origin.get(path).cloned().unwrap_or_default(),
+                    )?;
+                }
+            }
+            for (path, source) in &sources {
+                let proposal = match final_map.get(path) {
+                    None => migrate::MigrationProposal::Delete,
+                    Some(text) if text == source => migrate::MigrationProposal::Untouched,
+                    Some(text) => migrate::MigrationProposal::Rewrite(text.clone()),
+                };
+                let outcome = migrate::apply_migration_proposal(path, &proposal)?;
+                outcomes.push((path.clone(), outcome));
             }
             // Migration writes Java after the initial Kotlin/Java index was
             // built. Re-index once before repairing retained Kotlin so its
             // Java getter boundaries resolve against the generated sources,
             // not their pre-migration Kotlin declarations.
+            progress_done(
+                "write",
+                format!(
+                    "{} · {} migrated",
+                    item_count(java_written, "Java file", "Java files"),
+                    item_count(outcomes.len(), "source", "sources")
+                ),
+            );
+            progress_start("repair", "checking residual Kotlin boundaries");
             let migrated_index = SourceIndex::discover(&workspace_root)?;
-            for (file, outcome) in &outcomes {
-                annotate_manual_marks(file, outcome, &migrated_index);
-            }
+            let manual_marks = outcomes
+                .iter()
+                .map(|(file, outcome)| annotate_manual_marks(file, outcome, &migrated_index))
+                .sum::<usize>();
+            progress_done(
+                "repair",
+                format!(
+                    "{} flagged",
+                    item_count(manual_marks, "manual spot", "manual spots")
+                ),
+            );
             return finish_run(
                 cli,
                 files.len(),
@@ -211,6 +502,13 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     }
 
+    progress_start(
+        "translate",
+        format!(
+            "processing {}",
+            item_count(files.len(), "source", "sources")
+        ),
+    );
     for file in &files {
         log::debug!("transpiling {}", notlin::paths::display(file));
         let source = read_source(file)?;
@@ -351,48 +649,22 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     }
 
-    let untranslatable_strict = matches!(cli.untranslatable, UntranslatableMode::Error);
-    let failed = total_errors > 0
-        || (untranslatable_strict && total_warnings > 0)
-        || (cli.deny_warnings && total_warnings > 0);
-
-    let deleted = outcomes
-        .iter()
-        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Deleted))
-        .count();
-    let trimmed = outcomes
-        .iter()
-        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Trimmed { .. }))
-        .count();
-    let untouched = outcomes
-        .iter()
-        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Untouched))
-        .count();
-    stdout.flush().map_err(|error| format!("stdout: {error}"))?;
-    eprintln!(
-        "notlin: {} file(s) processed, {} java file(s) written, {} error(s), {} warning(s){} — {}",
+    progress_done(
+        "translate",
+        format!(
+            "{} ready",
+            item_count(java_written, "Java output", "Java outputs")
+        ),
+    );
+    finish_run(
+        cli,
         files.len(),
-        java_written,
         total_errors,
         total_warnings,
-        if outcomes.is_empty() {
-            String::new()
-        } else {
-            format!(", migration: {deleted} deleted, {trimmed} trimmed, {untouched} untouched")
-        },
-        if failed {
-            "failed".red()
-        } else {
-            "success".green()
-        }
-    );
-    print_retention_report();
-
-    Ok(if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+        java_written,
+        &outcomes,
+        &mut stdout,
+    )
 }
 
 /// Write one plan's java files: explicit -o dir, else next to the input during
@@ -443,72 +715,124 @@ fn write_java_files(
     Ok(())
 }
 
-/// Workspace migration for one plan: strip translated declarations, delete
-/// fully-translated files, orphan-cleanup retained ones. Mirrors the per-file
-/// loop's migration block.
-fn migrate_file(
-    cli: &Cli,
-    file: &Path,
-    source: &str,
-    errors: usize,
-    warnings: usize,
-    coverage: &notlin::diagnostics::FileCoverage,
-    emitted_java_files: &[(String, String)],
-) -> Result<MigrateOutcome, String> {
-    if !cli.migrates_in_place() || cli.dump_ast {
-        return Ok(MigrateOutcome::Untouched);
-    }
-    let strict_block =
-        matches!(cli.untranslatable, UntranslatableMode::Error) && (errors > 0 || warnings > 0);
-    if strict_block {
-        log::info!(
-            "{}: kept — run had errors/warnings in --untranslatable=error mode",
-            notlin::paths::display(file)
-        );
-        return Ok(MigrateOutcome::Untouched);
-    }
-    let outcome = migrate::migrate(file, source, coverage)?;
-    // A source can be partially translated: some declarations are emitted as
-    // Java while a later fixpoint pass retains others in Kotlin. Remove only
-    // generated siblings no longer emitted by THIS source; otherwise javac
-    // compiles an obsolete Java class beside the retained Kotlin declaration.
-    if cli.out_dir.is_none()
-        && let Some(dir) = file.parent()
-    {
-        let emitted: HashSet<&str> = emitted_java_files
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
-        let source_canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-        let source_text = source_canon.to_string_lossy().replace('\\', "/");
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("java")
-                    || emitted.contains(
-                        path.file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or_default(),
-                    )
-                {
-                    continue;
-                }
-                if let Ok(first_line) = std::fs::read_to_string(&path)
-                    .map(|content| content.lines().next().unwrap_or("").to_string())
-                    && first_line.contains("NOTLIN: generated from")
-                    && first_line.contains(&source_text)
-                {
-                    std::fs::remove_file(&path)
-                        .map_err(|error| format!("{}: {error}", notlin::paths::display(&path)))?;
-                    log::info!(
-                        "deleted stale generated output {}",
-                        notlin::paths::display(&path)
-                    );
-                }
-            }
+fn log_speculative_changes(
+    round: usize,
+    before_kotlin: &[(PathBuf, String)],
+    after_kotlin: &[(PathBuf, String)],
+    before_java: &HashMap<PathBuf, (PathBuf, String, String)>,
+    after_java: &HashMap<PathBuf, (PathBuf, String, String)>,
+    verbose: bool,
+) {
+    let before_kotlin: HashMap<_, _> = before_kotlin
+        .iter()
+        .map(|(path, source)| (path, source.as_bytes()))
+        .collect();
+    let after_kotlin: HashMap<_, _> = after_kotlin
+        .iter()
+        .map(|(path, source)| (path, source.as_bytes()))
+        .collect();
+    let mut kotlin_added = Vec::new();
+    let mut kotlin_removed = Vec::new();
+    let mut kotlin_changed = Vec::new();
+    for (path, source) in &after_kotlin {
+        match before_kotlin.get(path) {
+            None => kotlin_added.push((*path).clone()),
+            Some(old) if *old != *source => kotlin_changed.push((*path).clone()),
+            Some(_) => {}
         }
     }
-    Ok(outcome)
+    for path in before_kotlin.keys() {
+        if !after_kotlin.contains_key(path) {
+            kotlin_removed.push((*path).clone());
+        }
+    }
+    let mut java_added = Vec::new();
+    let mut java_removed = Vec::new();
+    let mut java_changed = Vec::new();
+    for (path, (_, content, _)) in after_java {
+        match before_java.get(path) {
+            None => java_added.push(path.clone()),
+            Some((_, old, _)) if old != content => java_changed.push(path.clone()),
+            Some(_) => {}
+        }
+    }
+    for path in before_java.keys() {
+        if !after_java.contains_key(path) {
+            java_removed.push(path.clone());
+        }
+    }
+    eprintln!(
+        "NOTLIN_PROFILE speculative round {round}: Kotlin added={} removed={} byte-changed={}; cumulative Java added={} removed={} content-changed={}",
+        kotlin_added.len(),
+        kotlin_removed.len(),
+        kotlin_changed.len(),
+        java_added.len(),
+        java_removed.len(),
+        java_changed.len()
+    );
+    if !verbose {
+        return;
+    }
+    for (category, mut paths) in [
+        ("Kotlin added", kotlin_added),
+        ("Kotlin removed", kotlin_removed),
+        ("Kotlin byte-changed", kotlin_changed),
+        ("Java added", java_added),
+        ("Java removed", java_removed),
+        ("Java content-changed", java_changed),
+    ] {
+        paths.sort();
+        let samples = paths
+            .iter()
+            .take(20)
+            .map(|path| notlin::paths::display(path).to_string())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "NOTLIN_PROFILE {category} samples: [{}]",
+            samples.join(", ")
+        );
+    }
+}
+
+fn remove_stale_generated_outputs(
+    source: &Path,
+    emitted_names: HashSet<String>,
+) -> Result<(), String> {
+    let Some(directory) = source.parent() else {
+        return Ok(());
+    };
+    let source_canon = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let source_text = source_canon.to_string_lossy().replace('\\', "/");
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("java")
+            || emitted_names.contains(name)
+        {
+            continue;
+        }
+        let generated_from_source = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| content.lines().next().map(str::to_string))
+            .is_some_and(|first_line| {
+                first_line.contains("NOTLIN: generated from") && first_line.contains(&source_text)
+            });
+        if generated_from_source {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("{}: {error}", notlin::paths::display(&path)))?;
+            log::info!(
+                "deleted stale generated output {}",
+                notlin::paths::display(&path)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Shared run summary: failure policy, migration tally, final line.
@@ -525,37 +849,16 @@ fn finish_run(
     let failed = total_errors > 0
         || (untranslatable_strict && total_warnings > 0)
         || (cli.deny_warnings && total_warnings > 0);
-    let deleted = outcomes
-        .iter()
-        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Deleted))
-        .count();
-    let trimmed = outcomes
-        .iter()
-        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Trimmed { .. }))
-        .count();
-    let untouched = outcomes
-        .iter()
-        .filter(|(_, outcome)| matches!(outcome, MigrateOutcome::Untouched))
-        .count();
     stdout.flush().map_err(|error| format!("stdout: {error}"))?;
-    eprintln!(
-        "notlin: {} file(s) processed, {} java file(s) written, {} error(s), {} warning(s){} — {}",
+    print_retention_report();
+    print_run_summary(
         file_count,
-        java_written,
         total_errors,
         total_warnings,
-        if outcomes.is_empty() {
-            String::new()
-        } else {
-            format!(", migration: {deleted} deleted, {trimmed} trimmed, {untouched} untouched")
-        },
-        if failed {
-            "failed".red()
-        } else {
-            "success".green()
-        }
+        java_written,
+        outcomes,
+        failed,
     );
-    print_retention_report();
     Ok(if failed {
         ExitCode::FAILURE
     } else {

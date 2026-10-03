@@ -165,7 +165,9 @@ fn in_place_migration_strips_annotated_declaration_source() {
         &index,
         std::slice::from_ref(&root),
         8,
-    );
+        false,
+    )
+    .unwrap();
     assert_eq!(plans.len(), 1);
     let plan = &plans[0];
     assert_eq!(plan.errors, 0);

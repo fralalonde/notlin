@@ -2,7 +2,7 @@ use clap::Parser;
 use filetime::{FileTime, set_file_mtime};
 use notlin::cli::Cli;
 use notlin::transpiler;
-use notlin::workspace::{MemberConflictClass, SourceIndex, SourceLanguage};
+use notlin::workspace::{MemberConflictClass, SourceIndex, SourceLanguage, SourceOverlay};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -1011,5 +1011,76 @@ fn declarations_named_preserves_simple_name_collisions() {
         .collect();
 
     assert_eq!(packages, ["left", "right"]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn virtual_overlay_rebuilds_without_changing_original() {
+    let root = std::env::temp_dir().join(format!("notlin-overlay-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let root = fs::canonicalize(&root).unwrap();
+    let base = root.join("Base.kt");
+    let child = root.join("Child.kt");
+    let caller = root.join("Caller.kt");
+    fs::write(
+        &base,
+        "package sample
+interface Base
+",
+    )
+    .unwrap();
+    fs::write(
+        &child,
+        "package sample
+class Child : Base
+",
+    )
+    .unwrap();
+    fs::write(
+        &caller,
+        "package sample
+fun make() = Old(1)
+",
+    )
+    .unwrap();
+    let original = SourceIndex::discover(&root).unwrap();
+    let overlay = original
+        .with_overlays(&[
+            SourceOverlay::Replace {
+                path: base.clone(),
+                language: SourceLanguage::Kotlin,
+                source: "package sample
+interface Residual
+"
+                .into(),
+            },
+            SourceOverlay::Delete {
+                path: child.clone(),
+            },
+            SourceOverlay::Replace {
+                path: caller.clone(),
+                language: SourceLanguage::Kotlin,
+                source: "package sample
+data class Fresh(val value: Int)
+fun make() = Fresh(1)
+"
+                .into(),
+            },
+            SourceOverlay::Replace {
+                path: root.join("Generated.java"),
+                language: SourceLanguage::Java,
+                source: "package sample; public class Generated {}".into(),
+            },
+        ])
+        .unwrap();
+
+    assert!(original.declarations_named("Base").next().is_some());
+    assert!(overlay.declarations_named("Base").next().is_none());
+    assert!(overlay.declarations_named("Residual").next().is_some());
+    assert!(overlay.source_file(&child).is_none());
+    assert!(overlay.declarations_named("Generated").next().is_some());
+    let fresh = overlay.declarations_named("Fresh").next().unwrap();
+    assert!(overlay.ctor_omission_evidence(fresh).patterns.is_empty());
     fs::remove_dir_all(root).unwrap();
 }

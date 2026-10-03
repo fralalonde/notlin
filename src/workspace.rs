@@ -288,6 +288,18 @@ pub struct SourceIndex {
     file_paths: HashMap<PathBuf, usize>,
 }
 
+#[derive(Debug, Clone)]
+pub enum SourceOverlay {
+    Replace {
+        path: PathBuf,
+        language: SourceLanguage,
+        source: String,
+    },
+    Delete {
+        path: PathBuf,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IndexStats {
     pub parsed_files: usize,
@@ -391,6 +403,21 @@ impl SourceIndex {
         )?;
         files.sort_by(|left, right| left.path.cmp(&right.path));
 
+        let index = Self::from_files(files);
+
+        let new_cache = IndexCache {
+            version: CACHE_VERSION,
+            producer: cache_producer(),
+            root_digest: new_root.digest,
+            sources: flatten_sources(&new_root),
+        };
+        if old_cache.as_ref() != Some(&new_cache) {
+            stats.cache_written = save_cache(&root, &new_cache);
+        }
+        Ok((index, stats))
+    }
+
+    fn from_files(files: Vec<SourceFile>) -> Self {
         let mut index = Self {
             files,
             kotlin_subtypes: HashMap::new(),
@@ -446,17 +473,53 @@ impl SourceIndex {
                 .or_default()
                 .push(subtype_name);
         }
+        index
+    }
 
-        let new_cache = IndexCache {
-            version: CACHE_VERSION,
-            producer: cache_producer(),
-            root_digest: new_root.digest,
-            sources: flatten_sources(&new_root),
-        };
-        if old_cache.as_ref() != Some(&new_cache) {
-            stats.cache_written = save_cache(&root, &new_cache);
+    pub fn with_overlays(&self, overlays: &[SourceOverlay]) -> Result<Self, String> {
+        let mut files = self.files.clone();
+        for overlay in overlays {
+            match overlay {
+                SourceOverlay::Delete { path } => {
+                    files.retain(|file| !paths_match(&file.path, path))
+                }
+                SourceOverlay::Replace {
+                    path,
+                    language,
+                    source,
+                } => {
+                    files.retain(|file| !paths_match(&file.path, path));
+                    let package = package_name(source);
+                    let imports = import_names(source);
+                    let (
+                        declarations,
+                        type_aliases,
+                        identifier_counts,
+                        enum_entries_qualifiers,
+                        smart_cast_properties,
+                        smart_cast_sites,
+                        bindings,
+                        ctor_calls,
+                    ) = parse_declarations(source, *language, package.as_deref())?;
+                    files.push(SourceFile {
+                        path: path.clone(),
+                        language: *language,
+                        package,
+                        imports,
+                        declarations,
+                        type_aliases,
+                        identifier_counts,
+                        enum_entries_qualifiers,
+                        smart_cast_properties,
+                        smart_cast_sites,
+                        bindings,
+                        ctor_calls,
+                    });
+                }
+            }
         }
-        Ok((index, stats))
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(Self::from_files(files))
     }
 
     /// Which primary-constructor parameters callers leave out of `target`'s

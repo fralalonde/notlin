@@ -17,9 +17,94 @@ pub enum MigrateOutcome {
     Deleted,
 }
 
+/// Pure decision for how a source file should be migrated.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MigrationProposal {
+    /// Nothing translated — leave the file untouched.
+    Untouched,
+    /// All useful source was translated — delete the file.
+    Delete,
+    /// Rewrite with the untranslated residue.
+    Rewrite(String),
+}
+
+/// Decide the migration result without performing filesystem or logging effects.
+pub fn propose_migration(source: &str, coverage: &FileCoverage) -> MigrationProposal {
+    propose_migration_with_blockers(source, coverage, true)
+}
+
+/// Plan an in-memory speculative rewrite without diagnostic comments. Comments
+/// are user-facing output, not Kotlin syntax: inserting them between modifiers
+/// can change Tree-sitter's attachment of an annotation block on the next
+/// speculative round and make an intrinsically retained declaration appear
+/// translatable.
+pub fn propose_speculative_migration(source: &str, coverage: &FileCoverage) -> MigrationProposal {
+    propose_migration_with_blockers(source, coverage, false)
+}
+
+fn propose_migration_with_blockers(
+    source: &str,
+    coverage: &FileCoverage,
+    include_blockers: bool,
+) -> MigrationProposal {
+    if coverage.translated_spans.is_empty() && (coverage.blockers.is_empty() || !include_blockers) {
+        return MigrationProposal::Untouched;
+    }
+    if !coverage.translated_spans.is_empty() && coverage.is_fully_translated() {
+        return MigrationProposal::Delete;
+    }
+
+    let stripped = tidy(&strip_translated_with_blockers(
+        source,
+        coverage,
+        include_blockers,
+    ));
+    if coverage.translated_spans.is_empty() {
+        return MigrationProposal::Rewrite(stripped);
+    }
+    if stripped.trim().is_empty()
+        || stripped
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim_start().starts_with("//"))
+    {
+        MigrationProposal::Delete
+    } else {
+        MigrationProposal::Rewrite(stripped)
+    }
+}
+
+pub fn apply_migration_proposal(
+    path: &Path,
+    proposal: &MigrationProposal,
+) -> Result<MigrateOutcome, String> {
+    match proposal {
+        MigrationProposal::Untouched => Ok(MigrateOutcome::Untouched),
+        MigrationProposal::Delete => {
+            std::fs::remove_file(path)
+                .map_err(|e| format!("{}: {e}", crate::paths::display(path)))?;
+            Ok(MigrateOutcome::Deleted)
+        }
+        MigrationProposal::Rewrite(source) => {
+            std::fs::write(path, source)
+                .map_err(|e| format!("{}: {e}", crate::paths::display(path)))?;
+            Ok(MigrateOutcome::Trimmed {
+                remaining_bytes: source.len(),
+            })
+        }
+    }
+}
+
 /// Strip translated spans from the source, insert `// NOTLIN: …` blocker
 /// comments ahead of untranslated residue, return the new text.
 pub fn strip_translated(source: &str, coverage: &FileCoverage) -> String {
+    strip_translated_with_blockers(source, coverage, true)
+}
+
+fn strip_translated_with_blockers(
+    source: &str,
+    coverage: &FileCoverage,
+    include_blockers: bool,
+) -> String {
     // Collect non-overlapping byte ranges to remove, sorted.
     let mut spans: Vec<(usize, usize)> = coverage.translated_spans.to_vec();
     spans.sort();
@@ -59,7 +144,11 @@ pub fn strip_translated(source: &str, coverage: &FileCoverage) -> String {
     let mut cursor = 0usize;
     // Blockers arrive in AST-traversal order, not byte-offset order;
     // copy_kept/flush_blockers both rely on ascending offsets.
-    let mut blockers: Vec<(usize, String)> = coverage.blockers.to_vec();
+    let mut blockers: Vec<(usize, String)> = if include_blockers {
+        coverage.blockers.to_vec()
+    } else {
+        Vec::new()
+    };
     blockers.sort_by_key(|(offset, _)| *offset);
     for (start, end) in merged {
         copy_kept(&mut blockers, source, cursor, start, &mut out);
@@ -103,6 +192,29 @@ fn copy_kept(
             .take_while(|b| *b == b' ' || *b == b'\t')
             .count()
             + line_start;
+        let indent = &source[line_start..indent_end];
+        let existing = format!("{indent}{text}");
+        let mut blocker_block_start = line_start;
+        while blocker_block_start > from {
+            let previous_end = blocker_block_start - 1;
+            let previous_start = source[..previous_end]
+                .rfind('\n')
+                .map(|index| index + 1)
+                .unwrap_or(from)
+                .max(from);
+            let previous_line = &source[previous_start..blocker_block_start];
+            if previous_line
+                .strip_prefix(indent)
+                .is_some_and(|line| line.starts_with("// NOTLIN:"))
+            {
+                blocker_block_start = previous_start;
+            } else {
+                break;
+            }
+        }
+        if source[blocker_block_start..line_start].contains(&existing) {
+            continue;
+        }
         out.push_str(&source[p..indent_end]);
         out.push_str(text);
         p = line_start;
@@ -151,50 +263,37 @@ pub fn migrate(
     source: &str,
     coverage: &FileCoverage,
 ) -> Result<MigrateOutcome, String> {
-    if coverage.translated_spans.is_empty() {
-        log::info!(
-            "{}: nothing translated; untouched",
-            crate::paths::display(kt_path)
-        );
-        return Ok(MigrateOutcome::Untouched);
+    match propose_migration(source, coverage) {
+        MigrationProposal::Untouched => {
+            log::info!(
+                "{}: nothing translated; untouched",
+                crate::paths::display(kt_path)
+            );
+            Ok(MigrateOutcome::Untouched)
+        }
+        MigrationProposal::Delete => {
+            std::fs::remove_file(kt_path)
+                .map_err(|e| format!("{}: {e}", crate::paths::display(kt_path)))?;
+            let message = if coverage.is_fully_translated() {
+                "fully translated; deleted"
+            } else {
+                "fully translated after strip; deleted"
+            };
+            log::info!("{}: {message}", crate::paths::display(kt_path));
+            Ok(MigrateOutcome::Deleted)
+        }
+        MigrationProposal::Rewrite(stripped) => {
+            std::fs::write(kt_path, &stripped)
+                .map_err(|e| format!("{}: {e}", crate::paths::display(kt_path)))?;
+            log::info!(
+                "{}: trimmed to {} bytes (was {})",
+                crate::paths::display(kt_path),
+                stripped.len(),
+                source.len()
+            );
+            Ok(MigrateOutcome::Trimmed {
+                remaining_bytes: stripped.len(),
+            })
+        }
     }
-
-    if coverage.is_fully_translated() {
-        std::fs::remove_file(kt_path)
-            .map_err(|e| format!("{}: {e}", crate::paths::display(kt_path)))?;
-        log::info!(
-            "{}: fully translated; deleted",
-            crate::paths::display(kt_path)
-        );
-        return Ok(MigrateOutcome::Deleted);
-    }
-
-    // Partially translated: rewrite with only untranslated code (plus any
-    // blocker comments explaining what could not translate).
-    let stripped = tidy(&strip_translated(source, coverage));
-    if stripped.trim().is_empty()
-        || stripped
-            .lines()
-            .all(|l| l.trim().is_empty() || l.trim_start().starts_with("//"))
-    {
-        // Only comment stubs remained — treat as fully translated.
-        std::fs::remove_file(kt_path)
-            .map_err(|e| format!("{}: {e}", crate::paths::display(kt_path)))?;
-        log::info!(
-            "{}: fully translated after strip; deleted",
-            crate::paths::display(kt_path)
-        );
-        return Ok(MigrateOutcome::Deleted);
-    }
-    std::fs::write(kt_path, &stripped)
-        .map_err(|e| format!("{}: {e}", crate::paths::display(kt_path)))?;
-    log::info!(
-        "{}: trimmed to {} bytes (was {})",
-        crate::paths::display(kt_path),
-        stripped.len(),
-        source.len()
-    );
-    Ok(MigrateOutcome::Trimmed {
-        remaining_bytes: stripped.len(),
-    })
 }

@@ -8,6 +8,7 @@
 //! target builds failed on 5499 kotlinc errors because subtypes retained by
 //! unrelated rules were suddenly implementing translated-away interfaces.
 
+use clap::Parser;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -60,7 +61,7 @@ fn clean_hub_and_implementor_translate_together() {
 }
 
 #[test]
-fn retained_enum_keeps_its_kotlin_supertype_in_all_roots_mode() {
+fn translated_kotlin_caller_releases_enum_and_supertype_in_one_run() {
     let root = Path::new("tests/tmp_scratch_fixpoint_retained_enum");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -92,12 +93,14 @@ fn retained_enum_keeps_its_kotlin_supertype_in_all_roots_mode() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "notlin failed:\n{stderr}");
     let speaker_java = fs::read_to_string(root.join("Speaker.java")).unwrap_or_default();
+    let mood_java = fs::read_to_string(root.join("Mood.java")).unwrap_or_default();
+    let usage_java = fs::read_to_string(root.join("Usage.java")).unwrap_or_default();
     assert!(
-        speaker_java.is_empty(),
-        "interface with an intrinsically retained Kotlin subtype must stay Kotlin; got:\n{speaker_java}\n{stderr}"
+        !speaker_java.is_empty() && !mood_java.is_empty() && !usage_java.is_empty(),
+        "the translated caller must release the enum and its supertype in the same invocation\n{stderr}"
     );
-    let types = fs::read_to_string(root.join("types.kt")).unwrap_or_default();
-    assert!(types.contains("interface Speaker") && types.contains("enum class Mood"));
+    assert!(!root.join("types.kt").exists());
+    assert!(!root.join("usage.kt").exists());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -172,5 +175,207 @@ fn retained_delta_rechecks_only_reverse_dependency_files() {
     assert!(index.retained_delta_can_affect(&retained, &delta));
     assert!(index.retained_delta_can_affect(&child, &delta));
     assert!(!index.retained_delta_can_affect(&unrelated, &delta));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn warm_retention_replanning_matches_cold_after_overlay_shrinks_seed() {
+    use notlin::workspace::{SourceIndex, SourceLanguage, SourceOverlay};
+    use notlin::{cli::Cli, transpiler::fixpoint};
+    let root = Path::new("tests/tmp_scratch_warm_retention");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    let file = root.join("Types.kt");
+    let original = "@Deprecated(\"keep\")\nclass Kept\nclass Free\n";
+    fs::write(&file, original).unwrap();
+    let base = SourceIndex::discover(root).unwrap();
+    let cli = Cli::parse_from(["notlin", "--in-place", file.to_str().unwrap()]);
+    let cold = fixpoint::plan_workspace_state(
+        &[(file.clone(), original.into())],
+        &cli,
+        &base,
+        &[root.to_path_buf()],
+        16,
+        false,
+    )
+    .unwrap();
+    let updated = "class Kept\nclass Free\n";
+    let changed = base
+        .with_overlays(&[SourceOverlay::Replace {
+            path: file.clone(),
+            language: SourceLanguage::Kotlin,
+            source: updated.into(),
+        }])
+        .unwrap();
+    let files = [(file.clone(), updated.into())];
+    let warm = fixpoint::plan_workspace_warm(
+        &files,
+        &cli,
+        &changed,
+        &[root.to_path_buf()],
+        16,
+        false,
+        &cold.retained,
+    )
+    .unwrap();
+    let fresh =
+        fixpoint::plan_workspace_state(&files, &cli, &changed, &[root.to_path_buf()], 16, false)
+            .unwrap();
+    assert_eq!(warm.retained, fresh.retained);
+    assert!(warm.retained.is_empty());
+    assert_eq!(
+        warm.plans
+            .iter()
+            .map(|p| &p.coverage.translated)
+            .collect::<Vec<_>>(),
+        fresh
+            .plans
+            .iter()
+            .map(|p| &p.coverage.translated)
+            .collect::<Vec<_>>()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn warm_retention_replanning_adds_names_missing_from_seed() {
+    use notlin::workspace::SourceIndex;
+    use notlin::{cli::Cli, transpiler::fixpoint};
+    let root = Path::new("tests/tmp_scratch_warm_incomplete");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    let file = root.join("Types.kt");
+    let source = "@Deprecated(\"keep\")\nclass Kept\nclass Free\n";
+    fs::write(&file, source).unwrap();
+    let index = SourceIndex::discover(root).unwrap();
+    let cli = Cli::parse_from(["notlin", "--in-place", file.to_str().unwrap()]);
+    let files = [(file.clone(), source.into())];
+    let seed = HashSet::from(["UnrelatedStaleName".to_string()]);
+    let warm = fixpoint::plan_workspace_warm(
+        &files,
+        &cli,
+        &index,
+        &[root.to_path_buf()],
+        16,
+        false,
+        &seed,
+    )
+    .unwrap();
+    let fresh =
+        fixpoint::plan_workspace_state(&files, &cli, &index, &[root.to_path_buf()], 16, false)
+            .unwrap();
+    assert_eq!(warm.retained, fresh.retained);
+    assert!(!warm.retained.contains("UnrelatedStaleName"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn retention_pass_limit_error_recommends_cli_override() {
+    let root = Path::new("tests/tmp_scratch_fixpoint_limit");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(root.join("Kept.kt"), "value class Kept(val raw: Int)\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--max-retention-passes",
+            "1",
+        ])
+        .arg(root.as_os_str())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "pass limit should fail:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("increase --max-retention-passes above 1"),
+        "failure must recommend the exact CLI override:\n{stderr}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn deep_valid_retention_chain_uses_configurable_budget() {
+    use notlin::workspace::SourceIndex;
+    use notlin::{cli::Cli, transpiler::fixpoint};
+
+    let scratch = Path::new("tests/tmp_scratch_fixpoint_deep_chain");
+    let _ = fs::remove_dir_all(scratch);
+    fs::create_dir_all(scratch).unwrap();
+    for depth in 0..7 {
+        let supertype = if depth == 0 {
+            String::new()
+        } else {
+            format!(" : Chain{}", depth - 1)
+        };
+        fs::write(
+            scratch.join(format!("Chain{depth}.kt")),
+            format!("package neutral.deep\ninterface Chain{depth}{supertype}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        scratch.join("Kept.kt"),
+        "package neutral.deep\nvalue class Kept(val raw: Int) : Chain6\n",
+    )
+    .unwrap();
+
+    let root = fs::canonicalize(scratch).unwrap();
+    let index = SourceIndex::discover(&root).unwrap();
+    let cli = Cli::parse_from(["notlin", "--in-place", root.to_str().unwrap()]);
+    let mut files = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "kt"))
+        .map(|path| {
+            let source = fs::read_to_string(&path).unwrap();
+            (path, source)
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let error =
+        fixpoint::plan_workspace_state(&files, &cli, &index, std::slice::from_ref(&root), 4, false)
+            .err()
+            .expect("four passes must be insufficient for this valid chain");
+    assert!(error.contains("increase --max-retention-passes above 4"));
+
+    let planned = fixpoint::plan_workspace_state(
+        &files,
+        &cli,
+        &index,
+        std::slice::from_ref(&root),
+        16,
+        false,
+    )
+    .expect("the same valid chain must converge with a larger budget");
+    assert_eq!(planned.retained.len(), 8);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn silent_fixpoint_jobs_profile_reports_requested_worker_count() {
+    let root = Path::new("tests/tmp_scratch_fixpoint_jobs");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(root.join("Type.kt"), "class Type\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.as_os_str())
+        .env("NOTLIN_JOBS", "4")
+        .env("NOTLIN_PROFILE", "1")
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "notlin failed:\n{stderr}");
+    assert!(
+        stderr.contains("fixpoint jobs=4"),
+        "missing jobs profile line:\n{stderr}"
+    );
     let _ = fs::remove_dir_all(root);
 }

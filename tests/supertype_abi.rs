@@ -86,18 +86,21 @@ fn whole_workspace_retains_class_whose_supertype_member_type_differs() {
         "conflicting property must not be emitted with a raw type, got:\n{out_java}"
     );
 
-    // The code on the warning line is the code of the run-end table row, so a
-    // human can grep the log for the row they picked out of the table.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let warning_code = stderr
+    // The code in the retained source comment is the code of the run-end table
+    // row, so a human can grep the summary by the marker beside the blocker.
+    let kotlin = fs::read_to_string(root.join("implementation.kt")).unwrap_or_default();
+    let blocker_line = kotlin
         .lines()
-        .find(|line| line.starts_with("warning:") && line.contains("a Kotlin supertype declares"))
-        .and_then(|line| line.rsplit('[').next())
-        .map(|tail| tail.trim_end_matches(']').to_string())
-        .unwrap_or_else(|| panic!("no mismatch warning in:\n{stderr}"));
+        .find(|line| line.contains("a Kotlin supertype declares"))
+        .unwrap_or_else(|| panic!("no mismatch blocker in:\n{kotlin}"));
+    let blocker_code = blocker_line
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or_else(|| panic!("no blocker code in:\n{blocker_line}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(&format!("  {warning_code} ")),
-        "table row for {warning_code} missing:\n{stderr}"
+        stderr.contains(&format!("  {blocker_code} ")),
+        "table row for {blocker_code} missing:\n{stderr}\n{kotlin}"
     );
     let _ = fs::remove_dir_all(root);
 }

@@ -60,6 +60,121 @@ pub struct FilePlan {
     pub coverage: crate::diagnostics::FileCoverage,
 }
 
+/// Workspace plans together with the stable retained declaration names.
+pub struct WorkspacePlan {
+    pub plans: Vec<FilePlan>,
+    pub retained: HashSet<String>,
+    /// Intrinsic retained declarations. Unlike the full retained closure, these
+    /// cannot form self-supporting cascade cycles when reused after overlays.
+    pub roots: HashSet<String>,
+}
+
+fn silent_jobs() -> usize {
+    std::env::var("NOTLIN_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|jobs| *jobs > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        })
+        .min(8)
+}
+
+fn worker_stack_bytes() -> usize {
+    std::env::var("NOTLIN_STACK_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(512)
+        .saturating_mul(1024 * 1024)
+}
+
+struct SilentPlanner<'a> {
+    files: &'a [(PathBuf, String)],
+    trees: &'a [tree_sitter::Tree],
+    workspace_files: &'a [Option<PathBuf>],
+    cli: &'a Cli,
+    index: &'a SourceIndex,
+    translation_roots: &'a [PathBuf],
+}
+
+impl SilentPlanner<'_> {
+    fn translate_one(&self, index: usize, retained: &HashSet<String>) -> FilePlan {
+        let (file, source) = &self.files[index];
+        let (java_files, errors, warnings, coverage) = transpile_with_tree_hint_selection(
+            source,
+            &self.trees[index],
+            file,
+            self.cli,
+            WorkspaceScope {
+                index: Some(self.index),
+                roots: self.translation_roots,
+                retained_hint: Some(retained),
+                indexed_path: self.workspace_files[index].as_deref(),
+            },
+            true,
+        );
+        FilePlan {
+            file: file.clone(),
+            source: source.clone(),
+            java_files,
+            errors,
+            warnings,
+            coverage,
+        }
+    }
+
+    fn translate_indices(
+        &self,
+        indices: &[usize],
+        retained: &HashSet<String>,
+    ) -> Result<Vec<(usize, FilePlan)>, String> {
+        let configured_jobs = silent_jobs();
+        let jobs = configured_jobs.min(indices.len().max(1));
+        if jobs <= 1 || indices.len() < 2 {
+            return Ok(indices
+                .iter()
+                .map(|index| (*index, self.translate_one(*index, retained)))
+                .collect());
+        }
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(jobs);
+            for worker in 0..jobs {
+                let assigned = indices
+                    .iter()
+                    .copied()
+                    .skip(worker)
+                    .step_by(jobs)
+                    .collect::<Vec<_>>();
+                handles.push(
+                    std::thread::Builder::new()
+                        .name(format!("notlin-{worker}"))
+                        .stack_size(worker_stack_bytes())
+                        .spawn_scoped(scope, move || {
+                            assigned
+                                .into_iter()
+                                .map(|index| (index, self.translate_one(index, retained)))
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(|error| format!("spawn translation worker: {error}"))?,
+                );
+            }
+            let mut translated = Vec::with_capacity(indices.len());
+            for handle in handles {
+                translated.extend(
+                    handle
+                        .join()
+                        .map_err(|_| "translation worker panicked".to_string())?,
+                );
+            }
+            translated.sort_by_key(|(index, _)| *index);
+            Ok(translated)
+        })
+    }
+}
+
 /// Probe-translate every file and iterate the retained set to the least
 /// fixpoint; return the final pass' plans (diagnostics NOT printed — the
 /// caller prints/serializes its own summary).
@@ -69,45 +184,183 @@ pub fn plan_workspace(
     index: &SourceIndex,
     translation_roots: &[PathBuf],
     max_passes: usize,
-) -> Vec<FilePlan> {
+    emit_diagnostics: bool,
+) -> Result<Vec<FilePlan>, String> {
+    Ok(plan_workspace_state(
+        files,
+        cli,
+        index,
+        translation_roots,
+        max_passes,
+        emit_diagnostics,
+    )?
+    .plans)
+}
+
+pub fn plan_workspace_state(
+    files: &[(PathBuf, String)],
+    cli: &Cli,
+    index: &SourceIndex,
+    translation_roots: &[PathBuf],
+    max_passes: usize,
+    emit_diagnostics: bool,
+) -> Result<WorkspacePlan, String> {
+    plan_workspace_cold(
+        files,
+        cli,
+        index,
+        translation_roots,
+        max_passes,
+        emit_diagnostics,
+        &HashSet::new(),
+    )
+}
+
+pub fn plan_workspace_warm(
+    files: &[(PathBuf, String)],
+    cli: &Cli,
+    index: &SourceIndex,
+    translation_roots: &[PathBuf],
+    max_passes: usize,
+    emit_diagnostics: bool,
+    seed: &HashSet<String>,
+) -> Result<WorkspacePlan, String> {
+    plan_workspace_cold(
+        files,
+        cli,
+        index,
+        translation_roots,
+        max_passes,
+        emit_diagnostics,
+        seed,
+    )
+}
+
+fn plan_workspace_cold(
+    files: &[(PathBuf, String)],
+    cli: &Cli,
+    index: &SourceIndex,
+    translation_roots: &[PathBuf],
+    max_passes: usize,
+    emit_diagnostics: bool,
+    seed: &HashSet<String>,
+) -> Result<WorkspacePlan, String> {
     let profile = std::env::var_os("NOTLIN_PROFILE").is_some();
     let trace = retention_trace_filter();
     let profile_start = Instant::now();
-    let mut probe_transpile = Duration::ZERO;
-    let mut probe_retention = Duration::ZERO;
-    let mut final_transpile = Duration::ZERO;
-    let mut probe_passes = 0usize;
-    let mut probe_files_per_pass = Vec::new();
-    let mut retained: HashSet<String> = HashSet::new();
-    let mut retained_delta: HashSet<String> = HashSet::new();
-    // Trees are immutable. Parsing each source once avoids re-parsing it for
-    // every retained-set probe and the final emitting translation.
     let trees: Vec<_> = files.iter().map(|(_, source)| parse_tree(source)).collect();
     let workspace_files: Vec<_> = files
         .iter()
         .map(|(file, _)| std::fs::canonicalize(file).ok())
         .collect();
+    let planner = SilentPlanner {
+        files,
+        trees: &trees,
+        workspace_files: &workspace_files,
+        cli,
+        index,
+        translation_roots,
+    };
+    if profile {
+        eprintln!("notlin profile: fixpoint jobs={}", silent_jobs());
+    }
+    let mut retained = seed.clone();
+    let mut retained_delta = retained.clone();
+    let mut probe_transpile = Duration::ZERO;
+    let mut probe_retention = Duration::ZERO;
+    let mut probe_files_per_pass = Vec::new();
     let mut plans = Vec::with_capacity(files.len());
-    let mut stable_pass_seen = false;
+    let mut stable = false;
+    let mut force_full_probe = false;
+
     for pass in 0..max_passes {
-        probe_passes += 1;
-        // The first pass discovers intrinsic blockers exhaustively. Later
-        // passes only need declarations linked to names newly retained by the
-        // preceding pass; every other coverage result is retention-stable.
-        let probe_all = pass == 0 || pass + 1 == max_passes;
-        let preserve_probe_plans = pass + 1 == max_passes;
-        let mut next_retained_delta = HashSet::new();
-        let mut probed_files = 0usize;
+        let pass_started = Instant::now();
+        let probe_all = pass == 0 || force_full_probe || pass + 1 == max_passes;
+        force_full_probe = false;
+        let mut next_delta = HashSet::new();
         let mut grew = false;
+        let indices = files
+            .iter()
+            .enumerate()
+            .filter_map(|(position, (file, _))| {
+                (probe_all || index.retained_delta_can_affect(file, &retained_delta))
+                    .then_some(position)
+            })
+            .collect::<Vec<_>>();
+        let probed_files = indices.len();
+        let started = Instant::now();
+        let translated = planner.translate_indices(&indices, &retained)?;
+        probe_transpile += started.elapsed();
+        let mut pass_plans = Vec::with_capacity(translated.len());
+        for (position, plan) in translated {
+            let file = &files[position].0;
+            if retention_traced(&trace, file) {
+                eprintln!(
+                    "notlin retention probe pass={} file={} translated={:?} untranslated={:?}",
+                    pass + 1,
+                    crate::paths::display(file),
+                    plan.coverage.translated,
+                    plan.coverage.untranslated
+                );
+            }
+            let started = Instant::now();
+            for name in index
+                .source_file(file)
+                .map(|source_file| {
+                    source_file
+                        .declarations
+                        .iter()
+                        .map(|declaration| declaration.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+            {
+                if !plan.coverage.translated.contains(&name) && retained.insert(name.clone()) {
+                    next_delta.insert(name);
+                    grew = true;
+                }
+            }
+            probe_retention += started.elapsed();
+            pass_plans.push(plan);
+        }
+        retained_delta = next_delta;
+        if profile {
+            probe_files_per_pass.push(probed_files);
+            eprintln!(
+                "notlin profile: fixpoint probe pass={} full={} probed_files={} retained_grew={} retained_total={} translation={:?} bookkeeping={:?} total={:?}",
+                pass + 1,
+                probe_all,
+                probed_files,
+                grew,
+                retained.len(),
+                probe_transpile,
+                probe_retention,
+                pass_started.elapsed()
+            );
+        }
+        if !grew {
+            if probe_all {
+                plans = pass_plans;
+                stable = true;
+                break;
+            }
+            // The reverse-dependency index is an optimization, not a proof of
+            // global stability. Verify every selective no-growth result with a
+            // complete workspace pass before declaring convergence.
+            force_full_probe = true;
+        }
+    }
+    if !stable {
+        return Err(format!(
+            "workspace retention did not converge within {max_passes} probe passes; increase --max-retention-passes above {max_passes} if this workspace has a deeper valid dependency chain"
+        ));
+    }
+
+    if emit_diagnostics {
         plans.clear();
         for (((file, source), tree), workspace_file) in
             files.iter().zip(&trees).zip(&workspace_files)
         {
-            if !probe_all && !index.retained_delta_can_affect(file, &retained_delta) {
-                continue;
-            }
-            probed_files += 1;
-            let started = Instant::now();
             let (java_files, errors, warnings, coverage) = transpile_with_tree_hint_selection(
                 source,
                 tree,
@@ -119,158 +372,27 @@ pub fn plan_workspace(
                     retained_hint: Some(&retained),
                     indexed_path: workspace_file.as_deref(),
                 },
-                /*silent=*/ true,
+                false,
             );
-            if retention_traced(&trace, file) {
-                eprintln!(
-                    "notlin retention probe pass={} file={} translated={:?} untranslated={:?}",
-                    pass + 1,
-                    crate::paths::display(file),
-                    coverage.translated,
-                    coverage.untranslated,
-                );
-            }
-            probe_transpile += started.elapsed();
-            // Declarations still in Kotlin after this pass: every declaration
-            // the index knows for this file that did NOT appear in
-            // `coverage.translated`. NOTE: index entries are workspace-wide;
-            // filter to this file's entries via its declarations list.
-            let started = Instant::now();
-            let file_decls = index
-                .source_file(file)
-                .map(|sf| {
-                    sf.declarations
-                        .iter()
-                        .map(|d| d.name.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            for name in file_decls {
-                if !coverage.translated.iter().any(|t| t == &name) && retained.insert(name.clone())
-                {
-                    next_retained_delta.insert(name);
-                    grew = true;
-                }
-            }
-            probe_retention += started.elapsed();
-            if preserve_probe_plans {
-                plans.push(FilePlan {
-                    file: file.clone(),
-                    source: source.clone(),
-                    java_files,
-                    errors,
-                    warnings,
-                    coverage,
-                });
-            }
-        }
-        retained_delta = next_retained_delta;
-        if profile {
-            probe_files_per_pass.push(probed_files);
-        }
-        log::debug!(
-            "fixpoint pass {}: retained set {} names{}",
-            pass + 1,
-            retained.len(),
-            if grew { " (grew)" } else { " (stable)" }
-        );
-        if !grew {
-            stable_pass_seen = true;
-            break;
+            plans.push(FilePlan {
+                file: file.clone(),
+                source: source.clone(),
+                java_files,
+                errors,
+                warnings,
+                coverage,
+            });
         }
     }
-    // Probe plans are always speculative: while a pass is walking files, an
-    // earlier file can be translated before a later file grows `retained`.
-    // Re-run all files from the complete retained set before writing, whether
-    // the fixpoint stabilized or the pass bound was reached. This removes
-    // file-order dependent output and prevents the final saved probe plans
-    // from being emitted with an incomplete retained hint.
-    //
-    // The probe passes prune files that the current delta cannot affect, so a
-    // retention rule that consults the retained set can keep a declaration in
-    // Kotlin on a pass that did not re-probe every file. The emitting pass
-    // therefore feeds its own findings back and repeats until the retained set
-    // stops growing: every unit's output then comes from the same complete
-    // hint. (Seeds are monotone, so this terminates; `FINAL_PASS_LIMIT` is the
-    // safety bound, and hitting it is reported.)
-    const FINAL_PASS_LIMIT: usize = 4;
-    if stable_pass_seen || !plans.is_empty() {
-        let mut converged = false;
-        for _ in 0..FINAL_PASS_LIMIT {
-            plans.clear();
-            let mut grew = false;
-            for (((file, source), tree), workspace_file) in
-                files.iter().zip(&trees).zip(&workspace_files)
-            {
-                let started = Instant::now();
-                let (java_files, errors, warnings, coverage) = transpile_with_tree_hint_selection(
-                    source,
-                    tree,
-                    file,
-                    cli,
-                    WorkspaceScope {
-                        index: Some(index),
-                        roots: translation_roots,
-                        retained_hint: Some(&retained),
-                        indexed_path: workspace_file.as_deref(),
-                    },
-                    /*silent=*/ false,
-                );
-                if retention_traced(&trace, file) {
-                    eprintln!(
-                        "notlin retention final file={} translated={:?} untranslated={:?}",
-                        crate::paths::display(file),
-                        coverage.translated,
-                        coverage.untranslated,
-                    );
-                }
-                for name in index
-                    .source_file(file)
-                    .map(|sf| {
-                        sf.declarations
-                            .iter()
-                            .map(|declaration| declaration.name.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-                {
-                    if !coverage.translated.contains(&name) && retained.insert(name) {
-                        grew = true;
-                    }
-                }
-                final_transpile += started.elapsed();
-                plans.push(FilePlan {
-                    file: file.clone(),
-                    source: source.clone(),
-                    java_files,
-                    errors,
-                    warnings,
-                    coverage,
-                });
-            }
-            if !grew {
-                converged = true;
-                break;
-            }
-        }
-        if !converged {
-            eprintln!(
-                "warning: retention did not converge within {FINAL_PASS_LIMIT} emitting passes; \
-                 output may retain less than the final pass decided"
-            );
-        }
-    }
+
+    let exact_retained = retained_from_plans(index, &plans);
     if profile {
         let translation = crate::transpiler::translation_profile();
         eprintln!(
-            "notlin profile: workspace fixpoint total={:?}; probe passes={probe_passes}; probe files/pass={probe_files_per_pass:?}; \
-             probe transpile={:?}; retention bookkeeping={:?}; final transpile={:?}; files={}; retained={}",
+            "notlin profile: workspace fixpoint total={:?}; probe files/pass={probe_files_per_pass:?}; probe transpile={probe_transpile:?}; retention bookkeeping={probe_retention:?}; files={}; retained={}",
             profile_start.elapsed(),
-            probe_transpile,
-            probe_retention,
-            final_transpile,
             files.len(),
-            retained.len(),
+            exact_retained.len()
         );
         eprintln!(
             "notlin profile: translation internals translations={}; parse={:?}; unit={:?}; diagnostics={:?}; java-output={:?}",
@@ -278,10 +400,206 @@ pub fn plan_workspace(
             translation.parses,
             translation.units,
             translation.diagnostics,
-            translation.java_output,
+            translation.java_output
         );
     }
-    plans
+    let roots = intrinsic_roots(&exact_retained);
+    Ok(WorkspacePlan {
+        plans,
+        retained: exact_retained,
+        roots,
+    })
+}
+
+fn intrinsic_roots(retained: &HashSet<String>) -> HashSet<String> {
+    crate::diagnostics::retention_sites()
+        .into_iter()
+        .filter(|site| site.blockers.is_empty() && retained.contains(&site.name))
+        .map(|site| site.name)
+        .collect()
+}
+
+fn retained_from_plans(index: &SourceIndex, plans: &[FilePlan]) -> HashSet<String> {
+    let mut retained = HashSet::new();
+    for plan in plans {
+        for name in index
+            .source_file(&plan.file)
+            .map(|source_file| {
+                source_file
+                    .declarations
+                    .iter()
+                    .map(|declaration| declaration.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+        {
+            if !plan.coverage.translated.contains(&name) {
+                retained.insert(name);
+            }
+        }
+    }
+    retained
+}
+
+#[allow(dead_code)]
+fn plan_workspace_warm_impl(
+    files: &[(PathBuf, String)],
+    cli: &Cli,
+    index: &SourceIndex,
+    translation_roots: &[PathBuf],
+    max_passes: usize,
+    emit_diagnostics: bool,
+    mut retained: HashSet<String>,
+) -> Result<WorkspacePlan, String> {
+    let profile = std::env::var_os("NOTLIN_PROFILE").is_some();
+    let trace = retention_trace_filter();
+    let profile_start = Instant::now();
+    let probe_transpile = Duration::ZERO;
+    let probe_retention = Duration::ZERO;
+    let final_transpile = Duration::ZERO;
+    let mut probe_passes = 0usize;
+    let mut probe_files_per_pass = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(sorted_key(&retained));
+    // Trees are immutable. Parsing each source once avoids re-parsing it for
+    // every retained-set probe and the final emitting translation.
+    let trees: Vec<_> = files.iter().map(|(_, source)| parse_tree(source)).collect();
+    let workspace_files: Vec<_> = files
+        .iter()
+        .map(|(file, _)| std::fs::canonicalize(file).ok())
+        .collect();
+    let planner = SilentPlanner {
+        files,
+        trees: &trees,
+        workspace_files: &workspace_files,
+        cli,
+        index,
+        translation_roots,
+    };
+    if profile {
+        eprintln!("notlin profile: fixpoint jobs={}", silent_jobs());
+    }
+    let all_indices = (0..files.len()).collect::<Vec<_>>();
+    let mut plans = Vec::with_capacity(files.len());
+    let mut stable_pass_seen = false;
+    for pass in 0..max_passes {
+        probe_passes += 1;
+        let pass_started = Instant::now();
+        let mut next_retained = HashSet::new();
+        let translated = planner.translate_indices(&all_indices, &retained)?;
+        let mut pass_plans = Vec::with_capacity(files.len());
+        for (position, plan) in translated {
+            let file = &files[position].0;
+            if retention_traced(&trace, file) {
+                eprintln!(
+                    "notlin retention probe pass={} file={} translated={:?} untranslated={:?}",
+                    pass + 1,
+                    crate::paths::display(file),
+                    plan.coverage.translated,
+                    plan.coverage.untranslated
+                );
+            }
+            for name in index
+                .source_file(file)
+                .map(|sf| {
+                    sf.declarations
+                        .iter()
+                        .map(|d| d.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+            {
+                if !plan.coverage.translated.contains(&name) {
+                    next_retained.insert(name);
+                }
+            }
+            pass_plans.push(plan);
+        }
+        if next_retained == retained {
+            plans = pass_plans;
+            stable_pass_seen = true;
+            break;
+        }
+        let key = sorted_key(&next_retained);
+        if !seen.insert(key) {
+            return Err("workspace retention entered a repeated retained set".into());
+        }
+        retained = next_retained;
+        if profile {
+            probe_files_per_pass.push(files.len());
+            eprintln!(
+                "notlin profile: fixpoint probe pass={} probed_files={} retained_total={} translation={:?} bookkeeping={:?} total={:?}",
+                pass + 1,
+                files.len(),
+                retained.len(),
+                probe_transpile,
+                probe_retention,
+                pass_started.elapsed()
+            );
+        }
+    }
+    if !stable_pass_seen {
+        return Err(format!(
+            "workspace retention did not converge within {max_passes} probe passes"
+        ));
+    }
+    if emit_diagnostics {
+        plans.clear();
+        for (((file, source), tree), workspace_file) in
+            files.iter().zip(&trees).zip(&workspace_files)
+        {
+            let (java_files, errors, warnings, coverage) = transpile_with_tree_hint_selection(
+                source,
+                tree,
+                file,
+                cli,
+                WorkspaceScope {
+                    index: Some(index),
+                    roots: translation_roots,
+                    retained_hint: Some(&retained),
+                    indexed_path: workspace_file.as_deref(),
+                },
+                false,
+            );
+            plans.push(FilePlan {
+                file: file.clone(),
+                source: source.clone(),
+                java_files,
+                errors,
+                warnings,
+                coverage,
+            });
+        }
+    }
+    if profile {
+        let translation = crate::transpiler::translation_profile();
+        eprintln!(
+            "notlin profile: workspace fixpoint total={:?}; probe passes={probe_passes}; probe files/pass={probe_files_per_pass:?}; probe transpile={probe_transpile:?}; retention bookkeeping={probe_retention:?}; final transpile={final_transpile:?}; files={}; retained={}",
+            profile_start.elapsed(),
+            files.len(),
+            retained.len()
+        );
+        eprintln!(
+            "notlin profile: translation internals translations={}; parse={:?}; unit={:?}; diagnostics={:?}; java-output={:?}",
+            translation.translations,
+            translation.parses,
+            translation.units,
+            translation.diagnostics,
+            translation.java_output
+        );
+    }
+    let roots = intrinsic_roots(&retained);
+    Ok(WorkspacePlan {
+        plans,
+        retained,
+        roots,
+    })
+}
+
+fn sorted_key(set: &HashSet<String>) -> Vec<String> {
+    let mut key = set.iter().cloned().collect::<Vec<_>>();
+    key.sort();
+    key
 }
 
 /// Convenience: count of java files in a plan list (for summary lines).

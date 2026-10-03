@@ -74,9 +74,11 @@ class ArrayArg(val a: String)
         "an array argument retains the declaration until the surrounding \
          bodies translate:\n{array_arg}"
     );
+    let kotlin = fs::read_to_string(root.join("anns.kt")).unwrap_or_default();
     assert!(
-        stderr.contains("N04DC"),
-        "and says so, rather than dropping the class silently:\n{stderr}"
+        kotlin.contains("// NOTLIN: N04DC declaration annotation is retained in Kotlin")
+            && kotlin.contains("class ArrayArg"),
+        "and records the blocker beside the retained class:\n{kotlin}\n{stderr}"
     );
 
     let _ = fs::remove_dir_all(root);

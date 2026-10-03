@@ -1,6 +1,16 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "expected a positive integer".to_string())?;
+    if parsed == 0 {
+        return Err("expected a positive integer".to_string());
+    }
+    Ok(parsed)
+}
+
 /// notlin — a Kotlin-to-Java transpiler.
 #[derive(Parser, Debug)]
 #[command(name = "notlin", version, about)]
@@ -51,7 +61,12 @@ pub struct Cli {
     #[arg(long)]
     pub in_place: bool,
 
-    /// Verbose logging (-v debug, -vv trace)
+    /// Maximum retention fixpoint passes before failing. Increase this for
+    /// workspaces with unusually deep Kotlin dependency chains.
+    #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
+    pub max_retention_passes: usize,
+
+    /// Show individual file activity (-v) and trace-level details (-vv)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 }

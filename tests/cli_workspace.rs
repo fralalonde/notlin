@@ -87,8 +87,8 @@ fn directory_input_migrates_in_place_without_extra_flags() {
 }
 
 #[test]
-fn default_run_emits_only_the_final_summary() {
-    let root = std::env::temp_dir().join(format!("notlin-quiet-cli-{}", std::process::id()));
+fn default_run_reports_phases_without_listing_individual_files() {
+    let root = std::env::temp_dir().join(format!("notlin-progress-cli-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
     let source = root.join("Sample.kt");
@@ -107,13 +107,75 @@ fn default_run_emits_only_the_final_summary() {
 
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("◇ index"), "{stderr}");
+    assert!(stderr.contains("✓ index"), "{stderr}");
+    assert!(stderr.contains("◇ plan"), "{stderr}");
+    assert!(stderr.contains("notlin summary"), "{stderr}");
+    assert!(stderr.contains("├─ sources"), "{stderr}");
+    assert!(stderr.contains("├─ java"), "{stderr}");
+    assert!(stderr.contains("├─ diagnostics"), "{stderr}");
+    assert!(stderr.contains("└─ result"), "{stderr}");
+    assert!(stderr.contains("success"), "{stderr}");
+    assert!(!stderr.contains("Sample.kt"), "{stderr}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn verbose_run_lists_individual_source_activity() {
+    let root = std::env::temp_dir().join(format!("notlin-verbose-cli-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("Sample.kt");
+    let output_dir = root.join("java");
+    fs::write(&source, "package sample\nclass Sample\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .current_dir(&root)
+        .arg("--root")
+        .arg(&root)
+        .arg("--out-dir")
+        .arg(&output_dir)
+        .arg("-v")
+        .arg(&source)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("planned Sample.kt:"), "{stderr}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn profile_mode_keeps_individual_paths_hidden_without_verbose() {
+    let root = std::env::temp_dir().join(format!("notlin-profile-cli-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("Hidden.kt");
+    let output_dir = root.join("java");
+    fs::write(&source, "package sample\nclass Hidden\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .current_dir(&root)
+        .arg("--root")
+        .arg(&root)
+        .arg("--out-dir")
+        .arg(&output_dir)
+        .arg(&source)
+        .env("NOTLIN_PROFILE", "1")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.starts_with("notlin: 1 file(s) processed"),
+        stderr.contains("NOTLIN_PROFILE speculative round"),
         "{stderr}"
     );
-    assert!(!stderr.contains("indexing"), "{stderr}");
-    assert!(!stderr.contains("transpiling"), "{stderr}");
+    assert!(!stderr.contains("Hidden.kt"), "{stderr}");
+    assert!(!stderr.contains("Hidden.java"), "{stderr}");
+    assert!(!stderr.contains("samples:"), "{stderr}");
 
     fs::remove_dir_all(root).unwrap();
 }

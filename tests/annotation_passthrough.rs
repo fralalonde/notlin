@@ -62,10 +62,18 @@ class Holder(val tag: Tagged)
     let kotlin_source = fs::read_to_string(root.join("Types.kt")).unwrap_or_default();
     let kotlin = kotlin_source.contains("interface Tagged");
     assert!(java || kotlin, "annotated interface disappeared: {stderr}");
-    assert!(
-        kotlin_source.contains("@TypeInfo("),
-        "annotation must stay with retained interface: {kotlin_source}"
-    );
+    if kotlin {
+        assert!(
+            kotlin_source.contains("@TypeInfo("),
+            "annotation must stay with retained interface: {kotlin_source}"
+        );
+    } else {
+        let tagged_java = fs::read_to_string(root.join("Tagged.java")).unwrap();
+        assert!(
+            tagged_java.contains("@TypeInfo(") && tagged_java.contains("@SubTypes("),
+            "annotation must migrate with translated interface: {tagged_java}"
+        );
+    }
     let leaf_java = fs::read_to_string(root.join("Leaf.java")).unwrap_or_default();
     assert!(!leaf_java.contains("@TypeInfo"), "{leaf_java}");
     assert!(!leaf_java.contains("@SubTypes"), "{leaf_java}");
@@ -131,13 +139,15 @@ fn kotlin_annotation_type_taints_declaration() {
     .unwrap();
     let stderr = run(root, &root.join("use.kt"));
     let java = fs::read_to_string(root.join("UsesMine.java")).unwrap_or_default();
+    let kotlin = fs::read_to_string(root.join("use.kt")).unwrap_or_default();
     assert!(
         java.is_empty(),
         "declaration using an untranslated Kotlin annotation type must stay Kotlin, got:\n{java}"
     );
     assert!(
-        stderr.contains("N04DC"),
-        "expected the annotation retention diagnostic:\n{stderr}"
+        kotlin.contains("// NOTLIN: N04DC declaration annotation is retained in Kotlin")
+            && kotlin.contains("data class UsesMine"),
+        "expected the retained declaration and its in-source annotation blocker:\n{kotlin}\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -169,13 +179,15 @@ fn kotlin_only_annotation_arguments_taint() {
         .unwrap();
         let stderr = run(root, &root.join("anno.kt"));
         let java = fs::read_to_string(root.join(format!("Arg_{name}.java"))).unwrap_or_default();
+        let kotlin = fs::read_to_string(root.join("anno.kt")).unwrap_or_default();
         assert!(
             java.is_empty(),
             "Kotlin-only annotation argument must taint ({name}), got:\n{java}"
         );
         assert!(
-            stderr.contains("N04DC"),
-            "expected annotation retention diagnostic ({name}):\n{stderr}"
+            kotlin.contains("// NOTLIN: N04DC declaration annotation is retained in Kotlin")
+                && kotlin.contains(&format!("data class Arg_{name}")),
+            "expected retained declaration and in-source annotation blocker ({name}):\n{kotlin}\n{stderr}"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -230,13 +242,15 @@ fn repeated_same_name_annotation_taints() {
     .unwrap();
     let stderr = run(root, &root.join("anno.kt"));
     let java = fs::read_to_string(root.join("Twice.java")).unwrap_or_default();
+    let kotlin = fs::read_to_string(root.join("anno.kt")).unwrap_or_default();
     assert!(
         java.is_empty(),
         "repeated same-name annotation must taint the declaration, got:\n{java}"
     );
     assert!(
-        stderr.contains("NB03C"),
-        "expected the repeated-annotation retention diagnostic:\n{stderr}"
+        kotlin.contains("// NOTLIN: NB03C annotation com.example.Mapping is repeated")
+            && kotlin.contains("data class Twice"),
+        "expected retained declaration and in-source repeated-annotation blocker:\n{kotlin}\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }

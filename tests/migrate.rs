@@ -200,3 +200,78 @@ fn migration_on_tmpdir_trim_and_delete() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn no_translated_spans_with_blocker_rewrites_source_and_is_idempotent() {
+    use migrate::{MigrationProposal, propose_migration};
+
+    let source = "class Kept {\n    fun blocked() = TODO()\n}\n";
+    let anchor = source.find("fun blocked").unwrap();
+    let mut coverage = FileCoverage {
+        blockers: vec![(anchor, "// NOTLIN: N001 unsupported\n".to_string())],
+        ..Default::default()
+    };
+
+    let MigrationProposal::Rewrite(rewritten) = propose_migration(source, &coverage) else {
+        panic!("expected blocker-only coverage to rewrite source");
+    };
+    assert!(rewritten.contains("    // NOTLIN: N001 unsupported\n    fun blocked()"));
+    assert!(rewritten.contains("class Kept {"));
+
+    // Re-run with the shifted source-coordinate anchor as coverage would
+    // report for the already annotated file; the existing marker is retained.
+    let new_anchor = rewritten.find("fun blocked").unwrap();
+    coverage.blockers[0].0 = new_anchor;
+    let MigrationProposal::Rewrite(repeated) = propose_migration(&rewritten, &coverage) else {
+        panic!("expected repeated blocker coverage to rewrite source");
+    };
+    assert_eq!(repeated, rewritten);
+}
+
+#[test]
+fn repeated_blocker_set_at_one_anchor_is_idempotent() {
+    use migrate::{MigrationProposal, propose_migration};
+
+    let source = "class Kept {\n    // NOTLIN: N001 first blocker\n    // NOTLIN: N002 second blocker\n    fun blocked() = TODO()\n}\n";
+    let anchor = source.find("fun blocked").unwrap();
+    let coverage = FileCoverage {
+        blockers: vec![
+            (anchor, "// NOTLIN: N001 first blocker\n".to_string()),
+            (anchor, "// NOTLIN: N002 second blocker\n".to_string()),
+        ],
+        ..Default::default()
+    };
+
+    let MigrationProposal::Rewrite(rewritten) = propose_migration(source, &coverage) else {
+        panic!("expected blocker-only coverage to rewrite source");
+    };
+    assert_eq!(rewritten, source);
+}
+
+#[test]
+fn proposal_classifies_untouched_delete_rewrite_without_filesystem_effects() {
+    use migrate::{MigrationProposal, propose_migration};
+
+    let untouched = FileCoverage::default();
+    assert!(matches!(
+        propose_migration("class A {}\n", &untouched),
+        MigrationProposal::Untouched
+    ));
+    let full = FileCoverage {
+        translated_spans: vec![(0, 13)],
+        ..Default::default()
+    };
+    assert!(matches!(
+        propose_migration("class Full {}\n", &full),
+        MigrationProposal::Delete
+    ));
+    let source = "class Ok {}\n\nclass Bad {}\n";
+    let partial = FileCoverage {
+        translated_spans: vec![(0, 12)],
+        untranslated: vec!["Bad".into()],
+        ..Default::default()
+    };
+    assert!(
+        matches!(propose_migration(source, &partial), MigrationProposal::Rewrite(ref text) if text == "class Bad {}\n")
+    );
+}
