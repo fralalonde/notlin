@@ -112,3 +112,39 @@ fn class_literal_call_reaches_java_class_overload() {
         .expect("KindSpec.java");
     assert!(spec.contains("Kind.class"), "{spec}");
 }
+
+#[test]
+fn notlin_marker_text_does_not_create_a_kclass_reference() {
+    let root = std::env::temp_dir().join(format!("notlin-kclass-marker-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("Kind.kt");
+    let source = "package neutral.props\n\
+                  enum class Kind {\n\
+                  \x20   // NOTLIN: N001 old reason mentions KClass\n\
+                  \x20   A\n\
+                  }\n";
+    fs::write(&path, source).unwrap();
+    fs::write(
+        root.join("Consumer.kt"),
+        "package neutral.props\nval selected = Kind.A\n",
+    )
+    .unwrap();
+
+    let index = SourceIndex::discover(&root).unwrap();
+    let cli = Cli::parse_from(["notlin", path.to_str().unwrap()]);
+    let (files, errors, warnings, _coverage) = notlin::transpiler::transpile_with_workspace(
+        source,
+        &path,
+        &cli,
+        Some(&index),
+        std::slice::from_ref(&root),
+    );
+
+    assert_eq!(errors, 0, "{warnings:?}");
+    assert!(
+        files.iter().any(|(name, _)| name == "Kind.java"),
+        "diagnostic marker prose must not become semantic KClass evidence: {warnings:?}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}

@@ -1,13 +1,12 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
-/// A Kotlin enum referenced as a member type by a RETAINED Kotlin
-/// declaration (interface property) participates in Kotlin's fake-override
-/// resolution — translating it to a plain Java enum breaks kotlinc IR for
-/// the retained partner. The enum must remain Kotlin whenever a retained
-/// Kotlin file references it by name.
+/// A retained Kotlin declaration can safely reference a translated Java enum.
+/// Java enums remain Kotlin-visible types, and the emitter adds `getEntries()`
+/// when a residual Kotlin caller reads `Enum.entries`.
 #[test]
-fn enum_referenced_by_retained_kotlin_stays_kotlin() {
+fn enum_referenced_by_retained_kotlin_translates() {
     let root = std::env::temp_dir().join(format!("notlin-enumref-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
@@ -38,7 +37,52 @@ fn enum_referenced_by_retained_kotlin_stays_kotlin() {
         std::slice::from_ref(&root),
     );
     assert!(
-        !files.iter().any(|(n, _)| n == "Kind.java"),
-        "Kind translated while a retained Kotlin declaration references it as a member type"
+        files.iter().any(|(n, _)| n == "Kind.java"),
+        "a retained Kotlin declaration can reference the translated Java enum"
     );
+}
+
+#[test]
+fn enum_implementing_retained_kotlin_interface_translates() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-enum-retained-interface-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("State.kt"),
+        "package neutral.er\ninterface State {\n    val code: String\n    fun unsupported() = mapOf(\"a\" to 1).plus(emptyMap())\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Mode.kt"),
+        "package neutral.er\nenum class Mode(override val code: String) : State { A(\"a\") }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .current_dir(&root)
+        .env_remove("NOTLIN_RETENTION_HIERARCHY")
+        .args(["--in-place", "."])
+        .output()
+        .expect("run notlin");
+    assert!(
+        output.status.success(),
+        "notlin failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state_residue = fs::read_to_string(root.join("State.kt")).unwrap();
+    assert!(
+        !root.join("State.java").exists() && state_residue.contains("interface State"),
+        "unsupported-body owner must remain Kotlin:\n{state_residue}"
+    );
+    assert!(
+        root.join("Mode.java").exists(),
+        "a Java enum can implement a retained Kotlin interface:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
 }

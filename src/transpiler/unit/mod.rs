@@ -318,17 +318,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         self.referenced_by_surviving_kotlin(name)
     }
 
-    /// Whether an enum's Kotlin `entries` ABI must survive the run. Readers
-    /// that only touch `E.entries` are served by the emitted `getEntries()`
-    /// bridge (see `enum_entries_retain.rs`), so they never force retention;
-    /// any OTHER Kotlin reference to the enum does.
-    fn enum_entries_abi_is_kotlin_bound(&self, name: &str) -> bool {
-        let Some(workspace) = self.workspace else {
-            return false;
-        };
-        workspace.has_external_kotlin_reference_by_name(name)
-    }
-
     /// A Kotlin reference that survives the run: with a fixpoint hint only
     /// references from declarations that THEMSELVES stay Kotlin keep the
     /// referenced declaration in Kotlin — a file that translates away lowers
@@ -859,22 +848,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         self.diag_untranslatable(
                             *decl,
                             "standalone annotation requires the following declaration to remain Kotlin",
-                        );
-                        self.end_decl();
-                        continue;
-                    }
-                    // The Kotlin `entries` ABI (`getEntries()`) has to survive
-                    // only while a declaration that will REMAIN Kotlin reads
-                    // `<Enum>.entries`: Java consumers are served by the
-                    // emitted `getEntries()` bridge, and a Kotlin consumer that
-                    // translates in this same run lowers its own read. Without
-                    // a fixpoint hint (single-file mode) any external Kotlin
-                    // mention is treated as a consumer.
-                    let is_enum = kt::child(*decl, "enum_class_body").is_some();
-                    if is_enum && self.enum_entries_abi_is_kotlin_bound(&type_name) {
-                        self.diag_untranslatable(
-                            *decl,
-                            "Kotlin enum `entries` ABI (`getEntries()`) is read by Kotlin that remains after this run; enum stays Kotlin to keep that read compiling",
                         );
                         self.end_decl();
                         continue;

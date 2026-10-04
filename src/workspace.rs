@@ -802,31 +802,6 @@ impl SourceIndex {
         self.has_java_get_entries_consumer(owner) || self.has_kotlin_enum_entries_consumer(owner)
     }
 
-    /// A Kotlin file that will SURVIVE this run reads `<owner>.entries`: only
-    /// such a consumer keeps the enum's Kotlin `entries` ABI alive. Java
-    /// consumers are served by the emitted `getEntries()` bridge, and Kotlin
-    /// files that translate away lower their own reads in the same run.
-    pub fn has_retained_kotlin_enum_entries_consumer(
-        &self,
-        owner: &str,
-        retained: &HashSet<String>,
-        translation_roots: &[PathBuf],
-    ) -> bool {
-        self.kotlin_files().any(|file| {
-            if !file.enum_entries_qualifiers.contains_key(owner) {
-                return false;
-            }
-            let declares_owner = file.declarations.iter().any(|decl| decl.name == owner);
-            if !self.is_selected(&file.path, translation_roots) {
-                // Outside the translation set: the whole file stays Kotlin.
-                return true;
-            }
-            file.declarations.iter().any(|decl| {
-                retained.contains(&decl.name) && !(declares_owner && decl.name == owner)
-            })
-        })
-    }
-
     /// `name` is referenced by Kotlin that survives the run, so the referenced
     /// ABI must survive with it. A file outside the translation set stays
     /// Kotlin whole; inside it, only the declarations the fixpoint retains do.
@@ -1148,24 +1123,6 @@ impl SourceIndex {
             Some(t) => Some(t),
             None => candidates.into_iter().flatten().next(),
         }
-    }
-
-    /// A RETAINED Kotlin file (other than the enum's own declaring file)
-    /// references the enum by name (member/local type use). Match by file
-    /// stem so harness call-sites without the indexed path still exclude the
-    /// declaring file.
-    pub fn has_external_kotlin_reference_by_name(&self, name: &str) -> bool {
-        self.kotlin_files().any(|file| {
-            let self_file = file.declarations.iter().any(|decl| decl.name == name)
-                || file
-                    .path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy() == name)
-                    .unwrap_or(false);
-            let references = file.identifier_counts.get(name).copied().unwrap_or(0);
-            let entries_only = file.enum_entries_qualifiers.get(name).copied().unwrap_or(0);
-            !self_file && references > entries_only
-        })
     }
 
     /// The recorded type of the property backing a Java getter name

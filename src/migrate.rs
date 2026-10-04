@@ -174,26 +174,39 @@ fn copy_kept(
     out: &mut String,
 ) {
     let mut p = from;
-    for (offset, text) in blockers.iter() {
-        if *offset < from || *offset >= to {
-            continue;
-        }
-        // Back up to the start of the line holding the element, then insert
-        // the comment AFTER that line's leading whitespace so the comment
-        // shares the element's indentation; re-copy the whitespace + content
-        // after it (p rewinds to the line start).
+    let region_blockers: Vec<_> = blockers
+        .iter()
+        .filter(|(offset, _)| *offset >= from && *offset < to)
+        .collect();
+    let mut blocker_index = 0usize;
+    while blocker_index < region_blockers.len() {
+        let (offset, _) = region_blockers[blocker_index];
         let line_start = source[..*offset]
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0)
             .max(from);
+        let mut group_end = blocker_index + 1;
+        while group_end < region_blockers.len()
+            && source[..region_blockers[group_end].0]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0)
+                .max(from)
+                == line_start
+        {
+            group_end += 1;
+        }
+        // Back up to the start of the line holding the element, then insert
+        // the comment AFTER that line's leading whitespace so the comment
+        // shares the element's indentation; re-copy the whitespace + content
+        // after it (p rewinds to the line start).
         let indent_end = source[line_start..*offset]
             .bytes()
             .take_while(|b| *b == b' ' || *b == b'\t')
             .count()
             + line_start;
         let indent = &source[line_start..indent_end];
-        let existing = format!("{indent}{text}");
         let mut blocker_block_start = line_start;
         while blocker_block_start > from {
             let previous_end = blocker_block_start - 1;
@@ -212,12 +225,16 @@ fn copy_kept(
                 break;
             }
         }
-        if source[blocker_block_start..line_start].contains(&existing) {
-            continue;
+        let desired_block = region_blockers[blocker_index..group_end]
+            .iter()
+            .map(|(_, text)| format!("{indent}{text}"))
+            .collect::<String>();
+        if source[blocker_block_start..line_start] != desired_block {
+            out.push_str(&source[p..blocker_block_start]);
+            out.push_str(&desired_block);
+            p = line_start;
         }
-        out.push_str(&source[p..indent_end]);
-        out.push_str(text);
-        p = line_start;
+        blocker_index = group_end;
     }
     out.push_str(&source[p..to]);
     blockers.retain(|(o, _)| !(*o >= from && *o < to));

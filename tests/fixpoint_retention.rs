@@ -529,3 +529,42 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
     assert_eq!(after, before, "precise comments must be byte-idempotent");
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn final_retention_markers_exclude_names_released_from_the_seed() {
+    use notlin::workspace::SourceIndex;
+    use notlin::{cli::Cli, transpiler::fixpoint};
+
+    let root = Path::new("tests/tmp_scratch_released_marker");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    let file = root.join("Types.kt");
+    let source = "interface Hub\n\
+                  enum class Free : Hub { A }\n\
+                  class Kept : Hub {\n\
+                  \x20   fun unsupported() = mapOf(\"a\" to 1).plus(emptyMap())\n\
+                  }\n";
+    fs::write(&file, source).unwrap();
+    let index = SourceIndex::discover(root).unwrap();
+    let cli = Cli::parse_from(["notlin", "--in-place", file.to_str().unwrap()]);
+    let files = [(file.clone(), source.into())];
+    let seed = HashSet::from(["Free".to_string()]);
+
+    let planned =
+        fixpoint::plan_workspace_warm(&files, &cli, &index, &[root.to_path_buf()], 16, true, &seed)
+            .unwrap();
+
+    assert!(!planned.retained.contains("Free"));
+    let blockers = planned.plans[0]
+        .coverage
+        .blockers
+        .iter()
+        .map(|(_, marker)| marker.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !blockers.contains("enum Free"),
+        "released declarations must not survive in final provenance:\n{blockers}"
+    );
+    let _ = fs::remove_dir_all(root);
+}

@@ -275,3 +275,38 @@ fn proposal_classifies_untouched_delete_rewrite_without_filesystem_effects() {
         matches!(propose_migration(source, &partial), MigrationProposal::Rewrite(ref text) if text == "class Bad {}\n")
     );
 }
+
+#[test]
+fn changed_blocker_replaces_the_existing_notlin_block() {
+    let source = "// NOTLIN: N001 old reason\ninterface Kept {}\n";
+    let mut coverage = FileCoverage::default();
+    let anchor = source.find("interface Kept").unwrap();
+    coverage
+        .blockers
+        .push((anchor, "// NOTLIN: N002 new reason\n".to_string()));
+
+    let out = migrate::strip_translated(source, &coverage);
+
+    assert_eq!(out, "// NOTLIN: N002 new reason\ninterface Kept {}\n");
+}
+
+#[test]
+fn blockers_with_distinct_offsets_on_one_line_replace_one_existing_block() {
+    let source = "// NOTLIN: N001 old reason\ninterface Kept : A, B {}\n";
+    let mut coverage = FileCoverage::default();
+    coverage.blockers.push((
+        source.find("A, B").unwrap(),
+        "// NOTLIN: N002 first reason\n".to_string(),
+    ));
+    coverage.blockers.push((
+        source.find("B {}").unwrap(),
+        "// NOTLIN: N003 second reason\n".to_string(),
+    ));
+
+    let out = migrate::strip_translated(source, &coverage);
+
+    assert_eq!(
+        out,
+        "// NOTLIN: N002 first reason\n// NOTLIN: N003 second reason\ninterface Kept : A, B {}\n"
+    );
+}

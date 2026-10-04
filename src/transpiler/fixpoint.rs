@@ -357,7 +357,41 @@ fn plan_workspace_cold(
         ));
     }
 
+    // The monotone probe above deliberately grows an upper bound, but a
+    // provisional retained name can disappear from the final plans (for
+    // example, an enum that can safely implement a retained Kotlin interface).
+    // Re-plan from the exact final coverage until the hint and the plans agree;
+    // otherwise released names leak into cascade provenance and make the next
+    // physical migration rewrite blocker comments.
+    let all_indices = (0..files.len()).collect::<Vec<_>>();
+    let mut refinement_seen = HashSet::new();
+    refinement_seen.insert(sorted_key(&retained));
+    let mut exact_stable = false;
+    for _ in 0..max_passes {
+        let exact = retained_from_plans(index, &plans);
+        if exact == retained {
+            exact_stable = true;
+            break;
+        }
+        let key = sorted_key(&exact);
+        if !refinement_seen.insert(key) {
+            return Err("workspace retention refinement entered a repeated retained set".into());
+        }
+        retained = exact;
+        plans = planner
+            .translate_indices(&all_indices, &retained)?
+            .into_iter()
+            .map(|(_, plan)| plan)
+            .collect();
+    }
+    if !exact_stable {
+        return Err(format!(
+            "workspace retention refinement did not converge within {max_passes} passes; increase --max-retention-passes above {max_passes}"
+        ));
+    }
+
     if emit_diagnostics {
+        crate::diagnostics::clear_retention();
         plans.clear();
         for (((file, source), tree), workspace_file) in
             files.iter().zip(&trees).zip(&workspace_files)

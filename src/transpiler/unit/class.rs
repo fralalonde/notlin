@@ -23,6 +23,34 @@ struct BridgeSig {
 }
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    fn declaration_is_enum(&self, decl: tree_sitter::Node<'tree>) -> bool {
+        let Some(modifiers) = kt::child(decl, "modifiers") else {
+            return false;
+        };
+        modifiers
+            .children(&mut modifiers.walk())
+            .filter(|modifier| modifier.kind() == "class_modifier")
+            .flat_map(|modifier| modifier.children(&mut modifier.walk()).collect::<Vec<_>>())
+            .any(|token| self.text(token) == "enum")
+    }
+
+    fn declaration_references_kclass(&self, decl: tree_sitter::Node<'tree>) -> bool {
+        let mut pending = vec![decl];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "user_type"
+                && self
+                    .text(node)
+                    .split(|character: char| !character.is_alphanumeric() && character != '_')
+                    .any(|part| part == "KClass")
+            {
+                return true;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        false
+    }
+
     pub(crate) fn collect_type_relations(&mut self, root: tree_sitter::Node<'tree>) {
         let mut stack: Vec<tree_sitter::Node<'tree>> = vec![root];
         while let Some(n) = stack.pop() {
@@ -570,6 +598,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return Some((RetentionKind::SmartCast, Vec::new(), Vec::new()));
         }
         if hierarchy_closure()
+            && !self.declaration_is_enum(decl)
             && self.retained_hint.as_ref().is_some_and(|retained| {
                 workspace.has_retained_kotlin_supertype(&target.supertypes, retained)
             })
@@ -645,7 +674,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // retention when residual Kotlin references the declaration,
         // translation when only Java (or nobody) does — Kotlin callers ad
         // apt via `X::class.java`, which is legal against a `Class` param.
-        if self.text(decl).contains("KClass") {
+        if self.declaration_references_kclass(decl) {
             let name = kt::field(decl, "name")
                 .map(|n| self.text(n).to_string())
                 .unwrap_or_default();
@@ -2765,7 +2794,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                             arg.children(&mut arg.walk()).find(|x| x.is_named())
                                         {
                                             let mut e2 = Expr { unit: self };
-                                            args.push(e2.transpile(ex));
+                                            let mut rendered = e2.transpile(ex);
+                                            let expects_object =
+                                                params.get(args.len()).is_some_and(
+                                                    |(_, _, _, ty)| ty.ends_with("Object"),
+                                                );
+                                            if expects_object && rendered == "() -> {}" {
+                                                rendered = "(kotlin.jvm.functions.Function0<kotlin.Unit>) () -> kotlin.Unit.INSTANCE".to_string();
+                                            }
+                                            args.push(rendered);
                                         }
                                     }
                                     // Fill omitted defaulted parameters so
