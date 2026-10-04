@@ -280,7 +280,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
     }
 
-    fn annotated_interface_parsed_as_expression(&self, node: tree_sitter::Node) -> bool {
+    fn annotated_interface_parsed_as_expression(&self, node: tree_sitter::Node) -> Option<String> {
         let mut pending = vec![node];
         while let Some(wrapper) = pending.pop() {
             for part in wrapper.children(&mut wrapper.walk()) {
@@ -290,11 +290,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     && kt::child(part, "identifier")
                         .is_some_and(|name| self.text(name) == "interface")
                 {
-                    return true;
+                    let name = self
+                        .text(part)
+                        .trim_start()
+                        .strip_prefix("interface")?
+                        .trim_start()
+                        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                        .next()
+                        .filter(|name| !name.is_empty())?;
+                    return Some(name.to_string());
                 }
             }
         }
-        false
+        None
     }
 
     fn top_level_name(&self, decl: tree_sitter::Node<'_>) -> Option<String> {
@@ -409,6 +417,31 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         kt::text(node, self.source)
     }
 
+    fn retention_context(&self, node: tree_sitter::Node<'_>) -> Option<String> {
+        let mut method = None;
+        let mut ancestor = Some(node);
+        while let Some(current) = ancestor {
+            if method.is_none() && current.kind() == "function_declaration" {
+                method = kt::field(current, "name").map(|name| self.text(name).to_string());
+            }
+            if let Some(name) = self.decl_labels.get(&current.id()) {
+                let declaration = match current.kind() {
+                    "function_declaration" => format!("function {name}()"),
+                    "property_declaration" => format!("property {name}"),
+                    _ => self.retained_declaration_label(name),
+                };
+                return Some(match method {
+                    Some(method) if current.kind() != "function_declaration" => {
+                        format!("affected declaration: {declaration}; source method: {method}()")
+                    }
+                    _ => format!("affected declaration: {declaration}"),
+                });
+            }
+            ancestor = current.parent();
+        }
+        None
+    }
+
     pub fn diag_untranslatable(&mut self, node: tree_sitter::Node, msg: impl Into<String>) {
         self.diag_untranslatable_coded(node, msg, None);
     }
@@ -454,9 +487,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // in --in-place residue when the surrounding declaration is stripped.
         let message: String = msg.into();
         let blocker_code = code.clone().unwrap_or_else(|| warning_code(&message));
+        let residue_message = if message.contains("retained") && !message.starts_with("retained ") {
+            self.retention_context(node)
+                .map(|context| format!("{message}; {context}"))
+                .unwrap_or_else(|| message.clone())
+        } else {
+            message.clone()
+        };
         self.coverage.blockers.push((
             node.start_byte(),
-            format!("// NOTLIN: {blocker_code} {message}\n"),
+            format!("// NOTLIN: {blocker_code} {residue_message}\n"),
         ));
 
         self.diags.push(crate::diagnostics::Diagnostic {
@@ -468,6 +508,57 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             line: node.start_position().row + 1,
             col: node.start_position().column + 1,
         });
+    }
+
+    fn retained_declaration_label(&self, name: &str) -> String {
+        let current = self
+            .workspace
+            .and_then(|workspace| {
+                let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
+                workspace.source_file(indexed_path)
+            })
+            .and_then(|source_file| {
+                source_file
+                    .declarations
+                    .iter()
+                    .find(|declaration| declaration.name == name)
+            });
+        match current.map(|declaration| declaration.kind) {
+            Some(crate::workspace::DeclarationKind::Class) => format!("class {name}"),
+            Some(crate::workspace::DeclarationKind::Interface) => format!("interface {name}"),
+            Some(crate::workspace::DeclarationKind::Enum) => format!("enum {name}"),
+            Some(crate::workspace::DeclarationKind::Object) => format!("object {name}"),
+            Some(crate::workspace::DeclarationKind::Record) => format!("record {name}"),
+            Some(crate::workspace::DeclarationKind::Annotation) => {
+                format!("annotation class {name}")
+            }
+            None => format!("declaration {name}"),
+        }
+    }
+
+    fn retained_blocker_label(&self, name: &str) -> String {
+        let Some(workspace) = self.workspace else {
+            return format!("declaration {name}");
+        };
+        let mut labels = workspace
+            .declarations()
+            .filter(|declaration| declaration.name == name)
+            .map(|declaration| match declaration.kind {
+                crate::workspace::DeclarationKind::Class => "class",
+                crate::workspace::DeclarationKind::Interface => "interface",
+                crate::workspace::DeclarationKind::Enum => "enum",
+                crate::workspace::DeclarationKind::Object => "object",
+                crate::workspace::DeclarationKind::Record => "record",
+                crate::workspace::DeclarationKind::Annotation => "annotation class",
+            })
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        labels.dedup();
+        if labels.len() == 1 {
+            format!("{} {name}", labels[0])
+        } else {
+            format!("declaration {name}")
+        }
     }
 
     /// A declaration that has to stay Kotlin because residual Kotlin still
@@ -485,17 +576,28 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         params: &[String],
         blockers: &[String],
     ) {
+        let declaration = self.retained_declaration_label(name);
+        let blocker_labels = blockers
+            .iter()
+            .map(|blocker| self.retained_blocker_label(blocker))
+            .collect::<Vec<_>>();
+        let blocker_details = blockers
+            .iter()
+            .cloned()
+            .zip(blocker_labels.iter().cloned())
+            .collect::<Vec<_>>();
         crate::diagnostics::record_retention(
             kind,
             params,
             self.file,
             decl.start_position().row + 1,
+            &declaration,
             name,
-            blockers,
+            &blocker_details,
         );
         self.diag_untranslatable_coded(
             decl,
-            crate::diagnostics::retention_message(&kind.detail(params)),
+            crate::diagnostics::retention_site_message(&declaration, kind, params, &blocker_labels),
             Some(kind.code()),
         );
     }
@@ -643,11 +745,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     // type or strip it with that type. Keep the opaque region
                     // in Kotlin until the grammar can expose its declaration.
                     if child.kind() == "annotated_expression"
-                        && self.annotated_interface_parsed_as_expression(child)
+                        && let Some(name) = self.annotated_interface_parsed_as_expression(child)
                     {
-                        self.diag_untranslatable(
+                        self.diag_untranslatable_coded(
                             child,
-                            "annotated top-level expression contains an unparsed declaration; retained in Kotlin",
+                            format!(
+                                "annotated top-level expression contains an unparsed declaration; retained in Kotlin; affected declaration: interface {name}"
+                            ),
+                            Some("N47BC".to_string()),
                         );
                         self.coverage
                             .untranslated

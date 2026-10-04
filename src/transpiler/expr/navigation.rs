@@ -661,6 +661,31 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 // Class/object references and method refs; pass through.
                 // `X::class` is the Java class literal `X.class`.
                 if self.unit.text(w[2]).trim() == "class" {
+                    if !result.contains('.')
+                        && let Some(source_file) = self.unit.workspace.and_then(|workspace| {
+                            let declaring = self
+                                .unit
+                                .workspace_file
+                                .as_deref()
+                                .unwrap_or(self.unit.file);
+                            workspace.source_file(declaring)
+                        })
+                        && let Some(imported) = source_file.imports.iter().find_map(|import| {
+                            let (target, visible_name) = import
+                                .split_once(" as ")
+                                .map(|(target, alias)| (target.trim(), alias.trim()))
+                                .unwrap_or_else(|| {
+                                    (
+                                        import.as_str(),
+                                        import.rsplit('.').next().unwrap_or(import.as_str()),
+                                    )
+                                });
+                            (visible_name == result && !target.ends_with(".*"))
+                                .then(|| target.to_string())
+                        })
+                    {
+                        result = imported;
+                    }
                     result.push_str(".class");
                     continue;
                 } else if self.unit.text(w[2]).trim() == "java" {

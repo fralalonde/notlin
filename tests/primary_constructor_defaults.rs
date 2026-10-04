@@ -40,7 +40,7 @@ fn jvm_overloads_primary_constructor_emits_every_trailing_default_overload() {
         "missing two-default constructor overload:\n{java}"
     );
     assert!(
-        java.contains("public Endpoint(String host, int port, boolean secure)"),
+        java.contains("public Endpoint(@NonNull String host, int port, boolean secure)"),
         "delegating overloads must not rely on Lombok annotation processing for their primary constructor:\n{java}"
     );
     assert!(

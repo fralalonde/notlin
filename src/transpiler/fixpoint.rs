@@ -21,7 +21,7 @@
 use crate::cli::Cli;
 use crate::transpiler::{WorkspaceScope, parse_tree, transpile_with_tree_hint_selection};
 use crate::workspace::SourceIndex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -296,11 +296,12 @@ fn plan_workspace_cold(
             let file = &files[position].0;
             if retention_traced(&trace, file) {
                 eprintln!(
-                    "notlin retention probe pass={} file={} translated={:?} untranslated={:?}",
+                    "notlin retention probe pass={} file={} translated={:?} untranslated={:?} blockers={:?}",
                     pass + 1,
                     crate::paths::display(file),
                     plan.coverage.translated,
-                    plan.coverage.untranslated
+                    plan.coverage.untranslated,
+                    plan.coverage.blockers
                 );
             }
             let started = Instant::now();
@@ -383,6 +384,7 @@ fn plan_workspace_cold(
                 coverage,
             });
         }
+        qualify_retention_markers(&mut plans);
     }
 
     let exact_retained = retained_from_plans(index, &plans);
@@ -409,6 +411,87 @@ fn plan_workspace_cold(
         retained: exact_retained,
         roots,
     })
+}
+
+pub fn qualify_retention_markers(plans: &mut [FilePlan]) {
+    let display_root = common_plan_root(plans)
+        .map(|root| format!("{}/", crate::paths::display(&root).trim_end_matches('/')));
+    let mut intrinsic: crate::diagnostics::IntrinsicRetentionMarkers = BTreeMap::new();
+    for plan in plans.iter() {
+        let file = crate::paths::display(&plan.file);
+        let mut retention_anchors = plan
+            .coverage
+            .blockers
+            .iter()
+            .filter_map(|(offset, marker)| {
+                marker
+                    .trim_start()
+                    .strip_prefix("// NOTLIN: ")
+                    .and_then(|rest| rest.split_once(' '))
+                    .filter(|(_, message)| message.starts_with("retained "))
+                    .map(|_| (*offset, source_line(&plan.source, *offset)))
+            })
+            .collect::<Vec<_>>();
+        retention_anchors.sort_unstable();
+        for (offset, marker) in &plan.coverage.blockers {
+            let Some(rest) = marker.trim_end().strip_prefix("// NOTLIN: ") else {
+                continue;
+            };
+            let Some((code, message)) = rest.split_once(' ') else {
+                continue;
+            };
+            if message.starts_with("retained ") {
+                continue;
+            }
+            let owner_line = retention_anchors
+                .iter()
+                .rev()
+                .find(|(anchor, _)| anchor <= offset)
+                .or_else(|| retention_anchors.first())
+                .map(|(_, line)| *line)
+                .unwrap_or_else(|| source_line(&plan.source, *offset));
+            intrinsic
+                .entry((file.clone(), owner_line))
+                .or_default()
+                .push((code.to_string(), message.to_string()));
+        }
+    }
+    for plan in plans {
+        for (offset, marker) in &mut plan.coverage.blockers {
+            let line = source_line(&plan.source, *offset);
+            let Some((code, message)) =
+                crate::diagnostics::retention_source_message(&plan.file, line, &intrinsic)
+            else {
+                continue;
+            };
+            let message = display_root
+                .as_deref()
+                .map(|prefix| message.replace(prefix, ""))
+                .unwrap_or(message);
+            let prefix = format!("// NOTLIN: {code} retained");
+            if marker.starts_with(&prefix) {
+                *marker = format!("// NOTLIN: {code} {message}\n");
+            }
+        }
+    }
+}
+
+fn common_plan_root(plans: &[FilePlan]) -> Option<PathBuf> {
+    let mut root = plans.first()?.file.parent()?.to_path_buf();
+    while !plans.iter().all(|plan| plan.file.starts_with(&root)) {
+        if !root.pop() {
+            return None;
+        }
+    }
+    Some(root)
+}
+
+fn source_line(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
 }
 
 fn intrinsic_roots(retained: &HashSet<String>) -> HashSet<String> {
@@ -492,11 +575,12 @@ fn plan_workspace_warm_impl(
             let file = &files[position].0;
             if retention_traced(&trace, file) {
                 eprintln!(
-                    "notlin retention probe pass={} file={} translated={:?} untranslated={:?}",
+                    "notlin retention probe pass={} file={} translated={:?} untranslated={:?} blockers={:?}",
                     pass + 1,
                     crate::paths::display(file),
                     plan.coverage.translated,
-                    plan.coverage.untranslated
+                    plan.coverage.untranslated,
+                    plan.coverage.blockers
                 );
             }
             for name in index

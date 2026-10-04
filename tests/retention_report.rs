@@ -9,7 +9,7 @@ use notlin::diagnostics::{
         SupertypeMemberType,
     },
     clear_retention, record_retention, retention_code, retention_message, retention_report,
-    warning_code,
+    retention_site_message, retention_source_message, warning_code,
 };
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -41,8 +41,19 @@ fn record_params(
     blockers: &[&str],
 ) {
     let params: Vec<String> = params.iter().map(|value| value.to_string()).collect();
-    let blockers: Vec<String> = blockers.iter().map(|blocker| blocker.to_string()).collect();
-    record_retention(kind, &params, Path::new(file), line, name, &blockers);
+    let blockers = blockers
+        .iter()
+        .map(|blocker| (blocker.to_string(), format!("declaration {blocker}")))
+        .collect::<Vec<_>>();
+    record_retention(
+        kind,
+        &params,
+        Path::new(file),
+        line,
+        &format!("declaration {name}"),
+        name,
+        &blockers,
+    );
 }
 
 fn row_for<'a>(report: &'a str, code: &str) -> &'a str {
@@ -160,6 +171,80 @@ fn report_groups_by_kind_with_counts_and_locations() {
         .expect("cascade row");
     assert!(primary < cascade, "roots must precede cascade:\n{report}");
     assert!(report.contains("(cascade)"), "{report}");
+}
+
+#[test]
+fn retained_source_comments_name_the_declaration_and_next_blocker() {
+    let root = retention_site_message(
+        "class Dto",
+        MiddleDefaultParameter,
+        &[
+            "constructor Dto(owner, locale) cannot serve omission from method Repository.find()"
+                .to_string(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        root,
+        "retained class Dto; root cause: no delegating overload can serve the default-argument omission: constructor Dto(owner, locale) cannot serve omission from method Repository.find()"
+    );
+
+    let cascade = retention_site_message(
+        "interface Hub",
+        InterfaceSubtypeRetained,
+        &[],
+        &["class Worker".to_string(), "object Registry".to_string()],
+    );
+    assert_eq!(
+        cascade,
+        "retained interface Hub; blocked by retained class Worker, object Registry; follow those declarations to their // NOTLIN root-cause markers"
+    );
+}
+
+#[test]
+fn final_retention_comment_names_direct_site_and_terminal_root() {
+    let _guard = lock_table();
+    clear_retention();
+    let no_params = Vec::new();
+    let no_blockers = Vec::new();
+    record_retention(
+        MiddleDefaultParameter,
+        &["method Repository.find() omits constructor parameter locale".to_string()],
+        Path::new("module/src/Root.kt"),
+        7,
+        "class Root",
+        "Root",
+        &no_blockers,
+    );
+    record_retention(
+        RetainedSupertype,
+        &no_params,
+        Path::new("module/src/Middle.kt"),
+        11,
+        "class Middle",
+        "Middle",
+        &[("Root".to_string(), "class Root".to_string())],
+    );
+    record_retention(
+        InterfaceSubtypeRetained,
+        &no_params,
+        Path::new("module/src/Leaf.kt"),
+        13,
+        "interface Leaf",
+        "Leaf",
+        &[("Middle".to_string(), "class Middle".to_string())],
+    );
+
+    let (_, message) =
+        retention_source_message(Path::new("module/src/Leaf.kt"), 13, &Default::default())
+            .expect("the recorded leaf marker");
+    assert!(
+        message.contains("retained interface Leaf")
+            && message.contains("blocked by class Middle at module/src/Middle.kt")
+            && message.contains("class Root at module/src/Root.kt")
+            && message.contains("method Repository.find()"),
+        "{message}"
+    );
 }
 
 #[test]

@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 // 8: `SourceFile::smart_cast_sites` / `SourceFile::bindings` — the retained-Kotlin
 // smart-cast boundary now carries the site shapes and the file's own name->type
 // table instead of a bare property-name set.
-const CACHE_VERSION: u32 = 10;
+const CACHE_VERSION: u32 = 11;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -34,6 +34,7 @@ pub struct MemberConflict {
     pub supertype: String,
     pub inherited_type: String,
     pub implementation_type: String,
+    pub parameter_types: Vec<String>,
     pub classification: MemberConflictClass,
     legacy_mismatch: bool,
 }
@@ -76,6 +77,8 @@ pub struct Member {
     /// accessor bridge that only exists for plain companion vals.
     pub is_jvm_field: bool,
     pub type_name: Option<String>,
+    #[serde(default)]
+    pub parameter_types: Vec<String>,
     pub is_nullable: bool,
 }
 
@@ -953,11 +956,11 @@ impl SourceIndex {
                 let Some(sup_ty) = m.type_name.clone() else {
                     continue;
                 };
-                if let Some(own_m) = own
-                    .members
-                    .iter()
-                    .find(|om| om.name == m.name && om.kind == m.kind)
-                    && let Some(own_ty) = own_m.type_name.as_deref()
+                if let Some(own_m) = own.members.iter().find(|om| {
+                    om.name == m.name
+                        && om.kind == m.kind
+                        && om.parameter_types == m.parameter_types
+                }) && let Some(own_ty) = own_m.type_name.as_deref()
                 {
                     conflicts.push(MemberConflict {
                         member_name: m.name.clone(),
@@ -965,6 +968,7 @@ impl SourceIndex {
                         supertype: sup_decl.name.clone(),
                         inherited_type: sup_ty.clone(),
                         implementation_type: own_ty.to_string(),
+                        parameter_types: m.parameter_types.clone(),
                         classification: classify_member_conflict(
                             self, own_file, sup_decl, &sup_ty, own_ty,
                         ),
@@ -1735,7 +1739,7 @@ impl SourceIndex {
         }
     }
 
-    fn declaration_source_file(&self, declaration: &Declaration) -> Option<&SourceFile> {
+    pub(crate) fn declaration_source_file(&self, declaration: &Declaration) -> Option<&SourceFile> {
         self.files.iter().find(|file| {
             file.declarations
                 .iter()
@@ -2815,6 +2819,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 is_static: false,
                 is_jvm_field: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
+                parameter_types: Vec::new(),
                 is_nullable: false,
             });
         }
@@ -2855,6 +2860,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 is_static: false,
                 is_jvm_field: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
+                parameter_types: Vec::new(),
                 is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
             });
         }
@@ -2891,6 +2897,43 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
         }
     }
     result
+}
+
+fn member_parameter_types(
+    node: tree_sitter::Node<'_>,
+    language: SourceLanguage,
+    source: &str,
+) -> Vec<String> {
+    let parameter_container = match language {
+        SourceLanguage::Kotlin => node
+            .children(&mut node.walk())
+            .find(|child| child.kind() == "function_value_parameters"),
+        SourceLanguage::Java => node.child_by_field_name("parameters").or_else(|| {
+            node.children(&mut node.walk())
+                .find(|child| child.kind() == "formal_parameters")
+        }),
+    };
+    let Some(parameter_container) = parameter_container else {
+        return Vec::new();
+    };
+    parameter_container
+        .named_children(&mut parameter_container.walk())
+        .filter(|parameter| {
+            matches!(
+                (language, parameter.kind()),
+                (SourceLanguage::Kotlin, "parameter")
+                    | (SourceLanguage::Java, "formal_parameter")
+                    | (SourceLanguage::Java, "spread_parameter")
+            )
+        })
+        .filter_map(|parameter| {
+            parameter
+                .child_by_field_name("type")
+                .or_else(|| first_type_node(parameter))
+                .and_then(|ty| node_text(ty, source).ok())
+                .map(|ty| ty.trim().to_string())
+        })
+        .collect()
 }
 
 fn member_from_node(
@@ -2975,6 +3018,7 @@ fn member_from_node(
         is_static,
         is_jvm_field,
         type_name,
+        parameter_types: member_parameter_types(node, language, source),
         is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
     })
 }

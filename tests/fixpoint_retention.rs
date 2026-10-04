@@ -61,6 +61,80 @@ fn clean_hub_and_implementor_translate_together() {
 }
 
 #[test]
+fn covariant_override_translates_with_its_interface_hierarchy() {
+    let root = Path::new("tests/tmp_scratch_fixpoint_covariant");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("activity.kt"),
+        "package neutral.fixpoint.covariant\n\
+         interface ActivityInfo\n\
+         class JobInfo : ActivityInfo\n\
+         interface Activity { fun getInfo(): ActivityInfo }\n\
+         class JobActivity : Activity {\n\
+         \x20   override fun getInfo(): JobInfo = JobInfo()\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root.as_os_str())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "notlin failed:\n{stderr}");
+
+    let activity = fs::read_to_string(root.join("Activity.java")).unwrap_or_default();
+    let job = fs::read_to_string(root.join("JobActivity.java")).unwrap_or_default();
+    assert!(
+        activity.contains("ActivityInfo getInfo()")
+            && job.contains("JobInfo getInfo()")
+            && !root.join("activity.kt").exists(),
+        "a Java-compatible covariant override and its hierarchy must translate together:\n{stderr}\n{activity}\n{job}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn covariant_override_matches_the_full_overloaded_signature() {
+    let root = Path::new("tests/tmp_scratch_fixpoint_covariant_overload");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("api.kt"),
+        "package neutral.fixpoint.covariant.overload\n\
+         interface BaseInfo\n\
+         class JobInfo : BaseInfo\n\
+         interface Activity {\n\
+         \x20   fun getInfo(index: Int): BaseInfo\n\
+         \x20   fun getInfo(name: String): String\n\
+         }\n\
+         class JobActivity : Activity {\n\
+         \x20   override fun getInfo(index: Int): JobInfo = JobInfo()\n\
+         \x20   override fun getInfo(name: String): String = name\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root.as_os_str())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "notlin failed:\n{stderr}");
+    let job = fs::read_to_string(root.join("JobActivity.java")).unwrap_or_default();
+    assert!(
+        job.contains("JobInfo getInfo(int index)")
+            && job.contains("String getInfo(String name)")
+            && !root.join("api.kt").exists(),
+        "overloaded members must be paired by parameter signature before covariance is classified:\n{stderr}\n{job}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn translated_kotlin_caller_releases_enum_and_supertype_in_one_run() {
     let root = Path::new("tests/tmp_scratch_fixpoint_retained_enum");
     let _ = fs::remove_dir_all(root);
@@ -377,5 +451,81 @@ fn silent_fixpoint_jobs_profile_reports_requested_worker_count() {
         stderr.contains("fixpoint jobs=4"),
         "missing jobs profile line:\n{stderr}"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn retained_comments_name_direct_declarations_and_root_markers() {
+    let root = Path::new("tests/tmp_scratch_precise_retention_comments");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("Chain0.kt"),
+        "package neutral.comments\ninterface Chain0\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Chain1.kt"),
+        "package neutral.comments\ninterface Chain1 : Chain0\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Kept.kt"),
+        "package neutral.comments\nvalue class Kept(val raw: Int) : Chain1\n",
+    )
+    .unwrap();
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_notlin"))
+            .args([
+                "--root",
+                root.to_str().unwrap(),
+                "--in-place",
+                "--max-retention-passes",
+                "16",
+            ])
+            .arg(root.as_os_str())
+            .output()
+            .expect("run notlin")
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "notlin failed:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let chain0 = fs::read_to_string(root.join("Chain0.kt")).unwrap();
+    let chain1 = fs::read_to_string(root.join("Chain1.kt")).unwrap();
+    assert!(
+        chain0.contains("retained interface Chain0")
+            && chain0.contains("blocked by interface Chain1 at Chain1.kt")
+            && chain0
+                .contains("class Kept at Kept.kt [NF7FA]: class modifier not supported: value"),
+        "{chain0}"
+    );
+    assert!(
+        chain1.contains("retained interface Chain1")
+            && chain1.contains("blocked by class Kept at Kept.kt")
+            && !chain1.contains(&root.to_string_lossy().replace('\\', "/")),
+        "{chain1}"
+    );
+
+    let before = [
+        fs::read_to_string(root.join("Chain0.kt")).unwrap(),
+        fs::read_to_string(root.join("Chain1.kt")).unwrap(),
+        fs::read_to_string(root.join("Kept.kt")).unwrap(),
+    ];
+    let second = run();
+    assert!(
+        second.status.success(),
+        "second notlin run failed:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let after = [
+        fs::read_to_string(root.join("Chain0.kt")).unwrap(),
+        fs::read_to_string(root.join("Chain1.kt")).unwrap(),
+        fs::read_to_string(root.join("Kept.kt")).unwrap(),
+    ];
+    assert_eq!(after, before, "precise comments must be byte-idempotent");
     let _ = fs::remove_dir_all(root);
 }

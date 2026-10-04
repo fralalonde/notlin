@@ -231,6 +231,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             for want in [
                 "lombok.Data",
                 "lombok.Value",
+                "lombok.NonNull",
                 "lombok.AllArgsConstructor",
                 "lombok.EqualsAndHashCode",
             ] {
@@ -1283,10 +1284,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             // writable `var` — or any body instance field, whose presence
             // changes the constructor arity `@Value`'s implied
             // all-args constructor would settle on — keeps mutable `@Data`.
-            out.line(self.data_class_lombok_annotation(
+            let lombok_annotation = self.data_class_lombok_annotation(
                 decl,
                 params.iter().all(|(_, is_mutable, _, _)| !*is_mutable),
-            ));
+            );
+            let primary_constructor_annotations = self.primary_constructor_annotations(decl);
+            let use_lombok_generated_members = lombok_annotation == "@Value"
+                && !self.primary_constructor_has_defaults(decl)
+                && primary_constructor_annotations.is_empty()
+                && !jpa_no_arg
+                && !has_secondary_constructor
+                && superclass.is_none();
+            out.line(lombok_annotation);
             self.emit_lombok_equals_call_super(decl, out);
             out.blank();
             // Java-native declaration annotations pass through verbatim
@@ -1299,6 +1308,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 "{}{}class {}{}{}",
                 visibility, modifiers, name, tp, extends
             ));
+            let is_non_null_reference = |ftype: &str| {
+                !ftype.starts_with('@')
+                    && !matches!(
+                        ftype,
+                        "boolean" | "byte" | "short" | "int" | "long" | "char" | "float" | "double"
+                    )
+            };
             for (is_property, is_mutable, fname, ftype) in &params {
                 if !*is_property {
                     continue;
@@ -1318,96 +1334,123 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 {
                     out.line(annotation);
                 }
-                out.line(format!("private {}{} {};", final_kw, ftype, fname));
+                let nullability = if is_non_null_reference(ftype) {
+                    "@NonNull "
+                } else {
+                    ""
+                };
+                if use_lombok_generated_members {
+                    out.line(format!("{}{} {};", nullability, ftype, fname));
+                } else {
+                    out.line(format!(
+                        "{}private {}{} {};",
+                        nullability, final_kw, ftype, fname
+                    ));
+                }
             }
             out.blank();
-            // Default-parameter overloads delegate with `this(...)`; emit the
-            // primary constructor explicitly so they compile even where
-            // Lombok annotation processing is unavailable or disabled.
-            // `data class Layout @Default constructor(...)`: the Kotlin
-            // constructor's own annotations must ride along — the overloads
-            // give the class several constructors, and MapStruct selects
-            // between them by an annotation named `@Default`.
-            for annotation in self.primary_constructor_annotations(decl) {
-                out.line(annotation);
-            }
-            out.open(format!("public {}({})", name, {
-                params
-                    .iter()
-                    .map(|(_, _, n, t)| format!("{} {}", t, n))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }));
-            for (is_property, _, fname, _) in &params {
-                if *is_property {
-                    out.line(format!("this.{} = {};", fname, fname));
+            if !use_lombok_generated_members {
+                // Default-parameter overloads delegate with `this(...)`; emit the
+                // primary constructor explicitly so they compile even where
+                // Lombok annotation processing is unavailable or disabled.
+                // `data class Layout @Default constructor(...)`: the Kotlin
+                // constructor's own annotations must ride along — the overloads
+                // give the class several constructors, and MapStruct selects
+                // between them by an annotation named `@Default`.
+                for annotation in &primary_constructor_annotations {
+                    out.line(annotation.clone());
                 }
-            }
-            out.close();
-            // NOTLIN: emit explicit accessors mirroring the original Kotlin ABI.
-            // Relying on @Data's synthesized getters breaks cross-language member
-            // resolution: kotlinc (reading our generated Java via the kotlin
-            // lombok plugin) merges the implemented interface's @Nullable getter
-            // into the lookup and reports T? where the original Kotlin member was
-            // non-nullable, so call sites fail to typecheck. An explicit getter
-            // overrides synthesis and keeps the declared member visible.
-            for (is_property, _, fname, ftype) in &params {
-                if !*is_property {
-                    continue;
+                out.open(format!("public {}({})", name, {
+                    params
+                        .iter()
+                        .map(|(_, _, n, t)| {
+                            let nullability = if is_non_null_reference(t) {
+                                "@NonNull "
+                            } else {
+                                ""
+                            };
+                            format!("{}{} {}", nullability, t, n)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }));
+                for (is_property, _, fname, _) in &params {
+                    if *is_property {
+                        out.line(format!("this.{} = {};", fname, fname));
+                    }
                 }
-                // Kotlin `val authenticated: Boolean` has a Java-style
-                // `getAuthenticated()` accessor. Only a property whose name
-                // itself starts with `is` uses that name as its getter.
-                let getter = if ftype == "boolean"
-                    && fname.starts_with("is")
-                    && fname.chars().nth(2).is_some_and(|c| c.is_ascii_uppercase())
-                {
-                    fname.clone()
-                } else {
-                    format!("get{}", capitalize(fname))
-                };
-                // A Kotlin supertype's member function of the same getter
-                // name (e.g. `fun getId(): LookupEntityId`) IS the accessor
-                // the JDK sees for this property: synthesizing one with the
-                // wider property type breaks the override and javac rejects
-                // the return-type clash. Let the inherited accessor stand.
-                if self.workspace.is_some_and(|w| {
-                    w.inherited_fun_getter_conflicts(
-                        self.workspace_file.as_deref().unwrap_or(self.file),
-                        &name,
-                        &getter,
-                    )
-                }) {
-                    continue;
-                }
-                // @NotNull pins the getter's nullability to the (non-null)
-                // field: kotlinc otherwise merges the implemented interface's
-                // nullable property into the member lookup and reports T?
-                // (verified with the jlombok-probe fixture). A source
-                // annotation on the type (e.g. `@Nullable Boolean` from a
-                // `Boolean?` property) already states nullability — keep it
-                // verbatim instead of prepending ours.
-                let nullability = if ftype.starts_with('@') {
-                    String::new()
-                } else {
-                    "@NotNull ".to_string()
-                };
-                out.line(format!(
-                    "{}public {} {}() {{ return {}; }}",
-                    nullability, ftype, getter, fname
-                ));
-            }
-
-            for (_, is_mutable, fname, ftype) in &params {
-                if *is_mutable && ftype != "boolean" {
+                out.close();
+                // NOTLIN: emit explicit accessors mirroring the original Kotlin ABI.
+                // Relying on @Data's synthesized getters breaks cross-language member
+                // resolution: kotlinc (reading our generated Java via the kotlin
+                // lombok plugin) merges the implemented interface's @Nullable getter
+                // into the lookup and reports T? where the original Kotlin member was
+                // non-nullable, so call sites fail to typecheck. An explicit getter
+                // overrides synthesis and keeps the declared member visible.
+                for (is_property, _, fname, ftype) in &params {
+                    if !*is_property {
+                        continue;
+                    }
+                    // Kotlin `val authenticated: Boolean` has a Java-style
+                    // `getAuthenticated()` accessor. Only a property whose name
+                    // itself starts with `is` uses that name as its getter.
+                    let getter = if ftype == "boolean"
+                        && fname.starts_with("is")
+                        && fname.chars().nth(2).is_some_and(|c| c.is_ascii_uppercase())
+                    {
+                        fname.clone()
+                    } else {
+                        format!("get{}", capitalize(fname))
+                    };
+                    // A Kotlin supertype's member function of the same getter
+                    // name (e.g. `fun getId(): LookupEntityId`) IS the accessor
+                    // the JDK sees for this property: synthesizing one with the
+                    // wider property type breaks the override and javac rejects
+                    // the return-type clash. Let the inherited accessor stand.
+                    if self.workspace.is_some_and(|w| {
+                        w.inherited_fun_getter_conflicts(
+                            self.workspace_file.as_deref().unwrap_or(self.file),
+                            &name,
+                            &getter,
+                        )
+                    }) {
+                        continue;
+                    }
+                    // @NotNull pins the getter's nullability to the (non-null)
+                    // field: kotlinc otherwise merges the implemented interface's
+                    // nullable property into the member lookup and reports T?
+                    // (verified with the jlombok-probe fixture). A source
+                    // annotation on the type (e.g. `@Nullable Boolean` from a
+                    // `Boolean?` property) already states nullability — keep it
+                    // verbatim instead of prepending ours.
+                    let nullability = if ftype.starts_with('@') {
+                        String::new()
+                    } else {
+                        "@NotNull ".to_string()
+                    };
                     out.line(format!(
-                        "public void set{}({} {}) {{ this.{} = {}; }}",
-                        capitalize(fname),
-                        ftype,
-                        fname,
-                        fname,
-                        fname
+                        "{}public {} {}() {{ return {}; }}",
+                        nullability, ftype, getter, fname
                     ));
+                }
+
+                for (_, is_mutable, fname, ftype) in &params {
+                    if *is_mutable && ftype != "boolean" {
+                        let nullability = if is_non_null_reference(ftype) {
+                            "@NonNull "
+                        } else {
+                            ""
+                        };
+                        out.line(format!(
+                            "public void set{}({}{} {}) {{ this.{} = {}; }}",
+                            capitalize(fname),
+                            nullability,
+                            ftype,
+                            fname,
+                            fname,
+                            fname
+                        ));
+                    }
                 }
             }
             self.emit_jvm_overloads_primary_constructors(decl, &name, &params, out);
@@ -1698,7 +1741,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 // to land and must stay on the field it is written on:
                 // dropping it would lose the very metadata the ORM reads.
                 let mut annotations = self.param_annotations(decl, fname);
-                if self.lombok {
+                let lombok_needs_kotlin_boolean_getter = self.lombok
+                    && ftype == "boolean"
+                    && !(fname.starts_with("is")
+                        && fname.chars().nth(2).is_some_and(|c| c.is_ascii_uppercase()));
+                if self.lombok && !lombok_needs_kotlin_boolean_getter {
                     annotations.extend(self.param_getter_annotations(decl, fname));
                 }
                 for annotation in annotations {
@@ -1788,6 +1835,40 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         out.close();
                     }
                     out.blank();
+                }
+            } else {
+                // Lombok names a primitive-boolean getter `isEnabled()`, while
+                // Kotlin's JVM ABI for `val enabled: Boolean` is
+                // `getEnabled()`. Keep the Kotlin getter explicitly; Lombok
+                // suppresses only the same method name and may still add its
+                // convenience `isEnabled()` without breaking callers.
+                for (is_property, _, fname, ftype) in &params {
+                    if !*is_property
+                        || ftype != "boolean"
+                        || (fname.starts_with("is")
+                            && fname.chars().nth(2).is_some_and(|c| c.is_ascii_uppercase()))
+                    {
+                        continue;
+                    }
+                    let getter = format!("get{}", capitalize(fname));
+                    if self.class_declares_method(decl, &getter)
+                        || self.workspace.is_some_and(|workspace| {
+                            workspace.inherited_fun_getter_conflicts(
+                                self.workspace_file.as_deref().unwrap_or(self.file),
+                                &name,
+                                &getter,
+                            )
+                        })
+                    {
+                        continue;
+                    }
+                    for annotation in self.param_getter_annotations(decl, fname) {
+                        out.line(annotation);
+                    }
+                    out.line(format!(
+                        "public boolean {}() {{ return {}; }}",
+                        getter, fname
+                    ));
                 }
             } // body members
             if let Some(body) = kt::child(decl, "class_body") {
@@ -2124,10 +2205,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .unwrap_or_default()
     }
 
-    /// Transpiled default expressions for primary-ctor parameters, aligned
-    /// by index (`None` where the parameter has no default). Used to fill
-    /// enum-constant call sites, since Java has no default arguments.
-    fn class_param_defaults(&mut self, decl: tree_sitter::Node) -> Vec<Option<String>> {
+    fn class_param_default_nodes(
+        &self,
+        decl: tree_sitter::Node<'tree>,
+    ) -> Vec<Option<tree_sitter::Node<'tree>>> {
         kt::child(decl, "primary_constructor")
             .and_then(|pc| kt::child(pc, "class_parameters"))
             .map(|cps| {
@@ -2135,29 +2216,26 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 cps.children(&mut cursor)
                     .filter(|c| c.kind() == "class_parameter")
                     .map(|cp| {
-                        // The grammar nests the default as whatever
-                        // expression follows the `=` child (no dedicated
-                        // wrapper node). Only params that HAVE a `=`
-                        // contribute an entry; the last named child is the
-                        // default expression.
                         let has_default = cp
                             .children(&mut cp.walk())
                             .any(|c| !c.is_named() && c.kind() == "=");
-                        if has_default {
-                            cp.children(&mut cp.walk())
-                                .filter(|c| c.is_named())
-                                .last()
-                                .map(|ex| {
-                                    let mut e = Expr { unit: self };
-                                    e.transpile(ex)
-                                })
-                        } else {
-                            None
-                        }
+                        has_default
+                            .then(|| cp.children(&mut cp.walk()).filter(|c| c.is_named()).last())
+                            .flatten()
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Transpiled default expressions for primary-ctor parameters, aligned
+    /// by index (`None` where the parameter has no default). Used to fill
+    /// enum-constant call sites, since Java has no default arguments.
+    fn class_param_defaults(&mut self, decl: tree_sitter::Node) -> Vec<Option<String>> {
+        self.class_param_default_nodes(decl)
+            .into_iter()
+            .map(|default| default.map(|ex| Expr { unit: self }.transpile(ex)))
+            .collect()
     }
 
     /// `@JvmOverloads` on the primary constructor: the annotation that asks
@@ -3203,16 +3281,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             self.var_types = prior_var_types;
             return false;
         };
-        let mut args = Vec::new();
+        let mut written_args = Vec::new();
         for arg in args_node.children(&mut args_node.walk()) {
-            if arg.kind() != "value_argument" || self.text(arg).contains('=') {
-                if arg.kind() == "value_argument" {
-                    self.var_types = prior_var_types;
-                    return false;
-                }
+            if arg.kind() != "value_argument" {
                 continue;
             }
-            let Some(value) = arg.children(&mut arg.walk()).find(|child| child.is_named()) else {
+            let children: Vec<_> = arg.children(&mut arg.walk()).collect();
+            let has_name = children
+                .iter()
+                .any(|child| !child.is_named() && child.kind() == "=");
+            let named: Vec<_> = children
+                .iter()
+                .copied()
+                .filter(|child| child.is_named())
+                .collect();
+            let Some(value) = named.last().copied() else {
                 self.var_types = prior_var_types;
                 return false;
             };
@@ -3220,8 +3303,59 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 self.var_types = prior_var_types;
                 return false;
             }
-            args.push(Expr { unit: self }.transpile(value));
+            let name = if has_name {
+                let Some(name) = named.first().filter(|node| node.kind() == "identifier") else {
+                    self.var_types = prior_var_types;
+                    return false;
+                };
+                Some(self.text(*name).to_string())
+            } else {
+                None
+            };
+            written_args.push((name, Expr { unit: self }.transpile(value)));
         }
+        let args = if delegation_target == "this" {
+            let Some(class_decl) = kt::parent_of(member)
+                .and_then(kt::parent_of)
+                .filter(|node| node.kind() == "class_declaration")
+            else {
+                self.var_types = prior_var_types;
+                return false;
+            };
+            let primary = self.class_params(class_decl);
+            let names: Vec<String> = primary.into_iter().map(|(_, _, name, _)| name).collect();
+            let Some(resolved) = crate::ctor_defaults::resolve_args(&names, &written_args) else {
+                self.var_types = prior_var_types;
+                return false;
+            };
+            let defaults = self.class_param_default_nodes(class_decl);
+            let mut args = Vec::with_capacity(names.len());
+            for (index, slot) in resolved.slots.into_iter().enumerate() {
+                if let Some(value) = slot {
+                    args.push(value);
+                    continue;
+                }
+                let Some(default) = defaults.get(index).copied().flatten() else {
+                    self.var_types = prior_var_types;
+                    return false;
+                };
+                if !self.is_safe_secondary_constructor_argument(default)
+                    || crate::ctor_defaults::unsupplied_reference(self.text(default), &names, &[])
+                        .is_some()
+                {
+                    self.var_types = prior_var_types;
+                    return false;
+                }
+                args.push(Expr { unit: self }.transpile(default));
+            }
+            args
+        } else {
+            if written_args.iter().any(|(name, _)| name.is_some()) {
+                self.var_types = prior_var_types;
+                return false;
+            }
+            written_args.into_iter().map(|(_, value)| value).collect()
+        };
         out.open(format!(
             "public {}({})",
             class_name,
@@ -3274,19 +3408,47 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             })
     }
 
-    /// Delegated constructor arguments are deliberately narrower than the
-    /// general expression lowerer. This path writes a constructor before the
-    /// target build can validate it, so admit only values with a direct,
-    /// syntax-preserving Java form.
+    /// Delegated constructor arguments are narrower than the general expression
+    /// lowerer. Admit constructor calls and the Java-compatible library calls
+    /// needed by constructor defaults, while leaving Kotlin collection/extension
+    /// calls (for example `joinToString`) in Kotlin.
     fn is_safe_secondary_constructor_argument(&self, node: tree_sitter::Node) -> bool {
         match node.kind() {
             "identifier" | "this_expression" | "number_literal" | "boolean_literal"
             | "hex_literal" | "long_literal" | "real_literal" | "null_literal" => true,
             "string_literal" => !self.text(node).contains('$'),
-            // `Owner.VALUE` is valid Java. Call-shaped navigation is not:
-            // it may hide a Kotlin extension or collection operation whose
-            // lowering has not passed the constructor gate.
-            "navigation_expression" => !self.text(node).contains('('),
+            "navigation_expression" | "parenthesized_expression" | "value_arguments" => node
+                .children(&mut node.walk())
+                .filter(|child| child.is_named())
+                .all(|child| self.is_safe_secondary_constructor_argument(child)),
+            "value_argument" => node
+                .children(&mut node.walk())
+                .filter(|child| child.is_named())
+                .last()
+                .is_some_and(|value| self.is_safe_secondary_constructor_argument(value)),
+            "call_expression" => {
+                let named: Vec<_> = node
+                    .children(&mut node.walk())
+                    .filter(|child| child.is_named())
+                    .collect();
+                let Some(callee) = named.first().copied() else {
+                    return false;
+                };
+                let callee_text = self.text(callee).trim();
+                let method = callee_text
+                    .rsplit_once('.')
+                    .map_or(callee_text, |(_, method)| method);
+                let is_constructor = method
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_ascii_uppercase());
+                let is_supported_method = matches!(method, "getOrDefault" | "now" | "toInstant");
+                (is_constructor || is_supported_method)
+                    && named
+                        .iter()
+                        .skip(1)
+                        .all(|child| self.is_safe_secondary_constructor_argument(*child))
+            }
             _ => false,
         }
     }

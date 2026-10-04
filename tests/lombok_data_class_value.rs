@@ -25,9 +25,13 @@ fn data_class_lombok_annotation_follows_mutability() {
         root.join("types.kt"),
         r#"package neutral.val
 
-data class Immutable(val id: String, val count: Int)
+data class Immutable(val id: String, val count: Int, val note: String?)
 
-data class Mutable(val id: String, var count: Int)
+data class Mutable(val id: String, var count: Int, var label: String)
+
+data class WithSecondary(val id: String, val label: String) {
+    constructor(label: String) : this(label, label)
+}
 
 data class WithBody(val id: String) {
     var extra: String? = null
@@ -53,6 +57,26 @@ data class WithBody(val id: String) {
         !immutable.contains("@Data"),
         "an all-val data class must not be mutable @Data:\n{immutable}"
     );
+    assert!(
+        immutable.contains("@NonNull String id;"),
+        "a non-null Kotlin reference must use Lombok @NonNull on the field:\n{immutable}"
+    );
+    assert!(
+        !immutable.contains("@NonNull int count;"),
+        "a primitive does not need Lombok @NonNull:\n{immutable}"
+    );
+    assert!(
+        immutable.contains("@Nullable String note;"),
+        "a nullable Kotlin reference must stay nullable:\n{immutable}"
+    );
+    assert!(
+        !immutable.contains("public Immutable("),
+        "plain @Value classes should let Lombok generate the checked constructor:\n{immutable}"
+    );
+    assert!(
+        !immutable.contains("getId()"),
+        "plain @Value classes should let Lombok generate the getter:\n{immutable}"
+    );
 
     let mutable = emitted(root, "Mutable");
     assert!(
@@ -62,6 +86,28 @@ data class WithBody(val id: String) {
     assert!(
         !mutable.contains("@Value"),
         "a data class with a writable property must not be immutable @Value:\n{mutable}"
+    );
+    assert!(
+        mutable.contains("@NonNull private final String id;"),
+        "explicit Lombok forms must mark non-null final fields:\n{mutable}"
+    );
+    assert!(
+        mutable.contains("@NonNull private String label;"),
+        "explicit Lombok forms must mark non-null mutable fields:\n{mutable}"
+    );
+    assert!(
+        mutable.contains("@NonNull String id") && mutable.contains("@NonNull String label"),
+        "explicit constructors must enforce Kotlin non-null parameters:\n{mutable}"
+    );
+    assert!(
+        mutable.contains("setLabel(@NonNull String label)"),
+        "explicit setters must enforce Kotlin non-null assignments:\n{mutable}"
+    );
+
+    let with_secondary = emitted(root, "WithSecondary");
+    assert!(
+        with_secondary.contains("public WithSecondary(@NonNull String id, @NonNull String label)"),
+        "secondary constructors need an explicit checked primary constructor:\n{with_secondary}"
     );
 
     let with_body = emitted(root, "WithBody");
@@ -116,6 +162,43 @@ class InterfaceOnly(val name: String) : Marker
     assert!(
         !interface_only.contains("callSuper"),
         "an interface-only supertype must not get a supercall:\n{interface_only}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn lombok_plain_class_keeps_kotlin_boolean_getter_abi() {
+    let root = Path::new("tests/tmp_scratch_lombok_boolean_getter");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("flag.kt"),
+        r#"package neutral.flag
+
+class Flag(val enabled: Boolean) {
+    fun enabled(): Boolean = enabled
+}
+"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.join("flag.kt").to_str().unwrap())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "notlin failed:\n{stderr}");
+
+    let flag = emitted(root, "Flag");
+    assert!(
+        flag.contains("public boolean getEnabled()"),
+        "Kotlin's Boolean property ABI is getEnabled(), not Lombok's isEnabled():\n{flag}"
+    );
+    assert!(
+        flag.contains("return this.getEnabled();"),
+        "same-name function must resolve the property through the Kotlin ABI getter:\n{flag}"
     );
 
     let _ = fs::remove_dir_all(root);

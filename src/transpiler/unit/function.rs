@@ -19,10 +19,32 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         None
     }
 
-    /// Detects `override fun f` inside a class where the supertype (per the
-    /// workspace index) declares the same function with a DIFFERENT type —
-    /// i.e. the override narrows the supertype's return type. Returns the
-    /// supertype-declared type when a conflict exists.
+    fn function_parameter_types(&self, decl: tree_sitter::Node) -> Vec<String> {
+        let Some(parameters) = kt::child(decl, "function_value_parameters") else {
+            return Vec::new();
+        };
+        parameters
+            .children(&mut parameters.walk())
+            .filter(|parameter| parameter.kind() == "parameter")
+            .filter_map(|parameter| {
+                parameter
+                    .children(&mut parameter.walk())
+                    .find(|child| {
+                        matches!(
+                            child.kind(),
+                            "user_type" | "nullable_type" | "function_type" | "parenthesized_type"
+                        )
+                    })
+                    .map(|ty| self.text(ty).trim().to_string())
+            })
+            .collect()
+    }
+
+    /// Detects an `override fun f` whose return differs from a Kotlin
+    /// supertype. Java-compatible covariance is allowed only when that
+    /// supertype is selected and will translate in the same fixpoint; retaining
+    /// the Kotlin interface beside a Java implementation can crash kotlinc's
+    /// fake-override lowering.
     fn covariant_iface_return_conflict(&self, decl: tree_sitter::Node) -> Option<String> {
         let workspace = self.workspace?;
         let class_name = self.enclosing_class_name(decl)?;
@@ -35,49 +57,50 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let fname = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_default();
-        // This function's (Java) return type, as emitted.
-        let my_ret = self
-            .declared_return_node(decl)
-            .map(|n| kt::java_type_ann(n, self.source, self.annots));
-        // Any DECLARED supertype of the class declaring `fname`?
-        for decl_d in workspace.declarations_named(&class_name) {
-            for st in &decl_d.supertypes {
-                for iface in workspace.declarations_named(st) {
-                    for member in &iface.members {
-                        if member.name == fname
-                            && member.kind == crate::workspace::MemberKind::Method
-                            && let Some(declared) = &member.type_name
-                            && let Some(my_ret) = &my_ret
-                        {
-                            let declared_java = declared.clone();
-                            if !declared_java.is_empty()
-                                && declared_java != *my_ret
-                                && declared_java != "Object"
-                            {
-                                return Some(declared_java);
-                            }
-                        }
-                    }
-                }
+        let owner = workspace
+            .declarations_named(&class_name)
+            .find(|candidate| candidate.language == crate::workspace::SourceLanguage::Kotlin)?;
+        let parameter_types = self.function_parameter_types(decl);
+        let conflicts =
+            workspace.retained_supertype_member_conflicts(&owner.supertypes, &class_name);
+        for conflict in conflicts.into_iter().filter(|conflict| {
+            conflict.member_name == fname
+                && conflict.kind == crate::workspace::MemberKind::Method
+                && conflict.parameter_types == parameter_types
+                && conflict.inherited_type != conflict.implementation_type
+        }) {
+            match conflict.classification {
+                crate::workspace::MemberConflictClass::SupertypeTypeParameter => continue,
+                crate::workspace::MemberConflictClass::JavaCovariantReturn => {}
+                _ => return Some(conflict.inherited_type),
             }
-        }
-        None
-    }
-
-    fn declared_return_node<'b>(
-        &self,
-        decl: tree_sitter::Node<'b>,
-    ) -> Option<tree_sitter::Node<'b>> {
-        let mut cursor = decl.walk();
-        let kids: Vec<_> = decl.children(&mut cursor).collect();
-        let mut after_params = false;
-        for k in kids {
-            if k.kind() == "function_value_parameters" {
-                after_params = true;
+            let Some(supertype) =
+                workspace
+                    .declarations_named(&conflict.supertype)
+                    .find(|candidate| {
+                        matches!(
+                            candidate.kind,
+                            crate::workspace::DeclarationKind::Interface
+                                | crate::workspace::DeclarationKind::Class
+                        )
+                    })
+            else {
+                return Some(conflict.inherited_type);
+            };
+            if supertype.language == crate::workspace::SourceLanguage::Java {
                 continue;
             }
-            if after_params && k.is_named() && matches!(k.kind(), "user_type" | "nullable_type") {
-                return Some(k);
+            let Some(retained) = self.retained_hint else {
+                return Some(conflict.inherited_type);
+            };
+            if retained.contains(&supertype.name) {
+                return Some(conflict.inherited_type);
+            }
+            let Some(supertype_file) = workspace.declaration_source_file(supertype) else {
+                return Some(conflict.inherited_type);
+            };
+            if !workspace.is_selected(&supertype_file.path, self.translation_roots) {
+                return Some(conflict.inherited_type);
             }
         }
         None

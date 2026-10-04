@@ -10,7 +10,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// Does the enclosing class body declare a method of this name? Such a
     /// declaration suppresses the generated accessor (it would collide in
     /// Java), which decides where a `@get:` annotation has to live.
-    fn class_declares_method(&self, decl: tree_sitter::Node, method: &str) -> bool {
+    pub(crate) fn class_declares_method(&self, decl: tree_sitter::Node, method: &str) -> bool {
         let Some(body) = kt::parent_of(decl).filter(|parent| parent.kind() == "class_body") else {
             return false;
         };

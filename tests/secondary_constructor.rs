@@ -137,6 +137,60 @@ fn secondary_constructor_with_simple_body_translates_after_delegation() {
 }
 
 #[test]
+fn named_secondary_delegation_lowers_supported_expressions_and_primary_defaults() {
+    let root = Path::new("tests/tmp_scratch_secondary_ctor_named_defaults");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("Token.kt"),
+        "package neutral.secondary\n\
+         import java.time.Instant\n\
+         import java.time.OffsetDateTime\n\
+         interface Source {\n\
+         \x20   val id: String\n\
+         \x20   val deadlines: Map<String, OffsetDateTime>\n\
+         \x20   val priorities: Map<String, Int>\n\
+         }\n\
+         class Token(\n\
+         \x20   val id: String,\n\
+         \x20   val source: Source,\n\
+         \x20   val created: Instant = Instant.now(),\n\
+         \x20   val deadline: Instant,\n\
+         \x20   val priority: Int = 0\n\
+         ) {\n\
+         \x20   constructor(source: Source) : this(\n\
+         \x20       id = source.id,\n\
+         \x20       source = source,\n\
+         \x20       deadline = source.deadlines.getOrDefault(\"end\", OffsetDateTime.now()).toInstant(),\n\
+         \x20       priority = source.priorities.getOrDefault(\"priority\", 1)\n\
+         \x20   )\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root.as_os_str())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "notlin failed:\n{stderr}");
+    let java = fs::read_to_string(root.join("Token.java")).unwrap_or_default();
+    assert!(
+        java.contains("public Token(Source source)")
+            && java.contains(
+                "this(source.getId(), source, Instant.now(), source.getDeadlines().getOrDefault(\"end\", OffsetDateTime.now()).toInstant(), source.getPriorities().getOrDefault(\"priority\", 1));"
+            ),
+        "named arguments must be reordered and omitted primary defaults filled in the delegated Java constructor:\n{java}\n{stderr}"
+    );
+    assert!(
+        !root.join("Token.kt").exists(),
+        "supported delegated constructor retained:\n{stderr}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn secondary_constructor_with_complex_delegation_argument_stays_kotlin() {
     let root = Path::new("tests/tmp_scratch_secondary_ctor_complex");
     let _ = fs::remove_dir_all(root);

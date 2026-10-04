@@ -353,6 +353,178 @@ pub fn retention_message(reason: &str) -> String {
     format!("retained: {reason}")
 }
 
+/// Source-residue message for one retained declaration. Unlike the compact
+/// summary wording, this names the declaration itself and either the exact
+/// intrinsic blocker or the retained declarations immediately upstream. Every
+/// cascade comment therefore points to the next marker a human should inspect.
+pub fn retention_site_message(
+    declaration: &str,
+    kind: RetentionKind,
+    params: &[String],
+    blocker_labels: &[String],
+) -> String {
+    if blocker_labels.is_empty() {
+        format!(
+            "retained {declaration}; root cause: {}",
+            kind.detail(params)
+        )
+    } else {
+        format!(
+            "retained {declaration}; blocked by retained {}; follow those declarations to their // NOTLIN root-cause markers",
+            blocker_labels.join(", ")
+        )
+    }
+}
+
+pub type IntrinsicRetentionMarkers = BTreeMap<(String, usize), Vec<(String, String)>>;
+
+/// Final location-qualified residue message for one recorded retention site.
+/// This is called only after the emitting fixpoint pass has recorded every
+/// site, so direct blockers can be resolved to files and cascades can name
+/// their terminal root causes.
+pub fn retention_source_message(
+    file: &Path,
+    line: usize,
+    intrinsic_markers: &IntrinsicRetentionMarkers,
+) -> Option<(String, String)> {
+    let sites = retention_sites();
+    let file = crate::paths::display(file);
+    let site = sites
+        .iter()
+        .find(|site| site.file == file && site.line == line)?;
+    if site.blockers.is_empty() {
+        return Some((
+            site.kind.code(),
+            format!(
+                "retained {}; root cause [{}]: {}",
+                site.declaration,
+                site.kind.code(),
+                site.kind.detail(&site.params)
+            ),
+        ));
+    }
+
+    let mut by_name: BTreeMap<&str, Vec<&RetentionSite>> = BTreeMap::new();
+    for candidate in &sites {
+        by_name
+            .entry(candidate.name.as_str())
+            .or_default()
+            .push(candidate);
+    }
+    let mut direct = site
+        .blockers
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let label = site
+                .blocker_labels
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or(name);
+            describe_blocker(name, label, &by_name)
+        })
+        .collect::<Vec<_>>();
+    const MAX_DIRECT: usize = 4;
+    let hidden_direct = direct.len().saturating_sub(MAX_DIRECT);
+    direct.truncate(MAX_DIRECT);
+    if hidden_direct > 0 {
+        direct.push(format!("+{hidden_direct} more direct blocker(s)"));
+    }
+    let mut roots = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    collect_retention_roots(site, &by_name, intrinsic_markers, &mut visited, &mut roots);
+    let mut roots = roots.into_iter().collect::<Vec<_>>();
+    const MAX_ROOTS: usize = 3;
+    let hidden = roots.len().saturating_sub(MAX_ROOTS);
+    roots.truncate(MAX_ROOTS);
+    let root_text = if roots.is_empty() {
+        "root not uniquely resolvable from the simple-name graph; follow the direct blocker marker(s)"
+            .to_string()
+    } else {
+        let suffix = if hidden == 0 {
+            String::new()
+        } else {
+            format!(" (+{hidden} more root(s))")
+        };
+        format!("root(s): {}{suffix}", roots.join("; "))
+    };
+    Some((
+        site.kind.code(),
+        format!(
+            "retained {}; blocked by {}; {}",
+            site.declaration,
+            direct.join(", "),
+            root_text
+        ),
+    ))
+}
+
+fn describe_blocker(
+    name: &str,
+    label: &str,
+    by_name: &BTreeMap<&str, Vec<&RetentionSite>>,
+) -> String {
+    let Some(candidates) = by_name.get(name) else {
+        return format!("{label}; inspect its // NOTLIN marker");
+    };
+    if candidates.len() == 1 {
+        let site = candidates[0];
+        return format!("{} at {}", site.declaration, site.file);
+    }
+    let locations = candidates
+        .iter()
+        .map(|site| site.file.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ambiguous declaration {name} at {locations}")
+}
+
+fn collect_retention_roots<'a>(
+    site: &'a RetentionSite,
+    by_name: &BTreeMap<&str, Vec<&'a RetentionSite>>,
+    intrinsic_markers: &IntrinsicRetentionMarkers,
+    visited: &mut BTreeSet<(String, usize)>,
+    roots: &mut BTreeSet<String>,
+) {
+    if !visited.insert((site.file.clone(), site.line)) {
+        return;
+    }
+    if let Some(markers) = intrinsic_markers.get(&(site.file.clone(), site.line)) {
+        for (code, message) in markers {
+            roots.insert(format!(
+                "{} at {} [{}]: {}",
+                site.declaration, site.file, code, message
+            ));
+        }
+    }
+    if site.blockers.is_empty() {
+        roots.insert(format!(
+            "{} at {} [{}]: {}",
+            site.declaration,
+            site.file,
+            site.kind.code(),
+            site.kind.detail(&site.params)
+        ));
+        return;
+    }
+    for (index, blocker) in site.blockers.iter().enumerate() {
+        let Some(candidates) = by_name.get(blocker.as_str()) else {
+            let label = site
+                .blocker_labels
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or(blocker);
+            roots.insert(format!(
+                "{label}; intrinsic blocker — inspect its // NOTLIN marker"
+            ));
+            continue;
+        };
+        for candidate in candidates {
+            collect_retention_roots(candidate, by_name, intrinsic_markers, visited, roots);
+        }
+    }
+}
+
 /// The code a retention site prints — on its warning line AND in the run-end
 /// table row that summarises it. Both must derive it from the same message,
 /// or the code a human reads in the table greps to nothing in the log.
@@ -378,6 +550,8 @@ pub struct RetentionSite {
     pub file: String,
     /// 1-based declaration line.
     pub line: usize,
+    /// Human-readable declaration identity (`class Worker`, `interface Hub`).
+    pub declaration: String,
     /// Simple name of the declaration — the node the blame graph is built on.
     pub name: String,
     /// The retained declarations this one waits for. EMPTY means the blocker is
@@ -386,6 +560,10 @@ pub struct RetentionSite {
     /// the declaration is fallout, and its reason is one a human cannot fix —
     /// only the roots behind these names can be.
     pub blockers: Vec<String>,
+    /// Human-readable identities parallel to `blockers`; unlike the graph keys,
+    /// these preserve whether each dependency is a class, interface, object,
+    /// enum, record, or annotation.
+    pub blocker_labels: Vec<String>,
 }
 
 /// One recorded site, before it is handed out as a [`RetentionSite`].
@@ -393,8 +571,10 @@ pub struct RetentionSite {
 struct Recorded {
     kind: RetentionKind,
     params: Vec<String>,
+    declaration: String,
     name: String,
     blockers: Vec<String>,
+    blocker_labels: Vec<String>,
 }
 
 /// Keyed by declaration site: a fixpoint reconsiders every declaration on every
@@ -410,8 +590,9 @@ pub fn record_retention(
     params: &[String],
     file: &Path,
     line: usize,
+    declaration: &str,
     name: &str,
-    blockers: &[String],
+    blockers: &[(String, String)],
 ) {
     if let Ok(mut sites) = RETENTION.lock() {
         sites.insert(
@@ -419,8 +600,10 @@ pub fn record_retention(
             Recorded {
                 kind,
                 params: params.to_vec(),
+                declaration: declaration.to_string(),
                 name: name.to_string(),
-                blockers: blockers.to_vec(),
+                blockers: blockers.iter().map(|(name, _)| name.clone()).collect(),
+                blocker_labels: blockers.iter().map(|(_, label)| label.clone()).collect(),
             },
         );
     }
@@ -445,8 +628,10 @@ pub fn retention_sites() -> Vec<RetentionSite> {
                     params: recorded.params.clone(),
                     file: file.clone(),
                     line: *line,
+                    declaration: recorded.declaration.clone(),
                     name: recorded.name.clone(),
                     blockers: recorded.blockers.clone(),
+                    blocker_labels: recorded.blocker_labels.clone(),
                 })
                 .collect()
         })

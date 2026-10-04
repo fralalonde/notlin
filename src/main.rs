@@ -395,11 +395,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 }
                 virtual_sources = next;
             }
-            let Some(final_plans) = converged_plans else {
+            let Some(mut final_plans) = converged_plans else {
                 return Err(format!(
                     "workspace migration did not converge within {limit} speculative rounds"
                 ));
             };
+            transpiler::fixpoint::qualify_retention_markers(&mut final_plans);
             progress_done(
                 "plan",
                 format!(

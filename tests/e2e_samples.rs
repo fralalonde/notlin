@@ -431,19 +431,20 @@ fn lombok_flag_emits_mutable_data_class() {
     // delegate without depending on annotation processing.
     assert!(all.contains("@Data"), "missing @Data");
     assert!(all.contains("import lombok.Data;"));
+    assert!(all.contains("import lombok.NonNull;"));
     assert!(
         all.contains("private int x;"),
         "var component must stay mutable"
     );
     assert!(
-        all.contains("private final String y;"),
+        all.contains("@NonNull private final String y;"),
         "val component is final"
     );
     // Lombok owns equals/hashCode/toString; the constructor and accessors are
     // explicit so Java overloads and kotlinc's cross-language resolution do
     // not depend on annotation processing (see class.rs comments).
     assert!(
-        all.contains("public Point(int x, String y)"),
+        all.contains("public Point(int x, @NonNull String y)"),
         "data class must provide a real primary constructor"
     );
 
