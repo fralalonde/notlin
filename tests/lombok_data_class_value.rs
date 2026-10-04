@@ -70,8 +70,13 @@ data class WithBody(val id: String) {
         "a nullable Kotlin reference must stay nullable:\n{immutable}"
     );
     assert!(
-        !immutable.contains("public Immutable("),
-        "plain @Value classes should let Lombok generate the checked constructor:\n{immutable}"
+        immutable.contains("@java.beans.ConstructorProperties({\"id\", \"count\", \"note\"})"),
+        "translated data classes must retain constructor-property names for reflection-based binders:\n{immutable}"
+    );
+    assert!(
+        immutable
+            .contains("public Immutable(@NonNull String id, int count, @Nullable String note)"),
+        "the constructor must be explicit so its property-name contract survives without Kotlin metadata:\n{immutable}"
     );
     assert!(
         !immutable.contains("getId()"),

@@ -860,7 +860,7 @@ fn translates_trailing_default_constructor_used_by_kotlin_caller() {
 }
 
 #[test]
-fn retains_non_null_property_override_of_nullable_kotlin_contract() {
+fn translates_java_covariant_non_null_override_of_nullable_kotlin_contract() {
     let root = std::env::temp_dir().join(format!(
         "notlin-nullability-contract-{}",
         std::process::id()
@@ -870,14 +870,14 @@ fn retains_non_null_property_override_of_nullable_kotlin_contract() {
     let path = root.join("Definitions.kt");
     fs::write(
         &path,
-        "package sample\nclass Value\ninterface Contract {\n    val item: Value?\n}\ndata class Implementation(override val item: Value) : Contract\n",
+        "package sample\ninterface Base\nclass Child : Base\ninterface Contract {\n    val item: Base?\n}\ndata class Implementation(override val item: Child) : Contract\n",
     )
     .unwrap();
 
     let index = SourceIndex::discover(&root).unwrap();
     let cli = Cli::parse_from(["notlin", "--in-place", path.to_str().unwrap()]);
     let source = fs::read_to_string(&path).unwrap();
-    let (files, errors, warnings, coverage) = transpiler::transpile_with_workspace(
+    let (files, errors, _warnings, coverage) = transpiler::transpile_with_workspace(
         &source,
         &path,
         &cli,
@@ -885,13 +885,19 @@ fn retains_non_null_property_override_of_nullable_kotlin_contract() {
         std::slice::from_ref(&root),
     );
     assert_eq!(errors, 0);
-    assert!(warnings > 0);
-    assert!(!files.iter().any(|(name, _)| name == "Implementation.java"));
+    let java = files
+        .iter()
+        .find(|(name, _)| name == "Implementation.java")
+        .map(|(_, text)| text)
+        .unwrap_or_else(|| {
+            panic!(
+                "a Java-return-substitutable nullable-to-non-null override must translate; untranslated: {:?}",
+                coverage.untranslated
+            )
+        });
     assert!(
-        coverage
-            .untranslated
-            .iter()
-            .any(|name| name == "Implementation")
+        java.contains("Child getItem()"),
+        "the covariant getter must preserve the narrower return type:\n{java}"
     );
     fs::remove_dir_all(root).unwrap();
 }

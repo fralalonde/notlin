@@ -320,6 +320,10 @@ impl RetentionKind {
                 "no delegating overload can serve the default-argument omission: {}",
                 params.join("; ")
             ),
+            Self::NullableNarrowing if params.len() >= 3 => format!(
+                "property {} narrows nullable {} to Java-incompatible {}",
+                params[0], params[1], params[2]
+            ),
             _ => self.summary().to_string(),
         }
     }

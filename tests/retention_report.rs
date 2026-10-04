@@ -189,6 +189,21 @@ fn retained_source_comments_name_the_declaration_and_next_blocker() {
         "retained class Dto; root cause: no delegating overload can serve the default-argument omission: constructor Dto(owner, locale) cannot serve omission from method Repository.find()"
     );
 
+    let nullable = retention_site_message(
+        "interface Activity",
+        NullableNarrowing,
+        &[
+            "priority".to_string(),
+            "Identifier?".to_string(),
+            "ConcreteIdentifier".to_string(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        nullable,
+        "retained interface Activity; root cause: property priority narrows nullable Identifier? to Java-incompatible ConcreteIdentifier"
+    );
+
     let cascade = retention_site_message(
         "interface Hub",
         InterfaceSubtypeRetained,

@@ -534,8 +534,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     .unwrap_or_default(),
             ));
         }
-        if workspace.narrows_nullable_kotlin_property(source_file, target) {
-            return Some((RetentionKind::NullableNarrowing, Vec::new(), Vec::new()));
+        if let Some((property, inherited_type, implementation_type)) =
+            workspace.nullable_property_narrowing_conflict(source_file, target)
+        {
+            return Some((
+                RetentionKind::NullableNarrowing,
+                vec![property, inherited_type, implementation_type],
+                Vec::new(),
+            ));
         }
         if self.retained_hint.is_some()
             && self.in_place
@@ -1349,37 +1355,43 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
             out.blank();
+            // Kotlin metadata makes primary-constructor parameter names available
+            // to reflection-based binders (notably Jackson's Kotlin module). The
+            // translated Java class has no kotlin.Metadata, so preserve the same
+            // constructor-property contract with the JDK annotation rather than
+            // requiring every consumer to install a Java parameter-name module.
+            for annotation in &primary_constructor_annotations {
+                out.line(annotation.clone());
+            }
+            out.line(format!(
+                "@java.beans.ConstructorProperties({{{}}})",
+                params
+                    .iter()
+                    .map(|(_, _, name, _)| format!("\"{}\"", name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            out.open(format!("public {}({})", name, {
+                params
+                    .iter()
+                    .map(|(_, _, n, t)| {
+                        let nullability = if is_non_null_reference(t) {
+                            "@NonNull "
+                        } else {
+                            ""
+                        };
+                        format!("{}{} {}", nullability, t, n)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }));
+            for (is_property, _, fname, _) in &params {
+                if *is_property {
+                    out.line(format!("this.{} = {};", fname, fname));
+                }
+            }
+            out.close();
             if !use_lombok_generated_members {
-                // Default-parameter overloads delegate with `this(...)`; emit the
-                // primary constructor explicitly so they compile even where
-                // Lombok annotation processing is unavailable or disabled.
-                // `data class Layout @Default constructor(...)`: the Kotlin
-                // constructor's own annotations must ride along — the overloads
-                // give the class several constructors, and MapStruct selects
-                // between them by an annotation named `@Default`.
-                for annotation in &primary_constructor_annotations {
-                    out.line(annotation.clone());
-                }
-                out.open(format!("public {}({})", name, {
-                    params
-                        .iter()
-                        .map(|(_, _, n, t)| {
-                            let nullability = if is_non_null_reference(t) {
-                                "@NonNull "
-                            } else {
-                                ""
-                            };
-                            format!("{}{} {}", nullability, t, n)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                }));
-                for (is_property, _, fname, _) in &params {
-                    if *is_property {
-                        out.line(format!("this.{} = {};", fname, fname));
-                    }
-                }
-                out.close();
                 // NOTLIN: emit explicit accessors mirroring the original Kotlin ABI.
                 // Relying on @Data's synthesized getters breaks cross-language member
                 // resolution: kotlinc (reading our generated Java via the kotlin
@@ -3442,7 +3454,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     .chars()
                     .next()
                     .is_some_and(|first| first.is_ascii_uppercase());
-                let is_supported_method = matches!(method, "getOrDefault" | "now" | "toInstant");
+                let is_supported_method = matches!(method, "getOrDefault" | "now" | "toInstant")
+                    || self.is_declared_zero_arg_instance_call(node, callee_text);
                 (is_constructor || is_supported_method)
                     && named
                         .iter()
@@ -3451,6 +3464,39 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             }
             _ => false,
         }
+    }
+
+    fn is_declared_zero_arg_instance_call(
+        &self,
+        call: tree_sitter::Node,
+        callee_text: &str,
+    ) -> bool {
+        let Some(arguments) = kt::child(call, "value_arguments") else {
+            return false;
+        };
+        if arguments
+            .children(&mut arguments.walk())
+            .any(|child| child.kind() == "value_argument")
+        {
+            return false;
+        }
+        let Some((receiver, method)) = callee_text.rsplit_once('.') else {
+            return false;
+        };
+        if receiver.contains('.') {
+            return false;
+        }
+        let Some(receiver_type) = self.var_types.get(receiver.trim()) else {
+            return false;
+        };
+        let Some(workspace) = self.workspace else {
+            return false;
+        };
+        let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
+        let Some(source_file) = workspace.source_file(declaring) else {
+            return false;
+        };
+        workspace.type_declares_zero_arg_instance_method(source_file, receiver_type, method.trim())
     }
 
     fn transpile_interface_companion(&mut self, companion: tree_sitter::Node, out: &mut JavaOut) {

@@ -1587,23 +1587,105 @@ impl SourceIndex {
         covered
     }
 
-    pub fn narrows_nullable_kotlin_property(
+    /// Whether `type_name` or one of its indexed supertypes declares a
+    /// Java-callable zero-argument instance method. This is used by narrow
+    /// lowering paths that must reject unknown Kotlin extension calls.
+    pub fn type_declares_zero_arg_instance_method(
+        &self,
+        source_file: &SourceFile,
+        type_name: &str,
+        method_name: &str,
+    ) -> bool {
+        let Some(declaration) = self.resolve_kotlin_type(source_file, type_name) else {
+            return false;
+        };
+        let mut visited = HashSet::new();
+        let mut pending = vec![declaration];
+        while let Some(current) = pending.pop() {
+            if !visited.insert(declaration_key(current)) {
+                continue;
+            }
+            if current.members.iter().any(|member| {
+                member.kind == MemberKind::Method
+                    && !member.is_static
+                    && member.name == method_name
+                    && member.parameter_types.is_empty()
+            }) {
+                return true;
+            }
+            let current_file = self.declaration_source_file(current).unwrap_or(source_file);
+            for supertype in &current.supertypes {
+                if let Some(parent) = self.resolve_type(current_file, supertype) {
+                    pending.push(parent);
+                }
+            }
+        }
+        false
+    }
+
+    pub fn nullable_property_narrowing_conflict(
         &self,
         source_file: &SourceFile,
         target: &Declaration,
-    ) -> bool {
-        target.supertypes.iter().any(|supertype| {
-            let Some(contract) = self.resolve_kotlin_type(source_file, supertype) else {
-                return false;
-            };
-            contract.members.iter().any(|contract_member| {
-                contract_member.kind == MemberKind::Property
-                    && contract_member.is_nullable
-                    && target.members.iter().any(|member| {
-                        member.kind == MemberKind::Property
-                            && member.name == contract_member.name
-                            && !member.is_nullable
-                    })
+    ) -> Option<(String, String, String)> {
+        target.supertypes.iter().find_map(|supertype| {
+            let contract = self.resolve_kotlin_type(source_file, supertype)?;
+            contract.members.iter().find_map(|contract_member| {
+                if contract_member.kind != MemberKind::Property || !contract_member.is_nullable {
+                    return None;
+                }
+                target.members.iter().find_map(|member| {
+                    if member.kind != MemberKind::Property
+                        || member.name != contract_member.name
+                        || member.is_nullable
+                    {
+                        return None;
+                    }
+                    let inherited_type =
+                        contract_member.type_name.as_deref().unwrap_or("<unknown>");
+                    let implementation_type = member.type_name.as_deref().unwrap_or("<unknown>");
+                    let inherited_base = inherited_type.trim().trim_end_matches('?').trim();
+                    let primitive_unboxing = inherited_base == implementation_type.trim()
+                        && matches!(
+                            inherited_base,
+                            "Boolean"
+                                | "Byte"
+                                | "Short"
+                                | "Int"
+                                | "Long"
+                                | "Float"
+                                | "Double"
+                                | "Char"
+                        );
+                    let classification = match (
+                        contract_member.type_name.as_deref(),
+                        member.type_name.as_deref(),
+                    ) {
+                        (Some(inherited_type), Some(implementation_type)) => {
+                            classify_member_conflict(
+                                self,
+                                source_file,
+                                contract,
+                                inherited_type,
+                                implementation_type,
+                            )
+                        }
+                        _ => MemberConflictClass::UnknownType,
+                    };
+                    if !primitive_unboxing
+                        && matches!(
+                            classification,
+                            MemberConflictClass::Exact | MemberConflictClass::JavaCovariantReturn
+                        )
+                    {
+                        return None;
+                    }
+                    Some((
+                        member.name.clone(),
+                        inherited_type.to_string(),
+                        implementation_type.to_string(),
+                    ))
+                })
             })
         })
     }
