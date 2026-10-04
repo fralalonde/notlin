@@ -46,3 +46,63 @@ fn retains_nullable_primitive_override_that_would_change_the_jvm_return_type() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn translates_nullable_covariant_override_when_narrow_type_is_java() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-nullable-java-covariance-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("Definitions.kt");
+    fs::write(
+        &path,
+        "package sample\ninterface Identifier\nopen class Base : Identifier\ninterface Contract {\n    val priority: Identifier?\n}\ndata class Implementation(override val priority: Ref) : Contract\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Ref.java"),
+        "package sample;\npublic class Ref extends Base {}\n",
+    )
+    .unwrap();
+
+    let index = SourceIndex::discover(&root).unwrap();
+    let source_file = index
+        .kotlin_files()
+        .find(|file| file.path.ends_with("Definitions.kt"))
+        .expect("fixture Kotlin source indexed");
+    let reference = index
+        .resolve_type(source_file, "Ref")
+        .expect("Java narrow type resolves from the mixed index");
+    assert_eq!(reference.language, notlin::workspace::SourceLanguage::Java);
+    assert!(
+        index.supertype_closure_contains(source_file, reference, "Identifier"),
+        "the Java-to-Kotlin supertype chain must prove Ref implements Identifier: {reference:?}"
+    );
+    let cli = Cli::parse_from(["notlin", "--in-place", path.to_str().unwrap()]);
+    let source = fs::read_to_string(&path).unwrap();
+    let (files, errors, _warnings, coverage) = transpiler::transpile_with_workspace(
+        &source,
+        &path,
+        &cli,
+        Some(&index),
+        std::slice::from_ref(&root),
+    );
+    assert_eq!(errors, 0);
+    let java = files
+        .iter()
+        .find(|(name, _)| name == "Implementation.java")
+        .map(|(_, text)| text)
+        .unwrap_or_else(|| {
+            panic!(
+                "the mixed Kotlin/Java index proves Ref is an Identifier; untranslated: {:?}",
+                coverage.untranslated
+            )
+        });
+    assert!(
+        java.contains("Ref getPriority()"),
+        "the Java subtype must remain the covariant getter return:\n{java}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}

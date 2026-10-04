@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 // 8: `SourceFile::smart_cast_sites` / `SourceFile::bindings` — the retained-Kotlin
 // smart-cast boundary now carries the site shapes and the file's own name->type
 // table instead of a bare property-name set.
-const CACHE_VERSION: u32 = 11;
+const CACHE_VERSION: u32 = 12;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -1926,17 +1926,6 @@ impl SourceIndex {
         matches.next().is_none().then_some(first)
     }
 
-    /// Public wrapper for narrowing checks: resolve a type name exactly like
-    /// the internal Kotlin-type resolver (imports + same-package + unique
-    /// Kotlin simple name).
-    pub fn resolve_kotlin_type_public<'a>(
-        &'a self,
-        source_file: &SourceFile,
-        type_name: &str,
-    ) -> Option<&'a Declaration> {
-        self.resolve_kotlin_type(source_file, type_name)
-    }
-
     /// True when `decl`'s transitive supertype closure (Kotlin and Java
     /// edges alike) contains the type named `target_base`.
     pub fn supertype_closure_contains(
@@ -2844,15 +2833,40 @@ fn supertypes(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &st
                 vec![child]
             }
         })
-        .map(|child| {
-            child
-                .utf8_text(source.as_bytes())
-                .unwrap_or("")
-                .trim()
-                .to_string()
+        .flat_map(|child| {
+            let text = child.utf8_text(source.as_bytes()).unwrap_or("").trim();
+            if language == SourceLanguage::Java {
+                split_java_supertypes(text)
+            } else {
+                vec![text.to_string()]
+            }
         })
         .filter(|text| !text.is_empty())
         .collect()
+}
+
+fn split_java_supertypes(text: &str) -> Vec<String> {
+    let text = text
+        .strip_prefix("extends ")
+        .or_else(|| text.strip_prefix("implements "))
+        .unwrap_or(text)
+        .trim();
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, character) in text.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                result.push(text[start..index].trim().to_string());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    result.push(text[start..].trim().to_string());
+    result
 }
 
 /// Type-parameter names of a declaration (`class Foo<T, I : Bar>` ->
@@ -3169,7 +3183,7 @@ fn is_java_compatible_narrow(
     let (super_base, super_args) = split_generic(super_ty);
     let (own_base, own_args) = split_generic(own_ty);
     if super_base != own_base {
-        let Some(own_decl) = index.resolve_kotlin_type_public(source_file, own_ty) else {
+        let Some(own_decl) = index.resolve_type(source_file, own_ty) else {
             return true;
         };
         return member_supertype_closure_contains(index, source_file, own_decl, super_base);
@@ -3224,7 +3238,7 @@ fn classify_member_conflict(
         return MemberConflictClass::JavaCovariantReturn;
     }
 
-    let Some(own_decl) = index.resolve_kotlin_type_public(source_file, own_ty) else {
+    let Some(own_decl) = index.resolve_type(source_file, own_ty) else {
         return MemberConflictClass::UnknownType;
     };
     if member_supertype_closure_contains(index, source_file, own_decl, super_base) {
