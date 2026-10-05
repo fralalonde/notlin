@@ -91,6 +91,21 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 }
                 // Elvis `?:` arrives as a binary_expression operator in this grammar
                 if op == "?:" {
+                    if l.kind() == "call_expression"
+                        && let Some(nav) = kt::child(l, "navigation_expression")
+                        && self.unit.text(nav).contains("?.")
+                        && let Some((receiver, method)) = self.unit.nav_base_member(nav)
+                        && method == "hashCode"
+                        && self.unit.text(r).trim() == "0"
+                        && kt::child(l, "value_arguments").is_some_and(|args| {
+                            !args
+                                .children(&mut args.walk())
+                                .any(|a| a.kind() == "value_argument")
+                        })
+                    {
+                        let receiver = self.transpile(receiver);
+                        return format!("java.util.Objects.hashCode({receiver})");
+                    }
                     self.unit.diags.warn_approx(
                         node,
                         self.unit.file,
@@ -128,6 +143,14 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     // `recv.get<T>()` brackets can survive here.
                     let inner = crate::transpiler::expr::rewrite_reified_type_args(&inner);
                     return format!("({} != null ? {} : {})", base, inner, r_java);
+                }
+                if op == "&&" {
+                    let left = self.transpile(l);
+                    let prior = self.unit.flow_smart_casts.clone();
+                    collect_conjunction_types(l, self.unit.source, &mut self.unit.flow_smart_casts);
+                    let right = self.transpile(r);
+                    self.unit.flow_smart_casts = prior;
+                    return format!("{left} && {right}");
                 }
                 // Infix functions: and/or are keywords; others pass through
                 let java_op = match op.as_str() {
@@ -262,6 +285,24 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 // is Kotlin's `operator fun plus(o)` — emit `a.plus(b)`.
                 let l_ty = self.infer_operand_type(l);
                 let r_ty = self.infer_operand_type(r);
+                if op == "+"
+                    && (l_ty.as_deref().is_some_and(|ty| {
+                        ty.contains("List<")
+                            || ty.contains("Set<")
+                            || ty.contains("Collection<")
+                            || ty.contains("Iterable<")
+                    }) || self.unit.text(l).contains(".filterNot"))
+                {
+                    self.unit.diags.warn_approx(
+                        node,
+                        self.unit.file,
+                        "Kotlin collection plus element lowered with Stream.concat",
+                    );
+                    return format!(
+                        "java.util.stream.Stream.concat({}.stream(), java.util.stream.Stream.of({})).collect(java.util.stream.Collectors.toList())",
+                        l_java, r_java
+                    );
+                }
                 let user_ty = [l_ty.as_deref(), r_ty.as_deref()]
                     .into_iter()
                     .flatten()
@@ -539,6 +580,44 @@ fn is_likely_primitive(expr_text: &str) -> bool {
 /// they are NOT user classes with `operator fun times`. Getting this wrong
 /// emits `amount.times(rate)` for a primitive product, which no Java
 /// compiler accepts.
+/// Only facts guaranteed by a true conjunction flow into its right operand.
+fn collect_conjunction_types(
+    node: tree_sitter::Node,
+    source: &str,
+    facts: &mut std::collections::HashMap<String, String>,
+) {
+    match node.kind() {
+        "is_expression" if !kt::text(node, source).contains("!is") => {
+            let children = node
+                .children(&mut node.walk())
+                .filter(|n| n.is_named())
+                .collect::<Vec<_>>();
+            if children.len() == 2 && children[0].kind() == "identifier" {
+                facts.insert(
+                    kt::text(children[0], source).to_string(),
+                    kt::java_type(children[1], source),
+                );
+            }
+        }
+        "binary_expression"
+            if kt::field(node, "operator").is_some_and(|op| kt::text(op, source) == "&&") =>
+        {
+            if let Some(left) = kt::field(node, "left") {
+                collect_conjunction_types(left, source, facts);
+            }
+            if let Some(right) = kt::field(node, "right") {
+                collect_conjunction_types(right, source, facts);
+            }
+        }
+        "parenthesized_expression" => {
+            if let Some(inner) = node.children(&mut node.walk()).find(|n| n.is_named()) {
+                collect_conjunction_types(inner, source, facts);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn is_primitive_type(ty: &str) -> bool {
     matches!(
         ty,

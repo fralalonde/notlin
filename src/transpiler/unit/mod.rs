@@ -124,6 +124,10 @@ pub struct Unit<'src, 'tree> {
     /// order. Filled by a pre-pass so destructuring sites can emit real
     /// `componentN()` extraction instead of `Object x = value; y = null;`.
     pub(crate) data_components: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Data classes that actually emit as Java records.
+    pub(crate) record_types: std::collections::HashSet<String>,
+    /// Data-class body initializers emitted in primary-constructor order.
+    pub(crate) deferred_property_initializers: std::collections::HashSet<usize>,
     /// enum declarations in this file (simple names) — `Enum#name` is
     /// public so `.name` on an enum-typed receiver stays a field read.
     pub(crate) enum_types: std::collections::HashSet<String>,
@@ -217,6 +221,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             pending_super_owner: None,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
+            record_types: std::collections::HashSet::new(),
+            deferred_property_initializers: std::collections::HashSet::new(),
             enum_types: std::collections::HashSet::new(),
             self_getters: std::collections::HashMap::new(),
             workspace: None,
@@ -455,6 +461,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
         // Taint the enclosing declaration (if any) so --in-place migration
         // knows this declaration must stay in the .kt file.
+        let mut marker_anchor = node.start_byte();
         {
             // The diagnostic node itself, then walk up through the AST: the
             // nearest enclosing declaration node that began via begin_decl
@@ -462,10 +469,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             // anchored on the decl or a member of it) and members nested in
             // class bodies.
             let mut ancestor = Some(node);
+            let mut in_modifiers = node.kind() == "annotation";
             while let Some(n) = ancestor {
+                in_modifiers |= n.kind() == "modifiers";
                 if self.decl_labels.contains_key(&n.id()) {
                     let label = self.decl_labels.get(&n.id()).cloned().unwrap_or_default();
                     self.taint_decl(&label);
+                    if in_modifiers {
+                        marker_anchor = n.start_byte();
+                    }
                     break;
                 }
                 ancestor = n.parent();
@@ -484,7 +496,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             message.clone()
         };
         self.coverage.blockers.push((
-            node.start_byte(),
+            marker_anchor,
             format!("// NOTLIN: {blocker_code} {residue_message}\n"),
         ));
 
@@ -872,8 +884,26 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let conflicts =
-                            ws.retained_supertype_member_mismatches(&supers, &type_name);
+                        let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
+                        let retained = self.retained_hint.cloned().unwrap_or_default();
+                        let mut conflicts = ws
+                            .retained_supertype_member_conflicts_in_file(
+                                declaring, &supers, &type_name,
+                            )
+                            .into_iter()
+                            .filter(|conflict| conflict.blocks_java_override())
+                            .filter(|conflict| {
+                                !ws.selected_covariant_property_conflict_is_safe(
+                                    declaring,
+                                    conflict,
+                                    self.translation_roots,
+                                    &retained,
+                                )
+                            })
+                            .map(|conflict| conflict.detail())
+                            .collect::<Vec<_>>();
+                        conflicts.sort();
+                        conflicts.dedup();
                         if !conflicts.is_empty() {
                             // Erasing the member to a raw type would make the
                             // override compile, but a raw `List`/`Set` loses

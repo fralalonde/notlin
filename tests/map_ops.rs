@@ -48,3 +48,42 @@ fn associate_by_collects_to_map() {
         "associateBy member must not survive: {m}"
     );
 }
+
+#[test]
+fn associate_by_with_value_selector_uses_second_lambda() {
+    let source = "package neutral.mapc\ndata class Entry(val key: String, val value: Int)\nfun tv(cs: List<Entry>) = cs.associateBy({ it.key }, { it.value })\nfun make() = Entry(\"x\", 1)\n";
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "M.kt"]);
+    let (files, errors, _warnings, _cov) =
+        notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
+    assert_eq!(errors, 0);
+    let java = files
+        .iter()
+        .find(|(name, _)| name == "M.java")
+        .map(|(_, code)| code.as_str())
+        .expect("M.java");
+    assert!(
+        java.contains("v -> v.getKey(), v -> v.getValue()"),
+        "{java}"
+    );
+    assert!(java.contains("new Entry(\"x\", 1)"), "{java}");
+}
+
+#[test]
+fn filter_not_and_plus_element_lower_to_streams() {
+    let source = "package neutral.mapd\nfun add(xs: List<String>, item: String): List<String> = xs.filterNot { it == item } + item\nfun remove(xs: List<String>, item: String): List<String> = xs.filterNot { it == item }\n";
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "M.kt"]);
+    let (files, errors, _warnings, _cov) =
+        notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
+    assert_eq!(errors, 0);
+    let java = files
+        .iter()
+        .find(|(name, _)| name == "M.java")
+        .map(|(_, code)| code.as_str())
+        .expect("M.java");
+    assert!(
+        java.contains("filter(it -> !(Objects.equals(it, item)))"),
+        "{java}"
+    );
+    assert!(java.contains("Stream.concat("), "{java}");
+    assert!(!java.contains("filterNot"), "{java}");
+}

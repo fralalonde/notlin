@@ -38,10 +38,12 @@ pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex)
 
     // The smart-cast repair runs first: it inserts binding lines, and every
     // pass below must see the text it produced (its own idempotency included).
-    let (source, smart_cast_rewrites) =
-        crate::smart_cast::rewrite(&original, &|owner, property| {
-            translated_property_owner(index, owner, property)
-        });
+    let smart_cast_bindings = index.smart_cast_bindings_for_path(path);
+    let (source, smart_cast_rewrites) = crate::smart_cast::rewrite_with_bindings(
+        &original,
+        &smart_cast_bindings,
+        &|owner, property| translated_property_owner(index, owner, property),
+    );
 
     // A named-argument constructor call cannot target a Java constructor at all,
     // and a parameter the caller omits is served by the delegating overload the

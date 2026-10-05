@@ -35,6 +35,105 @@ fn retained_supertype_abi_mismatch_taints() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn selected_covariant_collection_contract_translates_together() {
+    let root = Path::new("tests/tmp_scratch_abi_selected_covariant");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("Item.kt"),
+        "package selected.covariant\ninterface Item { val n: String }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Box.kt"),
+        "package selected.covariant\ninterface Box { val items: List<Item> }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("ItemImpl.kt"),
+        "package selected.covariant\nclass ItemImpl(override val n: String) : Item\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Holder.kt"),
+        "package selected.covariant\nclass Holder(override val items: List<ItemImpl>) : Box\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root.to_str().unwrap())
+        .output()
+        .expect("run notlin");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let contract = fs::read_to_string(root.join("Box.java")).unwrap_or_default();
+    let implementation = fs::read_to_string(root.join("Holder.java")).unwrap_or_default();
+    assert!(
+        contract.contains("List<? extends Item> getItems()"),
+        "{contract}"
+    );
+    assert!(
+        implementation.contains("List<ItemImpl> getItems()"),
+        "{implementation}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn selected_named_collection_wrapper_is_covariant() {
+    let root = Path::new("tests/tmp_scratch_abi_selected_collection_wrapper");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("model.kt"),
+        "package selected.wrapper\ninterface Item\nclass ItemImpl : Item\ninterface Box { val items: List<Item> }\nclass ItemList : ArrayList<ItemImpl>()\nclass Holder(override val items: ItemList) : Box\n",
+    )
+    .unwrap();
+    let selected = fs::canonicalize(root).unwrap();
+    let index = SourceIndex::discover(&selected).unwrap();
+    let conflicts = index.retained_supertype_member_conflicts_in_file(
+        &selected.join("model.kt"),
+        &["Box".to_string()],
+        "Holder",
+    );
+    assert!(
+        conflicts.iter().any(
+            |conflict| index.selected_covariant_property_conflict_is_safe(
+                &selected.join("model.kt"),
+                conflict,
+                std::slice::from_ref(&selected),
+                &std::collections::HashSet::new(),
+            )
+        ),
+        "{conflicts:?}"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root.to_str().unwrap())
+        .output()
+        .expect("run notlin");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let contract = fs::read_to_string(root.join("Box.java")).unwrap_or_default();
+    let implementation = fs::read_to_string(root.join("Holder.java")).unwrap_or_default();
+    assert!(
+        contract.contains("List<? extends Item> getItems()"),
+        "{contract}"
+    );
+    assert!(
+        implementation.contains("ItemList getItems()"),
+        "{implementation}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Whole-workspace mismatch: the supertype declares `entries: List<String>`
 /// while the class has `List<Int>`. Java cannot override that without erasing
 /// the type arguments, and a raw `List` breaks JPA and every generic consumer,
@@ -91,11 +190,12 @@ fn whole_workspace_retains_class_whose_supertype_member_type_differs() {
     let kotlin = fs::read_to_string(root.join("implementation.kt")).unwrap_or_default();
     let blocker_line = kotlin
         .lines()
-        .find(|line| line.contains("a Kotlin supertype declares"))
+        .find(|line| line.contains("Java cannot override the inherited member type safely"))
         .unwrap_or_else(|| panic!("no mismatch blocker in:\n{kotlin}"));
     let blocker_code = blocker_line
         .split_whitespace()
         .nth(2)
+        .map(|code| code.trim_end_matches(':'))
         .unwrap_or_else(|| panic!("no blocker code in:\n{blocker_line}"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

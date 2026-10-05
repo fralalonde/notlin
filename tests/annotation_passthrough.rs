@@ -109,16 +109,8 @@ fn java_native_annotation_passes_through_without_index() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// An UNTRANSLATED Kotlin annotation type retains the declaration that uses it.
-/// Not because javac could not name the annotation — a Kotlin `annotation
-/// class` compiles to a Java `@interface` on the same module's classpath — but
-/// because this rule stands in for "this declaration's surroundings are not
-/// translated either". Verification tried letting it through: on the real
-/// target it un-tied classes whose bodies Java cannot express yet and produced
-/// 96 distinct javac errors. See tests/annotation_preserved.rs for the shapes
-/// that ARE preserved (a translated annotation type, and array arguments).
 #[test]
-fn kotlin_annotation_type_taints_declaration() {
+fn untranslated_kotlin_annotation_type_is_java_visible() {
     let root = Path::new("tests/tmp_scratch_anno_kt");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -140,14 +132,25 @@ fn kotlin_annotation_type_taints_declaration() {
     let stderr = run(root, &root.join("use.kt"));
     let java = fs::read_to_string(root.join("UsesMine.java")).unwrap_or_default();
     let kotlin = fs::read_to_string(root.join("use.kt")).unwrap_or_default();
+    assert!(java.contains("@Mine(\"t\")"), "{java}\n{kotlin}\n{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn named_class_literal_without_spaces_lowers() {
+    let root = Path::new("tests/tmp_scratch_anno_named_class");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("types.kt"),
+        "package neutral.named\nclass Key\n@com.example.RepositoryID(id=Key::class)\nclass Repository\n",
+    )
+    .unwrap();
+    let stderr = run(root, &root.join("types.kt"));
+    let java = fs::read_to_string(root.join("Repository.java")).unwrap_or_default();
     assert!(
-        java.is_empty(),
-        "declaration using an untranslated Kotlin annotation type must stay Kotlin, got:\n{java}"
-    );
-    assert!(
-        kotlin.contains("// NOTLIN: N04DC declaration annotation is retained in Kotlin")
-            && kotlin.contains("data class UsesMine"),
-        "expected the retained declaration and its in-source annotation blocker:\n{kotlin}\n{stderr}"
+        java.contains("@com.example.RepositoryID(id=Key.class)"),
+        "{java}\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -185,7 +188,7 @@ fn kotlin_only_annotation_arguments_taint() {
             "Kotlin-only annotation argument must taint ({name}), got:\n{java}"
         );
         assert!(
-            kotlin.contains("// NOTLIN: N04DC declaration annotation is retained in Kotlin")
+            kotlin.contains("NOTLIN N04DC: declaration annotation is retained in Kotlin")
                 && kotlin.contains(&format!("data class Arg_{name}")),
             "expected retained declaration and in-source annotation blocker ({name}):\n{kotlin}\n{stderr}"
         );
@@ -248,7 +251,7 @@ fn repeated_same_name_annotation_taints() {
         "repeated same-name annotation must taint the declaration, got:\n{java}"
     );
     assert!(
-        kotlin.contains("// NOTLIN: NB03C annotation com.example.Mapping is repeated")
+        kotlin.contains("NOTLIN NB03C: annotation com.example.Mapping is repeated")
             && kotlin.contains("data class Twice"),
         "expected retained declaration and in-source repeated-annotation blocker:\n{kotlin}\n{stderr}"
     );

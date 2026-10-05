@@ -57,12 +57,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let fname = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_default();
+        let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
         let owner = workspace
-            .declarations_named(&class_name)
-            .find(|candidate| candidate.language == crate::workspace::SourceLanguage::Kotlin)?;
+            .source_file(declaring)?
+            .declarations
+            .iter()
+            .find(|candidate| candidate.name == class_name)?;
         let parameter_types = self.function_parameter_types(decl);
-        let conflicts =
-            workspace.retained_supertype_member_conflicts(&owner.supertypes, &class_name);
+        let conflicts = workspace.retained_supertype_member_conflicts_in_file(
+            declaring,
+            &owner.supertypes,
+            &class_name,
+        );
         for conflict in conflicts.into_iter().filter(|conflict| {
             conflict.member_name == fname
                 && conflict.kind == crate::workspace::MemberKind::Method
@@ -75,15 +81,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 _ => return Some(conflict.inherited_type),
             }
             let Some(supertype) =
-                workspace
-                    .declarations_named(&conflict.supertype)
-                    .find(|candidate| {
-                        matches!(
-                            candidate.kind,
-                            crate::workspace::DeclarationKind::Interface
-                                | crate::workspace::DeclarationKind::Class
-                        )
-                    })
+                workspace.resolve_type(workspace.source_file(declaring)?, &conflict.supertype)
             else {
                 return Some(conflict.inherited_type);
             };

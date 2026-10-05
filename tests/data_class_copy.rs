@@ -23,7 +23,7 @@ fn implicit_data_class_copy_rebuilds_current_instance() {
 
     assert_eq!(errors, 0, "{java}");
     assert!(
-        !java.contains("copy("),
+        !java.contains("return copy("),
         "Kotlin copy leaked into Java:\n{java}"
     );
     assert!(

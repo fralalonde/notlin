@@ -228,6 +228,11 @@ fn basic_class_produces_expected_types() {
     }
     // Person must have a constructor and accessors
     let person = &files.iter().find(|(n, _)| n == "Person.java").unwrap().1;
+    assert_eq!(
+        person.lines().next(),
+        Some("// NOTLIN: generated from BasicClass.kt")
+    );
+    assert!(!person.contains("do not edit by hand"), "{person}");
     assert!(person.contains("public Person(String name, int age)"));
     assert!(person.contains("public String getName()"));
     assert!(person.contains("public void setAge(int age)"));
@@ -448,18 +453,15 @@ fn lombok_flag_emits_mutable_data_class() {
         "data class must provide a real primary constructor"
     );
 
-    // without --lombok the same source is TAINTED (not emitted at all) with
-    // an N001: an immutable record silently loses setters, so plain mode
-    // refuses rather than degrading.
+    // Plain mode preserves mutability with an explicit Java class.
     let cli_plain = notlin::cli::Cli::parse_from(vec!["notlin", "Point.kt"]);
-    let (files2, errors2, warnings2, _cov2) =
+    let (files2, errors2, _warnings2, _cov2) =
         notlin::transpiler::transpile(source, &path, &cli_plain);
     assert_eq!(errors2, 0);
-    assert!(
-        warnings2 > 0,
-        "var component should warn when --lombok is off"
-    );
     let all2 = files2.iter().map(|(_, c)| c.as_str()).collect::<String>();
+    assert!(all2.contains("final class Point"), "{all2}");
+    assert!(all2.contains("public void setX(int x)"), "{all2}");
+    assert!(all2.contains("boolean equals(Object other)"), "{all2}");
     assert!(
         !all2.contains("record Point"),
         "plain mode must not emit an immutable record for a var data class"
@@ -1036,6 +1038,74 @@ fn record_component_implicit_reads_use_record_accessors() {
     assert!(currency.contains("this.code() + this.rate()"), "{currency}");
     assert!(!currency.contains("this.getRate()"), "{currency}");
     assert!(!currency.contains("this.getCode()"), "{currency}");
+}
+
+#[test]
+fn record_component_navigation_uses_record_accessors() {
+    let source = r#"data class Basket(val items: List<String>) {
+    fun first(): String = items.stream().findFirst().orElseThrow()
+}"#;
+    let (files, errors) = transpile_src(source, "Basket.kt");
+    assert_eq!(errors, 0);
+    let basket = files
+        .iter()
+        .find(|(name, _)| name == "Basket.java")
+        .map(|(_, content)| content)
+        .expect("record emitted");
+    assert!(basket.contains("this.items().stream()"), "{basket}");
+    assert!(!basket.contains("this.getItems()"), "{basket}");
+}
+
+#[test]
+fn record_components_keep_kotlin_bean_getter_abi() {
+    let source = r#"data class SortColumn(val column: String, val direction: String)"#;
+    let (files, errors) = transpile_src(source, "SortColumn.kt");
+    assert_eq!(errors, 0);
+    let sort_column = files
+        .iter()
+        .find(|(name, _)| name == "SortColumn.java")
+        .map(|(_, content)| content)
+        .expect("record emitted");
+    assert!(
+        sort_column.contains("public String getColumn()")
+            && sort_column.contains("return column();"),
+        "{sort_column}"
+    );
+    assert!(
+        sort_column.contains("public String getDirection()")
+            && sort_column.contains("return direction();"),
+        "{sort_column}"
+    );
+}
+
+#[test]
+fn data_class_with_interfaces_uses_record_components_and_bean_bridges() {
+    let source = r#"data class Label(val value: String)
+interface Named { val name: Label }
+data class Entry(override val name: Label) : Named, Comparable<Entry> {
+    fun normalized(): String = name.value.trim()
+    override fun compareTo(other: Entry): Int = name.value.compareTo(other.name.value)
+}"#;
+    let (files, errors) = transpile_src(source, "Entry.kt");
+    assert_eq!(errors, 0);
+    let entry = files
+        .iter()
+        .find(|(name, _)| name == "Entry.java")
+        .map(|(_, content)| content)
+        .expect("class emitted");
+    assert!(
+        entry.contains("return this.name().getValue().trim();"),
+        "{entry}"
+    );
+    assert!(
+        entry.contains("return this.name().getValue().compareTo(other.name().getValue());"),
+        "{entry}"
+    );
+    assert!(entry.contains("public Label getName()"), "{entry}");
+    assert!(
+        entry.contains("record Entry(Label name) implements Named, Comparable<Entry>"),
+        "{entry}"
+    );
 }
 
 #[test]

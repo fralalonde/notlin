@@ -222,7 +222,13 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         );
                     }
                 }
-                return self.map_entry_op(nav, &base_java, &member);
+                let lowered = self.map_entry_op(nav, &base_java, &member);
+                // This branch owns the complete call expression and returns
+                // it directly. `map_entry_op` also serves navigation-only
+                // callers, where the enclosing call must suppress its args;
+                // do not leak that suppression into the next expression.
+                self.unit.pending_full_call = false;
+                return lowered;
             }
             // Primitive-valued receivers (`.size()`, `.length`, `.count()`)
             // also can't take `.toString()` — same static wrapper path.
@@ -320,13 +326,26 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     }
                 }
             }
-            if self.unit.lombok
-                && self.unit.commons_lang
-                && member == "toList"
-                && self.unit.receiver_is_array(base)
-            {
+            if member == "toList" && self.unit.receiver_is_array(base) {
                 let receiver = self.transpile(base);
-                return format!("org.apache.commons.lang3.ArrayUtils.toList({receiver})");
+                let ty = self
+                    .unit
+                    .var_types
+                    .get(self.unit.text(base).trim())
+                    .map(String::as_str)
+                    .unwrap_or("");
+                return match ty {
+                    "int[]" | "long[]" | "double[]" => format!(
+                        "java.util.Arrays.stream({receiver}).boxed().collect(java.util.stream.Collectors.toList())"
+                    ),
+                    "byte[]" | "short[]" | "char[]" | "float[]" | "boolean[]" => format!(
+                        "java.util.stream.IntStream.range(0, {receiver}.length).mapToObj(i -> {receiver}[i]).collect(java.util.stream.Collectors.toList())"
+                    ),
+                    _ if self.unit.commons_lang => {
+                        format!("org.apache.commons.lang3.ArrayUtils.toList({receiver})")
+                    }
+                    _ => format!("new java.util.ArrayList<>(java.util.Arrays.asList({receiver}))"),
+                };
             }
             if let Some(_recv_ty) = self.unit.extension_fns.get(member.as_str()) {
                 // `x.f(...)` for a same-file extension -> static `f(x, ...)`.
@@ -403,7 +422,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 .iter()
                 .map(|(_, name)| {
                     replacements.remove(name).unwrap_or_else(|| {
-                        if self.unit.lombok {
+                        if self.unit.lombok || !self.unit.record_types.contains(&owner) {
                             let mut chars = name.chars();
                             let cap = chars
                                 .next()
@@ -594,6 +613,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     m,
                     "map"
                         | "filter"
+                        | "filterNot"
                         | "forEach"
                         | "flatMap"
                         | "sorted"
@@ -751,7 +771,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             let _ = &stream_base;
             let stream_fn = match member {
                 "map" | "mapNotNull" | "mapIndexed" => "map",
-                "filter" | "filterIndexed" => "filter",
+                "filter" | "filterNot" | "filterIndexed" => "filter",
                 "forEach" => "forEach",
                 "sorted" => "sorted",
                 other => other,
@@ -825,7 +845,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 // declared return type wins; getter-name properties are only
                 // a fallback for field-style receivers. A cross-file property
                 // with the same name must not shadow the local method.
+                let direct_method = base_str
+                    .split_once('(')
+                    .map(|(head, _)| head.rsplit('.').next().unwrap_or(head));
                 mrti(base_str.as_str())
+                    .or_else(|| direct_method.and_then(mrti))
                     .or_else(|| self.scope_property_type(&recv_name(&base_str)))
                     .or_else(|| {
                         mrti(
@@ -840,7 +864,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     })
                     .is_some_and(|t| t.contains("Optional<"))
             } {
-                return format!("{}.{}({})", base_str, stream_fn, self.transpile(lambda));
+                return format!("{}.{}({})", base_str, stream_fn, mapped_lambda);
             }
             match member {
                 // fold(init) { acc, x -> ... } -> reduce(identity, op)
@@ -928,6 +952,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 }
                 _ => {}
             }
+            let mapped_lambda = if member == "filterNot" {
+                negate_predicate_lambda(&mapped_lambda)
+            } else {
+                mapped_lambda
+            };
             // Chained stream continuation (`xs.stream().filter {..}.findFirst()`):
             // the base already ends `.stream()` AND the lambda member is a
             // stream-monadic op — the result must stay a Stream so terminal
@@ -940,6 +969,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         | "mapNotNull"
                         | "mapIndexed"
                         | "filter"
+                        | "filterNot"
                         | "filterIndexed"
                         | "sorted"
                         | "flatMap"
@@ -947,30 +977,20 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 );
             if continuation {
                 let inner = &base_str[..base_str.len() - ".stream()".len()];
-                return format!(
-                    "{}.stream().{}({})",
-                    inner,
-                    stream_fn,
-                    self.transpile(lambda)
-                );
+                return format!("{}.stream().{}({})", inner, stream_fn, mapped_lambda);
             }
             if matches!(member, "anyMatch" | "allMatch" | "noneMatch") {
-                return format!("{}.{}({})", stream_base, stream_fn, self.transpile(lambda));
+                return format!("{}.{}({})", stream_base, stream_fn, mapped_lambda);
             }
             return if let Some(sep) = self.unit.pending_join_to_string.take() {
                 format!(
                     "{}.{}({}).collect(java.util.stream.Collectors.joining({}))",
-                    stream_base,
-                    stream_fn,
-                    self.transpile(lambda),
-                    sep
+                    stream_base, stream_fn, mapped_lambda, sep
                 )
             } else {
                 format!(
                     "{}.{}({}).collect(java.util.stream.Collectors.toList())",
-                    stream_base,
-                    stream_fn,
-                    self.transpile(lambda)
+                    stream_base, stream_fn, mapped_lambda
                 )
             };
         }
@@ -1544,6 +1564,13 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         }
         false
     }
+}
+
+fn negate_predicate_lambda(mapped: &str) -> String {
+    mapped
+        .split_once(" -> ")
+        .map(|(parameters, body)| format!("{parameters} -> !({body})"))
+        .unwrap_or_else(|| format!("it -> !({mapped})"))
 }
 
 fn entry_lambda_to_kv(mapped: &str) -> (String, String) {

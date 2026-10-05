@@ -286,10 +286,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             for annotation in &field_annotations {
                 out.line(annotation.clone());
             }
-            let init_java = self.property_initializer(decl).map(|init| {
-                let mut e = Expr { unit: self };
-                e.transpile(init)
-            });
+            let init_java = self
+                .property_initializer(decl)
+                .filter(|_| !self.deferred_property_initializers.contains(&decl.id()))
+                .map(|init| {
+                    let mut e = Expr { unit: self };
+                    e.transpile(init)
+                });
             match init_java {
                 Some(java) => out.line(format!(
                     "{}{}{} {} = {};",

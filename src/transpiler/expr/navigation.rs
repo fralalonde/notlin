@@ -174,6 +174,13 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         if let Some(base) = base
             && base.kind() == "identifier"
             && result == self.unit.text(base).trim()
+            && self.enclosing_record_has_component(self.unit.text(base).trim())
+        {
+            result = format!("this.{}()", self.unit.text(base).trim());
+        }
+        if let Some(base) = base
+            && base.kind() == "identifier"
+            && result == self.unit.text(base).trim()
             && let Some(workspace) = self.unit.workspace
             && let Some(name) = self.enclosing_type_name()
         {
@@ -548,8 +555,19 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                 let ct = self.unit.var_types.get(&t0).cloned();
                                 ct.map(|c| {
                                     let bare = c.strip_prefix("@Nullable ").unwrap_or(&c).trim();
-                                    self.unit.data_components.contains_key(bare)
+                                    self.unit.record_types.contains(bare)
+                                        && self.unit.data_components.get(bare).is_some_and(
+                                            |components| {
+                                                components
+                                                    .iter()
+                                                    .any(|(_, component)| component == &member_name)
+                                            },
+                                        )
                                         && !self.unit.lombok
+                                        && self
+                                            .unit
+                                            .retained_hint
+                                            .is_none_or(|retained| !retained.contains(bare))
                                 })
                                 .unwrap_or(false)
                             })
@@ -795,6 +813,54 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         let raw = self.unit.text(node).replace("?.", ".");
         // member call: `.name(...)`
         let mut raw_trimmed = raw.trim().to_string();
+        if let Some(base) = node.named_children(&mut node.walk()).next()
+            && base.kind() == "super_expression"
+            && let Some(workspace) = self.unit.workspace
+        {
+            let declaring = self
+                .unit
+                .workspace_file
+                .as_deref()
+                .unwrap_or(self.unit.file);
+            if let Some(file) = workspace.source_file(declaring) {
+                let owner = kt::child(base, "user_type")
+                    .map(|ty| self.unit.text(ty).to_string())
+                    .or_else(|| {
+                        self.enclosing_type_name().and_then(|name| {
+                            file.declarations
+                                .iter()
+                                .find(|d| d.name == name)
+                                .and_then(|d| d.supertypes.first().cloned())
+                        })
+                    });
+                if let Some(owner) = owner
+                    && let Some(target) = workspace.resolve_type(file, &owner)
+                    && target.kind == crate::workspace::DeclarationKind::Interface
+                {
+                    let translated = target.language == crate::workspace::SourceLanguage::Java
+                        || self.unit.retained_hint.is_some_and(|retained| {
+                            !retained.contains(&target.name)
+                                && workspace
+                                    .declaration_source_file(target)
+                                    .is_some_and(|source| {
+                                        workspace
+                                            .is_selected(&source.path, self.unit.translation_roots)
+                                    })
+                        });
+                    if !translated {
+                        self.unit.diag_untranslatable(node, format!(
+                            "interface super method call targets retained Kotlin `{owner}`; its default bridge is not Java-visible"
+                        ));
+                        return "null".to_string();
+                    }
+                    raw_trimmed = format!(
+                        "{}.super{}",
+                        target.name,
+                        &raw_trimmed[self.unit.text(base).len()..]
+                    );
+                }
+            }
+        }
         if let Some(r) = &self.unit.ext_receiver_name {
             // `this.x` inside an extension body refers to the receiver param.
             if raw_trimmed.starts_with("this.") {
@@ -808,24 +874,29 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             && let Some(name) = self.enclosing_type_name()
         {
             let property = self.unit.text(base).trim();
-            let declaring = self
-                .unit
-                .workspace_file
-                .as_deref()
-                .unwrap_or(self.unit.file);
-            let inherited = self.unit.workspace.is_some_and(|ws| {
-                ws.inherited_property_names_in_file(declaring, &name)
-                    .iter()
-                    .any(|candidate| candidate == property)
-            });
-            let own_getter = self.unit.self_getters.get(property).cloned();
-            if inherited
-                || (!self.unit.var_types.contains_key(property)
-                    && self.unit.ext_receiver_name.is_none()
-                    && own_getter.is_some())
-            {
-                let getter = own_getter.unwrap_or_else(|| format!("get{}", capitalize(property)));
-                raw_trimmed = format!("this.{}(){}", getter, &raw_trimmed[property.len()..]);
+            if self.enclosing_record_has_component(property) {
+                raw_trimmed = format!("this.{}(){}", property, &raw_trimmed[property.len()..]);
+            } else {
+                let declaring = self
+                    .unit
+                    .workspace_file
+                    .as_deref()
+                    .unwrap_or(self.unit.file);
+                let inherited = self.unit.workspace.is_some_and(|ws| {
+                    ws.inherited_property_names_in_file(declaring, &name)
+                        .iter()
+                        .any(|candidate| candidate == property)
+                });
+                let own_getter = self.unit.self_getters.get(property).cloned();
+                if inherited
+                    || (!self.unit.var_types.contains_key(property)
+                        && self.unit.ext_receiver_name.is_none()
+                        && own_getter.is_some())
+                {
+                    let getter =
+                        own_getter.unwrap_or_else(|| format!("get{}", capitalize(property)));
+                    raw_trimmed = format!("this.{}(){}", getter, &raw_trimmed[property.len()..]);
+                }
             }
         }
         // Reified-generic callee with the type argument INSIDE the callee
@@ -1797,26 +1868,35 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         base_java: &str,
         member: &str,
     ) -> String {
-        let lambda = node.parent().and_then(|p| {
-            // trailing lambda lives directly under the call or as the only
-            // value_argument
-            kt::child(p, "annotated_lambda")
-                .and_then(|al| kt::child(al, "lambda_literal"))
-                .or_else(|| kt::child(p, "lambda_literal"))
-                .or_else(|| {
-                    kt::child(p, "value_arguments").and_then(|va| {
-                        let mut c = va.walk();
-                        va.children(&mut c)
-                            .filter(|arg| arg.kind() == "value_argument")
-                            .find_map(|arg| {
-                                arg.children(&mut arg.walk())
-                                    .find(|n| n.kind() == "lambda_literal")
-                            })
-                    })
-                })
-        });
+        let lambdas = node
+            .parent()
+            .map(|p| {
+                let mut found = Vec::new();
+                if let Some(va) = kt::child(p, "value_arguments") {
+                    for arg in va
+                        .children(&mut va.walk())
+                        .filter(|arg| arg.kind() == "value_argument")
+                    {
+                        if let Some(lambda) = arg
+                            .children(&mut arg.walk())
+                            .find(|n| n.kind() == "lambda_literal")
+                        {
+                            found.push(lambda);
+                        }
+                    }
+                }
+                if found.is_empty()
+                    && let Some(lambda) = kt::child(p, "annotated_lambda")
+                        .and_then(|al| kt::child(al, "lambda_literal"))
+                        .or_else(|| kt::child(p, "lambda_literal"))
+                {
+                    found.push(lambda);
+                }
+                found
+            })
+            .unwrap_or_default();
         // Without a lambda this call cannot be lowered soundly.
-        let Some(l) = lambda else {
+        let Some(&l) = lambdas.first() else {
             self.unit.diags.warn_approx(
                 node,
                 self.unit.file,
@@ -1863,13 +1943,33 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 } else {
                     replace_whole_word(&body, &param, "v")
                 };
+                let value = lambdas.get(1).map(|lambda| {
+                    let raw = self.transpile(*lambda);
+                    let trimmed = raw
+                        .trim()
+                        .trim_start_matches('{')
+                        .trim_end_matches('}')
+                        .trim();
+                    let (raw_params, body) = trimmed.split_once("->").unwrap_or(("", trimmed));
+                    let parameter = raw_params
+                        .trim()
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .trim();
+                    if parameter.is_empty() {
+                        replace_whole_word(body.trim(), "it", "v")
+                    } else {
+                        replace_whole_word(body.trim(), parameter, "v")
+                    }
+                });
                 self.unit.diags.warn_approx(
                     node,
                     self.unit.file,
-                    "Iterable.associateBy lowered to stream().collect(toMap(keyfn, v -> v))",
+                    "Iterable.associateBy lowered to stream().collect(toMap(keyfn, valuefn))",
                 );
                 format!(
-                    "{base_java}.stream().collect(java.util.stream.Collectors.toMap(v -> {bound}, v -> v))"
+                    "{base_java}.stream().collect(java.util.stream.Collectors.toMap(v -> {bound}, v -> {}))",
+                    value.unwrap_or_else(|| "v".to_string())
                 )
             }
             _ => {

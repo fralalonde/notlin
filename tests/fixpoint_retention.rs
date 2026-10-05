@@ -389,7 +389,14 @@ fn deep_valid_retention_chain_uses_configurable_budget() {
         };
         fs::write(
             scratch.join(format!("Chain{depth}.kt")),
-            format!("package neutral.deep\ninterface Chain{depth}{supertype}\n"),
+            format!(
+                "package neutral.deep\ninterface Chain{depth}{supertype}{}\n",
+                if depth == 0 {
+                    " { val marker: Int get() = 0 }"
+                } else {
+                    ""
+                }
+            ),
         )
         .unwrap();
     }
@@ -461,7 +468,7 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
     fs::create_dir_all(root).unwrap();
     fs::write(
         root.join("Chain0.kt"),
-        "package neutral.comments\ninterface Chain0\n",
+        "package neutral.comments\ninterface Chain0 { val marker: Int get() = 0 }\n",
     )
     .unwrap();
     fs::write(
@@ -497,14 +504,14 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
     let chain0 = fs::read_to_string(root.join("Chain0.kt")).unwrap();
     let chain1 = fs::read_to_string(root.join("Chain1.kt")).unwrap();
     assert!(
-        chain0.contains("retained interface Chain0")
+        !chain0.contains("retained interface Chain0")
             && chain0.contains("blocked by interface Chain1 at Chain1.kt")
             && chain0
                 .contains("class Kept at Kept.kt [NF7FA]: class modifier not supported: value"),
         "{chain0}"
     );
     assert!(
-        chain1.contains("retained interface Chain1")
+        !chain1.contains("retained interface Chain1")
             && chain1.contains("blocked by class Kept at Kept.kt")
             && !chain1.contains(&root.to_string_lossy().replace('\\', "/")),
         "{chain1}"
@@ -567,4 +574,30 @@ fn final_retention_markers_exclude_names_released_from_the_seed() {
         "released declarations must not survive in final provenance:\n{blockers}"
     );
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn projected_class_returns_translate_with_their_hierarchy() {
+    let root = Path::new("tests/tmp_scratch_fixpoint_projected");
+    fs::create_dir_all(root).unwrap();
+    fs::write(root.join("types.kt"), "package projected\ninterface Base\ninterface Child : Base\ninterface Contract { val type: Class<out Base> }\nclass Implementation(override val type: Class<Child>) : Contract\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!root.join("types.kt").exists(), "{stderr}");
+    let contract = fs::read_to_string(root.join("Contract.java")).unwrap();
+    let implementation = fs::read_to_string(root.join("Implementation.java")).unwrap();
+    assert!(
+        contract.contains("Class<? extends Base> getType()"),
+        "{contract}"
+    );
+    assert!(
+        implementation.contains("Class<Child> getType()"),
+        "{implementation}"
+    );
+    fs::remove_dir_all(root).unwrap();
 }

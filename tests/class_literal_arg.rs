@@ -71,7 +71,7 @@ fn unknown_class_literal_in_annotation_taints() {
     );
     let kotlin = fs::read_to_string(root.join("s.kt")).unwrap_or_default();
     assert!(
-        kotlin.contains("// NOTLIN: N04DC declaration annotation is retained in Kotlin")
+        kotlin.contains("NOTLIN N04DC: declaration annotation is retained in Kotlin")
             && kotlin.contains("interface Bad"),
         "expected retained interface and in-source annotation blocker:\n{kotlin}\n{stderr}"
     );

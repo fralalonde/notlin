@@ -145,3 +145,49 @@ pub fn box_primitive_generics(targs: &str) -> String {
     }
     out
 }
+
+/// Preserve Kotlin declaration-site covariance when a translated Java
+/// interface exposes a read-only collection as a return type. The concrete
+/// implementation may then return `List<Derived>` for an interface contract of
+/// `List<? extends Base>`, matching Kotlin's `List<out T>` relationship.
+pub fn covariant_interface_return(java_type: &str) -> String {
+    let (prefix, ty) = java_type
+        .strip_prefix("@Nullable ")
+        .map_or(("", java_type), |ty| ("@Nullable ", ty));
+    let Some(open) = ty.find('<') else {
+        return java_type.to_string();
+    };
+    if !ty.ends_with('>') {
+        return java_type.to_string();
+    }
+    let base = &ty[..open];
+    let arguments = &ty[open + 1..ty.len() - 1];
+    let parts = split_top_level_type_arguments(arguments);
+    let rendered = match (base, parts.as_slice()) {
+        ("List" | "Set" | "Collection" | "Iterable" | "Iterator" | "Sequence", [item]) => {
+            format!("{base}<? extends {}>", item.trim())
+        }
+        ("Map", [key, value]) => format!("Map<{}, ? extends {}>", key.trim(), value.trim()),
+        _ => return java_type.to_string(),
+    };
+    format!("{prefix}{rendered}")
+}
+
+fn split_top_level_type_arguments(arguments: &str) -> Vec<&str> {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    for (index, ch) in arguments.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&arguments[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&arguments[start..]);
+    parts
+}

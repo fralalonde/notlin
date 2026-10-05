@@ -31,6 +31,7 @@
 //! if (x.p is T) { ... x.p ... }        // positive narrowing
 //! if (x.p !is T) return ...; x.p ...   // negative narrowing, early exit
 //! when (x.p) { is T -> ... x.p ... }   // subject narrowing
+//! when { x.p is T -> ... x.p ... }    // first subjectless condition
 //! if (x.p is T && x.p.foo) { ... }     // conjunction: the RHS is dominated
 //! ```
 //!
@@ -38,7 +39,8 @@
 //! is covered): a chain deeper than `receiver.property`, safe calls (`x?.p`),
 //! `getP()`-style call receivers, a `!is` branch that falls through, and a
 //! conjunction whose test is not the first operand (hoisting it would reorder
-//! evaluation relative to the operands before it).
+//! evaluation relative to the operands before it). Subjectless `when` repairs
+//! are limited to a direct positive test in the first entry.
 
 use crate::transpiler::kt;
 use std::collections::{HashMap, HashSet};
@@ -52,6 +54,8 @@ pub enum SmartCastShape {
     IfNotIs,
     /// `when (x.p) { is T -> ... }`
     WhenSubject,
+    /// `when { x.p is T -> ... }` when this is the first entry
+    WhenCondition,
     /// `if (x.p is T && x.p.foo) { ... }`
     Conjunction,
 }
@@ -62,6 +66,7 @@ impl SmartCastShape {
             Self::IfIs => "if (x.p is T)",
             Self::IfNotIs => "if (x.p !is T) early exit",
             Self::WhenSubject => "when (x.p) { is T -> }",
+            Self::WhenCondition => "when { x.p is T -> }",
             Self::Conjunction => "x.p is T && x.p...",
         }
     }
@@ -93,6 +98,21 @@ pub struct SmartCastSite {
     pub insert_at: usize,
     /// 1-based line of the control-flow statement, for reporting.
     pub line: usize,
+}
+
+/// A local whose omitted source type can be recovered from an enclosing
+/// method's return type. The first supported shape is deliberately narrow:
+/// `val x = method(...).orElseThrow()`, where `method` returns `Optional<T>`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InferredBindingCall {
+    pub name: String,
+    pub enclosing_type: String,
+    pub callee: String,
+    /// Byte range of the function whose local binding this is. Binding names
+    /// are only meaningful inside that scope; the same file may use the same
+    /// name for an unrelated parameter or local elsewhere.
+    pub scope_start: usize,
+    pub scope_end: usize,
 }
 
 impl SmartCastSite {
@@ -179,6 +199,95 @@ pub fn bindings_in(tree: &tree_sitter::Tree, source: &str) -> HashMap<String, St
     table
 }
 
+/// Inferred locals whose initializer has a method-return shape the workspace
+/// index can resolve after all declarations and inheritance edges are known.
+pub fn inferred_binding_calls_in(
+    tree: &tree_sitter::Tree,
+    source: &str,
+) -> Vec<InferredBindingCall> {
+    let mut calls = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "property_declaration"
+            && let Some(call) = inferred_optional_binding(node, source)
+        {
+            calls.push(call);
+        }
+        for child in node.named_children(&mut node.walk()) {
+            stack.push(child);
+        }
+    }
+    calls.sort_by(|left, right| {
+        (
+            &left.name,
+            &left.enclosing_type,
+            &left.callee,
+            left.scope_start,
+            left.scope_end,
+        )
+            .cmp(&(
+                &right.name,
+                &right.enclosing_type,
+                &right.callee,
+                right.scope_start,
+                right.scope_end,
+            ))
+    });
+    calls.dedup();
+    calls
+}
+
+fn inferred_optional_binding(node: Node, source: &str) -> Option<InferredBindingCall> {
+    let variable = kt::child(node, "variable_declaration")?;
+    if declared_pair(variable, source).is_some() {
+        return None;
+    }
+    let name = variable
+        .named_children(&mut variable.walk())
+        .find(|child| child.kind() == "identifier")
+        .map(|child| kt::text(child, source).to_string())?;
+    let outer_call = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "call_expression")?;
+    let navigation = outer_call
+        .named_children(&mut outer_call.walk())
+        .find(|child| child.kind() == "navigation_expression")?;
+    let children: Vec<Node> = navigation.named_children(&mut navigation.walk()).collect();
+    if children.len() != 2
+        || children[0].kind() != "call_expression"
+        || children[1].kind() != "identifier"
+        || kt::text(children[1], source) != "orElseThrow"
+    {
+        return None;
+    }
+    let callee = children[0]
+        .named_children(&mut children[0].walk())
+        .find(|child| child.kind() == "identifier")
+        .map(|child| kt::text(child, source).to_string())?;
+    let mut ancestor = node.parent();
+    let mut scope = None;
+    let enclosing_type = loop {
+        let current = ancestor?;
+        if current.kind() == "function_declaration" && scope.is_none() {
+            scope = Some((current.start_byte(), current.end_byte()));
+        }
+        if current.kind() == "class_declaration" {
+            break current
+                .child_by_field_name("name")
+                .map(|child| kt::text(child, source).to_string())?;
+        }
+        ancestor = current.parent();
+    };
+    let (scope_start, scope_end) = scope?;
+    Some(InferredBindingCall {
+        name,
+        enclosing_type,
+        callee,
+        scope_start,
+        scope_end,
+    })
+}
+
 /// `(name, simple type)` for a node that declares one, when the type is a plain
 /// simple name. A declaration without an explicit type (`val x = ...`) names no
 /// type we can resolve, so it is dropped.
@@ -226,12 +335,32 @@ pub fn simple_type(text: &str) -> String {
 /// a guess.
 pub fn rewrite(source: &str, owner_ok: &dyn Fn(&str, &str) -> bool) -> (String, usize) {
     let tree = crate::transpiler::parse_tree(source);
-    let found = sites_in(&tree, source);
+    let table = bindings_in(&tree, source);
+    rewrite_with_bindings_in(source, &tree, &table, owner_ok)
+}
+
+/// [`rewrite`] with a binding table resolved by the complete workspace index.
+/// This includes inferred locals that source syntax alone cannot type.
+pub fn rewrite_with_bindings(
+    source: &str,
+    table: &HashMap<String, String>,
+    owner_ok: &dyn Fn(&str, &str) -> bool,
+) -> (String, usize) {
+    let tree = crate::transpiler::parse_tree(source);
+    rewrite_with_bindings_in(source, &tree, table, owner_ok)
+}
+
+fn rewrite_with_bindings_in(
+    source: &str,
+    tree: &tree_sitter::Tree,
+    table: &HashMap<String, String>,
+    owner_ok: &dyn Fn(&str, &str) -> bool,
+) -> (String, usize) {
+    let found = sites_in(tree, source);
     if found.is_empty() {
         return (source.to_string(), 0);
     }
-    let table = bindings_in(&tree, source);
-    let mut taken: HashSet<String> = identifiers_in(&tree, source);
+    let mut taken: HashSet<String> = identifiers_in(tree, source);
     let mut edits: Vec<Edit> = Vec::new();
     let mut rewritten_ranges: Vec<(usize, usize)> = Vec::new();
     let mut repaired = 0;
@@ -461,7 +590,9 @@ fn analyse_if(node: Node, source: &str) -> Option<SmartCastSite> {
 }
 
 fn analyse_when(node: Node, source: &str) -> Option<SmartCastSite> {
-    let subject = kt::child(node, "when_subject")?;
+    let Some(subject) = kt::child(node, "when_subject") else {
+        return analyse_subjectless_when(node, source);
+    };
     let subject_expr = subject.named_children(&mut subject.walk()).next()?;
     let narrowed: Vec<Node> = node
         .named_children(&mut node.walk())
@@ -498,6 +629,79 @@ fn analyse_when(node: Node, source: &str) -> Option<SmartCastSite> {
         source,
         chain,
         SmartCastShape::WhenSubject,
+        ranges,
+        true,
+    ))
+}
+
+/// A subjectless `when` has no shared value to narrow, but Kotlin still smart
+/// casts a property read inside the selected entry. Binding the first test's
+/// property immediately before the `when` preserves evaluation order: that
+/// property read was the first condition evaluated originally. Later entries
+/// are not dominated by a positive test, so only the first entry body is
+/// rewritten.
+fn analyse_subjectless_when(node: Node, source: &str) -> Option<SmartCastSite> {
+    let entries: Vec<Node> = node
+        .named_children(&mut node.walk())
+        .filter(|child| child.kind() == "when_entry")
+        .collect();
+    let first_entry = *entries.first()?;
+    let first_condition = kt::field(first_entry, "condition");
+    let first_test = first_condition.filter(|condition| {
+        condition.kind() == "is_expression" && kt::child(*condition, "is").is_some()
+    });
+    let candidate = first_test.or_else(|| {
+        entries.iter().skip(1).find_map(|entry| {
+            let mut stack = vec![kt::field(*entry, "condition")?];
+            while let Some(child) = stack.pop() {
+                if child.kind() == "is_expression" && kt::child(child, "is").is_some() {
+                    return Some(child);
+                }
+                stack.extend(child.named_children(&mut child.walk()));
+            }
+            None
+        })
+    });
+    let condition = candidate?;
+    let left = kt::field(condition, "left")?;
+    let Some(chain) = chain_of_opt(left, source) else {
+        return Some(unrepairable(
+            node,
+            source,
+            left,
+            SmartCastShape::WhenCondition,
+        ));
+    };
+    if first_test.is_none() {
+        return Some(unrepairable(
+            node,
+            source,
+            left,
+            SmartCastShape::WhenCondition,
+        ));
+    }
+    let statement_line = line_start(source, node.start_byte());
+    if !source[statement_line..node.start_byte()].trim().is_empty() {
+        // The current writer inserts a local at the start of the line. A
+        // subjectless `when` embedded in an expression (for example `= when`
+        // or `return when`) needs expression wrapping to keep that local in
+        // scope, so expose it as unrepairable until that rewrite exists.
+        return Some(unrepairable(
+            node,
+            source,
+            left,
+            SmartCastShape::WhenCondition,
+        ));
+    }
+    let mut ranges = vec![range_of(left)];
+    if let Some(body) = first_entry.named_children(&mut first_entry.walk()).nth(1) {
+        collect_occurrences(body, source, &chain, &mut ranges);
+    }
+    Some(finish(
+        node,
+        source,
+        chain,
+        SmartCastShape::WhenCondition,
         ranges,
         true,
     ))

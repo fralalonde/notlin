@@ -21,7 +21,7 @@
 use crate::cli::Cli;
 use crate::transpiler::{WorkspaceScope, parse_tree, transpile_with_tree_hint_selection};
 use crate::workspace::SourceIndex;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -448,76 +448,77 @@ fn plan_workspace_cold(
 }
 
 pub fn qualify_retention_markers(plans: &mut [FilePlan]) {
-    let display_root = common_plan_root(plans)
-        .map(|root| format!("{}/", crate::paths::display(&root).trim_end_matches('/')));
-    let mut intrinsic: crate::diagnostics::IntrinsicRetentionMarkers = BTreeMap::new();
-    for plan in plans.iter() {
-        let file = crate::paths::display(&plan.file);
-        let mut retention_anchors = plan
-            .coverage
-            .blockers
-            .iter()
-            .filter_map(|(offset, marker)| {
-                marker
-                    .trim_start()
-                    .strip_prefix("// NOTLIN: ")
-                    .and_then(|rest| rest.split_once(' '))
-                    .filter(|(_, message)| message.starts_with("retained "))
-                    .map(|_| (*offset, source_line(&plan.source, *offset)))
-            })
-            .collect::<Vec<_>>();
-        retention_anchors.sort_unstable();
-        for (offset, marker) in &plan.coverage.blockers {
-            let Some(rest) = marker.trim_end().strip_prefix("// NOTLIN: ") else {
-                continue;
-            };
-            let Some((code, message)) = rest.split_once(' ') else {
-                continue;
-            };
-            if message.starts_with("retained ") {
-                continue;
-            }
-            let owner_line = retention_anchors
+    qualify_retention_markers_at(plans);
+}
+
+pub fn qualify_retention_markers_at(plans: &mut [FilePlan]) {
+    let sites = crate::diagnostics::retention_sites();
+    let qualified_names = sites
+        .iter()
+        .filter_map(|site| {
+            let plan = plans
                 .iter()
-                .rev()
-                .find(|(anchor, _)| anchor <= offset)
-                .or_else(|| retention_anchors.first())
-                .map(|(_, line)| *line)
-                .unwrap_or_else(|| source_line(&plan.source, *offset));
-            intrinsic
-                .entry((file.clone(), owner_line))
-                .or_default()
-                .push((code.to_string(), message.to_string()));
-        }
-    }
+                .find(|plan| crate::paths::display(&plan.file) == site.file)?;
+            let package = plan.source.lines().map(str::trim).find_map(|line| {
+                line.strip_prefix("package ")
+                    .map(|package| package.trim_end_matches(';').trim())
+            })?;
+            Some((
+                (site.file.clone(), site.name.clone()),
+                format!("{package}.{}", site.name),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let sites_by_name = sites
+        .iter()
+        .fold(BTreeMap::<&str, Vec<_>>::new(), |mut map, site| {
+            map.entry(&site.name).or_default().push(site);
+            map
+        });
     for plan in plans {
         for (offset, marker) in &mut plan.coverage.blockers {
             let line = source_line(&plan.source, *offset);
-            let Some((code, message)) =
-                crate::diagnostics::retention_source_message(&plan.file, line, &intrinsic)
+            let Some((original_code, original_message)) = marker
+                .trim_end()
+                .strip_prefix("// NOTLIN: ")
+                .and_then(|rest| rest.split_once(' '))
             else {
                 continue;
             };
-            let message = display_root
-                .as_deref()
-                .map(|prefix| message.replace(prefix, ""))
-                .unwrap_or(message);
-            let prefix = format!("// NOTLIN: {code} retained");
-            if marker.starts_with(&prefix) {
-                *marker = format!("// NOTLIN: {code} {message}\n");
+            if !original_message.starts_with("retained ") {
+                *marker = crate::retention_docs::javadoc(original_code, original_message, &[]);
+                continue;
             }
+            let file = crate::paths::display(&plan.file);
+            let Some(site) = sites
+                .iter()
+                .find(|site| site.file == file && site.line == line)
+            else {
+                continue;
+            };
+            let links = site
+                .blockers
+                .iter()
+                .flat_map(|name| sites_by_name.get(name.as_str()).into_iter().flatten())
+                .filter_map(|blocker| {
+                    qualified_names
+                        .get(&(blocker.file.clone(), blocker.name.clone()))
+                        .cloned()
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let reason = if links.is_empty() {
+                site.kind.detail(&site.params)
+            } else {
+                format!(
+                    "{} because the linked declarations remain Kotlin.",
+                    site.kind.summary()
+                )
+            };
+            *marker = crate::retention_docs::javadoc(&site.kind.code(), &reason, &links);
         }
     }
-}
-
-fn common_plan_root(plans: &[FilePlan]) -> Option<PathBuf> {
-    let mut root = plans.first()?.file.parent()?.to_path_buf();
-    while !plans.iter().all(|plan| plan.file.starts_with(&root)) {
-        if !root.pop() {
-            return None;
-        }
-    }
-    Some(root)
 }
 
 fn source_line(source: &str, offset: usize) -> usize {

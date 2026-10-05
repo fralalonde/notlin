@@ -987,6 +987,45 @@ fn retains_property_smart_cast_the_rewrite_pass_cannot_reach() {
 }
 
 #[test]
+fn unrelated_smart_cast_with_same_property_name_does_not_retain_owner() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-smart-cast-unrelated-owner-{}",
+        std::process::id()
+    ));
+    let selected = root.join("selected");
+    let residue = root.join("residue");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&selected).unwrap();
+    fs::create_dir_all(&residue).unwrap();
+    let selected_path = selected.join("Rule.kt");
+    fs::write(
+        &selected_path,
+        "package sample\ninterface Kind\ndata class Rule(val type: Kind)\n",
+    )
+    .unwrap();
+    fs::write(
+        residue.join("Consumer.kt"),
+        "package sample\ninterface Value\nclass Detail(val text: String) : Value\ndata class Other(val type: Value)\nfun render(rule: Rule, other: Other): String {\n    if (other.type is Detail) return other.type.text\n    return rule.toString()\n}\n",
+    )
+    .unwrap();
+
+    let index = SourceIndex::discover(&root).unwrap();
+    let cli = Cli::parse_from(["notlin", "--in-place", selected_path.to_str().unwrap()]);
+    let source = fs::read_to_string(&selected_path).unwrap();
+    let (files, errors, _warnings, coverage) = transpiler::transpile_with_workspace(
+        &source,
+        &selected_path,
+        &cli,
+        Some(&index),
+        std::slice::from_ref(&selected),
+    );
+    assert_eq!(errors, 0);
+    assert!(files.iter().any(|(name, _)| name == "Rule.java"));
+    assert!(!coverage.untranslated.iter().any(|name| name == "Rule"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn discovery_reports_missing_workspace_root() {
     let error = SourceIndex::discover(&PathBuf::from("definitely-missing-workspace"))
         .expect_err("missing roots must not silently produce an empty index");
@@ -1088,5 +1127,209 @@ fun make() = Fresh(1)
     assert!(overlay.declarations_named("Generated").next().is_some());
     let fresh = overlay.declarations_named("Fresh").next().unwrap();
     assert!(overlay.ctor_omission_evidence(fresh).patterns.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn inherited_member_conflicts_use_each_declarations_package() {
+    let root = std::env::temp_dir().join(format!("notlin-scoped-conflicts-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    for (file, source) in [
+        (
+            "left.kt",
+            "package left\ninterface Contract { val type: String }\nclass Implementation(override val type: String) : Contract\n",
+        ),
+        (
+            "right.kt",
+            "package right\nimport left.*\ninterface Contract { val type: Int }\nclass Implementation(override val type: Int) : Contract\n",
+        ),
+        (
+            "qualified.kt",
+            "package use\ninterface Generic<T> { val value: T }\nclass Qualified(override val value: String) : use.Generic<String>\n",
+        ),
+    ] {
+        fs::write(root.join(file), source).unwrap();
+    }
+    let index = SourceIndex::discover(&root).unwrap();
+    for file in ["left.kt", "right.kt", "qualified.kt"] {
+        let path = root.join(file);
+        let source = index.source_file(&path).unwrap();
+        let implementation = source.declarations.last().unwrap();
+        let conflicts = index.retained_supertype_member_conflicts_in_file(
+            &path,
+            &implementation.supertypes,
+            &implementation.name,
+        );
+        assert_eq!(conflicts.len(), 1, "{file}: {conflicts:?}");
+        assert!(
+            index
+                .retained_supertype_member_mismatches_in_file(
+                    &path,
+                    &implementation.supertypes,
+                    &implementation.name,
+                )
+                .is_empty(),
+            "{file}: {conflicts:?}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn explicit_generic_projections_allow_proven_covariant_returns() {
+    let root =
+        std::env::temp_dir().join(format!("notlin-projected-returns-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let source = r#"package projections
+interface Base {}
+interface Child : Base {}
+interface Upper { val type: Class<out Base> }
+class Narrow(override val type: Class<out Child>) : Upper {}
+class Concrete(override val type: Class<Child>) : Upper {}
+interface Star { val type: Class<*> }
+class StarImpl(override val type: Class<Child>) : Star {}
+interface Invariant { val type: Class<Base> }
+class Invalid(override val type: Class<Child>) : Invariant {}
+interface Unknown { val type: Class<out ExternalBase> }
+class Unproven(override val type: Class<out ExternalChild>) : Unknown {}
+interface Lower { val type: Box<in Child> }
+class Wider(override val type: Box<Base>) : Lower {}
+"#;
+    for (i, declaration) in source.lines().skip(1).enumerate() {
+        fs::write(
+            root.join(format!("type{i}.kt")),
+            format!("package projections\n{declaration}\n"),
+        )
+        .unwrap();
+    }
+    let index = SourceIndex::discover(&root).unwrap();
+    for (name, allowed) in [
+        ("Narrow", true),
+        ("Concrete", true),
+        ("StarImpl", true),
+        ("Invalid", false),
+        ("Unproven", false),
+        ("Wider", true),
+    ] {
+        let declaration = index.declarations_named(name).next().unwrap_or_else(|| {
+            panic!(
+                "missing {name}: {:?}",
+                index.declarations().map(|d| &d.name).collect::<Vec<_>>()
+            )
+        });
+        let conflicts = index.retained_supertype_member_conflicts(&declaration.supertypes, name);
+        assert_eq!(conflicts.len(), 1, "{name}");
+        assert_eq!(
+            index
+                .retained_supertype_member_mismatches(&declaration.supertypes, name)
+                .is_empty(),
+            allowed,
+            "{name}: {conflicts:?}"
+        );
+        if allowed {
+            assert_eq!(
+                conflicts[0].classification,
+                MemberConflictClass::JavaCovariantReturn
+            );
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn java_interface_ancestry_survives_translation_overlays() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-java-interface-ancestry-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Base.java"),
+        "package ancestry; public interface Base {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Middle.java"),
+        "package ancestry; public interface Middle extends Base {}\n",
+    )
+    .unwrap();
+    fs::write(root.join("types.kt"), "package ancestry\ninterface Leaf : Middle\ninterface Contract { val item: Base }\nclass Implementation(override val item: Leaf) : Contract\n").unwrap();
+    let index = SourceIndex::discover(&root).unwrap();
+    assert_eq!(
+        index
+            .declarations_named("Middle")
+            .next()
+            .unwrap()
+            .supertypes,
+        ["Base"]
+    );
+    let implementation = index.declarations_named("Implementation").next().unwrap();
+    assert!(
+        index
+            .retained_supertype_member_mismatches(&implementation.supertypes, "Implementation")
+            .is_empty()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn enum_default_obligations_distinguish_single_defaults_and_bridges() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-enum-default-obligations-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("defaults.kt"),
+        r#"package defaults
+interface Default {
+    val alias: String
+        get() = "default"
+}
+interface Other {
+    val alias: String
+        get() = "other"
+}
+interface Abstract : Default {
+    override val alias: String
+}
+enum class Simple : Default { ONE; }
+enum class Conflict : Default, Other { ONE; }
+enum class Narrowed : Abstract { ONE; }
+enum class Explicit : Default, Other {
+    ONE;
+    override val alias: String
+        get() = "explicit"
+}
+"#,
+    )
+    .unwrap();
+    let index = SourceIndex::discover(&root).unwrap();
+    let path = root.join("defaults.kt");
+    assert!(index.enum_default_obligations(&path, "Simple").is_empty());
+    assert!(index.enum_default_obligations(&path, "Explicit").is_empty());
+    assert_eq!(
+        index.enum_default_obligations(&path, "Conflict"),
+        ["getAlias"]
+    );
+    assert_eq!(
+        index.enum_default_obligations(&path, "Narrowed"),
+        ["getAlias"]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn companion_constants_do_not_create_inherited_return_conflicts() {
+    let root = std::env::temp_dir().join(format!("notlin-static-conflicts-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("types.kt"), "package statics\ninterface Parent {\n companion object {\n val EMPTY: String = \"\"\n }\n}\nclass Child : Parent {\n companion object {\n val EMPTY: Int = 0\n }\n}\n").unwrap();
+    let index = SourceIndex::discover(&root).unwrap();
+    let child = index.declarations_named("Child").next().unwrap();
+    assert!(
+        index
+            .retained_supertype_member_mismatches(&child.supertypes, "Child")
+            .is_empty()
+    );
     fs::remove_dir_all(root).unwrap();
 }

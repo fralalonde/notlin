@@ -75,3 +75,23 @@ fn super_property_against_retained_supertype_taints_caller() {
     }
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn interface_super_method_uses_java_qualified_dispatch() {
+    let root = Path::new("tests/tmp_scratch_super_method");
+    fs::create_dir_all(root).unwrap();
+    fs::write(root.join("m.kt"), "package neutral.supermethod\ninterface Base {\n fun value(): String = \"base\"\n}\nenum class Impl : Base {\n ONE;\n override fun value(): String = super.value()\n}\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let java = fs::read_to_string(root.join("Impl.java")).unwrap();
+    assert!(java.contains("Base.super.value()"), "{java}");
+    fs::remove_dir_all(root).unwrap();
+}

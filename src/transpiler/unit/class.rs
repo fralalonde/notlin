@@ -127,6 +127,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
                 if !comps.is_empty() {
                     self.data_components.insert(tname.clone(), comps);
+                    if self.data_class_can_be_record(n) {
+                        self.record_types.insert(tname.clone());
+                    }
                 }
             }
             if let Some(sup) = self.superclass_name(n) {
@@ -153,6 +156,26 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             }
         }
         last.map(|n| self.text(n).to_string())
+    }
+
+    /// Records allow interfaces and delegating constructors, but no mutable
+    /// components, class superclass or additional instance fields.
+    fn data_class_can_be_record(&self, decl: tree_sitter::Node) -> bool {
+        let mutable = kt::child(decl, "primary_constructor")
+            .and_then(|ctor| kt::child(ctor, "class_parameters"))
+            .is_some_and(|params| {
+                params
+                    .children(&mut params.walk())
+                    .any(|param| kt::child(param, "var").is_some())
+            });
+        !mutable
+            && self.superclass_name(decl).is_none()
+            && !kt::child(decl, "class_body").is_some_and(|body| {
+                body.children(&mut body.walk()).any(|member| {
+                    member.kind() == "property_declaration"
+                        && self.property_emits_backing_field(member)
+                })
+            })
     }
 
     fn decl_contains(&self, decl: tree_sitter::Node<'tree>, name: &str) -> bool {
@@ -188,7 +211,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // unicode escape today, but `\c`-style prefixes would be rejected as
         // illegal escapes by javac on any path containing one.
         out.line(format!(
-            "// NOTLIN: generated from {} — do not edit by hand while the source .kt exists",
+            "// NOTLIN: generated from {}",
             normalized_source_path(self.file)
         ));
         if !package.is_empty() {
@@ -285,8 +308,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     ///   - the annotation NAME resolves to a pre-existing Java declaration in
     ///     the workspace index, OR the workspace is absent/unresolvable
     ///     (single-file probes; the target build proves the classpath) —
-    ///   - the ARGUMENTS contain no Kotlin-only syntax: `::class` references,
-    ///     string templates, `[]` array arguments, lambdas, or named-value
+    ///   - the ARGUMENTS contain no Kotlin-only syntax: unresolved `::class`
+    ///     references, string templates, lambdas, or named-value
     ///     forms the annotation node renders with Kotlin spellings.
     ///
     /// The use-site target (`@get:` / `@field:`) is dropped: Java annotates
@@ -345,26 +368,25 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // `Name::class` class literal, which rewrites to `Name.class` in Java
         // when `Name` resolves to a Java-visible declaration (checked below);
         // an unknown or Kotlin-only name keeps the taint.
-        // `[` is Kotlin's array literal, and it IS Java-expressible
-        // (`{a, b}`) — but lowering it is not free. On the real target the 12
-        // declarations retained solely for an array argument turned out to have
-        // bodies Java cannot express yet (calls to accessors of retained Kotlin
-        // classes, `log` fields, constructor arities): 96 distinct javac
-        // errors. The annotation is only preserved once those classes are
-        // translatable, so `[` keeps tainting until then.
         if argument_text.contains("${")
-            || argument_text.contains('[')
             || argument_text.contains('{')
             || argument_text.contains("-> ")
         {
             return None;
         }
         if argument_text.contains("::class") {
-            let mut lowered = argument_text.clone();
+            let mut lowered = lower_annotation_arrays(&argument_text);
             for part in argument_text.split(['(', ',', ')']) {
                 let trimmed = part.trim();
                 if let Some(token) = trimmed.strip_suffix("::class") {
-                    let class_name = token.split_whitespace().next_back().unwrap_or(token);
+                    let class_name = token
+                        .rsplit('=')
+                        .next()
+                        .unwrap_or(token)
+                        .split_whitespace()
+                        .next_back()
+                        .unwrap_or(token)
+                        .trim();
                     let simple = class_name.rsplit('.').next().unwrap_or(class_name);
                     let java_visible = self.workspace.is_some_and(|ws| {
                         ws.declarations_named(simple).any(|d| {
@@ -393,26 +415,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 .to_string(),
             );
         }
-        // An unselected Kotlin annotation type retains its declaration. The
-        // original reason recorded here — "the Java side cannot reference a
-        // Kotlin-only element" — is not sound: a Kotlin `annotation class`
-        // compiles to a Java `@interface` on the same module's classpath, so
-        // javac can name it.
-        //
-        // The clause is kept because the conservative behaviour is the measured
-        // one: this rule is one of several standing in for "this declaration's
-        // surroundings are not translated", and in this corpus removing it
-        // changed nothing observable (the 96 javac errors seen while probing
-        // were traced to the array-literal case, not to this clause). Loosening
-        // it needs its own measurement on a compiling tree, not an argument.
-        if let Some(workspace) = self.workspace
-            && workspace.declarations_named(&name).any(|decl| {
-                decl.name == name && decl.kind == crate::workspace::DeclarationKind::Annotation
-            })
-            && !workspace.annotation_is_selected(&name, self.translation_roots)
-        {
-            return None;
-        }
+        // Kotlin annotation classes compile to JVM annotation interfaces before
+        // javac runs, so Java emitted in the same module can reference them even
+        // when their Kotlin declarations remain outside this translation set.
         // Rebuild from the parts: a use-site target (`@get:X(...)` -> `@X(...)`)
         // is dropped and the arguments ride on the bare name; the wrapper
         // shape (annotated_expression) holds its arguments separately from
@@ -420,8 +425,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // Both shapes pass ONLY the argument list (never the annotation name)
         // to the transforms: brace-wrapping the name would move it inside the
         // braces.
-        let arguments =
-            brace_wrap_unnamed_nested_annotations(&prefix_nested_annotations(&argument_text));
+        let arguments = brace_wrap_unnamed_nested_annotations(&prefix_nested_annotations(
+            &lower_annotation_arrays(&argument_text),
+        ));
         let rebuilt = format!("@{name}{arguments}");
         // Kotlin wildcard/star imports and `!` nullability assertions never
         // appear here (parsed as value arguments), but a trailing semicolon
@@ -458,6 +464,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .declarations
             .iter()
             .find(|declaration| declaration.name == name)?;
+        // A root marker interface carries no property/default-method ABI.
+        // Residual Kotlin can safely implement the empty Java interface.
+        let marker_interface = self.retained_hint.is_some()
+            && target.kind == crate::workspace::DeclarationKind::Interface
+            && target.members.is_empty()
+            && target.supertypes.is_empty();
         if workspace.has_unselected_kotlin_subtype(target, self.translation_roots) {
             return Some((
                 RetentionKind::SubtypeOutsideTranslationSet,
@@ -474,7 +486,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         //   supertype (enum entries ABI, KClass...). Monotone: seeds
         //   (intrinsically tainted decls) never shrink, so iteration
         //   reaches the least fixpoint.
-        if hierarchy_closure() && target.kind == crate::workspace::DeclarationKind::Interface {
+        if hierarchy_closure()
+            && !marker_interface
+            && target.kind == crate::workspace::DeclarationKind::Interface
+        {
             let blockers = self.retained_subtypes(workspace, target);
             let retains = match self.retained_hint.as_ref() {
                 Some(_) => !blockers.is_empty(),
@@ -497,6 +512,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // resolves an inherited member as a real override against a Kotlin
         // declaration, not against a Java default method.
         if hierarchy_closure()
+            && !marker_interface
             && self
                 .retained_hint
                 .as_ref()
@@ -591,10 +607,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // the rewrite pass cannot repair (an unsupported shape, or a receiver
         // whose owner it cannot prove) keeps the owner here. Not in place, the
         // rewrite pass never runs, so nothing is repaired and the owner stays.
-        if self.in_place
-            && workspace.property_smart_cast_used_by_kotlin(indexed_path, target)
-            && !workspace.smart_cast_rewrites_cover(indexed_path, target)
-        {
+        if self.in_place && !workspace.smart_cast_rewrites_cover(indexed_path, target) {
             return Some((RetentionKind::SmartCast, Vec::new(), Vec::new()));
         }
         if hierarchy_closure()
@@ -722,9 +735,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         if let Some(text) = self.transpile_declaration_annotation(m) {
                             annotations.push(text);
                         } else {
-                            self.diag_untranslatable(
+                            self.diag_untranslatable_coded(
                                 m,
-                                "declaration annotation is retained in Kotlin",
+                                format!("declaration annotation is retained in Kotlin; annotation: `{}`; its type or argument expression cannot yet be lowered in this run", self.text(m)),
+                                Some(crate::diagnostics::warning_code("declaration annotation is retained in Kotlin")),
                             );
                         }
                     }
@@ -1230,7 +1244,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                     // declared type narrows the SUPERTYPE's
                                     // declared type (Java cannot bridge Object
                                     // against a type-variable getter).
-                                    let pty = kt::child(vd, "user_type")
+                                    let mut pty = kt::child(vd, "user_type")
                                         .or_else(|| kt::child(vd, "nullable_type"))
                                         .map(|t| kt::java_type_ann(t, self.source, self.annots))
                                         .or_else(|| {
@@ -1251,6 +1265,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                             })
                                         })
                                         .unwrap_or_else(|| "Object".to_string());
+                                    if kt::child(member, "val").is_some() {
+                                        pty = crate::transpiler::types::covariant_interface_return(
+                                            &pty,
+                                        );
+                                    }
                                     let cap = capitalize(&pname);
                                     let getter = kt::child(member, "getter");
                                     match getter.and_then(|g| kt::child(g, "function_body")) {
@@ -1506,70 +1525,89 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return;
         }
         if is_data && !params.is_empty() {
-            // A `var` PROPERTY in the body is another mutable member Java
-            // records reject (instance fields are illegal in records).
-            // Redirect to the final-class form so setters survive.
-            let body_has_var_property = kt::child(decl, "class_body").is_some_and(|body| {
-                body.children(&mut body.walk())
-                    .filter(|m| m.kind() == "property_declaration")
-                    .any(|m| kt::child(m, "var").is_some())
+            let as_record = self.data_class_can_be_record(decl);
+            let has_initialization = kt::child(decl, "class_body").is_some_and(|body| {
+                body.children(&mut body.walk()).any(|member| {
+                    member.kind() == "anonymous_initializer"
+                        || (member.kind() == "property_declaration"
+                            && self.property_initializer(member).is_some())
+                })
             });
-            if body_has_var_property {
-                if let Some(dn) = self.current_decl {
-                    let label = self.decl_labels.get(&dn.id()).cloned().unwrap_or_default();
-                    self.taint_decl(&label);
-                }
-                self.diag_untranslatable(
-                    decl,
-                    "data class body declares a `var` property; Java records cannot hold instance fields — use --lombok for a mutable @Data class",
-                );
-                return;
+            let mut init_method = "__notlin_initializeData".to_string();
+            while kt::child(decl, "class_body").is_some_and(|body| {
+                body.children(&mut body.walk()).any(|member| {
+                    member.kind() == "function_declaration"
+                        && kt::field(member, "name").is_some_and(|n| self.text(n) == init_method)
+                })
+            }) {
+                init_method.push('_');
             }
-            // record: parameters become record components. Records are
-            // immutable — a data class with any `var` component loses setter
-            // semantics, which is a semantic drop, so without --lombok the
-            // declaration is TAINTED (stays in the .kt, warns N001) instead
-            // of silently emitting a broken translation.
-            if params.iter().any(|(_, is_mutable, _, _)| *is_mutable) {
-                // --lombok data-class path is handled above with an early
-                // return, so `self.lombok` cannot be true here.
-                debug_assert!(!self.lombok);
-                if let Some(dn) = self.current_decl {
-                    let label = self.decl_labels.get(&dn.id()).cloned().unwrap_or_default();
-                    self.taint_decl(&label);
+            if let Some(body) = kt::child(decl, "class_body") {
+                for member in body.children(&mut body.walk()) {
+                    if member.kind() == "property_declaration"
+                        && self.property_emits_backing_field(member)
+                    {
+                        self.deferred_property_initializers.insert(member.id());
+                    }
                 }
-                self.diag_untranslatable(
-                    decl,
-                    "data class has `var` components; Java records are immutable — use --lombok for a mutable @Data class",
-                );
-                return;
             }
             let comps: Vec<String> = params
                 .iter()
                 .map(|(_, _, n, t)| format!("{} {}", t, n))
                 .collect();
-            // Java records can't extend anything. A data class with a
-            // superclass can't be a record — default to a final class with
-            // explicit fields + accessors (signature-identical to the
-            // record's: final fields, equals/hashCode/toString inherited or
-            // approximated). With `extends` present, emit that form.
-            // Type parameters must ride along on every shape — a record
-            // `data class FindQ<T : IObj>(...)` needs `record FindQ<T>(...)`
-            // or every `T` reference inside fails to resolve.
             let tp = type_params.trim_end(); // "<T> " / ""
             for annotation in &annotations {
                 out.line(annotation.clone());
             }
-            if extends.is_empty() {
+            if as_record {
                 out.open(format!(
-                    "{}record {}{}({})",
+                    "{}record {}{}({}){}",
                     visibility,
                     name,
                     tp.trim_end(),
-                    comps.join(", ")
+                    comps.join(", "),
+                    extends
                 ));
+                let has_initializers = kt::child(decl, "class_body").is_some_and(|body| {
+                    body.children(&mut body.walk())
+                        .any(|member| member.kind() == "anonymous_initializer")
+                });
+                if has_initializers || !self.primary_constructor_annotations(decl).is_empty() {
+                    for annotation in self.primary_constructor_annotations(decl) {
+                        out.line(annotation);
+                    }
+                    out.open(format!("public {}({})", name, comps.join(", ")));
+                    for (_, _, field, _) in &params {
+                        out.line(format!("this.{field} = {field};"));
+                    }
+                    self.emit_data_initialization(decl, &params, out);
+                    out.close();
+                }
                 if jpa_no_arg {
                     self.emit_jpa_no_arg_record_constructor(decl, &name, &params, out);
+                }
+                for (is_property, _, fname, ftype) in &params {
+                    if !*is_property {
+                        continue;
+                    }
+                    let getter_name = format!("get{}", capitalize(fname));
+                    let declares_getter = kt::child(decl, "class_body").is_some_and(|body| {
+                        body.children(&mut body.walk()).any(|member| {
+                            member.kind() == "function_declaration"
+                                && kt::field(member, "name")
+                                    .is_some_and(|method| self.text(method) == getter_name)
+                        })
+                    });
+                    if declares_getter {
+                        continue;
+                    }
+                    out.blank();
+                    for annotation in self.param_getter_annotations(decl, fname) {
+                        out.line(annotation);
+                    }
+                    out.open(format!("public {} {}()", ftype, getter_name));
+                    out.line(format!("return {}();", fname));
+                    out.close();
                 }
             } else {
                 let inner = if extends.is_empty() {
@@ -1615,12 +1653,23 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     out.line(annotation);
                 }
                 out.open(format!("public {}({})", name, comps.join(", ")));
+                if let Some(args) = &super_ctor_args {
+                    out.line(format!("super({args});"));
+                }
                 for (is_property, _, fname, _) in &params {
                     if *is_property {
                         out.line(format!("this.{} = {};", fname, fname));
                     }
                 }
+                if has_initialization {
+                    out.line(format!("{init_method}();"));
+                }
                 out.close();
+                if has_initialization {
+                    out.open(format!("private void {init_method}()"));
+                    self.emit_data_initialization(decl, &params, out);
+                    out.close();
+                }
                 if jpa_no_arg {
                     self.emit_jpa_no_arg_constructor(
                         decl,
@@ -1641,33 +1690,24 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     out.open(format!("public {} get{}()", ftype, cap));
                     out.line(format!("return {};", fname));
                     out.close();
+                    if params
+                        .iter()
+                        .any(|(_, mutable, n, _)| *mutable && n == fname)
+                    {
+                        out.open(format!("public void set{}({} {})", cap, ftype, fname));
+                        out.line(format!("this.{} = {};", fname, fname));
+                        out.close();
+                    }
                 }
                 out.blank();
             }
-            // record members: body content after the header (overrides etc.)
             if let Some(body) = kt::child(decl, "class_body") {
-                let mut cursor = body.walk();
-                for member in body.children(&mut cursor) {
-                    if member.kind() == "function_declaration" {
-                        out.blank();
-                        self.transpile_function(member, false, out);
-                    } else if member.kind() == "property_declaration" {
-                        // Custom properties inside a data class: backing
-                        // field + accessors are legal record members — do
-                        // NOT taint the record for these.
-                        out.blank();
-                        self.transpile_property(member, out);
-                    } else if member.is_named()
-                        && !matches!(
-                            member.kind(),
-                            ";" | "{" | "}" | "line_comment" | "block_comment"
-                        )
-                    {
-                        self.diag_untranslatable(
-                            member,
-                            format!("record member not supported: {}", member.kind()),
-                        );
-                    }
+                self.transpile_class_body(body, out);
+            }
+            self.emit_data_members(decl, &name, &params, as_record, out);
+            if let Some(body) = kt::child(decl, "class_body") {
+                for member in body.children(&mut body.walk()) {
+                    self.deferred_property_initializers.remove(&member.id());
                 }
             }
             // A record's canonical constructor is its only implicit one,
@@ -2668,6 +2708,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         out: &mut JavaOut,
     ) {
         self.enum_types.insert(name.to_string());
+        if let Some(workspace) = self.workspace {
+            let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
+            let obligations = workspace.enum_default_obligations(declaring, name);
+            if !obligations.is_empty() {
+                self.diag_untranslatable(
+                    decl,
+                    format!(
+                        "inherited interface members require explicit Java default bridges: {}",
+                        obligations.join(", ")
+                    ),
+                );
+                return;
+            }
+        }
         // Only visibility + (implicitly final) enum is legal Java. Any other
         // class modifier (sealed/abstract/open) on an enum taints.
         let extra = modifiers.trim();
@@ -3563,6 +3617,252 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
     }
 
+    fn emit_data_initialization(
+        &mut self,
+        decl: tree_sitter::Node,
+        params: &[(bool, bool, String, String)],
+        out: &mut JavaOut,
+    ) {
+        let prior = std::mem::take(&mut self.var_types);
+        for (_, _, name, ty) in params {
+            self.var_types.insert(name.clone(), ty.clone());
+        }
+        if let Some(body) = kt::child(decl, "class_body") {
+            for member in body.children(&mut body.walk()) {
+                if member.kind() == "property_declaration"
+                    && self.deferred_property_initializers.contains(&member.id())
+                {
+                    if let Some(initializer) = self.property_initializer(member) {
+                        let name = kt::child(member, "variable_declaration")
+                            .and_then(|vd| kt::child(vd, "identifier"));
+                        if let Some(name) = name {
+                            let value = Expr { unit: self }.transpile(initializer);
+                            out.line(format!("this.{} = {};", self.text(name), value));
+                        }
+                    }
+                } else if member.kind() == "anonymous_initializer" {
+                    if let Some(block) = kt::child(member, "block") {
+                        // Each Kotlin init block has its own local scope.
+                        let prior_block_types = self.var_types.clone();
+                        out.open("");
+                        for stmt in block
+                            .children(&mut block.walk())
+                            .filter(|stmt| stmt.is_named())
+                        {
+                            if !self.transpile_data_precondition(stmt, out) {
+                                self.transpile_statement(stmt, out);
+                            }
+                        }
+                        out.close();
+                        self.var_types = prior_block_types;
+                    } else {
+                        self.diag_untranslatable(member, "unrecognized data-class init block");
+                    }
+                }
+            }
+        }
+        self.var_types = prior;
+    }
+
+    /// Kotlin preconditions evaluate their message lazily, only on failure.
+    fn transpile_data_precondition(&mut self, stmt: tree_sitter::Node, out: &mut JavaOut) -> bool {
+        if stmt.kind() != "call_expression" {
+            return false;
+        }
+        let mut call = stmt;
+        while let Some(inner) = kt::child(call, "call_expression") {
+            call = inner;
+        }
+        let Some(callee) = call.children(&mut call.walk()).find(|n| n.is_named()) else {
+            return false;
+        };
+        let name = self.text(callee).to_string();
+        if !matches!(name.as_str(), "require" | "check")
+            || self.fn_rets.contains_key(&name)
+            || self.source.lines().any(|line| {
+                line.trim_start().starts_with("import ")
+                    && line.trim_end().ends_with(&format!(".{name}"))
+            })
+        {
+            return false;
+        }
+        let args = kt::child(call, "value_arguments")
+            .map(|args| {
+                args.children(&mut args.walk())
+                    .filter(|a| a.kind() == "value_argument")
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if args.len() != 1 {
+            return false;
+        }
+        let Some(condition) = args[0].children(&mut args[0].walk()).find(|n| n.is_named()) else {
+            return false;
+        };
+        let lambda =
+            kt::child(stmt, "annotated_lambda").and_then(|l| kt::child(l, "lambda_literal"));
+        let message = if let Some(lambda) = lambda {
+            let values = lambda
+                .children(&mut lambda.walk())
+                .filter(|n| n.is_named())
+                .collect::<Vec<_>>();
+            if values.len() != 1
+                || matches!(
+                    values[0].kind(),
+                    "return_expression" | "property_declaration" | "lambda_parameters"
+                )
+            {
+                self.diag_untranslatable(
+                    stmt,
+                    "data-class precondition message requires unsupported lambda control flow",
+                );
+                return true;
+            }
+            Expr { unit: self }.transpile(values[0])
+        } else if name == "require" {
+            "\"Failed requirement.\"".into()
+        } else {
+            "\"Check failed.\"".into()
+        };
+        let condition = Expr { unit: self }.transpile(condition);
+        out.open(format!("if (!({condition}))"));
+        out.line(format!(
+            "throw new {}(String.valueOf({message}));",
+            if name == "require" {
+                "IllegalArgumentException"
+            } else {
+                "IllegalStateException"
+            }
+        ));
+        out.close();
+        true
+    }
+
+    /// Kotlin data-class operations use primary-constructor properties only.
+    /// Records provide storage, but their default hash/toString differ from Kotlin.
+    fn emit_data_members(
+        &self,
+        decl: tree_sitter::Node,
+        name: &str,
+        params: &[(bool, bool, String, String)],
+        as_record: bool,
+        out: &mut JavaOut,
+    ) {
+        let declares = |method: &str| {
+            kt::child(decl, "class_body").is_some_and(|body| {
+                body.children(&mut body.walk()).any(|member| {
+                    member.kind() == "function_declaration"
+                        && kt::field(member, "name").is_some_and(|n| self.text(n) == method)
+                })
+            })
+        };
+        fn raw_type(ty: &str) -> &str {
+            ty.trim_start_matches("@Nullable ")
+                .trim_start_matches("@NonNull ")
+        }
+        if !declares("equals") {
+            out.open("@Override public boolean equals(Object other)");
+            out.line("if (this == other) return true;");
+            out.line(format!(
+                "if (!(other instanceof {name} that)) return false;"
+            ));
+            let comparisons = params
+                .iter()
+                .map(|(_, _, field, ty)| match raw_type(ty) {
+                    "float" => format!("Float.compare(this.{field}, that.{field}) == 0"),
+                    "double" => format!("Double.compare(this.{field}, that.{field}) == 0"),
+                    "boolean" | "byte" | "short" | "int" | "long" | "char" => {
+                        format!("this.{field} == that.{field}")
+                    }
+                    _ => format!("java.util.Objects.equals(this.{field}, that.{field})"),
+                })
+                .collect::<Vec<_>>();
+            out.line(format!("return {};", comparisons.join(" && ")));
+            out.close();
+        }
+        if !declares("hashCode") {
+            out.open("@Override public int hashCode()");
+            out.line("int result = 0;");
+            for (_, _, field, ty) in params {
+                let ty = raw_type(ty);
+                let hash = match ty {
+                    "boolean" => format!("(this.{field} ? 1 : 0)"),
+                    "byte" | "short" | "int" | "char" => format!("this.{field}"),
+                    "long" => format!("Long.hashCode(this.{field})"),
+                    "float" => format!("Float.hashCode(this.{field})"),
+                    "double" => format!("Double.hashCode(this.{field})"),
+                    _ if ty.ends_with("[]") => format!("java.util.Arrays.hashCode(this.{field})"),
+                    _ => format!("java.util.Objects.hashCode(this.{field})"),
+                };
+                out.line(format!("result = 31 * result + {hash};"));
+            }
+            out.line("return result;");
+            out.close();
+        }
+        if !declares("toString") {
+            out.open("@Override public String toString()");
+            let pieces = params
+                .iter()
+                .enumerate()
+                .map(|(index, (_, _, field, ty))| {
+                    let value = if raw_type(ty).ends_with("[]") {
+                        format!("java.util.Arrays.toString(this.{field})")
+                    } else {
+                        format!("this.{field}")
+                    };
+                    format!(
+                        "\"{}{field}=\" + {value}",
+                        if index == 0 { "" } else { ", " }
+                    )
+                })
+                .collect::<Vec<_>>();
+            out.line(format!(
+                "return \"{name}(\" + {} + \")\";",
+                pieces.join(" + ")
+            ));
+            out.close();
+        }
+        let generic = kt::child(decl, "type_parameters")
+            .map(|tp| {
+                tp.children(&mut tp.walk())
+                    .filter(|p| p.kind() == "type_parameter")
+                    .filter_map(|p| kt::child(p, "identifier"))
+                    .map(|n| self.text(n))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let self_type = if generic.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}<{}>", generic.join(", "))
+        };
+        out.open(format!(
+            "public {self_type} copy({})",
+            params
+                .iter()
+                .map(|(_, _, field, ty)| format!("{ty} {field}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        out.line(format!(
+            "return new {self_type}({});",
+            params
+                .iter()
+                .map(|(_, _, field, _)| field.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        out.close();
+        for (index, (_, _, field, ty)) in params.iter().enumerate() {
+            out.open(format!("public {ty} component{}()", index + 1));
+            out.line(format!(
+                "return this.{field}{};",
+                if as_record { "()" } else { "" }
+            ));
+            out.close();
+        }
+    }
+
     fn transpile_class_body(&mut self, body: tree_sitter::Node, out: &mut JavaOut) {
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
@@ -3602,6 +3902,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         );
                     }
                 }
+                "anonymous_initializer"
+                    if kt::parent_of(body).is_some_and(|decl| {
+                        !self.lombok
+                            && kt::child(decl, "modifiers")
+                                .is_some_and(|m| self.text(m).contains("data"))
+                    }) => {}
                 "class_declaration" | "object_declaration" => {
                     self.transpile_type_decl(member, out);
                     out.blank();
@@ -3813,6 +4119,38 @@ fn brace_wrap_unnamed_nested_annotations(prefixed: &str) -> String {
     // Wrap the element list in braces, keeping the enclosing parentheses:
     // Java annotation array values are `@X({elem, elem})`.
     format!("({{{trimmed}}})")
+}
+
+/// Kotlin annotation arrays use `[a, b]`; Java annotation arrays use
+/// `{a, b}`. Brackets inside string and character literals remain text.
+fn lower_annotation_arrays(arguments: &str) -> String {
+    let mut result = String::with_capacity(arguments.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in arguments.chars() {
+        if let Some(active) = quote {
+            result.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            result.push(ch);
+        } else if ch == '[' {
+            result.push('{');
+        } else if ch == ']' {
+            result.push('}');
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 /// Java requires the `@` prefix on nested annotation types inside annotation

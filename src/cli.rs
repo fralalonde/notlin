@@ -45,9 +45,8 @@ pub struct Cli {
     #[arg(long)]
     pub lombok: bool,
 
-    /// Assume Apache Commons Lang 3 on the target classpath. When combined
-    /// with --lombok, eligible Kotlin utility/extension operations may use
-    /// Commons Lang helpers in generated Java.
+    /// Assume Apache Commons Lang 3 on the target classpath. Eligible Kotlin
+    /// utility operations may use its helpers, independently of --lombok.
     #[arg(long = "commons-lang")]
     pub commons_lang: bool,
 

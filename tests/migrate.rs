@@ -310,3 +310,28 @@ fn blockers_with_distinct_offsets_on_one_line_replace_one_existing_block() {
         "// NOTLIN: N002 first reason\n// NOTLIN: N003 second reason\ninterface Kept : A, B {}\n"
     );
 }
+
+#[test]
+fn legacy_same_line_notlin_markers_are_split_over_lines() {
+    let source = "// NOTLIN: N001 old first // NOTLIN: N002 old second\ninterface Kept : A, B {}\n";
+    let mut coverage = FileCoverage::default();
+    coverage.blockers.push((
+        source.find("A, B").unwrap(),
+        "// NOTLIN: N003 first reason\n".to_string(),
+    ));
+    coverage.blockers.push((
+        source.find("B {}").unwrap(),
+        "// NOTLIN: N004 second reason\n".to_string(),
+    ));
+
+    let out = migrate::strip_translated(source, &coverage);
+
+    assert_eq!(
+        out,
+        "// NOTLIN: N003 first reason\n// NOTLIN: N004 second reason\ninterface Kept : A, B {}\n"
+    );
+    assert!(
+        out.lines()
+            .all(|line| line.matches("// NOTLIN:").count() <= 1)
+    );
+}

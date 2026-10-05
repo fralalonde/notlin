@@ -217,7 +217,7 @@ fn retained_source_comments_name_the_declaration_and_next_blocker() {
 }
 
 #[test]
-fn final_retention_comment_names_direct_site_and_terminal_root() {
+fn final_retention_comment_omits_its_attached_declaration() {
     let _guard = lock_table();
     clear_retention();
     let no_params = Vec::new();
@@ -254,11 +254,20 @@ fn final_retention_comment_names_direct_site_and_terminal_root() {
         retention_source_message(Path::new("module/src/Leaf.kt"), 13, &Default::default())
             .expect("the recorded leaf marker");
     assert!(
-        message.contains("retained interface Leaf")
-            && message.contains("blocked by class Middle at module/src/Middle.kt")
+        message.starts_with("blocked by class Middle at module/src/Middle.kt")
             && message.contains("class Root at module/src/Root.kt")
             && message.contains("method Repository.find()"),
         "{message}"
+    );
+    assert!(!message.contains("interface Leaf"), "{message}");
+
+    let (_, root_message) =
+        retention_source_message(Path::new("module/src/Root.kt"), 7, &Default::default())
+            .expect("the recorded root marker");
+    assert!(root_message.starts_with("root cause ["), "{root_message}");
+    assert!(
+        !root_message.starts_with("retained class Root"),
+        "{root_message}"
     );
 }
 
@@ -525,7 +534,7 @@ fn one_kind_is_one_code_however_the_parameters_read() {
     // the members, through the kind's template.
     let detail = SupertypeMemberType.detail(&["barcodes".to_string(), "type".to_string()]);
     assert!(
-        detail.starts_with("a Kotlin supertype declares barcodes, type"),
+        detail.starts_with("Java cannot override the inherited member type safely: barcodes, type"),
         "{detail}"
     );
     assert_ne!(

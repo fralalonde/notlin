@@ -88,6 +88,37 @@ fn when_subject_binds_across_is_entries() {
 }
 
 #[test]
+fn subjectless_when_binds_first_positive_condition() {
+    let source = "fun read(h: Holder) {\n    when {\n        h.payload is Detail -> h.payload.text\n        else -> \"\"\n    }\n}\n";
+    let text = repair(source);
+    assert!(
+        text.contains(
+            "    val payload = h.payload\n    when {\n        payload is Detail -> payload.text"
+        ),
+        "{text}"
+    );
+    assert_eq!(shapes(source)[0].0, SmartCastShape::WhenCondition);
+}
+
+#[test]
+fn subjectless_when_does_not_hoist_past_an_earlier_entry() {
+    let source = "fun read(h: Holder): String = when {\n    ready() -> \"ready\"\n    h.payload is Detail -> h.payload.text\n    else -> \"\"\n}\n";
+    assert_eq!(repair(source), source);
+    assert!(
+        shapes(source).iter().any(|site| !site.2),
+        "later type tests remain visible to retention: {:?}",
+        shapes(source)
+    );
+}
+
+#[test]
+fn subjectless_when_in_an_expression_body_is_refused() {
+    let source = "fun read(h: Holder): String = when {\n    h.payload is Detail -> h.payload.text\n    else -> \"\"\n}\n";
+    assert_eq!(repair(source), source);
+    assert!(!shapes(source)[0].2);
+}
+
+#[test]
 fn conjunction_rewrites_the_dominated_operand() {
     let source = "fun read4(h: Holder): Boolean {\n    if (h.payload is Detail && h.payload.text.isNotEmpty()) return true\n    return false\n}\n";
     let text = repair(source);
@@ -226,6 +257,56 @@ fn cli_run_translates_the_owner_and_repairs_the_retained_caller() {
     assert!(
         !stderr.contains("smart-casts one of its properties"),
         "no smart-cast retention is reported:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cli_run_infers_a_local_receiver_from_a_method_return() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-smart-cast-inferred-cli-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("p")).unwrap();
+    std::fs::write(
+        root.join("p/Holder.kt"),
+        "package neutral.smartcast3\n\ninterface Value\nclass Detail(val text: String) : Value\ndata class Holder(val payload: Value)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("p/Lookup.kt"),
+        "package neutral.smartcast3\n\nimport java.util.Optional\n\ninterface Lookup {\n    fun getHolder(id: String): Optional<Holder> = Optional.of(Holder(Detail(id)))\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("p/Consumer.kt"),
+        "package neutral.smartcast3\n\nclass Consumer : Lookup {\n    fun unrelated(holder: Value) = Unit\n\n    inline fun <reified T> render(): String {\n        val holder = getHolder(\"ok\").orElseThrow()\n        if (holder.payload is Detail) return holder.payload.text\n        return \"\"\n    }\n}\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root.join("p/Holder.kt"))
+        .arg(root.join("p/Lookup.kt"))
+        .arg(root.join("p/Consumer.kt"))
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "notlin failed:\n{stderr}");
+
+    let holder_java = std::fs::read_to_string(root.join("p/Holder.java")).unwrap_or_default();
+    assert!(
+        holder_java.contains("Holder"),
+        "the inferred receiver must not retain its property owner:\n{stderr}"
+    );
+
+    let consumer = std::fs::read_to_string(root.join("p/Consumer.kt")).unwrap_or_default();
+    assert!(
+        consumer.contains(
+            "        val payload = holder.payload\n        if (payload is Detail) return payload.text"
+        ),
+        "the retained caller is repaired:\n{consumer}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

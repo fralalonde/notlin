@@ -221,13 +221,41 @@ fn copy_kept(
                 .is_some_and(|line| line.starts_with("// NOTLIN:"))
             {
                 blocker_block_start = previous_start;
+            } else if previous_line.trim() == "*/" {
+                let before = &source[from..previous_start];
+                let generated_start = before.rfind("/**").filter(|start| {
+                    before[*start..]
+                        .lines()
+                        .nth(1)
+                        .is_some_and(|line| line.trim_start().starts_with("* NOTLIN "))
+                });
+                let legacy_start = before.rfind("/* NOTLIN:");
+                let Some(relative_start) = generated_start.or(legacy_start) else {
+                    break;
+                };
+                let comment_start = from + relative_start;
+                // Only replace the adjacent generated block, never an unrelated
+                // comment or source code between the two anchors.
+                let content = &source[comment_start..previous_start];
+                if content.contains("*/") {
+                    break;
+                }
+                blocker_block_start = source[..comment_start]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(from)
+                    .max(from);
             } else {
                 break;
             }
         }
         let desired_block = region_blockers[blocker_index..group_end]
             .iter()
-            .map(|(_, text)| format!("{indent}{text}"))
+            .map(|(_, text)| {
+                text.lines()
+                    .map(|line| format!("{indent}{line}\n"))
+                    .collect::<String>()
+            })
             .collect::<String>();
         if source[blocker_block_start..line_start] != desired_block {
             out.push_str(&source[p..blocker_block_start]);

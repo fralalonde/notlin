@@ -220,7 +220,11 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
                 // Records expose components via accessor `name()` directly —
                 // `p.comp1()` isn't real Java, so call the component accessor.
                 let shape_ty = &shape[i].0;
-                let accessor = &shape[i].1;
+                let accessor = if self.unit.lombok || !self.unit.record_types.contains(&comp_ty) {
+                    format!("get{}", crate::transpiler::unit::capitalize(&shape[i].1))
+                } else {
+                    shape[i].1.clone()
+                };
                 out.line(format!(
                     "{} {} = {}.{}();",
                     shape_ty, name, init_java, accessor
@@ -649,6 +653,12 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
             if let Some(b) = body {
                 for (i, (name, _ty)) in comps.iter().enumerate() {
                     let (sty, accessor) = &shape[i];
+                    let accessor = if self.unit.lombok || !self.unit.record_types.contains(&elem_ty)
+                    {
+                        format!("get{}", crate::transpiler::unit::capitalize(accessor))
+                    } else {
+                        accessor.clone()
+                    };
                     out.line(format!("{} {} = __notlin_item.{}();", sty, name, accessor));
                 }
                 self.transpile_body(b, out);

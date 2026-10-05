@@ -313,7 +313,7 @@ impl RetentionKind {
     pub fn detail(self, params: &[String]) -> String {
         match self {
             Self::SupertypeMemberType if !params.is_empty() => format!(
-                "a Kotlin supertype declares {} with a type Java cannot override exactly; erasing the type arguments would emit raw types, which JPA rejects",
+                "Java cannot override the inherited member type safely: {}; raw-type erasure would lose the generic contract",
                 params.join(", ")
             ),
             Self::MiddleDefaultParameter if !params.is_empty() => format!(
@@ -357,9 +357,9 @@ pub fn retention_message(reason: &str) -> String {
     format!("retained: {reason}")
 }
 
-/// Source-residue message for one retained declaration. Unlike the compact
-/// summary wording, this names the declaration itself and either the exact
-/// intrinsic blocker or the retained declarations immediately upstream. Every
+/// Source-residue message for one retained declaration. The declaration is
+/// already visible directly below the comment, so this names only the exact
+/// intrinsic blocker or the other declarations immediately upstream. Every
 /// cascade comment therefore points to the next marker a human should inspect.
 pub fn retention_site_message(
     declaration: &str,
@@ -400,8 +400,7 @@ pub fn retention_source_message(
         return Some((
             site.kind.code(),
             format!(
-                "retained {}; root cause [{}]: {}",
-                site.declaration,
+                "root cause [{}]: {}",
                 site.kind.code(),
                 site.kind.detail(&site.params)
             ),
@@ -454,12 +453,7 @@ pub fn retention_source_message(
     };
     Some((
         site.kind.code(),
-        format!(
-            "retained {}; blocked by {}; {}",
-            site.declaration,
-            direct.join(", "),
-            root_text
-        ),
+        format!("blocked by {}; {}", direct.join(", "), root_text),
     ))
 }
 

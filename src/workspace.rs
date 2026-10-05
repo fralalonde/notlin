@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 // 8: `SourceFile::smart_cast_sites` / `SourceFile::bindings` — the retained-Kotlin
 // smart-cast boundary now carries the site shapes and the file's own name->type
 // table instead of a bare property-name set.
-const CACHE_VERSION: u32 = 12;
+const CACHE_VERSION: u32 = 15;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -37,6 +37,23 @@ pub struct MemberConflict {
     pub parameter_types: Vec<String>,
     pub classification: MemberConflictClass,
     legacy_mismatch: bool,
+}
+
+impl MemberConflict {
+    pub fn blocks_java_override(&self) -> bool {
+        self.legacy_mismatch
+    }
+
+    pub fn detail(&self) -> String {
+        format!(
+            "`{}`: inherited `{}` from `{}`, implementation `{}` ({:?})",
+            self.member_name,
+            self.inherited_type,
+            self.supertype,
+            self.implementation_type,
+            self.classification
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +97,9 @@ pub struct Member {
     #[serde(default)]
     pub parameter_types: Vec<String>,
     pub is_nullable: bool,
+    /// A method body or property getter implementation, rather than an
+    /// abstract declaration. Used to detect Java default-method obligations.
+    pub has_body: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +258,10 @@ pub struct SourceFile {
     /// smart-cast receiver to the declaration whose property a translation
     /// would move to Java.
     bindings: HashMap<String, String>,
+    /// Locals whose source type is inferred through a method-return expression.
+    /// Resolved only after the complete workspace index exists.
+    #[serde(default)]
+    inferred_binding_calls: Vec<crate::smart_cast::InferredBindingCall>,
     /// Constructor calls this file makes, as written. A declaration with a
     /// middle default is only retained when a caller really omits one in a
     /// shape the emitter cannot serve, so the shapes have to be recorded where
@@ -502,6 +526,7 @@ impl SourceIndex {
                         smart_cast_properties,
                         smart_cast_sites,
                         bindings,
+                        inferred_binding_calls,
                         ctor_calls,
                     ) = parse_declarations(source, *language, package.as_deref())?;
                     files.push(SourceFile {
@@ -516,6 +541,7 @@ impl SourceIndex {
                         smart_cast_properties,
                         smart_cast_sites,
                         bindings,
+                        inferred_binding_calls,
                         ctor_calls,
                     });
                 }
@@ -634,6 +660,18 @@ impl SourceIndex {
     pub fn source_file(&self, path: &Path) -> Option<&SourceFile> {
         if let Some(&file_index) = self.file_paths.get(path) {
             return self.files.get(file_index);
+        }
+        if let Ok(canonical) = fs::canonicalize(path) {
+            if let Some(&file_index) = self.file_paths.get(&canonical) {
+                return self.files.get(file_index);
+            }
+            if let Some(file) = self
+                .files
+                .iter()
+                .find(|file| paths_match(&file.path, &canonical))
+            {
+                return Some(file);
+            }
         }
         self.files.iter().find(|file| paths_match(&file.path, path))
     }
@@ -857,82 +895,150 @@ impl SourceIndex {
         mismatches
     }
 
-    /// Classify same-name inherited members before projecting them onto the
-    /// conservative legacy retention decision. This keeps uncertainty visible
-    /// without changing which declarations N5258 retains.
+    /// Classify inherited members for callers whose declaration name is unique.
+    /// Translation uses the file-scoped variant below to avoid package collisions.
     pub fn retained_supertype_member_conflicts(
         &self,
         supertypes: &[String],
         class_name: &str,
     ) -> Vec<MemberConflict> {
-        // A Kotlin supertype whose member has a DIFFERENT type cannot be
-        // implemented from Java at all: a parameterized override must match
-        // exactly, and erasing the type arguments to force it through would
-        // emit raw types (which JPA rejects and generic consumers lose). So a
-        // conflict here means the class stays Kotlin — whether or not the
-        // supertype itself is translated.
-        // The class's own declaration, by name (first hit is this class in
-        // its own file because the class-name is canonical in the index).
         let Some(own) = self
             .declarations()
             .find(|d| d.name == class_name && d.language == SourceLanguage::Kotlin)
         else {
             return Vec::new();
         };
-        // The own declaration's file resolves type names written in the
-        // implementing class (imports/same-package rules apply there).
-        let own_file = self.declaration_source_file(own).unwrap();
-        let mut pending: Vec<&String> = supertypes.iter().collect();
-        let mut visited: Vec<String> = supertypes
-            .iter()
-            .map(|s| {
-                s.split('<')
-                    .next()
-                    .unwrap_or(s)
-                    .trim()
-                    .trim_start_matches('*')
-                    .to_string()
-            })
+        self.member_conflicts_for(supertypes, own)
+    }
+
+    pub fn retained_supertype_member_conflicts_in_file(
+        &self,
+        declaring: &Path,
+        supertypes: &[String],
+        class_name: &str,
+    ) -> Vec<MemberConflict> {
+        let Some(own) = self
+            .source_file(declaring)
+            .and_then(|file| file.declarations.iter().find(|d| d.name == class_name))
+        else {
+            return Vec::new();
+        };
+        self.member_conflicts_for(supertypes, own)
+    }
+
+    pub fn retained_supertype_member_mismatches_in_file(
+        &self,
+        declaring: &Path,
+        supertypes: &[String],
+        class_name: &str,
+    ) -> Vec<String> {
+        let mut names: Vec<_> = self
+            .retained_supertype_member_conflicts_in_file(declaring, supertypes, class_name)
+            .into_iter()
+            .filter(|conflict| conflict.legacy_mismatch)
+            .map(|conflict| conflict.member_name)
             .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    pub fn retained_supertype_member_mismatch_details_in_file(
+        &self,
+        declaring: &Path,
+        supertypes: &[String],
+        class_name: &str,
+    ) -> Vec<String> {
+        let mut details = self
+            .retained_supertype_member_conflicts_in_file(declaring, supertypes, class_name)
+            .into_iter()
+            .filter(|conflict| conflict.legacy_mismatch)
+            .map(|conflict| conflict.detail())
+            .collect::<Vec<_>>();
+        details.sort();
+        details.dedup();
+        details
+    }
+
+    /// A Kotlin read-only collection property is declaration-site covariant.
+    /// When both sides move to Java together, Notlin can preserve that contract
+    /// by emitting a wildcard return on the interface (`List<? extends Base>`)
+    /// and the exact return on the implementation (`List<Derived>`). This is
+    /// unsafe while the Kotlin supertype remains, because its JVM signature has
+    /// the invariant generic return Kotlin emitted.
+    pub fn selected_covariant_property_conflict_is_safe(
+        &self,
+        declaring: &Path,
+        conflict: &MemberConflict,
+        translation_roots: &[PathBuf],
+        _retained: &HashSet<String>,
+    ) -> bool {
+        if !conflict.legacy_mismatch || conflict.kind != MemberKind::Property {
+            return false;
+        }
+        let Some(super_decl) = self
+            .declarations()
+            .find(|decl| declaration_key(decl) == conflict.supertype)
+        else {
+            return false;
+        };
+        let Some(super_file) = self.declaration_source_file(super_decl) else {
+            return false;
+        };
+        if !self.is_selected(&super_file.path, translation_roots) {
+            return false;
+        }
+        let Some(own_file) = self.source_file(declaring) else {
+            return false;
+        };
+        declaration_covariant_return_is_subtype(
+            self,
+            own_file,
+            &conflict.implementation_type,
+            super_file,
+            &conflict.inherited_type,
+        )
+    }
+
+    fn member_conflicts_for(
+        &self,
+        supertypes: &[String],
+        own: &Declaration,
+    ) -> Vec<MemberConflict> {
+        // Resolve every inheritance edge in the file that declares that edge.
+        // A return may narrow through Java covariance or an explicit wildcard;
+        // incompatible invariant generics remain retained rather than erased.
+        let own_file = self.declaration_source_file(own).unwrap();
+        let mut pending: Vec<_> = supertypes.iter().map(|s| (own_file, s)).collect();
+        let mut visited = HashSet::new();
         let mut conflicts = Vec::new();
-        while let Some(sup) = pending.pop() {
-            let sup_base = sup
-                .split('<')
-                .next()
-                .unwrap_or(sup)
-                .trim()
-                .trim_start_matches('*')
-                .to_string();
-            let Some(sup_decl) = self.declarations().find(|d| {
-                d.name == sup_base
-                    && matches!(d.kind, DeclarationKind::Interface | DeclarationKind::Class)
-            }) else {
+        while let Some((context, sup)) = pending.pop() {
+            let Some(sup_decl) = self.resolve_type(context, sup) else {
                 continue;
             };
+            if !visited.insert(declaration_key(sup_decl)) {
+                continue;
+            }
+            let sup_file = self.declaration_source_file(sup_decl).unwrap_or(context);
             // Only a supertype that remains Kotlin forces the ABI match, but
             // its OWN supertypes still widen the conflict transitively
             // (ImportContainer extends IImportContainer, IBarcodeAware).
             for sup_sup in &sup_decl.supertypes {
-                let base = sup_sup
-                    .split('<')
-                    .next()
-                    .unwrap_or(sup_sup)
-                    .trim()
-                    .to_string();
-                if !visited.contains(&base) {
-                    visited.push(base.clone());
-                    pending.push(sup_sup);
-                }
+                pending.push((sup_file, sup_sup));
             }
             if sup_decl.language != SourceLanguage::Kotlin {
                 continue;
             }
             for m in &sup_decl.members {
+                if m.is_static {
+                    continue;
+                }
                 let Some(sup_ty) = m.type_name.clone() else {
                     continue;
                 };
                 if let Some(own_m) = own.members.iter().find(|om| {
                     om.name == m.name
+                        && !om.is_static
                         && om.kind == m.kind
                         && om.parameter_types == m.parameter_types
                 }) && let Some(own_ty) = own_m.type_name.as_deref()
@@ -940,7 +1046,7 @@ impl SourceIndex {
                     conflicts.push(MemberConflict {
                         member_name: m.name.clone(),
                         kind: m.kind,
-                        supertype: sup_decl.name.clone(),
+                        supertype: declaration_key(sup_decl),
                         inherited_type: sup_ty.clone(),
                         implementation_type: own_ty.to_string(),
                         parameter_types: m.parameter_types.clone(),
@@ -952,7 +1058,10 @@ impl SourceIndex {
                                 .type_params
                                 .iter()
                                 .any(|param| param == sup_ty.trim_end_matches('?').trim())
-                            && !is_java_compatible_narrow(self, own_file, &sup_ty, own_ty),
+                            && !is_java_compatible_narrow(self, own_file, &sup_ty, own_ty)
+                            && !projected_return_is_subtype(
+                                self, own_file, own_ty, sup_file, &sup_ty,
+                            ),
                     });
                 }
             }
@@ -966,6 +1075,88 @@ impl SourceIndex {
         });
         conflicts.dedup();
         conflicts
+    }
+
+    /// Kotlin synthesizes some inherited implementations that Java does not:
+    /// unrelated defaults, or an abstract narrowing layered over a default.
+    /// Until an explicit bridge can be emitted, an enum relying on one stays
+    /// Kotlin. Ordinary single-default inheritance remains representable.
+    pub fn enum_default_obligations(&self, declaring: &Path, name: &str) -> Vec<String> {
+        let Some(file) = self.source_file(declaring) else {
+            return Vec::new();
+        };
+        let Some(owner) = file.declarations.iter().find(|d| d.name == name) else {
+            return Vec::new();
+        };
+        let signature = |m: &Member| {
+            (
+                if m.kind == MemberKind::Property {
+                    property_accessor_name(&m.name)
+                } else {
+                    m.name.clone()
+                },
+                m.parameter_types.clone(),
+            )
+        };
+        let own: HashSet<_> = owner
+            .members
+            .iter()
+            .filter(|m| !m.is_static)
+            .map(&signature)
+            .collect();
+        let mut groups: BTreeMap<_, Vec<(&Declaration, &Member)>> = BTreeMap::new();
+        let mut pending: Vec<_> = owner.supertypes.iter().map(|s| (file, s)).collect();
+        let mut visited = HashSet::new();
+        while let Some((context, ty)) = pending.pop() {
+            let Some(decl) = self.resolve_type(context, ty) else {
+                continue;
+            };
+            if !visited.insert(declaration_key(decl)) {
+                continue;
+            }
+            let context = self.declaration_source_file(decl).unwrap_or(context);
+            pending.extend(decl.supertypes.iter().map(|s| (context, s)));
+            if decl.kind != DeclarationKind::Interface {
+                continue;
+            }
+            for member in &decl.members {
+                if member.is_static
+                    || member.visibility.as_deref() == Some("private")
+                    || !matches!(member.kind, MemberKind::Property | MemberKind::Method)
+                {
+                    continue;
+                }
+                let key = signature(member);
+                if !own.contains(&key) {
+                    groups.entry(key).or_default().push((decl, member));
+                }
+            }
+        }
+        groups
+            .into_iter()
+            .filter_map(|((name, _), members)| {
+                if !members.iter().any(|(_, m)| m.has_body) {
+                    return None;
+                }
+                let most_specific: Vec<_> = members
+                    .iter()
+                    .filter(|(decl, _)| {
+                        !members.iter().any(|(other, _)| {
+                            declaration_key(other) != declaration_key(decl)
+                                && proven_reference_subtype(
+                                    self,
+                                    self.declaration_source_file(other).unwrap_or(file),
+                                    &declaration_key(other),
+                                    self.declaration_source_file(decl).unwrap_or(file),
+                                    &declaration_key(decl),
+                                )
+                        })
+                    })
+                    .collect();
+                (most_specific.len() > 1 || most_specific.iter().any(|(_, m)| !m.has_body))
+                    .then_some(name)
+            })
+            .collect()
     }
 
     pub fn has_retained_kotlin_supertype(
@@ -1477,6 +1668,111 @@ impl SourceIndex {
             })
     }
 
+    /// Binding types used by N6C94 planning and the residual-Kotlin rewrite.
+    /// Inferred locals are resolved per smart-cast site and may override a
+    /// same-named explicit binding from another function in the file. A single
+    /// flat table is returned only when every relevant site for that name has
+    /// the same resolved inferred type; otherwise that name is removed so the
+    /// planner fails closed.
+    pub fn smart_cast_bindings_for_path(&self, path: &Path) -> HashMap<String, String> {
+        let Some(file) = self.source_file(path) else {
+            return HashMap::new();
+        };
+        let mut bindings = file.bindings.clone();
+        let inferred_names: HashSet<&str> = file
+            .inferred_binding_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect();
+        for name in inferred_names {
+            let sites: Vec<_> = file
+                .smart_cast_sites
+                .iter()
+                .filter(|site| site.needs_repair() && site.receiver == name)
+                .collect();
+            if sites.is_empty() {
+                continue;
+            }
+            let mut common_type = None;
+            let mut consistent = true;
+            for site in sites {
+                let resolved: HashSet<String> = file
+                    .inferred_binding_calls
+                    .iter()
+                    .filter(|call| {
+                        call.name == name
+                            && call.scope_start <= site.insert_at
+                            && site.insert_at < call.scope_end
+                    })
+                    .filter_map(|call| self.inferred_binding_type(file, call))
+                    .collect();
+                if resolved.len() != 1 {
+                    consistent = false;
+                    break;
+                }
+                let inferred = resolved.into_iter().next().expect("one resolved type");
+                match &common_type {
+                    Some(existing) if existing != &inferred => {
+                        consistent = false;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => common_type = Some(inferred),
+                }
+            }
+            if consistent && let Some(inferred) = common_type {
+                bindings.insert(name.to_string(), inferred);
+            } else {
+                bindings.remove(name);
+            }
+        }
+        bindings
+    }
+
+    fn inferred_binding_type(
+        &self,
+        file: &SourceFile,
+        call: &crate::smart_cast::InferredBindingCall,
+    ) -> Option<String> {
+        let enclosing = file
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == call.enclosing_type)?;
+        let return_type = self.method_return_type_on_declaration(
+            file,
+            enclosing,
+            &call.callee,
+            &mut HashSet::new(),
+        )?;
+        optional_element_type(&return_type)
+    }
+
+    fn method_return_type_on_declaration(
+        &self,
+        source_file: &SourceFile,
+        declaration: &Declaration,
+        method: &str,
+        visited: &mut HashSet<String>,
+    ) -> Option<String> {
+        if !visited.insert(declaration_key(declaration)) {
+            return None;
+        }
+        if let Some(return_type) = declaration.members.iter().find_map(|member| {
+            (member.kind == MemberKind::Method && member.name == method)
+                .then(|| member.type_name.clone())
+                .flatten()
+        }) {
+            return Some(return_type);
+        }
+        let declaring_file = self
+            .declaration_source_file(declaration)
+            .unwrap_or(source_file);
+        declaration.supertypes.iter().find_map(|supertype| {
+            let parent = self.resolve_type(declaring_file, supertype)?;
+            self.method_return_type_on_declaration(declaring_file, parent, method, visited)
+        })
+    }
+
     pub fn property_smart_cast_used_by_kotlin(
         &self,
         declaring_file: &Path,
@@ -1513,7 +1809,6 @@ impl SourceIndex {
             .filter(|member| member.kind == MemberKind::Property && !member.is_static)
             .map(|member| member.name.as_str())
             .collect();
-        let mut covered = false;
         for file in self.kotlin_files() {
             if paths_match(&file.path, declaring_file)
                 || file
@@ -1523,25 +1818,33 @@ impl SourceIndex {
             {
                 continue;
             }
+            let bindings = self.smart_cast_bindings_for_path(&file.path);
             for site in &file.smart_cast_sites {
                 // A site nothing depends on cannot break when the owner moves:
                 // a single getter call narrows nothing that needs narrowing.
                 if !properties.contains(site.property.as_str()) || !site.needs_repair() {
                     continue;
                 }
-                match file.bindings.get(&site.receiver) {
+                match bindings.get(&site.receiver) {
                     Some(owner) if owner == &target.name => {
                         if !site.repairable {
                             return false;
                         }
-                        covered = true;
                     }
                     Some(_) => {}
+                    // A file-level mention of `target` does not establish that
+                    // an unrelated or untyped receiver has that type. Retaining
+                    // every declaration that happens to share a common property
+                    // name (`type`, `data`, `state`, ...) creates enormous false
+                    // positive hierarchy cascades. Only a receiver resolved by
+                    // the source index is evidence that moving this target's
+                    // getter to Java affects the smart-cast site.
+                    None if site.receiver.is_empty() || site.property.is_empty() => {}
                     None => return false,
                 }
             }
         }
-        covered
+        true
     }
 
     /// Whether `type_name` or one of its indexed supertypes declares a
@@ -1844,7 +2147,7 @@ impl SourceIndex {
         source_file: &SourceFile,
         type_name: &str,
     ) -> Option<&'a Declaration> {
-        let simple = type_name
+        let base = type_name
             .trim()
             .trim_end_matches('?')
             .split('<')
@@ -1853,20 +2156,14 @@ impl SourceIndex {
             .split('(')
             .next()
             .unwrap_or("")
-            .rsplit('.')
-            .next()
-            .unwrap_or("");
-        if type_name.contains('.') {
-            return self.find_qualified(type_name.trim().trim_end_matches('?'));
+            .trim();
+        let simple = base.rsplit('.').next().unwrap_or("");
+        if base.contains('.') {
+            return self.find_qualified(base);
         }
         for import in &source_file.imports {
             if import.ends_with(&format!(".{simple}"))
                 && let Some(found) = self.find_qualified(import)
-            {
-                return Some(found);
-            }
-            if let Some(package) = import.strip_suffix(".*")
-                && let Some(found) = self.find_qualified(&format!("{package}.{simple}"))
             {
                 return Some(found);
             }
@@ -1875,6 +2172,16 @@ impl SourceIndex {
             && let Some(found) = self.find_qualified(&format!("{package}.{simple}"))
         {
             return Some(found);
+        }
+        let mut wildcard_matches = source_file
+            .imports
+            .iter()
+            .filter_map(|import| import.strip_suffix(".*"))
+            .filter_map(|package| self.find_qualified(&format!("{package}.{simple}")));
+        if let Some(found) = wildcard_matches.next() {
+            return wildcard_matches
+                .all(|other| declaration_key(other) == declaration_key(found))
+                .then_some(found);
         }
         let mut matches = self
             .declarations()
@@ -2202,6 +2509,7 @@ fn scan_source(
         smart_cast_properties,
         smart_cast_sites,
         bindings,
+        inferred_binding_calls,
         ctor_calls,
     ) = parse_declarations(&source, language, package.as_deref())?;
     stats.parsed_files += 1;
@@ -2221,6 +2529,7 @@ fn scan_source(
             smart_cast_properties,
             smart_cast_sites,
             bindings,
+            inferred_binding_calls,
             ctor_calls,
         },
     })
@@ -2259,6 +2568,7 @@ type ParseDeclarations = (
     HashSet<String>,
     Vec<crate::smart_cast::SmartCastSite>,
     HashMap<String, String>,
+    Vec<crate::smart_cast::InferredBindingCall>,
     Vec<CtorCall>,
 );
 
@@ -2351,13 +2661,15 @@ fn parse_declarations(
     // from them, so the retention decision and the rewrite pass read the same
     // evidence. The index's own tree is reused: a second parse of every Kotlin
     // file would double indexing cost for evidence this pass already has.
-    let (smart_cast_sites, bindings) = if language == SourceLanguage::Kotlin {
+    let (smart_cast_sites, bindings, inferred_binding_calls) = if language == SourceLanguage::Kotlin
+    {
         (
             crate::smart_cast::sites_in(&tree, source),
             crate::smart_cast::bindings_in(&tree, source),
+            crate::smart_cast::inferred_binding_calls_in(&tree, source),
         )
     } else {
-        (Vec::new(), HashMap::new())
+        (Vec::new(), HashMap::new(), Vec::new())
     };
     let smart_cast_properties = smart_cast_sites
         .iter()
@@ -2377,6 +2689,7 @@ fn parse_declarations(
         smart_cast_properties,
         smart_cast_sites,
         bindings,
+        inferred_binding_calls,
         ctor_calls,
     ))
 }
@@ -2762,7 +3075,12 @@ fn declaration_shape(
 fn supertypes(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) -> Vec<String> {
     let fields: &[&str] = match language {
         SourceLanguage::Kotlin => &["delegation_specifiers"],
-        SourceLanguage::Java => &["superclass", "interfaces", "super_interfaces"],
+        SourceLanguage::Java => &[
+            "superclass",
+            "interfaces",
+            "super_interfaces",
+            "extends_interfaces",
+        ],
     };
     let mut nodes: Vec<tree_sitter::Node<'_>> = fields
         .iter()
@@ -2771,7 +3089,12 @@ fn supertypes(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &st
     if nodes.is_empty() {
         let kinds: &[&str] = match language {
             SourceLanguage::Kotlin => &["delegation_specifiers"],
-            SourceLanguage::Java => &["superclass", "super_interfaces", "interfaces"],
+            SourceLanguage::Java => &[
+                "superclass",
+                "super_interfaces",
+                "interfaces",
+                "extends_interfaces",
+            ],
         };
         nodes = node
             .children(&mut node.walk())
@@ -2826,6 +3149,35 @@ fn split_java_supertypes(text: &str) -> Vec<String> {
     result
 }
 
+/// `Optional<pkg.Holder>` -> `Holder`. This is intentionally not a general
+/// generic-unwrapping rule: N6C94 may stabilize an inferred local only when the
+/// initializer explicitly calls `Optional.orElseThrow()`.
+fn optional_element_type(type_name: &str) -> Option<String> {
+    let text = type_name.trim().trim_end_matches('?').trim();
+    let open = text.find('<')?;
+    let outer = text[..open].trim().rsplit('.').next()?;
+    if outer != "Optional" {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, character) in text[open + 1..].char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' if depth == 0 => {
+                close = Some(open + 1 + offset);
+                break;
+            }
+            '>' => depth -= 1,
+            ',' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    let inner = text[open + 1..close?].trim();
+    let simple = crate::smart_cast::simple_type(inner);
+    (!simple.is_empty()).then_some(simple)
+}
+
 /// Type-parameter names of a declaration (`class Foo<T, I : Bar>` ->
 /// `["T", "I"]`), from the `type_parameters` AST child. Java only.
 fn type_param_names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
@@ -2874,6 +3226,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
                 parameter_types: Vec::new(),
                 is_nullable: false,
+                has_body: false,
             });
         }
     }
@@ -2915,12 +3268,13 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
                 parameter_types: Vec::new(),
                 is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
+                has_body: true,
             });
         }
     }
     if let Some(body) = node.child_by_field_name("body").or_else(|| {
         node.children(&mut node.walk())
-            .find(|child| child.kind() == "class_body")
+            .find(|child| matches!(child.kind(), "class_body" | "enum_class_body"))
     }) {
         result.extend(
             body.children(&mut body.walk())
@@ -3049,9 +3403,13 @@ fn member_from_node(
                 .any(|word| word == **visibility)
         })
         .map(|visibility| (*visibility).to_string());
-    let type_node = node
-        .child_by_field_name("type")
-        .or_else(|| first_type_node(node));
+    let type_node = match (language, kind) {
+        (SourceLanguage::Kotlin, MemberKind::Method) => kotlin_function_return_type(node),
+        (_, MemberKind::Constructor) => None,
+        _ => node
+            .child_by_field_name("type")
+            .or_else(|| first_type_node(node)),
+    };
     let type_name = type_node.map(|node| {
         node.utf8_text(source.as_bytes())
             .unwrap_or("")
@@ -3073,6 +3431,13 @@ fn member_from_node(
         type_name,
         parameter_types: member_parameter_types(node, language, source),
         is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
+        has_body: node.named_children(&mut node.walk()).any(|child| {
+            matches!(child.kind(), "function_body" | "block")
+                || child.kind() == "getter"
+                    && child
+                        .named_children(&mut child.walk())
+                        .any(|body| body.kind() == "function_body")
+        }),
     })
 }
 
@@ -3107,6 +3472,27 @@ fn first_type_node(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>>
     }
     node.named_children(&mut node.walk())
         .find_map(first_type_node)
+}
+
+/// Kotlin NG does not expose a stable `type` field for every function return.
+/// Search only direct children after the value-parameter list: a recursive
+/// first-type search sees the first parameter type and records it as the return.
+fn kotlin_function_return_type(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let parameters_end = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "function_value_parameters")?
+        .end_byte();
+    node.named_children(&mut node.walk()).find(|child| {
+        child.start_byte() >= parameters_end
+            && matches!(
+                child.kind(),
+                "user_type"
+                    | "nullable_type"
+                    | "function_type"
+                    | "parenthesized_type"
+                    | "definitely_non_nullable_type"
+            )
+    })
 }
 
 fn first_identifier(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
@@ -3173,6 +3559,17 @@ fn classify_member_conflict(
     if super_decl.type_params.iter().any(|param| param == super_ty) {
         return MemberConflictClass::SupertypeTypeParameter;
     }
+    if projected_return_is_subtype(
+        index,
+        source_file,
+        own_ty,
+        index
+            .declaration_source_file(super_decl)
+            .unwrap_or(source_file),
+        super_ty,
+    ) {
+        return MemberConflictClass::JavaCovariantReturn;
+    }
 
     let (super_base, super_args) = split_generic(super_ty);
     let (own_base, own_args) = split_generic(own_ty);
@@ -3203,6 +3600,191 @@ fn classify_member_conflict(
     } else {
         MemberConflictClass::UnrelatedReturnTypes
     }
+}
+
+/// Only explicit use-site projections widen Java generic returns. Invariant
+/// arguments stay invariant even for Kotlin's read-only collection types.
+fn projected_return_is_subtype(
+    index: &SourceIndex,
+    own_file: &SourceFile,
+    own_ty: &str,
+    super_file: &SourceFile,
+    super_ty: &str,
+) -> bool {
+    let (super_base, Some(super_args)) = split_generic(super_ty.trim().trim_end_matches('?'))
+    else {
+        return false;
+    };
+    let (own_base, Some(own_args)) = split_generic(own_ty.trim().trim_end_matches('?')) else {
+        return false;
+    };
+    if super_base != own_base || super_args.len() != own_args.len() {
+        return false;
+    }
+    match (
+        index.resolve_type(own_file, own_base),
+        index.resolve_type(super_file, super_base),
+    ) {
+        (Some(own), Some(sup)) if declaration_key(own) == declaration_key(sup) => {}
+        (None, None) => {}
+        _ => return false,
+    }
+    super_args.iter().zip(own_args.iter()).all(|(sup, own)| {
+        if sup == own || *sup == "*" {
+            return true;
+        }
+        if let Some(bound) = sup.strip_prefix("out ") {
+            let own = own.strip_prefix("out ").unwrap_or(own);
+            return !own.starts_with("in ")
+                && own != "*"
+                && proven_reference_subtype(index, own_file, own, super_file, bound);
+        }
+        if let Some(bound) = sup.strip_prefix("in ") {
+            let own = own.strip_prefix("in ").unwrap_or(own);
+            return !own.starts_with("out ")
+                && own != "*"
+                && proven_reference_subtype(index, super_file, bound, own_file, own);
+        }
+        false
+    })
+}
+
+fn declaration_covariant_return_is_subtype(
+    index: &SourceIndex,
+    own_file: &SourceFile,
+    own_ty: &str,
+    super_file: &SourceFile,
+    super_ty: &str,
+) -> bool {
+    let (super_base, Some(super_args)) = split_generic(super_ty.trim().trim_end_matches('?'))
+    else {
+        return false;
+    };
+    if let (own_base, Some(own_args)) = split_generic(own_ty.trim().trim_end_matches('?'))
+        && covariant_collection_base(own_base, super_base)
+        && covariant_collection_arguments(
+            index,
+            own_file,
+            &own_args,
+            super_file,
+            &super_args,
+            super_base,
+        )
+    {
+        return true;
+    }
+
+    // Named collection wrappers are common domain types (`AssetBarcodeList :
+    // ArrayList<AssetBarcode>`). Their declared superclass proves the same
+    // covariance as a direct `List<AssetBarcode>` return, and Java accepts the
+    // wrapper as a covariant return for `List<? extends IBarcode>`.
+    let Some(wrapper) = index.resolve_type(own_file, own_ty.trim().trim_end_matches('?')) else {
+        return false;
+    };
+    let wrapper_file = index.declaration_source_file(wrapper).unwrap_or(own_file);
+    wrapper.supertypes.iter().any(|candidate| {
+        let (candidate_base, Some(candidate_args)) =
+            split_generic(candidate.trim().trim_end_matches("()"))
+        else {
+            return false;
+        };
+        covariant_collection_base(candidate_base, super_base)
+            && covariant_collection_arguments(
+                index,
+                wrapper_file,
+                &candidate_args,
+                super_file,
+                &super_args,
+                super_base,
+            )
+    })
+}
+
+fn covariant_collection_base(own: &str, inherited: &str) -> bool {
+    match inherited {
+        "List" => matches!(own, "List" | "ArrayList" | "MutableList"),
+        "Set" => matches!(own, "Set" | "HashSet" | "LinkedHashSet" | "MutableSet"),
+        "Collection" | "Iterable" => matches!(
+            own,
+            "List"
+                | "ArrayList"
+                | "MutableList"
+                | "Set"
+                | "HashSet"
+                | "LinkedHashSet"
+                | "MutableSet"
+                | "Collection"
+                | "Iterable"
+        ),
+        "Iterator" | "Sequence" => own == inherited,
+        "Map" => matches!(own, "Map" | "HashMap" | "LinkedHashMap" | "MutableMap"),
+        _ => false,
+    }
+}
+
+fn covariant_collection_arguments(
+    index: &SourceIndex,
+    own_file: &SourceFile,
+    own_args: &[&str],
+    super_file: &SourceFile,
+    super_args: &[&str],
+    super_base: &str,
+) -> bool {
+    own_args.len() == super_args.len()
+        && own_args
+            .iter()
+            .zip(super_args.iter())
+            .enumerate()
+            .all(|(index_in_type, (own, sup))| {
+                own == sup
+                    || (super_base != "Map" || index_in_type == 1)
+                        && proven_reference_subtype(index, own_file, own, super_file, sup)
+            })
+}
+
+fn proven_reference_subtype(
+    index: &SourceIndex,
+    own_file: &SourceFile,
+    own_ty: &str,
+    super_file: &SourceFile,
+    super_ty: &str,
+) -> bool {
+    if own_ty == super_ty || matches!(super_ty, "Any" | "Object") {
+        return true;
+    }
+    if projected_return_is_subtype(index, own_file, own_ty, super_file, super_ty) {
+        return true;
+    }
+    // A bare inheritance edge cannot certify different generic instantiations.
+    if own_ty.contains('<') || super_ty.contains('<') {
+        return false;
+    }
+    let (Some(own), Some(target)) = (
+        index.resolve_type(own_file, own_ty),
+        index.resolve_type(super_file, super_ty),
+    ) else {
+        return false;
+    };
+    let target_key = declaration_key(target);
+    let mut pending = vec![own];
+    let mut visited = HashSet::new();
+    while let Some(current) = pending.pop() {
+        let key = declaration_key(current);
+        if key == target_key {
+            return true;
+        }
+        if !visited.insert(key) {
+            continue;
+        }
+        let context = index.declaration_source_file(current).unwrap_or(own_file);
+        pending.extend(
+            current
+                .supertypes
+                .iter()
+                .filter_map(|sup| index.resolve_type(context, sup)),
+        );
+    }
+    false
 }
 
 fn member_supertype_closure_contains(

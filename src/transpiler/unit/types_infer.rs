@@ -434,6 +434,25 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return true;
         }
         let t = self.text(base).trim();
+        if let Some((receiver, member)) = self.nav_base_member(base)
+            && member == "enumConstants"
+        {
+            let name = self.text(receiver).trim();
+            let own = self
+                .current_decl
+                .and_then(|decl| kt::field(decl, "name"))
+                .and_then(|owner| self.data_components.get(self.text(owner)))
+                .and_then(|components| components.iter().find(|(_, field)| field == name))
+                .map(|(ty, _)| ty);
+            if self
+                .var_types
+                .get(name)
+                .or(own)
+                .is_some_and(|ty| ty.starts_with("Class<") || ty.starts_with("java.lang.Class<"))
+            {
+                return true;
+            }
+        }
         t.ends_with("values()") && true
     }
 }
