@@ -11,13 +11,34 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// declaration suppresses the generated accessor (it would collide in
     /// Java), which decides where a `@get:` annotation has to live.
     pub(crate) fn class_declares_method(&self, decl: tree_sitter::Node, method: &str) -> bool {
-        let Some(body) = kt::parent_of(decl).filter(|parent| parent.kind() == "class_body") else {
+        let Some(body) = kt::parent_of(decl)
+            .filter(|parent| matches!(parent.kind(), "class_body" | "enum_class_body"))
+        else {
             return false;
         };
         let mut cursor = body.walk();
         body.children(&mut cursor)
             .filter(|member| member.kind() == "function_declaration")
-            .any(|member| kt::field(member, "name").is_some_and(|name| self.text(name) == method))
+            .any(|member| {
+                !self.is_property_repair_bridge(member)
+                    && kt::field(member, "name").is_some_and(|name| self.text(name) == method)
+            })
+    }
+
+    /// Property ABI repair temporarily adds a forwarding JavaBean method and
+    /// renames the Kotlin property's JVM accessor. If the declaration itself
+    /// translates on a later fixpoint pass, the ordinary Java property getter
+    /// is the bridge and the temporary forwarding method must disappear.
+    pub(crate) fn is_property_repair_bridge(&self, function: tree_sitter::Node) -> bool {
+        let Some(name) = kt::field(function, "name").map(|name| self.text(name)) else {
+            return false;
+        };
+        let Some(body) = kt::parent_of(function)
+            .filter(|parent| matches!(parent.kind(), "class_body" | "enum_class_body"))
+        else {
+            return false;
+        };
+        self.text(body).contains(&format!("notlinProperty{name}"))
     }
 
     /// Does this property emit a backing FIELD? A destructuring property never
@@ -337,6 +358,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             for member in body.children(&mut cursor) {
                 if member.kind() == "function_declaration"
                     && let Some(mname) = kt::field(member, "name")
+                    && !self.is_property_repair_bridge(member)
+                    && self.constructor_property_bridge(member).is_none()
                 {
                     conflicts.push(self.text(mname).to_string());
                 }
@@ -368,7 +391,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                     self.transpile_statement(s, out);
                                 }
                             }
-                        } else if c.is_named() && c.kind() != "=" {
+                        } else if c.is_named()
+                            && c.kind() != "="
+                            && !matches!(c.kind(), "line_comment" | "block_comment")
+                        {
                             let mut e = Expr { unit: self };
                             let java = e.transpile(c);
                             // Reified-generic gate: `recv.get<T>()` — Kotlin
@@ -424,7 +450,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                     self.transpile_statement(s, out);
                                 }
                             }
-                        } else if c.is_named() && c.kind() != "=" {
+                        } else if c.is_named()
+                            && c.kind() != "="
+                            && !matches!(c.kind(), "line_comment" | "block_comment")
+                        {
                             self.diag_untranslatable(c, "expression setters not yet supported");
                         }
                     }

@@ -341,10 +341,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     "byte[]" | "short[]" | "char[]" | "float[]" | "boolean[]" => format!(
                         "java.util.stream.IntStream.range(0, {receiver}.length).mapToObj(i -> {receiver}[i]).collect(java.util.stream.Collectors.toList())"
                     ),
-                    _ if self.unit.commons_lang => {
-                        format!("org.apache.commons.lang3.ArrayUtils.toList({receiver})")
-                    }
-                    _ => format!("new java.util.ArrayList<>(java.util.Arrays.asList({receiver}))"),
+                    _ => format!("java.util.Arrays.asList({receiver})"),
                 };
             }
             if let Some(_recv_ty) = self.unit.extension_fns.get(member.as_str()) {
@@ -382,8 +379,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         // (NotImplementedError); Java has no such class. Lower to a THROW
         // expression so statement emitters render it as `throw ...;`
         // instead of `return new TODO(...);` (which references a class
-        // that does not exist). Under --commons-lang the throw carries
-        // org.apache.commons.lang3.NotImplementedException.
+        // that does not exist).
         if callee_java == "TODO" {
             self.unit.diags.warn_approx(
                 node,
@@ -391,15 +387,10 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 "Kotlin `TODO(msg)` lowered to a NotImplemented-style throw (it is Nothing-typed, never returns)",
             );
             let msg = args.first().cloned().unwrap_or_default();
-            let exception = if self.unit.commons_lang {
-                "org.apache.commons.lang3.NotImplementedException".to_string()
-            } else {
-                "RuntimeException".to_string()
-            };
             return if msg.is_empty() {
-                format!("throw new {exception}()")
+                "throw new RuntimeException()".to_string()
             } else {
-                format!("throw new {exception}({msg})")
+                format!("throw new RuntimeException({msg})")
             };
         }
 
@@ -733,8 +724,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     b.to_string()
                 }
             };
-            let is_direct_java_stream =
-                base.starts_with("java.util.Arrays.stream") || base.ends_with(".stream()");
+            let is_direct_java_stream = base.starts_with("java.util.Arrays.stream")
+                || base.ends_with(".stream()")
+                || (base.contains(".stream()")
+                    && !base.contains(".collect(")
+                    && !base.ends_with(".toList()"));
             // Arrays.stream(...) and a pre-existing `.stream()` are already
             // Java Streams — no `.stream()` tail and no Kotlin collection-op
             // approximation warning are needed.
@@ -957,6 +951,32 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             } else {
                 mapped_lambda
             };
+            // Kotlin collection operators are eager, so an isolated
+            // `filter`/`map` is collected to a List. When another stream
+            // operator immediately consumes that generated list, fuse the
+            // two operations into one Java stream pipeline and collect only
+            // once at the outer boundary.
+            const TO_LIST: &str = ".collect(java.util.stream.Collectors.toList())";
+            if let Some(pipeline) = base_str.strip_suffix(TO_LIST)
+                && pipeline.contains(".stream()")
+                && matches!(
+                    member,
+                    "map"
+                        | "mapNotNull"
+                        | "mapIndexed"
+                        | "filter"
+                        | "filterNot"
+                        | "filterIndexed"
+                        | "sorted"
+                        | "flatMap"
+                        | "distinct"
+                )
+            {
+                return format!(
+                    "{}.{}({}).collect(java.util.stream.Collectors.toList())",
+                    pipeline, stream_fn, mapped_lambda
+                );
+            }
             // Chained stream continuation (`xs.stream().filter {..}.findFirst()`):
             // the base already ends `.stream()` AND the lambda member is a
             // stream-monadic op — the result must stay a Stream so terminal
@@ -1503,7 +1523,12 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     }
                 }
                 "->" => after_arrow = true,
-                k if after_arrow && c.is_named() && k != "{" && k != "}" => {
+                k if after_arrow
+                    && c.is_named()
+                    && !matches!(k, "line_comment" | "block_comment" | "multiline_comment")
+                    && k != "{"
+                    && k != "}" =>
+                {
                     body_nodes.push(c);
                 }
                 _ => {}

@@ -45,11 +45,6 @@ pub struct Cli {
     #[arg(long)]
     pub lombok: bool,
 
-    /// Assume Apache Commons Lang 3 on the target classpath. Eligible Kotlin
-    /// utility operations may use its helpers, independently of --lombok.
-    #[arg(long = "commons-lang")]
-    pub commons_lang: bool,
-
     /// Print the tree-sitter parse tree instead of transpiling
     #[arg(long)]
     pub dump_ast: bool,
@@ -72,7 +67,7 @@ pub struct Cli {
 
 impl Cli {
     /// A directory input denotes a workspace migration. This keeps the common
-    /// `notlin --lombok --commons-lang .` invocation useful without requiring
+    /// `notlin --lombok .` invocation useful without requiring
     /// a redundant flag, while a single file still writes to stdout unless an
     /// output mode is selected explicitly.
     pub fn migrates_in_place(&self) -> bool {

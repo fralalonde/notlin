@@ -32,15 +32,42 @@ const MARKER: &str = "NOTLIN-MANUAL:";
 /// `NOTLIN-MANUAL` comment lines where only a user edit unlocks more.
 /// Returns the number of changes made.
 pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex) -> usize {
+    annotate_manual_spots_inner(path, index, true)
+}
+
+/// The workspace fixpoint already applied property ABI repair to its virtual
+/// sources. Repeating component discovery file by file after writing would be
+/// redundant and defeats the shared per-round cache.
+pub fn annotate_manual_spots_after_speculation(
+    path: &Path,
+    index: &crate::workspace::SourceIndex,
+) -> usize {
+    annotate_manual_spots_inner(path, index, false)
+}
+
+fn annotate_manual_spots_inner(
+    path: &Path,
+    index: &crate::workspace::SourceIndex,
+    repair_property_abi: bool,
+) -> usize {
     let Ok(original) = fs::read_to_string(path) else {
         return 0;
+    };
+
+    // A retained implementation of a translated property interface needs
+    // explicit Java getter methods. Run this before the other source repairs
+    // so they all see one coherent version of the Kotlin file.
+    let (source, property_abi_rewrites) = if repair_property_abi {
+        crate::property_abi::repair_file(index, path, &original)
+    } else {
+        (original, 0)
     };
 
     // The smart-cast repair runs first: it inserts binding lines, and every
     // pass below must see the text it produced (its own idempotency included).
     let smart_cast_bindings = index.smart_cast_bindings_for_path(path);
     let (source, smart_cast_rewrites) = crate::smart_cast::rewrite_with_bindings(
-        &original,
+        &source,
         &smart_cast_bindings,
         &|owner, property| translated_property_owner(index, owner, property),
     );
@@ -115,6 +142,7 @@ pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex)
         && copy_rewrites.is_empty()
         && smart_cast_rewrites == 0
         && ctor_default_rewrites == 0
+        && property_abi_rewrites == 0
     {
         return 0;
     }
@@ -153,7 +181,11 @@ pub fn annotate_manual_spots(path: &Path, index: &crate::workspace::SourceIndex)
         }
     }
     fs::write(path, out).ok();
-    insertions.len() + copy_rewrites.len() + smart_cast_rewrites + ctor_default_rewrites
+    insertions.len()
+        + copy_rewrites.len()
+        + smart_cast_rewrites
+        + ctor_default_rewrites
+        + property_abi_rewrites
 }
 
 /// The emitted Java constructor's parameter names for `callee`, when this run

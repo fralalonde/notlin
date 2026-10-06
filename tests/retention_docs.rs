@@ -1,8 +1,8 @@
 use std::{fs, process::Command};
 
 #[test]
-fn multiline_diagnostics_stay_inside_javadoc() {
-    let comment = notlin::retention_docs::javadoc(
+fn multiline_diagnostics_stay_inside_kdoc() {
+    let comment = notlin::retention_docs::kdoc(
         "N04DC",
         "annotation: `@Table(\r\n name = \"X\",\n indexes = []\n)`; retained",
         &[],
@@ -12,7 +12,7 @@ fn multiline_diagnostics_stay_inside_javadoc() {
     assert!(comment.contains("name = \"X\""));
     assert_eq!(
         comment,
-        notlin::retention_docs::javadoc(
+        notlin::retention_docs::kdoc(
             "N04DC",
             "annotation: `@Table(\n name = \"X\",\n indexes = []\n)`; retained",
             &[],
@@ -21,8 +21,8 @@ fn multiline_diagnostics_stay_inside_javadoc() {
 }
 
 #[test]
-fn dependency_javadoc_uses_fully_qualified_links() {
-    let comment = notlin::retention_docs::javadoc(
+fn dependency_kdoc_uses_fully_qualified_links() {
+    let comment = notlin::retention_docs::kdoc(
         "N2142",
         "an interface subtype remains Kotlin.",
         &[
@@ -30,8 +30,9 @@ fn dependency_javadoc_uses_fully_qualified_links() {
             "com.onomatic.tes.config.device.DeviceEntity".into(),
         ],
     );
-    assert!(comment.contains("{@link com.onomatic.tes.coreapi.device.IDevice}"));
-    assert!(comment.contains("{@link com.onomatic.tes.config.device.DeviceEntity}"));
+    assert!(comment.contains("[com.onomatic.tes.coreapi.device.IDevice]"));
+    assert!(comment.contains("[com.onomatic.tes.config.device.DeviceEntity]"));
+    assert!(!comment.contains("{@link"));
     assert!(!comment.contains("markdown"));
 }
 

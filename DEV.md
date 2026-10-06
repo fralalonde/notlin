@@ -6,9 +6,9 @@ Developer documentation. For user-facing usage see README.md.
 
 notlin transpiles Kotlin source to Java (27+). `.kt` in, `.java` file(s) out.
 Nullability is annotated (`@Nullable`/`@NotNull` from vendor/jetbrains-annotations.jar
-by default), not enforced. Assumed on the receiving Java classpath: Lombok,
-commons-lang3, StreamEx — when hand-rolling getters/setters/statics, prefer
-emitting Lombok annotations instead.
+by default), not enforced. Optional integrations on the receiving Java classpath
+include Lombok and StreamEx; when Lombok is enabled, prefer emitting its annotations
+instead of hand-rolling getters, setters, and statics.
 
 Behavior contract:
 

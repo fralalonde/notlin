@@ -159,7 +159,7 @@ fn retained_supertype_members_have_structured_compatibility_classes() {
     );
     assert_eq!(
         classification("GenericImplementation"),
-        MemberConflictClass::SupertypeTypeParameter
+        MemberConflictClass::Exact
     );
     assert_eq!(
         classification("UnrelatedImplementation"),
@@ -1301,6 +1301,14 @@ enum class Explicit : Default, Other {
     override val alias: String
         get() = "explicit"
 }
+interface CategoryDefault {
+    val category: String
+        get() = "category"
+}
+interface CategoryAbstract {
+    val category: String
+}
+enum class Bridged : CategoryDefault, CategoryAbstract { ONE; }
 "#,
     )
     .unwrap();
@@ -1315,6 +1323,14 @@ enum class Explicit : Default, Other {
     assert_eq!(
         index.enum_default_obligations(&path, "Narrowed"),
         ["getAlias"]
+    );
+    assert_eq!(
+        index.enum_default_property_bridges(&path, "Bridged"),
+        [notlin::workspace::EnumDefaultBridge {
+            method_name: "getCategory".to_string(),
+            return_type: "String".to_string(),
+            provider: "CategoryDefault".to_string(),
+        }]
     );
     fs::remove_dir_all(root).unwrap();
 }

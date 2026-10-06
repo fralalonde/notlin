@@ -29,7 +29,6 @@ fn translate(root: &std::path::PathBuf, provider: &std::path::Path) -> String {
     let cli = Cli::parse_from([
         "notlin",
         "--lombok",
-        "--commons-lang",
         "--in-place",
         provider.to_str().unwrap(),
     ]);

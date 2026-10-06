@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 // 8: `SourceFile::smart_cast_sites` / `SourceFile::bindings` — the retained-Kotlin
 // smart-cast boundary now carries the site shapes and the file's own name->type
 // table instead of a bare property-name set.
-const CACHE_VERSION: u32 = 15;
+const CACHE_VERSION: u32 = 17;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -93,6 +93,33 @@ pub struct Member {
     /// caller sites must emit `Owner.MEMBER`, never the `Companion`
     /// accessor bridge that only exists for plain companion vals.
     pub is_jvm_field: bool,
+    /// Kotlin `var` property. Java interface setters are part of the ABI and
+    /// must be bridged separately when retained Kotlin implements that ABI.
+    #[serde(default)]
+    pub is_mutable: bool,
+    /// Property annotations outside the getter/setter annotation targets that
+    /// the retained-property ABI repair can preserve.
+    #[serde(default)]
+    pub has_unsupported_property_annotations: bool,
+    /// Kotlin property forms incompatible with the field bridge (`open`,
+    /// `lateinit`, delegated, or abstract properties).
+    #[serde(default)]
+    pub has_unsupported_property_shape: bool,
+    /// Kotlin primary-constructor `val`/`var` property. Its constructor
+    /// initializer is not a custom accessor and remains field-bridgeable.
+    #[serde(default)]
+    pub is_constructor_property: bool,
+    /// A Kotlin property with an explicit `get` or `set` accessor. Keep this
+    /// separate from `has_body`: an initializer is stored state and remains
+    /// bridgeable in all-open/JPA classes, while a custom accessor is virtual.
+    #[serde(default)]
+    pub has_custom_accessor: bool,
+    /// The property's getter begins on the declaration line. The property ABI
+    /// rewriter only handles accessor blocks on following lines, and this bit
+    /// must come from the indexed (possibly speculative) source rather than a
+    /// stale file on disk.
+    #[serde(default)]
+    pub has_inline_getter: bool,
     pub type_name: Option<String>,
     #[serde(default)]
     pub parameter_types: Vec<String>,
@@ -108,6 +135,8 @@ pub struct Declaration {
     pub package: Option<String>,
     pub language: SourceLanguage,
     pub kind: DeclarationKind,
+    #[serde(default)]
+    pub is_abstract: bool,
     pub supertypes: Vec<String>,
     pub members: Vec<Member>,
     pub has_default_constructor_parameter: bool,
@@ -240,6 +269,11 @@ pub struct CtorOmissionEvidence {
 pub struct SourceFile {
     pub path: PathBuf,
     pub language: SourceLanguage,
+    /// Exact indexed text, including speculative overlays. Analyses that
+    /// participate in migration convergence must never fall back to stale
+    /// filesystem contents after an in-memory rewrite.
+    #[serde(default)]
+    source_text: String,
     pub package: Option<String>,
     pub imports: Vec<String>,
     pub declarations: Vec<Declaration>,
@@ -271,6 +305,10 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
+    pub fn source_text(&self) -> &str {
+        &self.source_text
+    }
+
     /// Constructor calls this file makes, as written.
     pub fn ctor_calls(&self) -> &[CtorCall] {
         &self.ctor_calls
@@ -302,9 +340,22 @@ pub struct SourceIndex {
     /// subtypes is retained, and simple-name collisions over-taint
     /// conservatively (fewer translations, never a wrong Java ABI).
     subtype_names: HashMap<String, Vec<String>>,
+    /// Reverse subtype edges for both Kotlin and Java. ABI bridge planning
+    /// needs exact descendants without adding Java names to the Kotlin
+    /// retention fixpoint graph.
+    all_subtype_names: HashMap<String, Vec<String>>,
+    unresolved_supertype_names: HashSet<String>,
     /// Simple declaration-name lookup preserving every collision. This avoids
     /// repeated complete-workspace scans for name-based compatibility checks.
     declaration_names: HashMap<String, Vec<(usize, usize)>>,
+    /// Fully-qualified declaration lookup. Type resolution is on the hot path
+    /// while rebuilding speculative indexes, so avoid scanning every
+    /// declaration for each supertype edge.
+    qualified_declarations: HashMap<String, Vec<(usize, usize)>>,
+    /// Declaration address to its owning file. Declarations live in the boxed
+    /// buffers owned by `files`, so these addresses remain stable for the
+    /// lifetime of an index.
+    declaration_files: HashMap<usize, usize>,
     /// Constructor calls by callee simple name: `name -> [(file, call)]`.
     /// Derived from the files' recorded calls whenever the index is built (never
     /// cached): a declaration's omission evidence is then one lookup instead of a
@@ -313,6 +364,13 @@ pub struct SourceIndex {
     /// Exact indexed source paths. `source_file` retains its `paths_match`
     /// fallback for equivalent-but-not-identical caller paths.
     file_paths: HashMap<PathBuf, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDefaultBridge {
+    pub method_name: String,
+    pub return_type: String,
+    pub provider: String,
 }
 
 #[derive(Debug, Clone)]
@@ -449,7 +507,11 @@ impl SourceIndex {
             files,
             kotlin_subtypes: HashMap::new(),
             subtype_names: HashMap::new(),
+            all_subtype_names: HashMap::new(),
+            unresolved_supertype_names: HashSet::new(),
             declaration_names: HashMap::new(),
+            qualified_declarations: HashMap::new(),
+            declaration_files: HashMap::new(),
             ctor_uses: HashMap::new(),
             file_paths: HashMap::new(),
         };
@@ -467,21 +529,44 @@ impl SourceIndex {
             }
             for (declaration_index, declaration) in file.declarations.iter().enumerate() {
                 index
+                    .declaration_files
+                    .insert(declaration as *const Declaration as usize, file_index);
+                index
                     .declaration_names
                     .entry(declaration.name.clone())
+                    .or_default()
+                    .push((file_index, declaration_index));
+                index
+                    .qualified_declarations
+                    .entry(declaration_key(declaration))
                     .or_default()
                     .push((file_index, declaration_index));
             }
         }
         let mut subtype_edges = Vec::new();
         let mut subtype_name_edges = Vec::new();
-        for file in index.kotlin_files() {
+        let mut all_subtype_name_edges = Vec::new();
+        let mut unresolved_supertype_names = Vec::new();
+        for file in &index.files {
             for declaration in &file.declarations {
                 for supertype in &declaration.supertypes {
                     if let Some(target) = index.resolve_type(file, supertype) {
-                        subtype_edges.push((declaration_key(target), file.path.clone()));
-                        subtype_name_edges
+                        if file.language == SourceLanguage::Kotlin {
+                            subtype_edges.push((declaration_key(target), file.path.clone()));
+                            subtype_name_edges
+                                .push((declaration_key(target), declaration.name.clone()));
+                        }
+                        all_subtype_name_edges
                             .push((declaration_key(target), declaration.name.clone()));
+                    } else {
+                        let raw = supertype
+                            .split(['<', '('])
+                            .next()
+                            .unwrap_or(supertype)
+                            .trim();
+                        if !raw.is_empty() {
+                            unresolved_supertype_names.push(raw.to_string());
+                        }
                     }
                 }
             }
@@ -500,22 +585,43 @@ impl SourceIndex {
                 .or_default()
                 .push(subtype_name);
         }
+        for (target, subtype_name) in all_subtype_name_edges {
+            let target_name = target.rsplit_once('.').map(|(_, n)| n).unwrap_or(&target);
+            index
+                .all_subtype_names
+                .entry(target_name.to_string())
+                .or_default()
+                .push(subtype_name);
+        }
+        index
+            .unresolved_supertype_names
+            .extend(unresolved_supertype_names);
         index
     }
 
     pub fn with_overlays(&self, overlays: &[SourceOverlay]) -> Result<Self, String> {
-        let mut files = self.files.clone();
+        let mut by_path = HashMap::with_capacity(overlays.len());
         for overlay in overlays {
+            let path = match overlay {
+                SourceOverlay::Delete { path } | SourceOverlay::Replace { path, .. } => path,
+            };
+            by_path.insert(normalized_path(path), overlay);
+        }
+        let mut files = Vec::with_capacity(self.files.len() + overlays.len());
+        files.extend(
+            self.files
+                .iter()
+                .filter(|file| !by_path.contains_key(&normalized_path(&file.path)))
+                .cloned(),
+        );
+        for overlay in by_path.into_values() {
             match overlay {
-                SourceOverlay::Delete { path } => {
-                    files.retain(|file| !paths_match(&file.path, path))
-                }
+                SourceOverlay::Delete { .. } => {}
                 SourceOverlay::Replace {
                     path,
                     language,
                     source,
                 } => {
-                    files.retain(|file| !paths_match(&file.path, path));
                     let package = package_name(source);
                     let imports = import_names(source);
                     let (
@@ -532,6 +638,7 @@ impl SourceIndex {
                     files.push(SourceFile {
                         path: path.clone(),
                         language: *language,
+                        source_text: source.clone(),
                         package,
                         imports,
                         declarations,
@@ -674,6 +781,25 @@ impl SourceIndex {
             }
         }
         self.files.iter().find(|file| paths_match(&file.path, path))
+    }
+
+    /// Whether a resolved Java annotation may be written on `ElementType.FIELD`
+    /// or `ElementType.PARAMETER`. `None` means the annotation is unresolved,
+    /// Kotlin-defined, or its Java declaration could not be inspected.
+    pub fn java_annotation_allows(
+        &self,
+        context: &SourceFile,
+        annotation: &str,
+        element_type: &str,
+    ) -> Option<bool> {
+        let declaration = self.resolve_type(context, annotation)?;
+        if declaration.kind != DeclarationKind::Annotation
+            || declaration.language != SourceLanguage::Java
+        {
+            return None;
+        }
+        let file = self.declaration_source_file(declaration)?;
+        java_annotation_target(file.source_text(), &declaration.name, element_type)
     }
 
     /// Whether adding any simple declaration name to the retention set can
@@ -960,6 +1086,46 @@ impl SourceIndex {
         details
     }
 
+    /// Whether a retained implementation's property return can implement the
+    /// original Kotlin property contract after it becomes a Java getter.
+    /// Exact source types and proven Java-covariant reference returns are safe;
+    /// invariant generic mismatches, unknown types, and nullable mismatches
+    /// remain blockers.
+    pub fn property_getter_return_compatible(
+        &self,
+        implementation_file: &Path,
+        implementation_type: &str,
+        contract_owner: &Declaration,
+        contract_type: &str,
+    ) -> bool {
+        if implementation_type.trim().ends_with('?') != contract_type.trim().ends_with('?') {
+            return false;
+        }
+        let Some(own_file) = self.source_file(implementation_file) else {
+            return false;
+        };
+        if self.declaration_source_file(contract_owner).is_none() {
+            return false;
+        }
+        matches!(
+            classify_member_conflict(
+                self,
+                own_file,
+                contract_owner,
+                contract_type,
+                implementation_type,
+            ),
+            MemberConflictClass::Exact | MemberConflictClass::JavaCovariantReturn
+        ) || declaration_covariant_return_is_subtype(
+            self,
+            own_file,
+            implementation_type,
+            self.declaration_source_file(contract_owner)
+                .unwrap_or(own_file),
+            contract_type,
+        )
+    }
+
     /// A Kotlin read-only collection property is declaration-site covariant.
     /// When both sides move to Java together, Notlin can preserve that contract
     /// by emitting a wildcard return on the interface (`List<? extends Base>`)
@@ -1009,14 +1175,42 @@ impl SourceIndex {
         // A return may narrow through Java covariance or an explicit wildcard;
         // incompatible invariant generics remain retained rather than erased.
         let own_file = self.declaration_source_file(own).unwrap();
-        let mut pending: Vec<_> = supertypes.iter().map(|s| (own_file, s)).collect();
+        let mut pending: Vec<_> = supertypes
+            .iter()
+            .map(|supertype| {
+                (
+                    own_file,
+                    supertype.clone(),
+                    HashMap::<String, String>::new(),
+                )
+            })
+            .collect();
         let mut visited = HashSet::new();
         let mut conflicts = Vec::new();
-        while let Some((context, sup)) = pending.pop() {
-            let Some(sup_decl) = self.resolve_type(context, sup) else {
+        while let Some((context, sup, inherited_bindings)) = pending.pop() {
+            let resolved_sup = substitute_type_parameters(&sup, &inherited_bindings);
+            let Some(sup_decl) = self.resolve_type(context, &resolved_sup) else {
                 continue;
             };
-            if !visited.insert(declaration_key(sup_decl)) {
+            let (_, supplied_args) = split_generic(resolved_sup.trim().trim_end_matches("()"));
+            let bindings: HashMap<String, String> = sup_decl
+                .type_params
+                .iter()
+                .zip(supplied_args.unwrap_or_default())
+                .map(|(parameter, argument)| (parameter.clone(), argument.to_string()))
+                .collect();
+            let visit_key = format!(
+                "{}<{}>",
+                declaration_key(sup_decl),
+                sup_decl
+                    .type_params
+                    .iter()
+                    .filter_map(|parameter| bindings.get(parameter))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            if !visited.insert(visit_key) {
                 continue;
             }
             let sup_file = self.declaration_source_file(sup_decl).unwrap_or(context);
@@ -1024,7 +1218,7 @@ impl SourceIndex {
             // its OWN supertypes still widen the conflict transitively
             // (ImportContainer extends IImportContainer, IBarcodeAware).
             for sup_sup in &sup_decl.supertypes {
-                pending.push((sup_file, sup_sup));
+                pending.push((sup_file, sup_sup.clone(), bindings.clone()));
             }
             if sup_decl.language != SourceLanguage::Kotlin {
                 continue;
@@ -1033,14 +1227,20 @@ impl SourceIndex {
                 if m.is_static {
                     continue;
                 }
-                let Some(sup_ty) = m.type_name.clone() else {
+                let Some(raw_sup_ty) = m.type_name.as_deref() else {
                     continue;
                 };
+                let sup_ty = substitute_type_parameters(raw_sup_ty, &bindings);
+                let parameter_types: Vec<String> = m
+                    .parameter_types
+                    .iter()
+                    .map(|parameter| substitute_type_parameters(parameter, &bindings))
+                    .collect();
                 if let Some(own_m) = own.members.iter().find(|om| {
                     om.name == m.name
                         && !om.is_static
                         && om.kind == m.kind
-                        && om.parameter_types == m.parameter_types
+                        && om.parameter_types == parameter_types
                 }) && let Some(own_ty) = own_m.type_name.as_deref()
                 {
                     conflicts.push(MemberConflict {
@@ -1049,7 +1249,7 @@ impl SourceIndex {
                         supertype: declaration_key(sup_decl),
                         inherited_type: sup_ty.clone(),
                         implementation_type: own_ty.to_string(),
-                        parameter_types: m.parameter_types.clone(),
+                        parameter_types,
                         classification: classify_member_conflict(
                             self, own_file, sup_decl, &sup_ty, own_ty,
                         ),
@@ -1157,6 +1357,96 @@ impl SourceIndex {
                     .then_some(name)
             })
             .collect()
+    }
+
+    /// Explicit zero-argument bridges that make Kotlin's inherited interface
+    /// resolution legal in Java. Kotlin accepts a concrete property getter
+    /// from one direct interface beside an unrelated abstract declaration;
+    /// javac requires the implementing enum to choose the concrete provider.
+    pub fn enum_default_property_bridges(
+        &self,
+        declaring: &Path,
+        name: &str,
+    ) -> Vec<EnumDefaultBridge> {
+        let obligations = self.enum_default_obligations(declaring, name);
+        if obligations.is_empty() {
+            return Vec::new();
+        }
+        let Some(file) = self.source_file(declaring) else {
+            return Vec::new();
+        };
+        let Some(owner) = file
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+        else {
+            return Vec::new();
+        };
+        obligations
+            .into_iter()
+            .filter_map(|method_name| {
+                owner.supertypes.iter().find_map(|supertype| {
+                    let provider = self.resolve_type(file, supertype)?;
+                    if provider.kind != DeclarationKind::Interface {
+                        return None;
+                    }
+                    let member = provider.members.iter().find(|member| {
+                        !member.is_static
+                            && member.kind == MemberKind::Property
+                            && member.has_body
+                            && property_accessor_name(&member.name) == method_name
+                    })?;
+                    let raw_return_type = member.type_name.clone()?;
+                    let provider_file = self.declaration_source_file(provider).unwrap_or(file);
+                    let return_type = self
+                        .resolve_type(provider_file, raw_return_type.trim_end_matches('?'))
+                        .map(declaration_key)
+                        .unwrap_or(raw_return_type);
+                    Some(EnumDefaultBridge {
+                        method_name: method_name.clone(),
+                        return_type,
+                        provider: supertype
+                            .split('<')
+                            .next()
+                            .unwrap_or(supertype)
+                            .trim()
+                            .to_string(),
+                    })
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn direct_supertype_for_member(
+        &self,
+        declaring: &Path,
+        owner_name: &str,
+        member_name: &str,
+    ) -> Option<String> {
+        let file = self.source_file(declaring)?;
+        let owner = file
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == owner_name)?;
+        owner.supertypes.iter().find_map(|supertype| {
+            let target = self.resolve_type(file, supertype)?;
+            target
+                .members
+                .iter()
+                .any(|member| {
+                    member.name == member_name
+                        || (member.kind == MemberKind::Property
+                            && property_accessor_name(&member.name) == member_name)
+                })
+                .then(|| {
+                    supertype
+                        .split('<')
+                        .next()
+                        .unwrap_or(supertype)
+                        .trim()
+                        .to_string()
+                })
+        })
     }
 
     pub fn has_retained_kotlin_supertype(
@@ -1535,11 +1825,9 @@ impl SourceIndex {
             if !visited.insert(declaration_key(decl)) {
                 continue;
             }
-            if decl
-                .members
-                .iter()
-                .any(|member| member.kind == MemberKind::Method && member.name == getter_name)
-            {
+            if decl.members.iter().any(|member| {
+                member.kind == MemberKind::Method && member.name == getter_name && member.has_body
+            }) {
                 return true;
             }
             for supertype in &decl.supertypes {
@@ -1610,9 +1898,73 @@ impl SourceIndex {
         })
     }
 
+    /// True when any indexed Kotlin or Java declaration names `name` as a
+    /// supertype. Used by ABI repairs that introduce fields: the repair is
+    /// safe only when no descendant can observe an overridden property through
+    /// a parent-typed reference.
+    pub fn has_any_subtype(&self, name: &str) -> bool {
+        self.has_subtype_named(name)
+    }
+
+    /// Direct Kotlin or Java subtype names recorded for this resolved declaration.
+    /// Callers that require collision-free identity must still resolve each
+    /// candidate in its declaring-file context.
+    pub fn direct_subtype_names(&self, target: &Declaration) -> Vec<String> {
+        let key = declaration_key(target);
+        let target_name = key.rsplit_once('.').map(|(_, name)| name).unwrap_or(&key);
+        let mut names = self
+            .all_subtype_names
+            .get(target_name)
+            .cloned()
+            .unwrap_or_default();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    pub fn direct_subtypes<'a>(&'a self, target: &Declaration) -> Vec<&'a Declaration> {
+        let target_path = self.declaration_source_file(target).map(|file| &file.path);
+        self.direct_subtype_names(target)
+            .into_iter()
+            .filter_map(|name| self.declaration_names.get(&name))
+            .flatten()
+            .filter_map(|(file_index, declaration_index)| {
+                let file = self.files.get(*file_index)?;
+                let declaration = file.declarations.get(*declaration_index)?;
+                declaration
+                    .supertypes
+                    .iter()
+                    .any(|supertype| {
+                        self.resolve_type(file, supertype).is_some_and(|resolved| {
+                            resolved.name == target.name
+                                && self.declaration_source_file(resolved).is_some_and(
+                                    |resolved_file| target_path == Some(&resolved_file.path),
+                                )
+                        })
+                    })
+                    .then_some(declaration)
+            })
+            .collect()
+    }
+
+    pub fn has_unresolved_supertype(&self, target: &Declaration) -> bool {
+        let qualified = target
+            .package
+            .as_deref()
+            .map(|package| format!("{package}.{}", target.name));
+        self.unresolved_supertype_names.iter().any(|raw| {
+            if raw.contains('.') {
+                qualified.as_deref() == Some(raw.as_str())
+            } else {
+                raw == &target.name
+            }
+        })
+    }
+
     pub fn has_kotlin_subtype(&self, target: &Declaration) -> bool {
         self.kotlin_subtypes.contains_key(&declaration_key(target))
     }
+
     /// Retention fixpoint seed: true when any simple-name Kotlin subtype of
     /// `target` is retained for an INTRINSIC reason (its own file taints
     /// under the current fixpoint pass, independent of the subtype rule).
@@ -1890,6 +2242,13 @@ impl SourceIndex {
     ) -> Option<(String, String, String)> {
         target.supertypes.iter().find_map(|supertype| {
             let contract = self.resolve_kotlin_type(source_file, supertype)?;
+            let (_, supplied_args) = split_generic(supertype.trim().trim_end_matches("()"));
+            let bindings: HashMap<String, String> = contract
+                .type_params
+                .iter()
+                .zip(supplied_args.unwrap_or_default())
+                .map(|(parameter, argument)| (parameter.clone(), argument.to_string()))
+                .collect();
             contract.members.iter().find_map(|contract_member| {
                 if contract_member.kind != MemberKind::Property || !contract_member.is_nullable {
                     return None;
@@ -1901,8 +2260,10 @@ impl SourceIndex {
                     {
                         return None;
                     }
-                    let inherited_type =
-                        contract_member.type_name.as_deref().unwrap_or("<unknown>");
+                    let inherited_type = substitute_type_parameters(
+                        contract_member.type_name.as_deref().unwrap_or("<unknown>"),
+                        &bindings,
+                    );
                     let implementation_type = member.type_name.as_deref().unwrap_or("<unknown>");
                     let inherited_base = inherited_type.trim().trim_end_matches('?').trim();
                     let primitive_unboxing = inherited_base == implementation_type.trim()
@@ -1918,31 +2279,41 @@ impl SourceIndex {
                                 | "Char"
                         );
                     let classification = match (
-                        contract_member.type_name.as_deref(),
-                        member.type_name.as_deref(),
+                        contract_member.type_name.as_ref(),
+                        member.type_name.as_ref(),
                     ) {
-                        (Some(inherited_type), Some(implementation_type)) => {
-                            classify_member_conflict(
-                                self,
-                                source_file,
-                                contract,
-                                inherited_type,
-                                implementation_type,
-                            )
-                        }
+                        (Some(_), Some(_)) => classify_member_conflict(
+                            self,
+                            source_file,
+                            contract,
+                            &inherited_type,
+                            implementation_type,
+                        ),
                         _ => MemberConflictClass::UnknownType,
                     };
+                    let contract_file = self
+                        .declaration_source_file(contract)
+                        .unwrap_or(source_file);
+                    let collection_covariance = declaration_covariant_return_is_subtype(
+                        self,
+                        source_file,
+                        implementation_type,
+                        contract_file,
+                        &inherited_type,
+                    );
                     if !primitive_unboxing
-                        && matches!(
-                            classification,
-                            MemberConflictClass::Exact | MemberConflictClass::JavaCovariantReturn
-                        )
+                        && (collection_covariance
+                            || matches!(
+                                classification,
+                                MemberConflictClass::Exact
+                                    | MemberConflictClass::JavaCovariantReturn
+                            ))
                     {
                         return None;
                     }
                     Some((
                         member.name.clone(),
-                        inherited_type.to_string(),
+                        inherited_type,
                         implementation_type.to_string(),
                     ))
                 })
@@ -2082,11 +2453,9 @@ impl SourceIndex {
     }
 
     pub(crate) fn declaration_source_file(&self, declaration: &Declaration) -> Option<&SourceFile> {
-        self.files.iter().find(|file| {
-            file.declarations
-                .iter()
-                .any(|candidate| std::ptr::eq(candidate, declaration))
-        })
+        self.declaration_files
+            .get(&(declaration as *const Declaration as usize))
+            .and_then(|index| self.files.get(*index))
     }
 
     fn resolve_kotlin_type<'a>(
@@ -2107,12 +2476,16 @@ impl SourceIndex {
             .next()
             .unwrap_or("");
         let find = |qualified: &str| {
-            let (package, name) = qualified.rsplit_once('.')?;
-            self.declarations().find(|declaration| {
-                declaration.language == SourceLanguage::Kotlin
-                    && declaration.name == name
-                    && declaration.package.as_deref() == Some(package)
-            })
+            self.qualified_declarations.get(qualified)?.iter().find_map(
+                |(file_index, declaration_index)| {
+                    let declaration = self
+                        .files
+                        .get(*file_index)?
+                        .declarations
+                        .get(*declaration_index)?;
+                    (declaration.language == SourceLanguage::Kotlin).then_some(declaration)
+                },
+            )
         };
         if type_name.contains('.') {
             return find(type_name.trim().trim_end_matches('?'));
@@ -2134,10 +2507,16 @@ impl SourceIndex {
         {
             return Some(found);
         }
-        let mut matches = self
-            .declarations()
-            .filter(|declaration| declaration.language == SourceLanguage::Kotlin)
-            .filter(|declaration| declaration.name == simple);
+        let mut matches = self.declaration_names.get(simple)?.iter().filter_map(
+            |(file_index, declaration_index)| {
+                let declaration = self
+                    .files
+                    .get(*file_index)?
+                    .declarations
+                    .get(*declaration_index)?;
+                (declaration.language == SourceLanguage::Kotlin).then_some(declaration)
+            },
+        );
         let first = matches.next()?;
         matches.next().is_none().then_some(first)
     }
@@ -2183,9 +2562,14 @@ impl SourceIndex {
                 .all(|other| declaration_key(other) == declaration_key(found))
                 .then_some(found);
         }
-        let mut matches = self
-            .declarations()
-            .filter(|declaration| declaration.name == simple);
+        let mut matches = self.declaration_names.get(simple)?.iter().filter_map(
+            |(file_index, declaration_index)| {
+                self.files
+                    .get(*file_index)?
+                    .declarations
+                    .get(*declaration_index)
+            },
+        );
         let first = matches.next()?;
         matches.next().is_none().then_some(first)
     }
@@ -2229,10 +2613,12 @@ impl SourceIndex {
     }
 
     fn find_qualified(&self, qualified: &str) -> Option<&Declaration> {
-        let (package, name) = qualified.rsplit_once('.')?;
-        self.declarations().find(|declaration| {
-            declaration.name == name && declaration.package.as_deref() == Some(package)
-        })
+        let (file_index, declaration_index) =
+            self.qualified_declarations.get(qualified)?.first()?;
+        self.files
+            .get(*file_index)?
+            .declarations
+            .get(*declaration_index)
     }
 }
 
@@ -2244,16 +2630,17 @@ fn declaration_key(declaration: &Declaration) -> String {
 }
 
 fn paths_match(left: &Path, right: &Path) -> bool {
-    fn normalized(path: &Path) -> String {
-        let value = path.to_string_lossy().replace('\\', "/");
-        let value = value.strip_prefix("//?/").unwrap_or(&value);
-        if cfg!(windows) {
-            value.to_ascii_lowercase()
-        } else {
-            value.to_string()
-        }
+    normalized_path(left) == normalized_path(right)
+}
+
+fn normalized_path(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    let value = value.strip_prefix("//?/").unwrap_or(&value);
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
     }
-    normalized(left) == normalized(right)
 }
 
 fn cache_producer() -> u128 {
@@ -2520,6 +2907,7 @@ fn scan_source(
         source_file: SourceFile {
             path: canonical_path,
             language,
+            source_text: source,
             package,
             imports,
             declarations,
@@ -2571,6 +2959,39 @@ type ParseDeclarations = (
     Vec<crate::smart_cast::InferredBindingCall>,
     Vec<CtorCall>,
 );
+
+fn java_annotation_target(source: &str, name: &str, element_type: &str) -> Option<bool> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "annotation_type_declaration"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name_node| name_node.utf8_text(source.as_bytes()).ok())
+                == Some(name)
+        {
+            let declaration = node.utf8_text(source.as_bytes()).ok()?;
+            let Some(target) = declaration.find("Target(") else {
+                // Java annotations without @Target are applicable everywhere.
+                return Some(true);
+            };
+            let arguments = &declaration[target + "Target(".len()..];
+            let close = arguments.find(')')?;
+            let arguments = &arguments[..close];
+            return Some(
+                arguments
+                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .any(|token| token == element_type),
+            );
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    None
+}
 
 fn parse_declarations(
     source: &str,
@@ -2624,6 +3045,13 @@ fn parse_declarations(
                     package: package.map(str::to_string),
                     language,
                     kind,
+                    is_abstract: node
+                        .children(&mut node.walk())
+                        .find(|child| child.kind() == "modifiers")
+                        .and_then(|modifiers| modifiers.utf8_text(source.as_bytes()).ok())
+                        .is_some_and(|modifiers| {
+                            modifiers.split_whitespace().any(|word| word == "abstract")
+                        }),
                     supertypes: supertypes(node, language, source),
                     members: members(node, language, source),
                     has_default_constructor_parameter: has_default_constructor_parameter(
@@ -3223,6 +3651,12 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 visibility: None,
                 is_static: false,
                 is_jvm_field: false,
+                is_mutable: false,
+                has_unsupported_property_annotations: false,
+                has_unsupported_property_shape: false,
+                is_constructor_property: false,
+                has_custom_accessor: false,
+                has_inline_getter: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
                 parameter_types: Vec::new(),
                 is_nullable: false,
@@ -3259,12 +3693,38 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
             let type_node = parameter
                 .child_by_field_name("type")
                 .or_else(|| first_type_node(parameter));
+            let parameter_text = node_text(parameter, source).unwrap_or_default();
+            let property_marker = parameter_text
+                .find("val ")
+                .or_else(|| parameter_text.find("var "))
+                .unwrap_or(parameter_text.len());
+            let property_modifiers = parameter_text[..property_marker]
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .collect::<HashSet<_>>();
             result.push(Member {
                 name: node_text(name_node, source).unwrap_or_default(),
                 kind: MemberKind::Property,
                 visibility: None,
                 is_static: false,
                 is_jvm_field: false,
+                is_mutable: parameter
+                    .children(&mut parameter.walk())
+                    .any(|child| child.kind() == "var"),
+                // Ordinary constructor-property annotations remain on the
+                // field/property when the bridge adds @JvmField. Targeted
+                // getter/setter annotations are supported only when their
+                // complete argument syntax stays within one lexical token;
+                // the source rewriter cannot safely rebuild split arguments.
+                has_unsupported_property_annotations: constructor_property_annotations_unsupported(
+                    &parameter_text,
+                ),
+                has_unsupported_property_shape: property_modifiers.contains("open")
+                    || property_modifiers.contains("lateinit")
+                    || property_modifiers.contains("abstract")
+                    || parameter_text.contains(" by "),
+                is_constructor_property: true,
+                has_custom_accessor: false,
+                has_inline_getter: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
                 parameter_types: Vec::new(),
                 is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
@@ -3418,6 +3878,7 @@ fn member_from_node(
     });
     let is_static = modifiers.split_whitespace().any(|word| word == "static");
     let is_jvm_field = modifiers.contains("JvmField");
+    let member_text = node.utf8_text(source.as_bytes()).unwrap_or("");
     Some(Member {
         name: if name.is_empty() {
             "<init>".to_string()
@@ -3428,6 +3889,39 @@ fn member_from_node(
         visibility,
         is_static,
         is_jvm_field,
+        is_mutable: kind == MemberKind::Property
+            && language == SourceLanguage::Kotlin
+            && node
+                .children(&mut node.walk())
+                .any(|child| child.kind() == "var"),
+        has_unsupported_property_annotations: kind == MemberKind::Property
+            && language == SourceLanguage::Kotlin
+            && {
+                let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+                text.contains("@JvmName") || body_property_annotations_unsupported(text)
+            },
+        has_unsupported_property_shape: kind == MemberKind::Property
+            && language == SourceLanguage::Kotlin
+            && {
+                let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+                let modifiers = modifiers.split_whitespace().collect::<HashSet<_>>();
+                modifiers.contains("open")
+                    || modifiers.contains("lateinit")
+                    || modifiers.contains("abstract")
+                    || text.contains(" by ")
+            },
+        is_constructor_property: false,
+        has_custom_accessor: kind == MemberKind::Property
+            && language == SourceLanguage::Kotlin
+            && node
+                .named_children(&mut node.walk())
+                .any(|child| matches!(child.kind(), "getter" | "setter")),
+        has_inline_getter: kind == MemberKind::Property
+            && language == SourceLanguage::Kotlin
+            && member_text
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("get()")),
         type_name,
         parameter_types: member_parameter_types(node, language, source),
         is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
@@ -3438,6 +3932,75 @@ fn member_from_node(
                         .named_children(&mut child.walk())
                         .any(|body| body.kind() == "function_body")
         }),
+    })
+}
+
+fn constructor_property_annotations_unsupported(text: &str) -> bool {
+    if !text.contains('@') {
+        return false;
+    }
+    if text.contains("@JvmName") || text.contains("@JvmField") {
+        return true;
+    }
+    // Ordinary constructor-property annotations stay attached to the field
+    // when the bridge removes `override` and adds `final @JvmField`; their
+    // arguments may span whitespace. Only targeted accessor annotations are
+    // moved onto synthesized methods, and that narrow token-based rewrite
+    // still requires the complete annotation to be one lexical token.
+    text.split_whitespace()
+        .filter(|token| token.starts_with("@get:") || token.starts_with("@set:"))
+        .any(|token| {
+            let mut depth = 0isize;
+            let mut in_string = false;
+            let mut escaped = false;
+            for ch in token.chars() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth < 0 {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            depth != 0 || in_string
+        })
+}
+
+fn body_property_annotations_unsupported(text: &str) -> bool {
+    if !text.contains('@') {
+        return false;
+    }
+    let property_at = text
+        .find("val ")
+        .or_else(|| text.find("var "))
+        .unwrap_or(usize::MAX);
+    let getter_at = text.find("get()");
+    let setter_at = text.find("set(");
+    text.match_indices('@').any(|(at, _)| {
+        let tail = &text[at..];
+        if tail.starts_with("@get:") || tail.starts_with("@set:") {
+            return false;
+        }
+        // Kotlin permits an annotation directly on a custom accessor.  It is
+        // inside the property node, after the declaration and before get/set,
+        // and can move to the explicit JavaBean bridge method unchanged.
+        let on_getter = getter_at.is_some_and(|accessor| at > property_at && at < accessor);
+        let on_setter = setter_at.is_some_and(|accessor| at > property_at && at < accessor);
+        !(on_getter || on_setter)
     })
 }
 
@@ -3736,9 +4299,17 @@ fn covariant_collection_arguments(
             .zip(super_args.iter())
             .enumerate()
             .all(|(index_in_type, (own, sup))| {
-                own == sup
-                    || (super_base != "Map" || index_in_type == 1)
-                        && proven_reference_subtype(index, own_file, own, super_file, sup)
+                if own == sup || *sup == "*" {
+                    return true;
+                }
+                if let Some(bound) = sup.strip_prefix("out ") {
+                    let own = own.strip_prefix("out ").unwrap_or(own);
+                    return !own.starts_with("in ")
+                        && own != "*"
+                        && proven_reference_subtype(index, own_file, own, super_file, bound);
+                }
+                (super_base != "Map" || index_in_type == 1)
+                    && proven_reference_subtype(index, own_file, own, super_file, sup)
             })
 }
 
@@ -3854,6 +4425,37 @@ fn split_generic(ty: &str) -> (&str, Option<Vec<&str>>) {
     }
     args.push(body[start..].trim());
     (base, Some(args))
+}
+
+/// Substitute declaration type parameters in an inherited member signature.
+/// The index stores source-level type text, so this deliberately replaces only
+/// identifier tokens; a parameter named `T` must not alter `Thing`.
+fn substitute_type_parameters(ty: &str, bindings: &HashMap<String, String>) -> String {
+    if bindings.is_empty() {
+        return ty.to_string();
+    }
+    let mut out = String::with_capacity(ty.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if token.is_empty() {
+            return;
+        }
+        out.push_str(bindings.get(token).map_or(token.as_str(), String::as_str));
+        token.clear();
+    };
+    for ch in ty.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            token.push(ch);
+        } else {
+            flush(&mut token, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut token, &mut out);
+    while out.contains("??") {
+        out = out.replace("??", "?");
+    }
+    out
 }
 
 /// Prefer a candidate type whose bare name is an indexed enum declaration.

@@ -173,6 +173,27 @@ pub fn covariant_interface_return(java_type: &str) -> String {
     format!("{prefix}{rendered}")
 }
 
+/// Kotlin read-only collections are declaration-site covariant. Java callers
+/// need an equivalent wildcard when such a collection appears as a parameter;
+/// otherwise `List<Derived>` cannot be passed to Kotlin's `List<Base>` API.
+pub fn covariant_readonly_parameter(kotlin_type: &str, java_type: &str) -> String {
+    let base = kotlin_type
+        .trim()
+        .trim_end_matches('?')
+        .split('<')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if matches!(
+        base,
+        "List" | "Set" | "Collection" | "Iterable" | "Iterator" | "Sequence" | "Map"
+    ) {
+        covariant_interface_return(java_type)
+    } else {
+        java_type.to_string()
+    }
+}
+
 fn split_top_level_type_arguments(arguments: &str) -> Vec<&str> {
     let mut depth = 0usize;
     let mut start = 0usize;

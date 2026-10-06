@@ -76,6 +76,52 @@ class Ref(
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn parameter_only_annotations_stay_on_the_java_constructor_parameter() {
+    let root = Path::new("tests/tmp_scratch_ctor_parameter_annotations");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("Parent.java"),
+        "package neutral.ctorparam;\nimport java.lang.annotation.*;\n@Target(ElementType.PARAMETER)\npublic @interface Parent { String value(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("types.kt"),
+        r#"package neutral.ctorparam
+
+data class Ref(
+    @Parent("site")
+    val id: String,
+)
+"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root)
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "notlin failed:\n{stderr}");
+
+    let java = emitted(root, "Ref");
+    assert!(
+        java.contains("public Ref(@Parent(\"site\") @NonNull String id)"),
+        "a PARAMETER-only annotation must follow Kotlin's use-site selection:\n{java}"
+    );
+    let field = java
+        .find("String id;")
+        .unwrap_or_else(|| panic!("expected id field:\n{java}"));
+    assert!(
+        !java[field.saturating_sub(80)..field].contains("@Parent"),
+        "a PARAMETER-only annotation is invalid on a Java field:\n{java}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Annotations on a property written in the CLASS BODY (not the constructor
 /// parameter list) reach the field the same way, and `@get:` follows the same
 /// rule: onto the generated getter when one is emitted, onto the field when it

@@ -129,6 +129,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // supertype declares this member with a different type, keep the
         // declaration in Kotlin.
         self.current_function_name = None;
+        self.current_function_returns_value = false;
+        self.current_function_return_type = None;
+        if self.is_property_repair_bridge(decl) {
+            return;
+        }
         if let Some(_iface_type) = self.covariant_iface_return_conflict(decl) {
             self.diag_untranslatable(
                 decl,
@@ -331,9 +336,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         {
             let is_expr_body = fv.children(&mut fv.walk()).any(|c| c.kind() == "=");
             if is_expr_body {
-                let body_expr = fv
-                    .children(&mut fv.walk())
-                    .find(|c| c.is_named() && c.kind() != "=");
+                let body_expr = fv.children(&mut fv.walk()).find(|c| {
+                    c.is_named()
+                        && c.kind() != "="
+                        && !matches!(c.kind(), "line_comment" | "block_comment")
+                });
                 let inferred = body_expr.map(|be| {
                     match be.kind() {
                         "number_literal" => Some("int"),
@@ -439,7 +446,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             .unwrap_or_else(|| "arg".to_string());
                         let pty = kt::child(*k, "user_type")
                             .or_else(|| kt::child(*k, "nullable_type"))
-                            .map(|t| kt::java_parameter_type(t, self.source, self.annots))
+                            .map(|t| {
+                                let java = kt::java_parameter_type(t, self.source, self.annots);
+                                crate::transpiler::types::covariant_readonly_parameter(
+                                    self.text(t),
+                                    &java,
+                                )
+                            })
                             .unwrap_or_else(|| "Object".to_string());
                         if is_vararg {
                             params.push(format!("{}... {}", pty, pname));
@@ -541,8 +554,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 "{}{}{}{}{} {}({});",
                 visibility,
                 is_static,
-                type_params,
                 abstract_kw,
+                type_params,
                 ret,
                 name,
                 params.join(", ")
@@ -553,18 +566,45 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             "{}{}{}{}{} {}({})",
             visibility,
             is_static,
-            type_params,
             abstract_kw,
+            type_params,
             ret,
             name,
             params.join(", ")
         ));
 
         // body
+        self.current_function_returns_value = ret != "void";
+        self.current_function_return_type = Some(ret.clone());
         if let Some(fb) = kt::child(decl, "function_body") {
-            self.transpile_function_body(fb, out);
+            let reflective_locals = self.text(fb).contains(".getConstructor(") && {
+                let mut stack = vec![fb];
+                let mut found = false;
+                while let Some(node) = stack.pop() {
+                    if node.kind() == "property_declaration" {
+                        found = true;
+                        break;
+                    }
+                    stack.extend(
+                        node.children(&mut node.walk())
+                            .filter(|child| child.is_named()),
+                    );
+                }
+                found
+            };
+            if reflective_locals {
+                out.open("try");
+                self.transpile_function_body(fb, out, ret != "void");
+                out.close_then("catch (Exception e)");
+                out.line("throw new RuntimeException(e);");
+                out.close();
+            } else {
+                self.transpile_function_body(fb, out, ret != "void");
+            }
         }
         out.close();
+        self.current_function_returns_value = false;
+        self.current_function_return_type = None;
 
         // Kotlin default parameters -> Java overloads. Only a defaulted
         // *suffix* is expressible as overloads (a defaulted middle param
@@ -623,7 +663,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         "{}{}{}{} {}({})",
                         visibility, is_static, type_params, ret, name, sig
                     ));
-                    out.line(format!("return {}({});", name, call_args.join(", ")));
+                    if ret == "void" {
+                        out.line(format!("{}({});", name, call_args.join(", ")));
+                    } else {
+                        out.line(format!("return {}({});", name, call_args.join(", ")));
+                    }
                     out.close();
                 }
             }
@@ -631,20 +675,35 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         self.ext_receiver_name = prev_receiver;
     }
 
-    pub(crate) fn transpile_function_body(&mut self, fb: tree_sitter::Node, out: &mut JavaOut) {
+    pub(crate) fn transpile_function_body(
+        &mut self,
+        fb: tree_sitter::Node,
+        out: &mut JavaOut,
+        returns_value: bool,
+    ) {
+        let previous_returns_value = self.current_function_returns_value;
+        self.current_function_returns_value = returns_value;
         let mut cursor = fb.walk();
         for child in fb.children(&mut cursor) {
             if child.kind() == "block" {
                 let mut inner = child.walk();
                 for stmt in child.children(&mut inner) {
-                    if stmt.is_named() && stmt.kind() != "{" && stmt.kind() != "}" {
+                    if stmt.is_named()
+                        && stmt.kind() != "{"
+                        && stmt.kind() != "}"
+                        && !matches!(stmt.kind(), "line_comment" | "block_comment")
+                    {
                         self.transpile_statement(stmt, out);
                     }
                 }
-            } else if child.is_named() && child.kind() != "=" {
+            } else if child.is_named()
+                && child.kind() != "="
+                && !matches!(child.kind(), "line_comment" | "block_comment")
+            {
                 // expression body: `= expr` -> `return expr;`
                 let mut e = Expr { unit: self };
                 let java = e.transpile(child);
+                let java = self.coerce_optional_stream_return(java);
                 let java = crate::transpiler::stmt::fix_join_tail(&java);
                 let trimmed = java.trim_start();
                 // `= if (…) … else …` / `= when (…)` cannot become a ternary
@@ -659,10 +718,29 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     out.line(format!("{};", java));
                 } else if statement_shaped {
                     out.line(java);
-                } else {
+                } else if returns_value {
                     out.line(format!("return {};", java));
+                } else {
+                    out.line(format!("{};", java));
                 }
             }
+        }
+        self.current_function_returns_value = previous_returns_value;
+    }
+
+    pub(crate) fn coerce_optional_stream_return(&self, java: String) -> String {
+        let Some(inner) = self
+            .current_function_return_type
+            .as_deref()
+            .and_then(|ty| ty.strip_prefix("Optional<"))
+            .and_then(|ty| ty.strip_suffix('>'))
+        else {
+            return java;
+        };
+        if java.ends_with(".findAny()") || java.ends_with(".findFirst()") {
+            format!("(Optional<{inner}>) (Optional<?>) ({java})")
+        } else {
+            java
         }
     }
 }

@@ -244,6 +244,9 @@ pub enum RetentionKind {
     SubtypeOutsideTranslationSet,
     /// The declaration is an interface with a retained Kotlin implementor.
     InterfaceSubtypeRetained,
+    /// A property interface has a retained Kotlin implementation whose
+    /// property cannot yet be rewritten to an explicit Java getter bridge.
+    PropertyInterfaceBridge,
     /// A retained Kotlin declaration inherits from it.
     RetainedInheritor,
     /// A caller omits a defaulted constructor parameter and no delegating
@@ -271,9 +274,10 @@ pub enum RetentionKind {
 impl RetentionKind {
     /// All kinds, for tests and for anything that needs to enumerate the
     /// vocabulary rather than discover it from a run.
-    pub const ALL: [RetentionKind; 10] = [
+    pub const ALL: [RetentionKind; 11] = [
         RetentionKind::SubtypeOutsideTranslationSet,
         RetentionKind::InterfaceSubtypeRetained,
+        RetentionKind::PropertyInterfaceBridge,
         RetentionKind::RetainedInheritor,
         RetentionKind::MiddleDefaultParameter,
         RetentionKind::ReferencedFromRetainedKotlin,
@@ -290,6 +294,9 @@ impl RetentionKind {
         match self {
             Self::SubtypeOutsideTranslationSet => "a Kotlin subtype is outside the translation set",
             Self::InterfaceSubtypeRetained => "an interface subtype is itself retained in Kotlin",
+            Self::PropertyInterfaceBridge => {
+                "a retained Kotlin property implementation cannot preserve the Java getter ABI"
+            }
             Self::RetainedInheritor => "a retained Kotlin declaration inherits from it",
             Self::MiddleDefaultParameter => {
                 "a caller omits a default argument that cannot be lowered to Java"
@@ -324,6 +331,10 @@ impl RetentionKind {
                 "property {} narrows nullable {} to Java-incompatible {}",
                 params[0], params[1], params[2]
             ),
+            Self::PropertyInterfaceBridge if params.len() >= 2 => format!(
+                "property interface cannot move to Java because {} cannot be bridged: {}",
+                params[0], params[1]
+            ),
             _ => self.summary().to_string(),
         }
     }
@@ -336,6 +347,7 @@ impl RetentionKind {
         matches!(
             self,
             Self::InterfaceSubtypeRetained
+                | Self::PropertyInterfaceBridge
                 | Self::RetainedInheritor
                 | Self::ReferencedFromRetainedKotlin
                 | Self::RetainedPropertyInterface

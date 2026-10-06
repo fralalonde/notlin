@@ -28,8 +28,6 @@ pub struct Unit<'src, 'tree> {
     /// Assume Lombok on target classpath (--lombok): data classes emit as
     /// @Data classes (mutable), hand-rolled accessors become annotations.
     pub lombok: bool,
-    /// Assume Apache Commons Lang 3 on the target classpath (--commons-lang).
-    pub commons_lang: bool,
     pub in_place: bool,
     /// Per-file coverage: which declarations translated, which didn't.
     pub coverage: FileCoverage,
@@ -85,6 +83,11 @@ pub struct Unit<'src, 'tree> {
     /// Name of the function whose body is currently being transpiled (used
     /// to detect self-setter field writes that must not re-enter `setX(...)`).
     pub(crate) current_function_name: Option<String>,
+    /// Whether an explicit `return expr` in the current body may return a
+    /// value. Kotlin permits `return unitCall()` in a Unit function; Java
+    /// requires the call and `return` to be separate statements.
+    pub(crate) current_function_returns_value: bool,
+    pub(crate) current_function_return_type: Option<String>,
 
     /// Set by navigation_call when the member mapping already consumed the
     /// call args (joinToString) — call.rs must not append its own `(args)`.
@@ -174,7 +177,6 @@ pub struct Unit<'src, 'tree> {
 pub struct UnitOptions {
     pub untranslatable_as_error: bool,
     pub lombok: bool,
-    pub commons_lang: bool,
     pub in_place: bool,
 }
 
@@ -193,7 +195,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             annots,
             untranslatable_as_error: options.untranslatable_as_error,
             lombok: options.lombok,
-            commons_lang: options.commons_lang,
             in_place: options.in_place,
             coverage: FileCoverage::default(),
             untranslated_names: std::collections::HashSet::new(),
@@ -211,6 +212,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             static_member_types: std::collections::HashMap::new(),
             pending_setter: false,
             current_function_name: None,
+            current_function_returns_value: false,
+            current_function_return_type: None,
 
             pending_full_call: false,
             pending_callee_type_arg: None,
@@ -712,9 +715,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let mut package = String::new();
         let mut imports: Vec<String> = Vec::new();
         let mut decls: Vec<tree_sitter::Node> = Vec::new();
-        let mut standalone_annotation_targets = std::collections::HashSet::new();
+        let mut standalone_annotation_targets = std::collections::HashMap::new();
         let mut file_jvm_name: Option<String> = None;
         let mut retain_next_declaration = false;
+        let mut retained_annotations: Vec<String> = Vec::new();
         // Java-native annotations hoisted from top-level annotated_expression
         // wrappers (grammar quirk) waiting for the next declaration.
         let mut hoisted_annotations: Vec<String> = Vec::new();
@@ -787,15 +791,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     match self.transpile_declaration_annotation(child) {
                         Some(text) => hoisted_annotations.push(text),
                         None => {
-                            self.diag_untranslatable(
-                                child,
-                                "annotated top-level declaration is retained in Kotlin",
-                            );
-                            if self.current_decl.is_none() {
-                                self.coverage
-                                    .untranslated
-                                    .push(format!("top-level@{}", child.start_byte()));
-                            }
+                            retained_annotations.push(annotation.to_string());
                             retain_next_declaration = true;
                         }
                     }
@@ -807,7 +803,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     || k == "property_declaration" =>
                 {
                     if retain_next_declaration {
-                        standalone_annotation_targets.insert(child.id());
+                        standalone_annotation_targets
+                            .insert(child.id(), std::mem::take(&mut retained_annotations));
                         retain_next_declaration = false;
                     }
                     if !wrapper_spans_for_next.is_empty() {
@@ -856,11 +853,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     let imports2 = imports.clone();
                     let package2 = package.clone();
                     self.begin_decl(*decl, type_name.clone());
-                    if standalone_annotation_targets.contains(&decl.id()) {
-                        self.diag_untranslatable(
-                            *decl,
-                            "standalone annotation requires the following declaration to remain Kotlin",
-                        );
+                    if let Some(retained) = standalone_annotation_targets.get(&decl.id()) {
+                        for annotation in retained {
+                            self.diag_untranslatable_coded(
+                                *decl,
+                                format!(
+                                    "declaration annotation is retained in Kotlin; annotation: `{annotation}`; its type or argument expression cannot yet be lowered in this run"
+                                ),
+                                Some(crate::diagnostics::warning_code(
+                                    "declaration annotation is retained in Kotlin",
+                                )),
+                            );
+                        }
                         self.end_decl();
                         continue;
                     }

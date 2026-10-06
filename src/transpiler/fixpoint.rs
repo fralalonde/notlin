@@ -21,8 +21,10 @@
 use crate::cli::Cli;
 use crate::transpiler::{WorkspaceScope, parse_tree, transpile_with_tree_hint_selection};
 use crate::workspace::SourceIndex;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Debug hook: `NOTLIN_TRACE_RETENTION=<substr>[,<substr>...]` prints one line
@@ -91,6 +93,22 @@ fn worker_stack_bytes() -> usize {
         .saturating_mul(1024 * 1024)
 }
 
+fn planner_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(silent_jobs())
+            .stack_size(worker_stack_bytes())
+            .thread_name(|index| format!("notlin-{index}"))
+            .build()
+            .expect("build the translation worker pool")
+    })
+}
+
+pub(crate) fn install_parallel<R: Send>(operation: impl FnOnce() -> R + Send) -> R {
+    planner_pool().install(operation)
+}
+
 struct SilentPlanner<'a> {
     files: &'a [(PathBuf, String)],
     trees: &'a [tree_sitter::Tree],
@@ -131,47 +149,19 @@ impl SilentPlanner<'_> {
         indices: &[usize],
         retained: &HashSet<String>,
     ) -> Result<Vec<(usize, FilePlan)>, String> {
-        let configured_jobs = silent_jobs();
-        let jobs = configured_jobs.min(indices.len().max(1));
+        let jobs = silent_jobs().min(indices.len().max(1));
         if jobs <= 1 || indices.len() < 2 {
             return Ok(indices
                 .iter()
                 .map(|index| (*index, self.translate_one(*index, retained)))
                 .collect());
         }
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(jobs);
-            for worker in 0..jobs {
-                let assigned = indices
-                    .iter()
-                    .copied()
-                    .skip(worker)
-                    .step_by(jobs)
-                    .collect::<Vec<_>>();
-                handles.push(
-                    std::thread::Builder::new()
-                        .name(format!("notlin-{worker}"))
-                        .stack_size(worker_stack_bytes())
-                        .spawn_scoped(scope, move || {
-                            assigned
-                                .into_iter()
-                                .map(|index| (index, self.translate_one(index, retained)))
-                                .collect::<Vec<_>>()
-                        })
-                        .map_err(|error| format!("spawn translation worker: {error}"))?,
-                );
-            }
-            let mut translated = Vec::with_capacity(indices.len());
-            for handle in handles {
-                translated.extend(
-                    handle
-                        .join()
-                        .map_err(|_| "translation worker panicked".to_string())?,
-                );
-            }
-            translated.sort_by_key(|(index, _)| *index);
-            Ok(translated)
-        })
+        Ok(planner_pool().install(|| {
+            indices
+                .par_iter()
+                .map(|index| (*index, self.translate_one(*index, retained)))
+                .collect()
+        }))
     }
 }
 
@@ -486,7 +476,7 @@ pub fn qualify_retention_markers_at(plans: &mut [FilePlan]) {
                 continue;
             };
             if !original_message.starts_with("retained ") {
-                *marker = crate::retention_docs::javadoc(original_code, original_message, &[]);
+                *marker = crate::retention_docs::kdoc(original_code, original_message, &[]);
                 continue;
             }
             let file = crate::paths::display(&plan.file);
@@ -513,10 +503,10 @@ pub fn qualify_retention_markers_at(plans: &mut [FilePlan]) {
             } else {
                 format!(
                     "{} because the linked declarations remain Kotlin.",
-                    site.kind.summary()
+                    site.kind.detail(&site.params)
                 )
             };
-            *marker = crate::retention_docs::javadoc(&site.kind.code(), &reason, &links);
+            *marker = crate::retention_docs::kdoc(&site.kind.code(), &reason, &links);
         }
     }
 }

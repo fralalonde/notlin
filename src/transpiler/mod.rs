@@ -251,7 +251,6 @@ pub(crate) fn transpile_with_tree_hint_selection(
             crate::transpiler::unit::UnitOptions {
                 untranslatable_as_error,
                 lombok: cli.lombok,
-                commons_lang: cli.commons_lang,
                 in_place: cli.migrates_in_place(),
             },
         )

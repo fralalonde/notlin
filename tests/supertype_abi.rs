@@ -3,6 +3,79 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+fn migrate_fixture(root: &Path, files: &[(&str, &str)]) -> String {
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    for (name, source) in files {
+        fs::write(root.join(name), source).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root)
+        .output()
+        .expect("run notlin");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn inherited_generic_method_return_is_substituted() {
+    let root = Path::new("tests/tmp_scratch_abi_generic_method");
+    migrate_fixture(
+        root,
+        &[(
+            "model.kt",
+            "package selected.genericmethod\nimport java.util.Optional\nclass Item\ninterface Repo<T> {\n    fun find(): Optional<T>\n}\ninterface ItemRepo : Repo<Item> {\n    override fun find(): Optional<Item>\n}\n",
+        )],
+    );
+    assert!(root.join("Repo.java").exists());
+    assert!(root.join("ItemRepo.java").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicitly_projected_map_key_allows_narrow_implementation() {
+    let root = Path::new("tests/tmp_scratch_abi_projected_map");
+    migrate_fixture(
+        root,
+        &[(
+            "model.kt",
+            "package selected.projectedmap\nclass Key\nclass Value\ninterface Props { val props: Map<out Any, Any> }\nclass Impl(override val props: Map<Key, Value>) : Props\n",
+        )],
+    );
+    let contract = fs::read_to_string(root.join("Props.java")).unwrap();
+    assert!(
+        contract.contains("Map<? extends Object, ? extends Object> getProps()"),
+        "{contract}"
+    );
+    assert!(root.join("Impl.java").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn nullable_generic_property_is_substituted_before_narrowing_check() {
+    let root = Path::new("tests/tmp_scratch_abi_nullable_generic");
+    migrate_fixture(
+        root,
+        &[(
+            "model.kt",
+            "package selected.nullablegeneric\nclass Item\ninterface Has<T> { val item: T? }\nclass Impl(override val item: Item) : Has<Item?>\n",
+        )],
+    );
+    assert!(root.join("Has.java").exists());
+    let implementation = fs::read_to_string(root.join("Impl.java")).unwrap();
+    assert!(
+        implementation.contains("implements Has<Item>"),
+        "{implementation}"
+    );
+    assert!(!implementation.contains("Item?>"), "{implementation}");
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A class implementing a RETAINED Kotlin interface whose abstract property
 /// `items: List<Item>` conflicts with the class's `List<ItemImpl>` — Java
 /// return types must match exactly. The class must stay Kotlin (taint) rather

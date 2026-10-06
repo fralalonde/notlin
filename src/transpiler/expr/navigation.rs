@@ -88,6 +88,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             && b.kind() == "super_expression"
             && super_owner.is_none()
         {
+            let accessed_member = kids
+                .iter()
+                .filter(|child| child.is_named())
+                .nth(1)
+                .map(|member| self.unit.text(*member).trim().to_string());
             // Plain `super.<member>`: the qualifying supertype is the first
             // supertype of the enclosing declaration, resolved via the
             // workspace index (the index stores each declaration's own
@@ -109,11 +114,23 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 };
                 class_name.and_then(|cn| {
                     self.unit.workspace.and_then(|ws| {
-                        ws.declarations_named(&cn).next().and_then(|dc| {
-                            dc.supertypes
-                                .first()
-                                .map(|s| s.split('<').next().unwrap_or(s).trim().to_string())
-                        })
+                        let declaring = self
+                            .unit
+                            .workspace_file
+                            .as_deref()
+                            .unwrap_or(self.unit.file);
+                        accessed_member
+                            .as_deref()
+                            .and_then(|member| {
+                                ws.direct_supertype_for_member(declaring, &cn, member)
+                            })
+                            .or_else(|| {
+                                ws.declarations_named(&cn).next().and_then(|dc| {
+                                    dc.supertypes.first().map(|s| {
+                                        s.split('<').next().unwrap_or(s).trim().to_string()
+                                    })
+                                })
+                            })
                     })
                 })
             });
@@ -198,10 +215,12 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 result = format!("this.get{}()", capitalize(property));
             }
         }
-        if let Some(owner) = super_owner
-            && !result.starts_with(&owner)
-        {
-            result = format!("{owner}.{result}");
+        if let Some(owner) = super_owner {
+            if base.is_some_and(|base| base.kind() == "super_expression") && result == owner {
+                result = format!("{owner}.super");
+            } else if !result.starts_with(&owner) {
+                result = format!("{owner}.{result}");
+            }
         }
         for w in kids.windows(3) {
             if w[1].kind() == "." || w[1].kind() == "?." {
@@ -827,10 +846,21 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     .map(|ty| self.unit.text(ty).to_string())
                     .or_else(|| {
                         self.enclosing_type_name().and_then(|name| {
-                            file.declarations
-                                .iter()
-                                .find(|d| d.name == name)
-                                .and_then(|d| d.supertypes.first().cloned())
+                            let member = raw_trimmed
+                                .strip_prefix(self.unit.text(base))
+                                .unwrap_or(&raw_trimmed)
+                                .trim_start_matches('.')
+                                .split('(')
+                                .next()
+                                .unwrap_or_default();
+                            workspace
+                                .direct_supertype_for_member(declaring, &name, member)
+                                .or_else(|| {
+                                    file.declarations
+                                        .iter()
+                                        .find(|d| d.name == name)
+                                        .and_then(|d| d.supertypes.first().cloned())
+                                })
                         })
                     });
                 if let Some(owner) = owner
@@ -871,6 +901,21 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .children(&mut node.walk())
             .find(|child| child.is_named())
             && base.kind() == "identifier"
+        {
+            let property = self.unit.text(base).trim();
+            if !self.unit.var_types.contains_key(property)
+                && self.unit.ext_receiver_name.is_none()
+                && !self.enclosing_record_has_component(property)
+                && let Some(getter) = self.unit.self_getters.get(property)
+            {
+                raw_trimmed = format!("this.{}(){}", getter, &raw_trimmed[property.len()..]);
+            }
+        }
+        if let Some(base) = node
+            .children(&mut node.walk())
+            .find(|child| child.is_named())
+            && base.kind() == "identifier"
+            && raw_trimmed.starts_with(self.unit.text(base).trim())
             && let Some(name) = self.enclosing_type_name()
         {
             let property = self.unit.text(base).trim();
@@ -1167,7 +1212,16 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                 || kt::child(p, "annotated_lambda").is_some()
                         })
                         .unwrap_or(false);
-                    let base_stream_ready = base_java.ends_with(".stream()");
+                    let base_stream_ready = base_java.ends_with(".stream()")
+                        || (base_java.contains(".stream()")
+                            && !base_java.contains(".collect(")
+                            && !base_java.ends_with(".toList()"));
+                    const TO_LIST_COLLECT: &str = ".collect(java.util.stream.Collectors.toList())";
+                    if matches!(member.as_str(), "findFirst" | "findAny" | "toList")
+                        && let Some(pipeline) = base_java.strip_suffix(TO_LIST_COLLECT)
+                    {
+                        return format!("{}.{}", pipeline, member);
+                    }
                     // `collection.stream().filter { ... }` is already the
                     // Java Stream API; preserve the direct member rather than
                     // treating Kotlin's Iterable.filter as the receiver.

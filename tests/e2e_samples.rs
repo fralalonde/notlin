@@ -622,6 +622,31 @@ fn companion_line_comments_do_not_make_members_unsupported() {
 }
 
 #[test]
+fn generated_block_comments_inside_lambdas_are_not_expressions() {
+    let source = r#"class Mapper {
+    fun doubled(values: List<Int>): List<Int> = values.map { value ->
+        /**
+         * NOTLIN N0001: marker from an earlier migration pass.
+         */
+        value * 2
+    }
+}"#;
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Mapper.kt"]);
+    let (_files, errors, _warnings, coverage) =
+        notlin::transpiler::transpile(source, &PathBuf::from("Mapper.kt"), &cli);
+
+    assert_eq!(errors, 0);
+    assert!(
+        coverage
+            .blockers
+            .iter()
+            .all(|(_, blocker)| !blocker.contains("block_comment")),
+        "generated comments must not become new translation blockers: {:?}",
+        coverage.blockers
+    );
+}
+
+#[test]
 fn mutable_iterable_parameters_preserve_covariant_java_signature() {
     let source = "interface Sink { fun removeAll(values: MutableIterable<Long>) }";
     let (files, errors) = transpile_src(source, "Sink.kt");
@@ -711,13 +736,7 @@ interface Child : Base {
         "inherited property must be indexed"
     );
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args([
-            "--root",
-            root.to_str().unwrap(),
-            "--in-place",
-            "--lombok",
-            "--commons-lang",
-        ])
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
         .arg(source_path.to_str().unwrap())
         .output()
         .expect("run notlin");
@@ -774,7 +793,6 @@ enum class Residual : Child {
             root.to_str().unwrap(),
             "--in-place",
             "--lombok",
-            "--commons-lang",
             root.to_str().unwrap(),
         ])
         .output()
@@ -838,13 +856,7 @@ data class TranslatedId(override val objectId: String, override val lookupId: St
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args([
-            "--root",
-            root.to_str().unwrap(),
-            "--in-place",
-            "--lombok",
-            "--commons-lang",
-        ])
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
         .arg(&source_path)
         .output()
         .expect("run notlin");

@@ -149,16 +149,47 @@ fn strip_translated_with_blockers(
     } else {
         Vec::new()
     };
+    // Generated NOTLIN KDoc blocks are input metadata on subsequent in-place
+    // passes, not Kotlin expressions. Ignore stale cached diagnostics whose
+    // AST anchor points at or inside one of those comments; otherwise the
+    // migrator annotates its own annotation and grows the file every run.
+    blockers.retain(|(offset, _)| !inside_generated_notlin_kdoc(source, *offset));
     blockers.sort_by_key(|(offset, _)| *offset);
     for (start, end) in merged {
         copy_kept(&mut blockers, source, cursor, start, &mut out);
-        // Blockers anchored inside the stripped span: emit at its start,
-        // where the removed code used to be.
-        flush_blockers(&mut blockers, start, end, &mut out);
+        // A blocker anchored in a declaration that translated is stale
+        // fixpoint metadata. Drop it with the declaration; emitting it here
+        // leaves an orphan NOTLIN KDoc block in the retained source.
+        blockers.retain(|(offset, _)| !(*offset >= start && *offset < end));
         cursor = end;
     }
     copy_kept(&mut blockers, source, cursor, source.len(), &mut out);
     out
+}
+
+fn inside_generated_notlin_kdoc(source: &str, offset: usize) -> bool {
+    if offset > source.len() {
+        return false;
+    }
+    let before = &source[..offset];
+    let Some(comment_start) = before.rfind("/**").or_else(|| {
+        source
+            .get(offset..)
+            .is_some_and(|tail| tail.starts_with("/**"))
+            .then_some(offset)
+    }) else {
+        return false;
+    };
+    if source[comment_start..offset].contains("*/") {
+        return false;
+    }
+    let Some(relative_end) = source[offset..].find("*/") else {
+        return false;
+    };
+    source[comment_start..offset + relative_end + 2]
+        .lines()
+        .nth(1)
+        .is_some_and(|line| line.trim_start().starts_with("* NOTLIN "))
 }
 
 /// Copy `source[from..to]` verbatim, inserting each blocker whose anchor
@@ -207,6 +238,33 @@ fn copy_kept(
             .count()
             + line_start;
         let indent = &source[line_start..indent_end];
+        let desired_block = region_blockers[blocker_index..group_end]
+            .iter()
+            .map(|(_, text)| {
+                text.lines()
+                    .map(|line| format!("{indent}{line}\n"))
+                    .collect::<String>()
+            })
+            .collect::<String>();
+
+        // Kotlin annotations belong to the declaration but tree-sitter may
+        // anchor that declaration either at its first annotation or at the
+        // declaration keyword on a later parse. Preserve and update a marker
+        // before the attached annotation block instead of inserting a second
+        // copy after the annotations.
+        if let Some((comment_start, comment_end)) =
+            generated_kdoc_before_annotations(source, p.max(from), line_start, indent)
+        {
+            if source[comment_start..comment_end] != desired_block {
+                out.push_str(&source[p..comment_start]);
+                out.push_str(&desired_block);
+                out.push_str(&source[comment_end..line_start]);
+                p = line_start;
+            }
+            blocker_index = group_end;
+            continue;
+        }
+
         let mut blocker_block_start = line_start;
         while blocker_block_start > from {
             let previous_end = blocker_block_start - 1;
@@ -249,16 +307,14 @@ fn copy_kept(
                 break;
             }
         }
-        let desired_block = region_blockers[blocker_index..group_end]
-            .iter()
-            .map(|(_, text)| {
-                text.lines()
-                    .map(|line| format!("{indent}{line}\n"))
-                    .collect::<String>()
-            })
-            .collect::<String>();
-        if source[blocker_block_start..line_start] != desired_block {
-            out.push_str(&source[p..blocker_block_start]);
+        // A stale generated marker can itself receive a blocker on a later
+        // pass. In that case this backward scan overlaps a marker region that
+        // an earlier blocker group has already consumed. Replace only the
+        // still-unwritten suffix; slicing from the older start would put the
+        // range before `p` and panic.
+        let replace_start = blocker_block_start.max(p);
+        if source[replace_start..line_start] != desired_block {
+            out.push_str(&source[p..replace_start]);
             out.push_str(&desired_block);
             p = line_start;
         }
@@ -268,16 +324,56 @@ fn copy_kept(
     blockers.retain(|(o, _)| !(*o >= from && *o < to));
 }
 
-/// Emit (and remove) blockers with `from <= offset < to`, in offset order.
-fn flush_blockers(blockers: &mut Vec<(usize, String)>, from: usize, to: usize, out: &mut String) {
-    blockers.retain(|(offset, text)| {
-        if *offset >= from && *offset < to {
-            out.push_str(text);
-            false
-        } else {
-            true
+fn generated_kdoc_before_annotations(
+    source: &str,
+    from: usize,
+    line_start: usize,
+    indent: &str,
+) -> Option<(usize, usize)> {
+    let before = &source[from..line_start];
+    let relative_start = before.rfind("/**")?;
+    let comment_start = from + relative_start;
+    let comment_tail = &source[comment_start..line_start];
+    if !comment_tail
+        .lines()
+        .nth(1)
+        .is_some_and(|line| line.trim_start().starts_with("* NOTLIN "))
+    {
+        return None;
+    }
+    let relative_close = comment_tail.find("*/")? + 2;
+    let mut comment_end = comment_start + relative_close;
+    if source.as_bytes().get(comment_end) == Some(&b'\r') {
+        comment_end += 1;
+    }
+    if source.as_bytes().get(comment_end) == Some(&b'\n') {
+        comment_end += 1;
+    }
+    annotations_only(&source[comment_end..line_start], indent)
+        .then_some((comment_start, comment_end))
+}
+
+fn annotations_only(source: &str, indent: &str) -> bool {
+    let mut saw_annotation = false;
+    let mut paren_depth = 0isize;
+    for line in source.lines() {
+        let line = line.strip_prefix(indent).unwrap_or(line).trim();
+        if line.is_empty() {
+            continue;
         }
-    });
+        if paren_depth == 0 {
+            if !line.starts_with('@') {
+                return false;
+            }
+            saw_annotation = true;
+        }
+        paren_depth += line.chars().filter(|ch| *ch == '(').count() as isize;
+        paren_depth -= line.chars().filter(|ch| *ch == ')').count() as isize;
+        if paren_depth < 0 {
+            return false;
+        }
+    }
+    saw_annotation && paren_depth == 0
 }
 
 /// Collapse more than one consecutive blank line into one and trim leading

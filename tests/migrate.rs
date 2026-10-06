@@ -27,6 +27,21 @@ fn strip_swallows_trailing_newline() {
 }
 
 #[test]
+fn blocker_inside_a_translated_declaration_is_removed_with_it() {
+    let source = "interface Gone { val state: String }\n\ninterface Kept {}\n";
+    let mut cov = FileCoverage::default();
+    let end = source.find("\n\n").unwrap();
+    cov.translated_spans.push((0, end));
+    cov.blockers.push((
+        source.find("state").unwrap(),
+        "/**\n * NOTLIN N4E99: stale property blocker.\n */\n".to_string(),
+    ));
+    let out = migrate::strip_translated(source, &cov);
+    assert_eq!(out, "\ninterface Kept {}\n");
+    assert!(!out.contains("NOTLIN"));
+}
+
+#[test]
 fn fully_translated_means_no_untranslated() {
     let cov = FileCoverage {
         translated: vec!["A".into()],
@@ -291,6 +306,62 @@ fn changed_blocker_replaces_the_existing_notlin_block() {
 }
 
 #[test]
+fn generated_kdoc_before_annotations_is_idempotent() {
+    let marker = "/**\n * NOTLIN N2142: retained hierarchy.\n * Retained Kotlin dependencies:\n * - [example.Child]\n */\n";
+    let source = format!(
+        "{marker}@JsonTypeInfo(\n    use = JsonTypeInfo.Id.NAME\n)\n@JsonTypeName(\"kept\")\ninterface Kept {{}}\n"
+    );
+    let mut coverage = FileCoverage::default();
+    coverage
+        .blockers
+        .push((source.find("interface Kept").unwrap(), marker.to_string()));
+
+    let out = migrate::strip_translated(&source, &coverage);
+
+    assert_eq!(out, source);
+    assert_eq!(out.matches("NOTLIN N2142").count(), 1);
+}
+
+#[test]
+fn changed_kdoc_before_annotations_preserves_the_annotations() {
+    let source =
+        "/**\n * NOTLIN N001: old reason.\n */\n@JsonTypeName(\"kept\")\ninterface Kept {}\n";
+    let replacement = "/**\n * NOTLIN N002: new reason.\n */\n";
+    let mut coverage = FileCoverage::default();
+    coverage.blockers.push((
+        source.find("interface Kept").unwrap(),
+        replacement.to_string(),
+    ));
+
+    let out = migrate::strip_translated(source, &coverage);
+
+    assert_eq!(
+        out,
+        "/**\n * NOTLIN N002: new reason.\n */\n@JsonTypeName(\"kept\")\ninterface Kept {}\n"
+    );
+}
+
+#[test]
+fn annotated_kdoc_blocks_for_multiple_declarations_are_idempotent() {
+    let first = "/**\n * NOTLIN N001: first.\n */\n";
+    let second = "/**\n * NOTLIN N002: second.\n */\n";
+    let source = format!(
+        "{first}@Marker(1)\ninterface First {{}}\n\n{second}@Marker(2)\ninterface Second {{}}\n"
+    );
+    let mut coverage = FileCoverage::default();
+    coverage
+        .blockers
+        .push((source.find("interface First").unwrap(), first.to_string()));
+    coverage
+        .blockers
+        .push((source.find("interface Second").unwrap(), second.to_string()));
+
+    let out = migrate::strip_translated(&source, &coverage);
+
+    assert_eq!(out, source);
+}
+
+#[test]
 fn blockers_with_distinct_offsets_on_one_line_replace_one_existing_block() {
     let source = "// NOTLIN: N001 old reason\ninterface Kept : A, B {}\n";
     let mut coverage = FileCoverage::default();
@@ -309,6 +380,34 @@ fn blockers_with_distinct_offsets_on_one_line_replace_one_existing_block() {
         out,
         "// NOTLIN: N002 first reason\n// NOTLIN: N003 second reason\ninterface Kept : A, B {}\n"
     );
+}
+
+#[test]
+fn blocker_replacement_tolerates_overlapping_generated_marker_regions() {
+    let first = "/**\n * NOTLIN N001: stale generated marker.\n */\n";
+    let second = "/**\n * NOTLIN N002: another stale generated marker.\n */\n";
+    let source = format!("fun kept() {{\n    {first}    {second}    val value = 1\n}}\n");
+    let first_anchor = source.find("/**").unwrap();
+    let declaration_anchor = source.find("val value").unwrap();
+    let coverage = FileCoverage {
+        blockers: vec![
+            (
+                first_anchor,
+                "// NOTLIN: N010 generated comments are ignored\n".to_string(),
+            ),
+            (
+                declaration_anchor,
+                "/**\n * NOTLIN N020: retained declaration.\n */\n".to_string(),
+            ),
+        ],
+        ..Default::default()
+    };
+
+    let out = migrate::strip_translated(&source, &coverage);
+
+    assert!(!out.contains("NOTLIN N010"), "{out}");
+    assert!(out.contains("NOTLIN N020"), "{out}");
+    assert!(out.contains("val value = 1"), "{out}");
 }
 
 #[test]

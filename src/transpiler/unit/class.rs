@@ -6,6 +6,7 @@ use crate::diagnostics::{DiagnosticKind, RetentionKind};
 use crate::transpiler::expr::Expr;
 use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
+use std::collections::HashSet;
 
 /// Retention closure over the type hierarchy: a retained declaration forces
 /// every declaration it shares a hierarchy edge with to stay Kotlin. It exists
@@ -272,7 +273,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 if collides || !import_is_referenced(imp, &body) {
                     continue;
                 }
-                block.push_str(&format!("import {};\n", imp));
+                if imp == "com.fasterxml.jackson.module.kotlin.jacksonObjectMapper" {
+                    block.push_str(
+                        "import static com.fasterxml.jackson.module.kotlin.ExtensionsKt.jacksonObjectMapper;\n",
+                    );
+                } else {
+                    block.push_str(&format!("import {};\n", imp));
+                }
             }
         }
         // Under --lombok the emitted @Data/@AllArgsConstructor need their
@@ -470,7 +477,22 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             && target.kind == crate::workspace::DeclarationKind::Interface
             && target.members.is_empty()
             && target.supertypes.is_empty();
-        if workspace.has_unselected_kotlin_subtype(target, self.translation_roots) {
+        let property_bridge_result = self.retained_hint.as_ref().and_then(|retained| {
+            crate::property_abi::is_property_interface_candidate(target).then(|| {
+                crate::property_abi::retained_subtypes_bridge(
+                    workspace,
+                    target,
+                    retained,
+                    self.translation_roots,
+                )
+            })
+        });
+        let property_interface_bridge = property_bridge_result.as_ref().is_some_and(Result::is_ok);
+        let safe_for_retained_subtypes = marker_interface || property_interface_bridge;
+        if hierarchy_closure()
+            && !safe_for_retained_subtypes
+            && workspace.has_unselected_kotlin_subtype(target, self.translation_roots)
+        {
             return Some((
                 RetentionKind::SubtypeOutsideTranslationSet,
                 Vec::new(),
@@ -487,7 +509,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         //   (intrinsically tainted decls) never shrink, so iteration
         //   reaches the least fixpoint.
         if hierarchy_closure()
-            && !marker_interface
+            && !safe_for_retained_subtypes
             && target.kind == crate::workspace::DeclarationKind::Interface
         {
             let blockers = self.retained_subtypes(workspace, target);
@@ -496,6 +518,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 None => workspace.has_kotlin_subtype(target),
             };
             if retains {
+                if let Some(Err(failure)) = property_bridge_result {
+                    let failure_is_root = failure.declaration == target.name;
+                    return Some((
+                        RetentionKind::PropertyInterfaceBridge,
+                        vec![failure.declaration.clone(), failure.reason],
+                        if failure_is_root {
+                            Vec::new()
+                        } else {
+                            vec![failure.declaration]
+                        },
+                    ));
+                }
                 return Some((
                     RetentionKind::InterfaceSubtypeRetained,
                     Vec::new(),
@@ -512,7 +546,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // resolves an inherited member as a real override against a Kotlin
         // declaration, not against a Java default method.
         if hierarchy_closure()
-            && !marker_interface
+            && !safe_for_retained_subtypes
             && self
                 .retained_hint
                 .as_ref()
@@ -880,6 +914,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // bare identifier when function bodies are lowered first.
         if let Some(body) = kt::child(decl, "class_body") {
             for member in body.children(&mut body.walk()) {
+                if member.kind() == "function_declaration"
+                    && kt::child(member, "function_value_parameters").is_some_and(|parameters| {
+                        !parameters
+                            .children(&mut parameters.walk())
+                            .any(|parameter| parameter.kind() == "parameter")
+                    })
+                    && let Some(method) = kt::field(member, "name").map(|name| self.text(name))
+                    && let Some(stem) = method.strip_prefix("get").filter(|stem| !stem.is_empty())
+                {
+                    let mut chars = stem.chars();
+                    if let Some(first) = chars.next() {
+                        let property = first.to_lowercase().collect::<String>() + chars.as_str();
+                        self.self_getters.insert(property, method.to_string());
+                    }
+                }
                 if member.kind() != "property_declaration" {
                     continue;
                 }
@@ -972,7 +1021,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     let id_text = self.text(id).to_string();
                     match kt::child(t, "user_type").or_else(|| kt::child(t, "nullable_type")) {
                         Some(bound) => {
-                            let b = kt::java_type_ann(bound, self.source, self.annots);
+                            // A nullable Kotlin bound (`T : Foo?`) erases to
+                            // the same Java bound as `T : Foo`. Declaration
+                            // annotations are not valid between `extends` and
+                            // the bound for common annotation sets.
+                            let b = kt::java_type(bound, self.source);
                             if b == "Object" || b == "Any" {
                                 parts.push(id_text);
                             } else {
@@ -1008,10 +1061,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             if !*is_property {
                 continue;
             }
-            self.self_getters.insert(
-                member_name.clone(),
-                format!("get{}", capitalize(member_name)),
-            );
+            let getter = format!("get{}", capitalize(member_name));
+            // A retained Kotlin property repaired for a Java interface has an
+            // explicit `getX()` bridge. If that class translates on a later
+            // speculative pass, its own field reads must stay field reads;
+            // routing the bridge body back through `getX()` creates recursion.
+            if self.class_declares_method(decl, &getter) {
+                continue;
+            }
+            self.self_getters.insert(member_name.clone(), getter);
         }
         let has_secondary_constructor = kt::child(decl, "class_body").is_some_and(|body| {
             body.children(&mut body.walk())
@@ -1111,7 +1169,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             .children(&mut inner.walk())
                             .find(|c| c.kind() == "user_type")
                         {
-                            parts.push(format!("iface:{}", self.text(ut).replace(" ", "")));
+                            parts.push(format!(
+                                "iface:{}",
+                                kt::java_type(ut, self.source).replace(" ", "")
+                            ));
                         }
                         self.diag_approx(
                             inner,
@@ -1121,7 +1182,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     // `: Greeter` — bare supertype; can't tell class vs
                     // interface without cross-file metadata, assume interface
                     "user_type" | "nullable_type" => {
-                        let t = self.text(inner).replace(" ", "");
+                        let t = kt::java_type(inner, self.source).replace(" ", "");
                         if !t.starts_with("@") {
                             parts.push(format!("iface:{}", t));
                         }
@@ -1225,6 +1286,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 visibility, modifiers, name, type_params, extends
             ));
             if let Some(body) = kt::child(decl, "class_body") {
+                for property in body
+                    .children(&mut body.walk())
+                    .filter(|member| member.kind() == "property_declaration")
+                {
+                    if let Some(property_name) = kt::child(property, "variable_declaration")
+                        .and_then(|variable| kt::child(variable, "identifier"))
+                    {
+                        let property_name = self.text(property_name).to_string();
+                        self.self_getters.insert(
+                            property_name.clone(),
+                            format!("get{}", capitalize(&property_name)),
+                        );
+                    }
+                }
                 let mut cursor = body.walk();
                 for member in body.children(&mut cursor) {
                     match member.kind() {
@@ -1279,7 +1354,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                             // interface members.
                                             self.var_types.clear();
                                             out.open(format!("default {} get{}()", pty, cap));
-                                            self.transpile_function_body(gb, out);
+                                            self.transpile_function_body(gb, out, true);
                                             out.close();
                                         }
                                         None => out.line(format!("{} get{}();", pty, cap)),
@@ -1293,7 +1368,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                                     "default void set{}({} value)",
                                                     cap, pty
                                                 ));
-                                                self.transpile_function_body(sb, out);
+                                                self.transpile_function_body(sb, out, false);
                                                 out.close();
                                             }
                                             None => {
@@ -1428,7 +1503,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         } else {
                             ""
                         };
-                        format!("{}{} {}", nullability, t, n)
+                        self.java_constructor_parameter(decl, n, t, nullability)
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -1682,19 +1757,24 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.blank();
                 for (_, _, fname, ftype) in &params {
                     let cap = capitalize(fname);
+                    let getter = format!("get{cap}");
+                    let setter = format!("set{cap}");
                     // `@get:`-targeted annotations belong on the generated
                     // getter, which this path emits.
-                    for annotation in self.param_getter_annotations(decl, fname) {
-                        out.line(annotation);
+                    if !self.class_declares_method(decl, &getter) {
+                        for annotation in self.param_getter_annotations(decl, fname) {
+                            out.line(annotation);
+                        }
+                        out.open(format!("public {} {}()", ftype, getter));
+                        out.line(format!("return {};", fname));
+                        out.close();
                     }
-                    out.open(format!("public {} get{}()", ftype, cap));
-                    out.line(format!("return {};", fname));
-                    out.close();
                     if params
                         .iter()
                         .any(|(_, mutable, n, _)| *mutable && n == fname)
+                        && !self.class_declares_method(decl, &setter)
                     {
-                        out.open(format!("public void set{}({} {})", cap, ftype, fname));
+                        out.open(format!("public void {}({} {})", setter, ftype, fname));
                         out.line(format!("this.{} = {};", fname, fname));
                         out.close();
                     }
@@ -1777,8 +1857,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             // that one), so relying on the synthesized all-args ctor would
             // silently DELETE it and break every call site — the explicit ctor
             // has to be written beside the no-arg one.
-            let lombok_supplies_all_args =
-                !jpa_no_arg && !self.class_body_declares_instance_fields(decl);
+            let lombok_supplies_all_args = !jpa_no_arg
+                && !self.class_body_declares_instance_fields(decl)
+                && params
+                    .iter()
+                    .all(|(_, _, name, _)| self.param_parameter_annotations(decl, name).is_empty());
             if self.lombok
                 && !params.is_empty()
                 // Lombok would generate a second equals/hashCode/toString
@@ -1850,7 +1933,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.open(format!("public {}({})", name, {
                     params
                         .iter()
-                        .map(|(_, _, n, t)| format!("{} {}", t, n))
+                        .map(|(_, _, n, t)| self.java_constructor_parameter(decl, n, t, ""))
                         .collect::<Vec<_>>()
                         .join(", ")
                 }));
@@ -1873,7 +1956,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.open(format!("public {}({})", name, {
                     params
                         .iter()
-                        .map(|(_, _, n, t)| format!("{} {}", t, n))
+                        .map(|(_, _, n, t)| self.java_constructor_parameter(decl, n, t, ""))
                         .collect::<Vec<_>>()
                         .join(", ")
                 }));
@@ -1901,17 +1984,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         continue;
                     }
                     let cap = capitalize(fname);
+                    let getter = format!("get{cap}");
+                    let setter = format!("set{cap}");
                     // `@get:`-targeted annotations belong on the generated
                     // getter, which this path emits.
-                    for annotation in self.param_getter_annotations(decl, fname) {
-                        out.line(annotation);
+                    if !self.class_declares_method(decl, &getter) {
+                        for annotation in self.param_getter_annotations(decl, fname) {
+                            out.line(annotation);
+                        }
+                        out.open(format!("public {} {}()", ftype, getter));
+                        out.line(format!("return {};", fname));
+                        out.close();
                     }
-                    out.open(format!("public {} get{}()", ftype, cap));
-                    out.line(format!("return {};", fname));
-                    out.close();
-                    if *is_mutable {
+                    if *is_mutable && !self.class_declares_method(decl, &setter) {
                         out.blank();
-                        out.open(format!("public void set{}({} {})", cap, ftype, fname));
+                        out.open(format!("public void {}({} {})", setter, ftype, fname));
                         out.line(format!("this.{} = {};", fname, fname));
                         out.close();
                     }
@@ -2131,6 +2218,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             let mut cursor = current.walk();
             for child in current.children(&mut cursor) {
                 if child.kind() == "annotation" {
+                    if self.text(child).contains("notlinProperty") {
+                        continue;
+                    }
                     if let Some(text) = self.transpile_declaration_annotation(child) {
                         if use_site_target(self.text(child)) == Some("get") {
                             getter.push(text);
@@ -2166,8 +2256,92 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// Annotations for a constructor property that belong on the FIELD.
     fn param_annotations(&self, decl: tree_sitter::Node, property: &str) -> Vec<String> {
         self.param_node(decl, property)
-            .map(|parameter| self.annotation_split(parameter).0)
+            .map(|parameter| {
+                self.parameter_annotations(parameter)
+                    .into_iter()
+                    .filter(|(target, annotation)| {
+                        !annotation.contains("JvmField")
+                            && match target.as_deref() {
+                                Some("get" | "param") => false,
+                                Some("field") => true,
+                                _ => {
+                                    self.java_annotation_allows(annotation, "PARAMETER")
+                                        != Some(true)
+                                }
+                            }
+                    })
+                    .map(|(_, annotation)| annotation)
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// Untargeted Java annotations that Kotlin places on the primary
+    /// constructor parameter because their `@Target` admits PARAMETER, plus
+    /// explicit `@param:` annotations.
+    fn param_parameter_annotations(&self, decl: tree_sitter::Node, property: &str) -> Vec<String> {
+        self.param_node(decl, property)
+            .map(|parameter| {
+                self.parameter_annotations(parameter)
+                    .into_iter()
+                    .filter(|(target, annotation)| match target.as_deref() {
+                        Some("param") => true,
+                        Some(_) => false,
+                        None => self.java_annotation_allows(annotation, "PARAMETER") == Some(true),
+                    })
+                    .map(|(_, annotation)| annotation)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn parameter_annotations(&self, parameter: tree_sitter::Node) -> Vec<(Option<String>, String)> {
+        let mut annotations = Vec::new();
+        let mut stack = vec![parameter];
+        while let Some(current) = stack.pop() {
+            for child in current.children(&mut current.walk()) {
+                if child.kind() == "annotation" {
+                    if self.text(child).contains("notlinProperty") {
+                        continue;
+                    }
+                    if let Some(annotation) = self.transpile_declaration_annotation(child) {
+                        annotations.push((
+                            use_site_target(self.text(child)).map(str::to_string),
+                            annotation,
+                        ));
+                    }
+                } else {
+                    stack.push(child);
+                }
+            }
+        }
+        annotations
+    }
+
+    fn java_annotation_allows(&self, annotation: &str, element_type: &str) -> Option<bool> {
+        let workspace = self.workspace?;
+        let context = workspace.source_file(self.workspace_file.as_deref().unwrap_or(self.file))?;
+        let name = annotation
+            .trim_start_matches('@')
+            .split(|ch: char| ch == '(' || ch.is_whitespace())
+            .next()?;
+        workspace.java_annotation_allows(context, name, element_type)
+    }
+
+    fn java_constructor_parameter(
+        &self,
+        decl: tree_sitter::Node,
+        name: &str,
+        java_type: &str,
+        prefix: &str,
+    ) -> String {
+        let annotations = self.param_parameter_annotations(decl, name);
+        let annotations = if annotations.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", annotations.join(" "))
+        };
+        format!("{annotations}{prefix}{java_type} {name}")
     }
 
     /// Annotations for a constructor property that belong on the GETTER —
@@ -2708,9 +2882,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         out: &mut JavaOut,
     ) {
         self.enum_types.insert(name.to_string());
+        let mut default_property_bridges = Vec::new();
         if let Some(workspace) = self.workspace {
             let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
-            let obligations = workspace.enum_default_obligations(declaring, name);
+            default_property_bridges = workspace.enum_default_property_bridges(declaring, name);
+            let bridged = default_property_bridges
+                .iter()
+                .map(|bridge| bridge.method_name.as_str())
+                .collect::<HashSet<_>>();
+            let obligations = workspace
+                .enum_default_obligations(declaring, name)
+                .into_iter()
+                .filter(|obligation| !bridged.contains(obligation.as_str()))
+                .collect::<Vec<_>>();
             if !obligations.is_empty() {
                 self.diag_untranslatable(
                     decl,
@@ -2951,7 +3135,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         out.open(format!("{}enum {}{}", visibility, name, implements));
         // constants
         out.line(entries.join(",\n"));
-        if !members.is_empty() || !params.is_empty() || emit_entries_bridge {
+        if !members.is_empty()
+            || !params.is_empty()
+            || emit_entries_bridge
+            || !default_property_bridges.is_empty()
+        {
             out.line(";");
         }
         if emit_entries_bridge {
@@ -2961,6 +3149,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 name
             ));
             out.line("return kotlin.enums.EnumEntriesKt.enumEntries(values());");
+            out.close();
+        }
+        for bridge in &default_property_bridges {
+            out.blank();
+            let return_type =
+                crate::transpiler::types::map_type_name(bridge.return_type.trim_end_matches('?'));
+            out.line("@Override");
+            out.open(format!("public {} {}()", return_type, bridge.method_name));
+            out.line(format!(
+                "return {}.super.{}();",
+                bridge.provider, bridge.method_name
+            ));
             out.close();
         }
         // ctor params -> fields + accessors + private ctor
@@ -2982,15 +3182,29 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             out.blank();
             for (_is_property, is_mutable, fname, ftype) in &params {
                 let cap = capitalize(fname);
+                let getter_name = format!("get{cap}");
+                let setter_name = format!("set{cap}");
+                let declares_getter = members.iter().any(|member| {
+                    member.kind() == "function_declaration"
+                        && kt::field(*member, "name")
+                            .is_some_and(|name| self.text(name) == getter_name)
+                });
+                let declares_setter = members.iter().any(|member| {
+                    member.kind() == "function_declaration"
+                        && kt::field(*member, "name")
+                            .is_some_and(|name| self.text(name) == setter_name)
+                });
                 // `@get:`-targeted annotations belong on the generated
                 // getter, which this path emits.
-                for annotation in self.param_getter_annotations(decl, fname) {
-                    out.line(annotation);
+                if !declares_getter {
+                    for annotation in self.param_getter_annotations(decl, fname) {
+                        out.line(annotation);
+                    }
+                    out.open(format!("public {} get{}()", ftype, cap));
+                    out.line(format!("return {};", fname));
+                    out.close();
                 }
-                out.open(format!("public {} get{}()", ftype, cap));
-                out.line(format!("return {};", fname));
-                out.close();
-                if *is_mutable {
+                if *is_mutable && !declares_setter {
                     out.blank();
                     out.open(format!("public void set{}({} {})", cap, ftype, fname));
                     out.line(format!("this.{} = {};", fname, fname));
@@ -3868,6 +4082,29 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         for member in body.children(&mut cursor) {
             match member.kind() {
                 "function_declaration" => {
+                    // A retained Kotlin constructor property may have gained a
+                    // mechanical `getX() = x` ABI bridge on an earlier pass.
+                    // If the class now translates, the constructor-property
+                    // accessor emitted above is the same Java method; omit the
+                    // redundant bridge instead of producing a duplicate (and
+                    // preserve non-trivial explicit getters normally).
+                    if let Some(property) = self.constructor_property_bridge(member) {
+                        let current_is_record = !self.lombok
+                            && self
+                                .current_decl
+                                .and_then(|decl| kt::field(decl, "name"))
+                                .is_some_and(|name| self.record_types.contains(self.text(name)));
+                        if !current_is_record {
+                            continue;
+                        }
+                        let getter = self.self_getters.remove(&property);
+                        self.transpile_function(member, /*in_class=*/ true, out);
+                        if let Some(getter) = getter {
+                            self.self_getters.insert(property, getter);
+                        }
+                        out.blank();
+                        continue;
+                    }
                     self.transpile_function(member, /*in_class=*/ true, out);
                     out.blank();
                 }
@@ -3923,6 +4160,71 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
         }
+    }
+
+    pub(crate) fn constructor_property_bridge(
+        &self,
+        function: tree_sitter::Node,
+    ) -> Option<String> {
+        let name_node = kt::field(function, "name")?;
+        let name = self.text(name_node);
+        let (stem, getter) = if let Some(stem) = name.strip_prefix("get") {
+            (stem, true)
+        } else {
+            (name.strip_prefix("set")?, false)
+        };
+        let mut chars = stem.chars();
+        let first = chars.next()?;
+        let property = first.to_lowercase().collect::<String>() + chars.as_str();
+        let parameters = kt::child(function, "function_value_parameters")?;
+        let parameter_count = parameters
+            .children(&mut parameters.walk())
+            .filter(|child| child.kind() == "parameter")
+            .count();
+        let body = kt::child(function, "function_body")?;
+        if getter {
+            let mut owner = kt::parent_of(function);
+            while owner.is_some_and(|candidate| {
+                !matches!(
+                    candidate.kind(),
+                    "class_declaration" | "enum_class_declaration"
+                )
+            }) {
+                owner = owner.and_then(kt::parent_of);
+            }
+            let constructor_property = owner
+                .and_then(|class| kt::child(class, "primary_constructor"))
+                .and_then(|constructor| kt::child(constructor, "class_parameters"))
+                .is_some_and(|parameters| {
+                    parameters
+                        .children(&mut parameters.walk())
+                        .filter(|candidate| candidate.kind() == "class_parameter")
+                        .any(|candidate| {
+                            (kt::child(candidate, "val").is_some()
+                                || kt::child(candidate, "var").is_some())
+                                && kt::child(candidate, "identifier")
+                                    .is_some_and(|name| self.text(name) == property)
+                        })
+                });
+            return ((constructor_property
+                || self.self_getters.get(&property).map(String::as_str) == Some(name))
+                && parameter_count == 0
+                && body
+                    .children(&mut body.walk())
+                    .find(|child| child.is_named())
+                    .is_some_and(|expression| self.text(expression).trim() == property))
+            .then_some(property);
+        }
+        let setter_matches = self.self_getters.contains_key(&property)
+            && name == format!("set{}", capitalize(&property));
+        let normalized = self
+            .text(body)
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && !matches!(ch, '{' | '}' | ';'))
+            .collect::<String>()
+            .replace("this.", "");
+        (setter_matches && parameter_count == 1 && normalized == format!("{property}=value"))
+            .then_some(property)
     }
 }
 

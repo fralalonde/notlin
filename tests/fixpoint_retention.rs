@@ -504,15 +504,12 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
     let chain0 = fs::read_to_string(root.join("Chain0.kt")).unwrap();
     let chain1 = fs::read_to_string(root.join("Chain1.kt")).unwrap();
     assert!(
-        !chain0.contains("retained interface Chain0")
-            && chain0.contains("blocked by interface Chain1 at Chain1.kt")
-            && chain0
-                .contains("class Kept at Kept.kt [NF7FA]: class modifier not supported: value"),
+        chain0.contains("* NOTLIN N2142:") && chain0.contains("[neutral.comments.Chain1]"),
         "{chain0}"
     );
     assert!(
-        !chain1.contains("retained interface Chain1")
-            && chain1.contains("blocked by class Kept at Kept.kt")
+        chain1.contains("* NOTLIN N2142:")
+            && chain1.contains("[neutral.comments.Kept]")
             && !chain1.contains(&root.to_string_lossy().replace('\\', "/")),
         "{chain1}"
     );

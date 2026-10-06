@@ -64,6 +64,13 @@ interface Tagged {
 class Leaf
 class Other
 class Holder(val tag: Tagged)
+
+class Converter {
+    fun convert(value: String?): String? = value?.let { it.trim() }
+}
+
+@JsonNaming(PropertyNamingStrategies.UpperCamelCaseStrategy::class)
+data class Request(val value: String)
 "#,
     )
     .unwrap();
@@ -145,13 +152,11 @@ value class External(val raw: Int) : Hub
     );
 
     let residue = fs::read_to_string(&input).unwrap();
-    assert!(residue.contains("@Table(name = \"ENTRIES\""), "{residue}");
-    assert!(residue.contains("@IdClass(EntryId::class)"), "{residue}");
-    assert!(residue.contains("data class Entry"), "{residue}");
-    assert!(
-        !root.join("Entry.java").exists(),
-        "the retained entity must not be emitted without its class annotations"
-    );
+    assert!(!residue.contains("data class Entry"), "{residue}");
+    let entry = fs::read_to_string(root.join("Entry.java")).unwrap();
+    assert!(entry.contains("@Table(name = \"ENTRIES\""), "{entry}");
+    assert!(entry.contains("@IdClass(EntryId.class)"), "{entry}");
+    assert!(entry.contains("class Entry"), "{entry}");
     assert!(
         root.join("EntryId.java").exists(),
         "the independent ID class should still translate"

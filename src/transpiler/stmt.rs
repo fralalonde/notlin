@@ -11,6 +11,7 @@ pub struct Stmt<'a, 'src, 'tree> {
 impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
     pub fn transpile(&mut self, stmt: tree_sitter::Node, out: &mut JavaOut) {
         match stmt.kind() {
+            "line_comment" | "block_comment" | "multiline_comment" => {}
             "property_declaration" => self.transpile_local_property(stmt, out),
             "assignment" => self.transpile_assignment(stmt, out),
             "return_expression" => self.transpile_return(stmt, out),
@@ -354,13 +355,19 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
             let java = fix_join_tail(&java);
             // Reified-generic gate: `recv.get<T>()` -> `recv.get(T.class)`.
             let java = crate::transpiler::expr::rewrite_reified_type_args(&java);
+            let java = self.unit.coerce_optional_stream_return(java);
             // A Nothing-typed return expression (e.g. `TODO(...)`) lowers to
             // `throw ...` — a statement, not a value. Emit it bare.
             if java.trim_start().starts_with("throw ") {
                 out.line(format!("{};", java));
                 return;
             }
-            if java.contains(".getConstructor(") {
+            if !self.unit.current_function_returns_value {
+                out.line(format!("{};", java));
+                out.line("return;");
+                return;
+            }
+            if java.contains(".getConstructor(") || java.contains(".writeValueAsString(") {
                 // Reflective instantiation throws checked exceptions in
                 // Java but is unchecked in Kotlin: wrap the reflective
                 // return in try/catch rethrowing RuntimeException so the

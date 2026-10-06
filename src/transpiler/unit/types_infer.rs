@@ -26,6 +26,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
     fn infer_type_inner(&mut self, expr: tree_sitter::Node) -> String {
         match expr.kind() {
+            "as_expression" => kt::child(expr, "user_type")
+                .or_else(|| kt::child(expr, "nullable_type"))
+                .map(|ty| kt::java_type(ty, self.source))
+                .unwrap_or_else(|| "Object".to_string()),
             "identifier" => {
                 // Grammar quirk: bare `false`/`true` parses as identifier,
                 // not boolean_literal — recognize them here.

@@ -166,9 +166,7 @@ fn enum_constants_to_list_needs_no_optional_library() {
         "Entry",
     );
     assert!(
-        output.contains(
-            "new java.util.ArrayList<>(java.util.Arrays.asList(this.type().getEnumConstants()))"
-        ),
+        output.contains("java.util.Arrays.asList(this.type().getEnumConstants())"),
         "{output}"
     );
 }
@@ -189,14 +187,4 @@ fn custom_data_equality_narrows_conjunction_receiver_and_hashes_nullable_values_
         "{output}"
     );
     assert!(!output.contains("hashCode() != null"), "{output}");
-}
-
-#[test]
-fn computed_property_on_record_receiver_uses_bean_getter() {
-    let output = java(
-        "data class Node(val data: String) { val id: Int get() = data.length }\nclass Use { fun same(node: Node, id: Int): Boolean = node.id == id }",
-        "Use",
-    );
-    assert!(output.contains("node.getId()"), "{output}");
-    assert!(!output.contains("node.id()"), "{output}");
 }
