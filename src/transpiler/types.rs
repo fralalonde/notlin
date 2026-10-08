@@ -101,6 +101,17 @@ pub fn nullable_import(set: AnnotationSet) -> Option<&'static str> {
     }
 }
 
+/// Fully qualified non-null return annotation paired with the selected
+/// nullability dialect. Fully qualified names avoid depending on generated
+/// imports, while `None` preserves the explicit `--annotations none` contract.
+pub fn non_null_annotation(set: AnnotationSet) -> Option<&'static str> {
+    match set {
+        AnnotationSet::Jetbrains => Some("@org.jetbrains.annotations.NotNull"),
+        AnnotationSet::Jspecify => Some("@org.jspecify.annotations.NonNull"),
+        AnnotationSet::None => None,
+    }
+}
+
 /// Box Kotlin primitive abbreviations inside a `type_arguments` text blob
 /// (`<Op, Int>` -> `<Op, Integer>`). Splits on `<`, `,`, `>` and maps the
 /// standalone primitive names.

@@ -94,6 +94,13 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
     }
 
     fn transpile_local_property(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
+        if let Some(delegate) = kt::child(decl, "property_delegate") {
+            self.unit.diag_untranslatable(
+                delegate,
+                "local delegated property requires Kotlin delegate semantics; retained in Kotlin",
+            );
+            return;
+        }
         let is_val = kt::child(decl, "val").is_some();
         let _ = is_val; // locals are always effectively mutable in Java unless final
         // destructuring `val (a, b) = expr`: multi_variable_declaration

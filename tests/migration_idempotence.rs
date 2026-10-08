@@ -183,6 +183,59 @@ value class External(val raw: Int) : Hub
 }
 
 #[test]
+fn nested_class_annotation_wrappers_preserve_every_annotation_and_argument() {
+    let root = fixture_root().with_extension("nested-class-annotations");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let input = root.join("Reference.kt");
+    let source = r#"package sample.persistence
+
+import jakarta.persistence.Entity
+import jakarta.persistence.Table
+import org.hibernate.annotations.Immutable
+import org.hibernate.annotations.SQLRestriction
+
+@Entity
+@Table(name = "RESOURCE_REF")
+@Immutable
+@SQLRestriction("tenant_id <> 'ignored' and active = true")
+class ResourceReference(val code: String)
+
+interface Repository<T>
+interface ResourceRepository : Repository<ResourceReference>
+"#;
+    let ast = notlin::transpiler::dump_ast(source);
+    assert!(
+        ast.matches("annotated_expression").count() >= 4,
+        "fixture must exercise the nested annotation-wrapper parser shape:\n{ast}"
+    );
+    fs::write(&input, source).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(&input)
+        .output()
+        .expect("run notlin CLI");
+    assert!(
+        output.status.success(),
+        "notlin invocation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let java = fs::read_to_string(root.join("ResourceReference.java")).unwrap();
+    for annotation in [
+        "@Entity",
+        "@Table(name = \"RESOURCE_REF\")",
+        "@Immutable",
+        "@SQLRestriction(\"tenant_id <> 'ignored' and active = true\")",
+    ] {
+        assert!(java.contains(annotation), "missing {annotation}:\n{java}");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn explicit_empty_directory_is_a_successful_noop() {
     let root = fixture_root().with_extension("empty");
     let _ = fs::remove_dir_all(&root);

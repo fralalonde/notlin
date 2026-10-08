@@ -19,7 +19,12 @@ fn reflective_getconstructor_wraps_checked_exceptions() {
     )
     .unwrap();
     Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--allow-approximations",
+        ])
         .arg(root.join("m.kt").to_str().unwrap())
         .output()
         .expect("run notlin");

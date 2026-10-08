@@ -21,43 +21,13 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     if raw.is_empty() {
                         continue;
                     }
-                    if raw == "$" {
-                        // `$` + identifier continues in the next piece —
-                        // defer emission until we see the name.
-                        dollar_pending = true;
-                        continue;
-                    }
-                    if dollar_pending
-                        && raw
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_alphabetic() || c == '_')
-                    {
-                        let ident_end = raw
-                            .char_indices()
-                            .take_while(|(i, c)| *i == 0 || c.is_alphanumeric() || *c == '_')
-                            .map(|(i, c)| i + c.len_utf8())
-                            .last()
-                            .unwrap_or(0);
-                        let ident = raw[..ident_end].to_string();
-                        let rest = &raw[ident_end..];
-                        // The interpolated name splices the implicit `this`
-                        // receiver around that identifier: `"... $name ..."`
-                        // reads `this.getName()`, NOT a bare unqualified
-                        // symbol (which javac rejects on interfaces).
-                        let interped = self.transpile_identifier_text(&ident);
-                        parts.push(interped);
-                        if !rest.is_empty() {
-                            parts.push(format!("{:?}", rest));
-                        }
+                    let content = if dollar_pending {
                         dollar_pending = false;
-                        continue;
-                    }
-                    if dollar_pending {
-                        parts.push("\\\"$\\\"".to_string());
-                        dollar_pending = false;
-                    }
-                    parts.push(format!("{:?}", raw));
+                        format!("${raw}")
+                    } else {
+                        raw.to_string()
+                    };
+                    self.push_string_content(&content, node, &mut parts, &mut dollar_pending);
                 }
                 "interpolation" => {
                     dollar_pending = false;
@@ -93,13 +63,55 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             parts.join(" + ")
         }
     }
+
+    fn push_string_content(
+        &mut self,
+        content: &str,
+        anchor: tree_sitter::Node,
+        parts: &mut Vec<String>,
+        dollar_pending: &mut bool,
+    ) {
+        let mut rest = content;
+        while let Some(dollar) = rest.find('$') {
+            if dollar > 0 {
+                parts.push(format!("{:?}", &rest[..dollar]));
+            }
+            let after = &rest[dollar + 1..];
+            let Some(first) = after.chars().next() else {
+                *dollar_pending = true;
+                return;
+            };
+            if !(first.is_alphabetic() || first == '_') {
+                parts.push("\"$\"".to_string());
+                rest = after;
+                continue;
+            }
+            let ident_end = after
+                .char_indices()
+                .take_while(|(index, character)| {
+                    *index == 0 || character.is_alphanumeric() || *character == '_'
+                })
+                .map(|(index, character)| index + character.len_utf8())
+                .last()
+                .unwrap_or(first.len_utf8());
+            parts.push(self.transpile_identifier_text(&after[..ident_end], anchor));
+            rest = &after[ident_end..];
+        }
+        if !rest.is_empty() {
+            parts.push(format!("{:?}", rest));
+        }
+    }
 }
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     /// Transpile a bare identifier spliced by string interpolation with the
     /// same rules as a real `identifier` expression node: property accessors
     /// on the implicit `this` (`"...$name..." -> "..." + this.getName()`).
-    pub(crate) fn transpile_identifier_text(&mut self, ident: &str) -> String {
+    pub(crate) fn transpile_identifier_text(
+        &mut self,
+        ident: &str,
+        reference: tree_sitter::Node,
+    ) -> String {
         if self.unit.current_object.as_deref() == Some(ident) {
             return format!("{}.INSTANCE", ident);
         }
@@ -107,6 +119,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             && let Some(getter) = self.unit.self_getters.get(ident)
         {
             return format!("this.{}()", getter);
+        }
+        if !self.unit.var_types.contains_key(ident)
+            && let Some(literal) = self.inline_same_file_string_const(ident, reference)
+        {
+            return literal;
         }
         if !self.unit.var_types.contains_key(ident)
             && let Some(owner) = self
@@ -122,5 +139,25 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             return format!("this.get{}()", cap);
         }
         ident.to_string()
+    }
+
+    pub(crate) fn inline_same_file_string_const(
+        &self,
+        ident: &str,
+        reference: tree_sitter::Node,
+    ) -> Option<String> {
+        let provider = self.unit.semantic_provider?;
+        let file = self
+            .unit
+            .workspace_file
+            .as_deref()
+            .unwrap_or(self.unit.file);
+        crate::semantics::same_file_string_const_literal(
+            self.unit.source,
+            file,
+            ident,
+            reference,
+            provider,
+        )
     }
 }

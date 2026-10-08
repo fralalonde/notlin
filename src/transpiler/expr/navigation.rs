@@ -313,7 +313,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                     .unit
                                     .retained_hint
                                     .as_ref()
-                                    .is_some_and(|retained| retained.contains(&base_text))
+                                    .is_some_and(|_| self.unit.is_retained_type(&base_text))
                             {
                                 result.push_str(&format!(".Companion.{}", accessor));
                             } else {
@@ -324,7 +324,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                 .unit
                                 .retained_hint
                                 .as_ref()
-                                .is_some_and(|retained| retained.contains(&base_text))
+                                .is_some_and(|_| self.unit.is_retained_type(&base_text))
                                 && self.unit.workspace.is_some_and(|workspace| {
                                     workspace
                                         .find_static_property(&base_text, &member_name)
@@ -492,37 +492,29 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                                 // shadowing), so first-match is
                                                 // unreliable.
                                                 let mut hit: Option<Option<String>> = None;
-                                                for cl in ws.declarations() {
-                                                    for mm in &cl.members {
-                                                        if mm.name != recv {
-                                                            continue;
-                                                        }
-                                                        let bare = mm
-                                                            .type_name
-                                                            .as_deref()
-                                                            .unwrap_or("")
-                                                            .split('<')
-                                                            .next()
-                                                            .unwrap_or("")
-                                                            .trim()
-                                                            .to_string();
-                                                        let enum_typed = bare
-                                                            .get(0..1)
-                                                            .is_some_and(|c| {
-                                                                c.chars().next().is_some_and(|c| {
-                                                                    c.is_ascii_uppercase()
-                                                                })
+                                                for (_, mm) in ws.members_named(&recv) {
+                                                    let bare = mm
+                                                        .type_name
+                                                        .as_deref()
+                                                        .unwrap_or("")
+                                                        .split('<')
+                                                        .next()
+                                                        .unwrap_or("")
+                                                        .trim()
+                                                        .to_string();
+                                                    let enum_typed = bare
+                                                        .get(0..1)
+                                                        .is_some_and(|c| {
+                                                            c.chars().next().is_some_and(|c| {
+                                                                c.is_ascii_uppercase()
                                                             })
-                                                            && ws.declarations_named(&bare).any(|d| {
-                                                                d.kind
-                                                                    == crate::workspace::DeclarationKind::Enum
-                                                            });
-                                                        if enum_typed {
-                                                            hit = Some(mm.type_name.clone());
-                                                            break;
-                                                        }
-                                                    }
-                                                    if hit.is_some() {
+                                                        })
+                                                        && ws.declarations_named(&bare).any(|d| {
+                                                            d.kind
+                                                                == crate::workspace::DeclarationKind::Enum
+                                                        });
+                                                    if enum_typed {
+                                                        hit = Some(mm.type_name.clone());
                                                         break;
                                                     }
                                                 }
@@ -586,7 +578,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                         && self
                                             .unit
                                             .retained_hint
-                                            .is_none_or(|retained| !retained.contains(bare))
+                                            .is_none_or(|_| !self.unit.is_retained_type(bare))
                                 })
                                 .unwrap_or(false)
                             })
@@ -869,7 +861,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 {
                     let translated = target.language == crate::workspace::SourceLanguage::Java
                         || self.unit.retained_hint.is_some_and(|retained| {
-                            !retained.contains(&target.name)
+                            !workspace.declaration_retained(target, retained)
                                 && workspace
                                     .declaration_source_file(target)
                                     .is_some_and(|source| {
@@ -1091,6 +1083,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 "call_expression"
                     | "navigation_expression"
                     | "indexing_expression"
+                    | "string_literal"
                     | "parenthesized"
                     | "parenthesized_expression"
                     | "if_expression"
@@ -1105,6 +1098,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     .next_back();
                 if let Some(member) = member {
                     let base_java = self.transpile(b);
+                    let base_java = if b.kind() == "string_literal" && base_java.contains(" + ") {
+                        format!("({base_java})")
+                    } else {
+                        base_java
+                    };
                     // `m.filterValues { v -> pred }` — Java Map has no
                     // filterValues member: lower to entrySet stream + toMap.
                     if member == "filterValues" || member == "mapKeys" {
@@ -1353,7 +1351,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                 );
                                 return format!("{}.{}()", base_java, getter);
                             }
-                            self.unit.diags.warn_approx(
+                            if !self.unit.known_declared_method(&base_java, &member) {
+                                self.unit.diags.warn_approx(
                                 node,
                                 self.unit.file,
                                 format!(
@@ -1361,6 +1360,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                     member
                                 ),
                             );
+                            }
                             format!("{}.{}", base_java, member)
                         }
                     };
@@ -1738,7 +1738,14 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         return raw_trimmed.to_string();
                     }
                 }
-                self.unit.diags.warn_approx(
+                if !self.unit.known_declared_method(
+                    raw_trimmed
+                        .rsplit_once('.')
+                        .map(|(base, _)| base)
+                        .unwrap_or(""),
+                    member,
+                ) {
+                    self.unit.diags.warn_approx(
                     node,
                     self.unit.file,
                     format!(
@@ -1746,6 +1753,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         member
                     ),
                 );
+                }
             }
         }
         raw_trimmed.to_string()

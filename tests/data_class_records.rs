@@ -13,6 +13,51 @@ fn java(source: &str, name: &str) -> String {
         .1
 }
 
+fn java_allow_approximations(source: &str, name: &str) -> String {
+    let cli = notlin::cli::Cli::parse_from(["notlin", "--allow-approximations", "fixture.kt"]);
+    let (files, errors, _, _) =
+        notlin::transpiler::transpile(source, Path::new("fixture.kt"), &cli);
+    assert_eq!(errors, 0);
+    files
+        .into_iter()
+        .find(|(file, _)| file == &format!("{name}.java"))
+        .unwrap_or_else(|| panic!("{name} retained"))
+        .1
+}
+
+#[test]
+fn lombok_keeps_data_initialization_convertible_with_explicit_java_fallback() {
+    for source in [
+        "data class Entry(val count: Int) { init { if (count < 0) throw IllegalArgumentException(\"negative\") } }",
+        "data class Entry(var count: Int) { init { count = count + 1 }; val saved: Int = count }",
+        "data class Entry(val count: Int) { val saved: Int = count + 1 }",
+    ] {
+        let cli = notlin::cli::Cli::parse_from([
+            "notlin",
+            "--lombok",
+            "--annotations",
+            "none",
+            "fixture.kt",
+        ]);
+        let (files, errors, _, _) =
+            notlin::transpiler::transpile(source, Path::new("fixture.kt"), &cli);
+        assert_eq!(errors, 0);
+        let output = &files
+            .iter()
+            .find(|(name, _)| name == "Entry.java")
+            .expect("Lombok must not change data-class convertibility")
+            .1;
+        assert!(output.contains("final class Entry"), "{output}");
+        assert!(
+            !output.contains("@Value") && !output.contains("@Data"),
+            "{output}"
+        );
+        assert!(output.contains("this.count = count;"), "{output}");
+        assert!(output.contains("__notlin_initializeData"), "{output}");
+        assert!(!java(source, "Entry").is_empty());
+    }
+}
+
 #[test]
 fn record_secondary_constructors_preserve_constructor_calls() {
     let output = java(
@@ -103,7 +148,7 @@ fn generic_data_class_copy_keeps_type_parameters() {
 
 #[test]
 fn record_init_preconditions_keep_lazy_failure_messages() {
-    let output = java(
+    let output = java_allow_approximations(
         r#"data class Entry(val count: Int) {
         init { require(count >= 0) { "negative" }; check(count < 10) }
     }"#,
@@ -122,7 +167,7 @@ fn record_init_preconditions_keep_lazy_failure_messages() {
 
 #[test]
 fn mutable_data_copy_uses_bean_accessors_for_unchanged_properties() {
-    let output = java(
+    let output = java_allow_approximations(
         "data class Entry(var count: Int, val label: String) { fun renamed(label: String): Entry = copy(label = label) }",
         "Entry",
     );
@@ -161,7 +206,7 @@ fn mutable_primary_properties_are_fields_during_initialization() {
 
 #[test]
 fn enum_constants_to_list_needs_no_optional_library() {
-    let output = java(
+    let output = java_allow_approximations(
         "data class Entry(val type: Class<out Enum<*>>) { fun values(): List<Enum<*>> = type.enumConstants.toList() }",
         "Entry",
     );
@@ -173,7 +218,7 @@ fn enum_constants_to_list_needs_no_optional_library() {
 
 #[test]
 fn custom_data_equality_narrows_conjunction_receiver_and_hashes_nullable_values_once() {
-    let output = java(
+    let output = java_allow_approximations(
         r#"data class Entry(val name: String?, var count: Int) {
         override fun equals(other: Any?): Boolean = other is Entry && other.name == name && other.count == count
         override fun hashCode(): Int { return name?.hashCode() ?: 0 }

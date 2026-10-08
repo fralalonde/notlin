@@ -57,7 +57,12 @@ fn kotlin_collections_become_java_equivalents() {
     fs::create_dir_all(root).unwrap();
     fs::write(root.join("repo.kt"), FIXTURE).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--allow-approximations",
+        ])
         .arg(root.as_os_str())
         .output()
         .expect("run notlin");

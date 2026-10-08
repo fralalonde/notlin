@@ -3,7 +3,7 @@ use colored::Colorize;
 use notlin::cli::{Cli, UntranslatableMode};
 use notlin::migrate::{self, MigrateOutcome};
 use notlin::transpiler;
-use notlin::workspace::{SourceIndex, SourceLanguage, SourceOverlay};
+use notlin::workspace::SourceIndex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,51 +12,62 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-static PROGRESS_OUTPUT: OnceLock<Mutex<()>> = OnceLock::new();
+static PROGRESS_OUTPUT: OnceLock<Mutex<bool>> = OnceLock::new();
+
+fn finish_active_line(stderr: &mut impl Write, active: &mut bool) {
+    if *active {
+        // Remove the trailing spinner while preserving the activity text.
+        let _ = writeln!(stderr, "\x08 \x08");
+        *active = false;
+    }
+}
 
 fn progress_line(marker: &str, phase: &str, detail: impl std::fmt::Display) {
     let label = format!("{phase:<11}");
-    let _guard = PROGRESS_OUTPUT
-        .get_or_init(|| Mutex::new(()))
+    let mut active = PROGRESS_OUTPUT
+        .get_or_init(|| Mutex::new(false))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    eprintln!(
+    let mut stderr = std::io::stderr().lock();
+    finish_active_line(&mut stderr, &mut active);
+    let _ = writeln!(
+        stderr,
         "  {marker} {}{}",
         label.bold(),
         detail.to_string().bright_black()
     );
 }
 
-fn progress_active(marker: &str, phase: &str, detail: &str) {
+fn progress_active(phase: &str, detail: &str, spinner: char) {
     let label = format!("{phase:<11}");
-    let _guard = PROGRESS_OUTPUT
-        .get_or_init(|| Mutex::new(()))
+    let mut active = PROGRESS_OUTPUT
+        .get_or_init(|| Mutex::new(false))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut stderr = std::io::stderr().lock();
+    finish_active_line(&mut stderr, &mut active);
     let _ = write!(
         stderr,
-        "\r\x1b[2K  {marker} {}{}",
+        "  {} {}{} {spinner}",
+        "◇".cyan(),
         label.bold(),
         detail.bright_black()
     );
+    *active = true;
     let _ = stderr.flush();
 }
 
-fn progress_active_done(phase: &str, detail: impl std::fmt::Display) {
-    let label = format!("{phase:<11}");
-    let _guard = PROGRESS_OUTPUT
-        .get_or_init(|| Mutex::new(()))
+fn progress_spinner(spinner: char) {
+    let active = PROGRESS_OUTPUT
+        .get_or_init(|| Mutex::new(false))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !*active {
+        return;
+    }
     let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(
-        stderr,
-        "\r\x1b[2K  {} {}{}",
-        "✓".green(),
-        label.bold(),
-        detail.to_string().bright_black()
-    );
+    let _ = write!(stderr, "\x08{spinner}");
+    let _ = stderr.flush();
 }
 
 fn progress_start(phase: &str, detail: impl std::fmt::Display) {
@@ -92,6 +103,7 @@ fn run_result_text(failed: bool, elapsed: Duration) -> String {
     )
 }
 
+#[cfg(test)]
 fn plan_progress_detail(round: usize, kotlin_remaining: usize, java_outputs: usize) -> String {
     format!(
         "pass {round} · {} · {} ready",
@@ -109,7 +121,6 @@ struct ProgressReporter {
     stop: Option<mpsc::Sender<()>>,
     heartbeat: Option<JoinHandle<()>>,
     phase: String,
-    detail: std::sync::Arc<Mutex<String>>,
 }
 
 impl ProgressReporter {
@@ -119,31 +130,20 @@ impl ProgressReporter {
         let phase = phase.to_owned();
         let is_terminal = std::io::stderr().is_terminal();
         if is_terminal {
-            progress_active(&spinner_frame(0).to_string(), &phase, &detail);
+            progress_active(&phase, &detail, spinner_frame(0));
         } else {
             progress_start(&phase, &detail);
         }
 
-        let detail = std::sync::Arc::new(Mutex::new(detail));
         let (stop, heartbeat) = if is_terminal {
             let (stop, stopped) = mpsc::channel();
-            let heartbeat_phase = phase.clone();
-            let heartbeat_detail = detail.clone();
             let heartbeat = std::thread::spawn(move || {
                 let mut tick = 1usize;
                 loop {
                     match stopped.recv_timeout(Duration::from_millis(120)) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            let current_detail = heartbeat_detail
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .clone();
-                            progress_active(
-                                &spinner_frame(tick).to_string(),
-                                &heartbeat_phase,
-                                &current_detail,
-                            );
+                            progress_spinner(spinner_frame(tick));
                             tick += 1;
                         }
                     }
@@ -159,18 +159,13 @@ impl ProgressReporter {
             stop,
             heartbeat,
             phase,
-            detail,
         }
     }
 
     fn update(&self, detail: impl std::fmt::Display) {
         let detail = detail.to_string();
-        *self
-            .detail
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = detail.clone();
         if std::io::stderr().is_terminal() {
-            progress_active(&"·".bright_black().to_string(), &self.phase, &detail);
+            progress_active(&self.phase, &detail, spinner_frame(0));
         } else {
             progress_activity(&self.phase, detail);
         }
@@ -182,11 +177,7 @@ impl ProgressReporter {
             "{detail} · elapsed {}",
             elapsed_label(self.started.elapsed())
         );
-        if std::io::stderr().is_terminal() {
-            progress_active_done(&self.phase, detail);
-        } else {
-            progress_done(&self.phase, detail);
-        }
+        progress_done(&self.phase, detail);
     }
 
     fn stop_heartbeat(&mut self) {
@@ -202,6 +193,11 @@ impl ProgressReporter {
 impl Drop for ProgressReporter {
     fn drop(&mut self) {
         self.stop_heartbeat();
+        let mut active = PROGRESS_OUTPUT
+            .get_or_init(|| Mutex::new(false))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        finish_active_line(&mut std::io::stderr().lock(), &mut active);
     }
 }
 
@@ -392,6 +388,20 @@ fn annotate_manual_marks(
 
 fn run(cli: &Cli) -> Result<ExitCode, String> {
     let run_started = Instant::now();
+    if cli.dump_ast {
+        let files = collect_inputs(&cli.input)?;
+        if files.is_empty() {
+            return Err("no input files given for AST inspection".into());
+        }
+        let mut stdout = BufWriter::new(std::io::stdout().lock());
+        for file in files {
+            stdout
+                .write_all(transpiler::dump_ast(&read_source(&file)?).as_bytes())
+                .map_err(|error| format!("stdout: {error}"))?;
+        }
+        stdout.flush().map_err(|error| format!("stdout: {error}"))?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let workspace_root = cli
         .workspace_root
         .clone()
@@ -455,6 +465,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         return Err("no input files given (positional <INPUT>..., or use - for stdin)".into());
     }
 
+    if cli.validation_config.is_some() && files.iter().any(|f| f.as_os_str() == "-") {
+        return Err(
+            "--validation-config requires file-backed inputs; stdin cannot be staged".into(),
+        );
+    }
+
     let mut total_errors = 0usize;
     let mut total_warnings = 0usize;
     let mut java_written = 0usize;
@@ -465,7 +481,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     // diagnostics), then write each file's plan exactly once. The subtype
     // retention rule then only fires for subtypes that are THEMSELVES
     // retained, so clean hub-and-implementor families translate together.
-    if cli.workspace_root.is_some() || files.len() > 1 {
+    if !cli.dump_ast
+        && (cli.workspace_root.is_some()
+            || files.len() > 1
+            || cli.migrates_in_place()
+            || cli.validation_config.is_some())
+    {
         // Read every source up front; stdin ('-') cannot participate in a
         // multi-file fixpoint (no path to index), so it keeps the old path.
         if files.iter().all(|f| f.as_os_str() != "-") {
@@ -497,195 +518,90 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 "plan",
                 format!("resolving {}", item_count(files.len(), "source", "sources")),
             );
-            let mut virtual_sources = sources.clone();
-            let mut cumulative: HashMap<PathBuf, (PathBuf, String, String)> = HashMap::new();
-            let declaration_count = index
-                .kotlin_files()
-                .map(|f| f.declarations.len())
-                .sum::<usize>();
-            let limit = declaration_count.saturating_mul(2).max(16);
-            let mut converged_plans = None;
-            let mut converged_round = 0usize;
-            let mut retained_seed: Option<HashSet<String>> = None;
-            let profile_speculation = std::env::var_os("NOTLIN_PROFILE").is_some();
-            for round in 1..=limit {
-                notlin::diagnostics::clear_retention();
-                let overlays = speculative_overlays(&sources, &virtual_sources, &cumulative);
-                let current_index = index.with_overlays(&overlays)?;
-                let planned = if let Some(seed) = &retained_seed {
-                    transpiler::fixpoint::plan_workspace_warm(
-                        &virtual_sources,
-                        cli,
-                        &current_index,
-                        &translation_roots,
-                        cli.max_retention_passes,
-                        false,
-                        seed,
-                    )?
-                } else {
-                    transpiler::fixpoint::plan_workspace_state(
-                        &virtual_sources,
-                        cli,
-                        &current_index,
-                        &translation_roots,
-                        cli.max_retention_passes,
-                        false,
-                    )?
-                };
-                retained_seed = Some(planned.roots);
-                let plans = planned.plans;
-                let mut next = virtual_sources.iter().cloned().collect::<HashMap<_, _>>();
-                let cumulative_before = profile_speculation.then(|| cumulative.clone());
-                let mut cumulative_changed = false;
-                let strict = matches!(cli.untranslatable, UntranslatableMode::Error);
-                for plan in &plans {
-                    let blocked = strict && (plan.errors > 0 || plan.warnings > 0);
-                    if blocked {
-                        continue;
-                    }
-                    match migrate::propose_speculative_migration(&plan.source, &plan.coverage) {
-                        migrate::MigrationProposal::Untouched => {}
-                        migrate::MigrationProposal::Delete => {
-                            next.remove(&plan.file);
-                        }
-                        migrate::MigrationProposal::Rewrite(text) => {
-                            next.insert(plan.file.clone(), text);
-                        }
-                    }
-                    for (name, content) in &plan.java_files {
-                        let target = plan.file.parent().unwrap_or(Path::new(".")).join(name);
-                        let key = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-                        if let Some((origin, old, _)) = cumulative.get(&key)
-                            && origin != &plan.file
-                            && old != content
-                        {
-                            return Err(format!(
-                                "generated Java path conflict: {}",
-                                notlin::paths::display(&target)
-                            ));
-                        }
-                        let value = (plan.file.clone(), content.clone(), name.clone());
-                        cumulative_changed |= cumulative.get(&key) != Some(&value);
-                        cumulative.insert(key, value);
-                    }
-                }
-                let mut next = next.into_iter().collect::<Vec<_>>();
-                next.sort_by(|left, right| left.0.cmp(&right.0));
-                // Property ABI repair is part of the speculative state, not a
-                // post-write cleanup. A translated interface can therefore
-                // repair its retained Kotlin implementation here, and that
-                // implementation is reconsidered in the next planning round
-                // of this same invocation.
-                let repair_overlays = speculative_overlays(&sources, &next, &cumulative);
-                let repair_index = index.with_overlays(&repair_overlays)?;
-                let generated_java = cumulative.keys().cloned().collect::<HashSet<_>>();
-                notlin::property_abi::repair_virtual_sources(
-                    &repair_index,
-                    &mut next,
-                    &generated_java,
-                );
-                let callsite_contracts = notlin::property_abi::repaired_callsite_contracts(
-                    &repair_index,
-                    &generated_java,
-                );
-                if !callsite_contracts.is_empty() {
-                    let callsite_overlays = speculative_overlays(&sources, &next, &cumulative);
-                    let callsite_index = index.with_overlays(&callsite_overlays)?;
-                    for (path, source) in &mut next {
-                        let (rewritten, _) = notlin::property_callsite::rewrite_file(
-                            &callsite_index,
-                            path,
-                            source,
-                            &callsite_contracts,
-                        );
-                        *source = rewritten;
-                    }
-                }
-                if profile_speculation {
-                    log_speculative_changes(
-                        round,
-                        &virtual_sources,
-                        &next,
-                        cumulative_before.as_ref().expect("profile snapshot"),
-                        &cumulative,
-                        cli.verbose > 0,
-                    );
-                }
-                plan_progress.update(plan_progress_detail(round, next.len(), cumulative.len()));
-                if next == virtual_sources && !cumulative_changed {
-                    converged_round = round;
-                    converged_plans = Some(plans);
-                    break;
-                }
-                virtual_sources = next;
-            }
-            let Some(mut final_plans) = converged_plans else {
-                return Err(format!(
-                    "workspace migration did not converge within {limit} speculative rounds"
-                ));
-            };
-            transpiler::fixpoint::qualify_retention_markers(&mut final_plans);
+            let plan = notlin::migration_pipeline::plan_workspace_migration(
+                sources,
+                cli,
+                &index,
+                &translation_roots,
+                |detail| plan_progress.update(detail),
+            )?;
             plan_progress.finish(format!(
                 "converged in {} · {}",
-                item_count(converged_round, "pass", "passes"),
-                item_count(cumulative.len(), "Java output", "Java outputs")
+                item_count(plan.rounds, "pass", "passes"),
+                item_count(plan.generated_java.len(), "Java output", "Java outputs")
             ));
-            progress_start("write", "applying the converged migration");
-            let mut final_map: HashMap<_, _> = virtual_sources.iter().cloned().collect();
-            for plan in &final_plans {
-                match migrate::propose_migration(&plan.source, &plan.coverage) {
-                    migrate::MigrationProposal::Untouched => {}
-                    migrate::MigrationProposal::Delete => {
-                        final_map.remove(&plan.file);
-                    }
-                    migrate::MigrationProposal::Rewrite(text) => {
-                        final_map.insert(plan.file.clone(), text);
-                    }
-                }
+            if let Some(config_path) = &cli.validation_config {
+                notlin::migration_pipeline::validate_workspace_plan(
+                    &plan,
+                    &index
+                        .kotlin_files()
+                        .map(|file| file.path.clone())
+                        .collect::<Vec<_>>(),
+                    &index
+                        .java_files()
+                        .map(|file| file.path.clone())
+                        .collect::<Vec<_>>(),
+                    config_path,
+                )?;
             }
-            for plan in &final_plans {
+            notlin::migration_pipeline::verify_original_snapshots(&plan)?;
+            progress_start("write", "applying the converged migration");
+            let apply_migration =
+                cli.workspace_root.is_some() || files.len() > 1 || cli.migrates_in_place();
+            let final_plans = &plan.final_plans;
+            for file_plan in final_plans {
                 log::debug!(
                     "planned {}: {} Java output(s), {} declaration(s) translated, {} retained",
-                    notlin::paths::display(&plan.file),
-                    plan.java_files.len(),
-                    plan.coverage.translated.len(),
-                    plan.coverage.untranslated.len()
+                    notlin::paths::display(&file_plan.file),
+                    file_plan.java_files.len(),
+                    file_plan.coverage.translated.len(),
+                    file_plan.coverage.untranslated.len()
                 );
-                total_errors += plan.errors;
-                total_warnings += plan.warnings;
+                total_errors += file_plan.errors;
+                total_warnings += file_plan.warnings;
             }
             let mut emitted_by_origin: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-            for (origin, _, name) in cumulative.values() {
+            for generated in &plan.generated_java {
                 emitted_by_origin
-                    .entry(origin.clone())
+                    .entry(generated.origin.clone())
                     .or_default()
-                    .insert(name.clone());
+                    .insert(generated.name.clone());
             }
-            for (path, (origin, content, name)) in &cumulative {
-                let _ = path;
+            for generated in &plan.generated_java {
                 log::debug!(
-                    "planned {}: Java output {name}",
-                    notlin::paths::display(origin)
+                    "planned {}: Java output {}",
+                    notlin::paths::display(&generated.origin),
+                    generated.name
                 );
-                write_java_files(cli, origin, &[(name.clone(), content.clone())], &mut stdout)?;
+                write_java_files(
+                    cli,
+                    &generated.origin,
+                    &[(generated.name.clone(), generated.source.clone())],
+                    &mut stdout,
+                )?;
                 java_written += 1;
             }
-            if cli.out_dir.is_none() {
-                for (path, _) in &sources {
+            if apply_migration && cli.out_dir.is_none() {
+                for (path, _) in &plan.original_sources {
                     remove_stale_generated_outputs(
                         path,
                         emitted_by_origin.get(path).cloned().unwrap_or_default(),
                     )?;
                 }
             }
-            for (path, source) in &sources {
-                let proposal = match final_map.get(path) {
-                    None => migrate::MigrationProposal::Delete,
-                    Some(text) if text == source => migrate::MigrationProposal::Untouched,
-                    Some(text) => migrate::MigrationProposal::Rewrite(text.clone()),
-                };
-                let outcome = migrate::apply_migration_proposal(path, &proposal)?;
-                outcomes.push((path.clone(), outcome));
+            if apply_migration {
+                for (path, _) in &plan.original_sources {
+                    let proposal = plan.migration_proposals.get(path).ok_or_else(|| {
+                        format!(
+                            "migration plan missing source proposal: {}",
+                            notlin::paths::display(path)
+                        )
+                    })?;
+                    outcomes.push((
+                        path.clone(),
+                        migrate::apply_migration_proposal(path, proposal)?,
+                    ));
+                }
             }
             // Migration writes Java after the initial Kotlin/Java index was
             // built. Re-index once before annotating retained Kotlin so links
@@ -938,128 +854,6 @@ fn write_java_files(
         }
     }
     Ok(())
-}
-
-fn log_speculative_changes(
-    round: usize,
-    before_kotlin: &[(PathBuf, String)],
-    after_kotlin: &[(PathBuf, String)],
-    before_java: &HashMap<PathBuf, (PathBuf, String, String)>,
-    after_java: &HashMap<PathBuf, (PathBuf, String, String)>,
-    verbose: bool,
-) {
-    let before_kotlin: HashMap<_, _> = before_kotlin
-        .iter()
-        .map(|(path, source)| (path, source.as_bytes()))
-        .collect();
-    let after_kotlin: HashMap<_, _> = after_kotlin
-        .iter()
-        .map(|(path, source)| (path, source.as_bytes()))
-        .collect();
-    let mut kotlin_added = Vec::new();
-    let mut kotlin_removed = Vec::new();
-    let mut kotlin_changed = Vec::new();
-    for (path, source) in &after_kotlin {
-        match before_kotlin.get(path) {
-            None => kotlin_added.push((*path).clone()),
-            Some(old) if *old != *source => kotlin_changed.push((*path).clone()),
-            Some(_) => {}
-        }
-    }
-    for path in before_kotlin.keys() {
-        if !after_kotlin.contains_key(path) {
-            kotlin_removed.push((*path).clone());
-        }
-    }
-    let mut java_added = Vec::new();
-    let mut java_removed = Vec::new();
-    let mut java_changed = Vec::new();
-    for (path, (_, content, _)) in after_java {
-        match before_java.get(path) {
-            None => java_added.push(path.clone()),
-            Some((_, old, _)) if old != content => java_changed.push(path.clone()),
-            Some(_) => {}
-        }
-    }
-    for path in before_java.keys() {
-        if !after_java.contains_key(path) {
-            java_removed.push(path.clone());
-        }
-    }
-    eprintln!(
-        "NOTLIN_PROFILE speculative round {round}: Kotlin added={} removed={} byte-changed={}; cumulative Java added={} removed={} content-changed={}",
-        kotlin_added.len(),
-        kotlin_removed.len(),
-        kotlin_changed.len(),
-        java_added.len(),
-        java_removed.len(),
-        java_changed.len()
-    );
-    if !verbose {
-        return;
-    }
-    for (category, mut paths) in [
-        ("Kotlin added", kotlin_added),
-        ("Kotlin removed", kotlin_removed),
-        ("Kotlin byte-changed", kotlin_changed),
-        ("Java added", java_added),
-        ("Java removed", java_removed),
-        ("Java content-changed", java_changed),
-    ] {
-        paths.sort();
-        let samples = paths
-            .iter()
-            .take(20)
-            .map(|path| notlin::paths::display(path).to_string())
-            .collect::<Vec<_>>();
-        eprintln!(
-            "NOTLIN_PROFILE {category} samples: [{}]",
-            samples.join(", ")
-        );
-    }
-}
-
-fn speculative_overlays(
-    original: &[(PathBuf, String)],
-    current: &[(PathBuf, String)],
-    generated: &HashMap<PathBuf, (PathBuf, String, String)>,
-) -> Vec<SourceOverlay> {
-    let original_by_path = original
-        .iter()
-        .map(|(path, source)| (path, source))
-        .collect::<HashMap<_, _>>();
-    let current_paths = current.iter().map(|(path, _)| path).collect::<HashSet<_>>();
-    let mut overlays = Vec::with_capacity(original.len() + generated.len());
-    overlays.extend(
-        original
-            .iter()
-            .filter(|(path, _)| !current_paths.contains(path))
-            .map(|(path, _)| SourceOverlay::Delete { path: path.clone() }),
-    );
-    overlays.extend(
-        current
-            .iter()
-            .filter(|(path, source)| {
-                original_by_path
-                    .get(path)
-                    .is_none_or(|original| *original != source)
-            })
-            .map(|(path, source)| SourceOverlay::Replace {
-                path: path.clone(),
-                language: SourceLanguage::Kotlin,
-                source: source.clone(),
-            }),
-    );
-    overlays.extend(
-        generated
-            .iter()
-            .map(|(path, (_, source, _))| SourceOverlay::Replace {
-                path: path.clone(),
-                language: SourceLanguage::Java,
-                source: source.clone(),
-            }),
-    );
-    overlays
 }
 
 fn remove_stale_generated_outputs(

@@ -14,7 +14,7 @@ enum class Kind(override val value: Any?) : ValueHolder {
     EMPTY({})
 }
 "#;
-    let cli = notlin::cli::Cli::parse_from(["notlin", "Kind.kt"]);
+    let cli = notlin::cli::Cli::parse_from(["notlin", "--allow-approximations", "Kind.kt"]);
     let (files, errors, _warnings, _coverage) =
         notlin::transpiler::transpile(source, &PathBuf::from("Kind.kt"), &cli);
 

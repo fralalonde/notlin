@@ -36,7 +36,7 @@ fn companion_calls_route_through_companion_holder() {
         "Kind.kt",
     ]);
     let index = SourceIndex::discover(&root).unwrap();
-    let (files, errors, _warnings, _cov) = transpiler::transpile_with_workspace(
+    let (files, errors, _warnings, cov) = transpiler::transpile_with_workspace(
         caller,
         &PathBuf::from("Kind.kt"),
         &cli,
@@ -48,7 +48,7 @@ fn companion_calls_route_through_companion_holder() {
         .iter()
         .find(|(n, _)| n == "Kind.java")
         .map(|(_, c)| c.as_str())
-        .expect("Kind.java emitted");
+        .unwrap_or_else(|| panic!("Kind.java emitted; coverage: {cov:?}"));
     assert!(
         kind.contains("Owner.Companion.of(\"a\")"),
         "plain companion call must route via Companion: {kind}"

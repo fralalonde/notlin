@@ -31,6 +31,41 @@ pub enum DiagnosticKind {
     Parse,
 }
 
+/// Planning policy: informational differences do not weaken program semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproximationClass {
+    SemanticLoss,
+    UnresolvedAssumption,
+    Informational,
+}
+
+pub fn classify_approximation(message: &str) -> ApproximationClass {
+    if message.contains("function modifier `infix`")
+        || message.contains("nested Companion bridge that delegates")
+        || message.contains("companion call on retained Kotlin decl")
+        || (message.contains("companion `operator fun invoke`")
+            && message.contains("factory call routed via"))
+    {
+        ApproximationClass::Informational
+    } else if [
+        "semantics lost",
+        "eager",
+        "lateinit",
+        "unsigned",
+        "not enforced",
+        "dropped",
+        "ignored",
+        "lossy",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        ApproximationClass::SemanticLoss
+    } else {
+        ApproximationClass::UnresolvedAssumption
+    }
+}
+
 impl DiagnosticKind {
     pub fn code(&self) -> &'static str {
         match self {

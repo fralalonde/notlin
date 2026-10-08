@@ -9,8 +9,13 @@ fn map_filter_uses_entry_set_stream() {
     fs::create_dir_all(&root).unwrap();
     let path = root.join("Properties.kt");
     fs::write(&path, source).unwrap();
-    let cli =
-        notlin::cli::Cli::parse_from(["notlin", "--root", root.to_str().unwrap(), "Properties.kt"]);
+    let cli = notlin::cli::Cli::parse_from([
+        "notlin",
+        "--allow-approximations",
+        "--root",
+        root.to_str().unwrap(),
+        "Properties.kt",
+    ]);
     let index = notlin::workspace::SourceIndex::discover(&root).unwrap();
     let (files, errors, _warnings, _coverage) = notlin::transpiler::transpile_with_workspace(
         source,

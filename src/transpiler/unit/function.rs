@@ -91,7 +91,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             let Some(retained) = self.retained_hint else {
                 return Some(conflict.inherited_type);
             };
-            if retained.contains(&supertype.name) {
+            if workspace.declaration_retained(supertype, retained) {
                 return Some(conflict.inherited_type);
             }
             let Some(supertype_file) = workspace.declaration_source_file(supertype) else {
@@ -156,6 +156,28 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .unwrap_or_else(|| "anon".to_string());
         self.current_function_name = Some(name.clone());
         let visibility = self.visibility_of(decl);
+        let function_annotations: Vec<String> = kt::child(decl, "modifiers")
+            .map(|modifiers| {
+                modifiers
+                    .children(&mut modifiers.walk())
+                    .filter(|modifier| {
+                        matches!(modifier.kind(), "annotation" | "annotated_expression")
+                    })
+                    .filter_map(|annotation| self.transpile_declaration_annotation(annotation))
+                    .filter(|annotation| !is_kotlin_jvm_annotation(annotation))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Kotlin override methods can narrow a nullable supertype return (for
+        // example, `String?` to `String`). Java's unannotated override loses
+        // that contract to Kotlin callers, which merge the inherited nullable
+        // declaration back into the lookup. Preserve the source's explicit,
+        // non-null reference return as JVM nullability metadata.
+        let has_override_modifier = kt::child(decl, "modifiers").is_some_and(|modifiers| {
+            self.text(modifiers)
+                .split_whitespace()
+                .any(|part| part == "override")
+        });
 
         // function_modifier children (suspend/operator/infix/tailrec/
         // external/inline...): suspend changes semantics, external can't be
@@ -172,10 +194,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     let word = self.text(f).trim().to_string();
                     match word.as_str() {
                         "suspend" => {
-                            self.diag_approx(
+                            self.diag_untranslatable(
                                 f,
-                                "Kotlin `suspend` compiled to a plain blocking method; coroutine semantics lost",
+                                "Kotlin suspend function requires coroutine lowering; retained in Kotlin",
                             );
+                            return;
                         }
                         "external" => {
                             // JNI-shaped; bodyless native method is closest
@@ -437,10 +460,26 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 match k.kind() {
                     "parameter_modifiers" => prev_modifiers = Some(*k),
                     "parameter" => {
-                        let is_vararg = prev_modifiers
-                            .take()
+                        let modifiers = prev_modifiers.take();
+                        let is_vararg = modifiers
                             .map(|m| self.text(m).contains("vararg"))
                             .unwrap_or(false);
+                        let annotations = modifiers
+                            .map(|m| {
+                                m.children(&mut m.walk())
+                                    .filter(|modifier| {
+                                        matches!(
+                                            modifier.kind(),
+                                            "annotation" | "annotated_expression"
+                                        )
+                                    })
+                                    .filter_map(|annotation| {
+                                        self.transpile_declaration_annotation(annotation)
+                                    })
+                                    .filter(|annotation| !is_kotlin_jvm_annotation(annotation))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
                         let pname = kt::child(*k, "identifier")
                             .map(|n| self.text(n).to_string())
                             .unwrap_or_else(|| "arg".to_string());
@@ -455,9 +494,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             })
                             .unwrap_or_else(|| "Object".to_string());
                         if is_vararg {
-                            params.push(format!("{}... {}", pty, pname));
+                            params.push(format!(
+                                "{}{}{}... {}",
+                                annotations.join(" "),
+                                if annotations.is_empty() { "" } else { " " },
+                                pty,
+                                pname,
+                            ));
                         } else {
-                            params.push(format!("{} {}", pty, pname));
+                            params.push(format!(
+                                "{}{}{} {}",
+                                annotations.join(" "),
+                                if annotations.is_empty() { "" } else { " " },
+                                pty,
+                                pname,
+                            ));
                         }
                         param_names.push(pname.clone());
                         param_defaults.push(
@@ -532,6 +583,28 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
 
         let is_static = if make_static { "static " } else { "" };
+        let is_getter_function = fname_raw.strip_prefix("get").is_some_and(|suffix| {
+            suffix
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_uppercase())
+        });
+        let non_null_override_return = has_override_modifier
+            && is_getter_function
+            && explicit_ret
+            && !ret.starts_with('@')
+            && !matches!(
+                ret.as_str(),
+                "void"
+                    | "boolean"
+                    | "byte"
+                    | "short"
+                    | "int"
+                    | "long"
+                    | "float"
+                    | "double"
+                    | "char"
+            );
         let has_body = kt::child(decl, "function_body").is_some();
         // Inside an interface: bodyless stays implicit, with body -> default
         let in_interface = kt::parent_of(decl)
@@ -547,6 +620,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             "abstract "
         };
         let has_body = has_body && !is_external;
+        for annotation in function_annotations {
+            out.line(annotation);
+        }
+        if non_null_override_return
+            && let Some(annotation) = crate::transpiler::types::non_null_annotation(self.annots)
+        {
+            out.line(annotation);
+        }
         if !has_body {
             // Bodyless: signature-only (abstract / interface method)
             self.ext_receiver_name = prev_receiver;
@@ -743,4 +824,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             java
         }
     }
+}
+
+fn is_kotlin_jvm_annotation(annotation: &str) -> bool {
+    [
+        "JvmOverloads",
+        "JvmName",
+        "JvmStatic",
+        "JvmField",
+        "JvmSuppressWildcards",
+        "JvmSynthetic",
+    ]
+    .iter()
+    .any(|jvm_only| annotation.contains(jvm_only))
 }

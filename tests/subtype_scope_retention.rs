@@ -98,3 +98,85 @@ fn interface_with_unselected_kotlin_subtype_still_retained() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn memberless_interface_waits_for_retained_supertype() {
+    let root = Path::new("tests/tmp_scratch_memberless_retained_parent");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("events.kt"),
+        "package neutral.events.waiting\n\
+         @com.example.Mapping(mapper = { it.toString() })\n\
+         interface IObjectEvent { val id: String get() = \"fixed\" }\n\
+         interface AgentEvent : IObjectEvent\n\
+         value class RetainedEvent(val raw: String) : AgentEvent\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.as_os_str())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "notlin failed:\n{stderr}");
+    assert!(
+        !root.join("IObjectEvent.java").exists(),
+        "the annotation-blocked root interface must remain Kotlin"
+    );
+    assert!(
+        !root.join("AgentEvent.java").exists(),
+        "a memberless interface over a retained Kotlin property must remain Kotlin"
+    );
+    let kotlin = fs::read_to_string(root.join("events.kt")).unwrap();
+    assert!(
+        kotlin.contains("NOTLIN N04DC")
+            && kotlin.contains("interface AgentEvent : IObjectEvent")
+            && kotlin.contains("interface IObjectEvent")
+            && kotlin.contains("NOTLIN NF7FA")
+            && kotlin.contains("class RetainedEvent"),
+        "the retained root and intrinsically retained subtype must remain explicit:\n{kotlin}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn memberless_event_branch_translates_after_property_contract_is_bridged() {
+    let root = Path::new("tests/tmp_scratch_memberless_event_branch");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("object.kt"),
+        "package neutral.events.bridged\n\ninterface IObjectEvent {\n    val id: String\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("agent.kt"),
+        "package neutral.events.bridged\n\ninterface AgentEvent : IObjectEvent\n\n@com.example.Mapping(mapper = { it.toString() })\ndata class AgentCreatedEvent(override val id: String) : AgentEvent\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.as_os_str())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "notlin failed:\n{stderr}");
+    assert!(
+        root.join("IObjectEvent.java").exists(),
+        "the proven property contract should translate:\n{stderr}"
+    );
+    assert!(
+        root.join("AgentEvent.java").exists(),
+        "a memberless event branch must not be retained by its Kotlin implementation:\n{stderr}"
+    );
+    assert!(
+        !root.join("AgentCreatedEvent.java").exists(),
+        "the unsupported implementation is intentionally retained"
+    );
+    let kotlin = fs::read_to_string(root.join("agent.kt")).unwrap();
+    assert!(kotlin.contains("class AgentCreatedEvent"), "{kotlin}");
+    let _ = fs::remove_dir_all(root);
+}

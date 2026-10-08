@@ -11,6 +11,10 @@ fn transpile_lombok(source: &str, file_name: &str) -> String {
     transpile_with_args(source, file_name, &["--lombok", file_name])
 }
 
+fn transpile_allow_approximations(source: &str, file_name: &str) -> String {
+    transpile_with_args(source, file_name, &["--allow-approximations", file_name])
+}
+
 fn transpile_with_args(source: &str, file_name: &str, args: &[&str]) -> String {
     let cli = Cli::parse_from(std::iter::once("notlin").chain(args.iter().copied()));
     let (files, errors, _warnings, _coverage) =
@@ -146,7 +150,7 @@ enum class Item(final @JvmField val alias: String) : Api {
 
 #[test]
 fn interface_default_getter_reads_sibling_property_through_its_accessor() {
-    let java = transpile(
+    let java = transpile_allow_approximations(
         "package neutral.regression\ninterface Api {\n    fun getCategory(): Category\n    val baseAlias: String get() = category.getKey()\n}\n",
         "Api.kt",
     );
@@ -155,7 +159,7 @@ fn interface_default_getter_reads_sibling_property_through_its_accessor() {
 
 #[test]
 fn reflection_in_local_initializers_is_wrapped_as_an_unchecked_failure() {
-    let java = transpile(
+    let java = transpile_allow_approximations(
         "package neutral.regression\ninterface Api {\n    fun create(type: Class<*>): Any {\n        val value = type.getConstructor().newInstance()\n        return value\n    }\n}\n",
         "Api.kt",
     );
@@ -165,7 +169,7 @@ fn reflection_in_local_initializers_is_wrapped_as_an_unchecked_failure() {
 
 #[test]
 fn unit_expression_body_wrappers_do_not_return_void_calls() {
-    let java = transpile(
+    let java = transpile_allow_approximations(
         r#"package neutral.regression
 class Box {
     val values: MutableList<String> = mutableListOf()
@@ -189,7 +193,7 @@ class Box {
 
 #[test]
 fn chained_collection_filters_stream_only_once() {
-    let java = transpile(
+    let java = transpile_allow_approximations(
         r#"package neutral.regression
 fun filtered(values: List<String>) = values
     .filter { it.isNotEmpty() }
@@ -211,7 +215,7 @@ fun filtered(values: List<String>) = values
 
 #[test]
 fn explicit_java_stream_pipeline_is_not_collected_before_terminal() {
-    let java = transpile(
+    let java = transpile_allow_approximations(
         r#"package neutral.regression
 import java.util.Optional
 fun first(values: List<String>): Optional<String> = values.stream()
@@ -235,7 +239,7 @@ fun all(values: List<String>): List<String> = values.stream()
 
 #[test]
 fn optional_stream_return_closes_declaration_site_wildcard() {
-    let java = transpile(
+    let java = transpile_allow_approximations(
         r#"package neutral.regression
 import java.util.Optional
 interface Nodes {

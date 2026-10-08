@@ -13,7 +13,12 @@ fn kclass_java_bridge_erases_when_parameter_becomes_class() {
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--allow-approximations",
+        ])
         .arg(root.join("pkg").join("m.kt").to_str().unwrap())
         .output()
         .expect("run notlin");

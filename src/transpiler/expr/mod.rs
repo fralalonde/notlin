@@ -103,6 +103,10 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     // through its accessor (implicit `this`).
                     format!("this.{}()", getter)
                 } else if !self.unit.var_types.contains_key(&name)
+                    && let Some(literal) = self.inline_same_file_string_const(&name, node)
+                {
+                    literal
+                } else if !self.unit.var_types.contains_key(&name)
                     && let Some(owner) = self
                         .unit
                         .workspace
@@ -122,18 +126,12 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     .workspace
                     .and_then(|w| w.object_declaration_named(&name))
                     .is_some_and(|obj| {
-                        // An object-referencing identifier must lower to the
-                        // `Name.INSTANCE` singleton UNLESS the object stays
-                        // Kotlin (then the Kotlin type name remains a value).
+                        // Java calls both generated and retained Kotlin object
+                        // values through their public singleton field. A
+                        // retained Kotlin object is still a Java class with
+                        // `INSTANCE`; its source-level bare-value syntax does
+                        // not survive this Java emission boundary.
                         obj.name != self.unit.current_object.as_deref().unwrap_or("")
-                            && !self
-                                .unit
-                                .retained_hint
-                                .map(|r| match r {
-                                    x if x.is_empty() => false,
-                                    retained => retained.contains(&obj.name),
-                                })
-                                .unwrap_or(true)
                     })
                 {
                     format!("{}.INSTANCE", name)

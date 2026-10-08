@@ -7,13 +7,26 @@ use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    fn accessor_class_body<'node>(
+        &self,
+        decl: tree_sitter::Node<'node>,
+    ) -> Option<tree_sitter::Node<'node>> {
+        if matches!(
+            decl.kind(),
+            "class_declaration" | "object_declaration" | "companion_object"
+        ) {
+            kt::child(decl, "class_body").or_else(|| kt::child(decl, "enum_class_body"))
+        } else {
+            kt::parent_of(decl)
+                .filter(|parent| matches!(parent.kind(), "class_body" | "enum_class_body"))
+        }
+    }
+
     /// Does the enclosing class body declare a method of this name? Such a
     /// declaration suppresses the generated accessor (it would collide in
     /// Java), which decides where a `@get:` annotation has to live.
     pub(crate) fn class_declares_method(&self, decl: tree_sitter::Node, method: &str) -> bool {
-        let Some(body) = kt::parent_of(decl)
-            .filter(|parent| matches!(parent.kind(), "class_body" | "enum_class_body"))
-        else {
+        let Some(body) = self.accessor_class_body(decl) else {
             return false;
         };
         let mut cursor = body.walk();
@@ -21,7 +34,99 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .filter(|member| member.kind() == "function_declaration")
             .any(|member| {
                 !self.is_property_repair_bridge(member)
+                    && self.constructor_property_bridge(member).is_none()
                     && kt::field(member, "name").is_some_and(|name| self.text(name) == method)
+            })
+    }
+
+    /// Whether the class declares a method with this exact Java-visible
+    /// parameter signature. Name-only checks are unsafe for setters: an
+    /// overload such as `setAmount(AmountUpdate)` does not replace the
+    /// property ABI `setAmount(String)`.
+    pub(crate) fn class_declares_method_signature(
+        &self,
+        decl: tree_sitter::Node,
+        method: &str,
+        expected_parameter_types: &[&str],
+    ) -> bool {
+        let Some(body) = self.accessor_class_body(decl) else {
+            return false;
+        };
+        let mut cursor = body.walk();
+        body.children(&mut cursor)
+            .filter(|member| member.kind() == "function_declaration")
+            .any(|member| {
+                if self.is_property_repair_bridge(member)
+                    || self.constructor_property_bridge(member).is_some()
+                    || kt::field(member, "name").is_none_or(|name| self.text(name) != method)
+                {
+                    return false;
+                }
+                let Some(parameters) = kt::child(member, "function_value_parameters") else {
+                    return expected_parameter_types.is_empty();
+                };
+                let actual = parameters
+                    .children(&mut parameters.walk())
+                    .filter(|parameter| parameter.kind() == "parameter")
+                    .map(|parameter| {
+                        parameter
+                            .children(&mut parameter.walk())
+                            .find(|child| {
+                                matches!(
+                                    child.kind(),
+                                    "user_type"
+                                        | "nullable_type"
+                                        | "function_type"
+                                        | "parenthesized_type"
+                                )
+                            })
+                            .map(|ty| kt::java_type_ann(ty, self.source, self.annots))
+                    })
+                    .collect::<Option<Vec<_>>>();
+                actual.is_some_and(|actual| {
+                    actual.len() == expected_parameter_types.len()
+                        && actual
+                            .iter()
+                            .zip(expected_parameter_types)
+                            .all(|(actual, expected)| {
+                                let signature_type = |ty: &str| {
+                                    ty.split_whitespace()
+                                        .filter(|token| !token.starts_with('@'))
+                                        .collect::<String>()
+                                };
+                                signature_type(actual) == signature_type(expected)
+                            })
+                })
+            })
+    }
+
+    /// Whether a same-name overload has this arity. Lombok suppresses a
+    /// generated accessor for a same-name, same-arity method even when its
+    /// parameter type differs, so the translator must emit the property's
+    /// exact bridge explicitly in that case.
+    pub(crate) fn class_declares_method_arity(
+        &self,
+        decl: tree_sitter::Node,
+        method: &str,
+        arity: usize,
+    ) -> bool {
+        let Some(body) = self.accessor_class_body(decl) else {
+            return false;
+        };
+        let mut cursor = body.walk();
+        body.children(&mut cursor)
+            .filter(|member| member.kind() == "function_declaration")
+            .any(|member| {
+                !self.is_property_repair_bridge(member)
+                    && self.constructor_property_bridge(member).is_none()
+                    && kt::field(member, "name").is_some_and(|name| self.text(name) == method)
+                    && kt::child(member, "function_value_parameters").is_some_and(|parameters| {
+                        parameters
+                            .children(&mut parameters.walk())
+                            .filter(|parameter| parameter.kind() == "parameter")
+                            .count()
+                            == arity
+                    })
             })
     }
 
@@ -366,7 +471,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             }
         }
         let has_getter_method = conflicts.contains(&getter_name);
-        let has_setter_method = conflicts.contains(&setter_name);
+        let has_setter_method =
+            self.class_declares_method_signature(decl, &setter_name, &[ty.as_str()]);
 
         if !has_getter_method {
             for annotation in &getter_annotations {

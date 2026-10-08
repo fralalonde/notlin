@@ -13,7 +13,7 @@ fn map_holder_members_emit_java_calls() {
         "    fun bucket() = m.hashCode()\n",
         "}\n"
     );
-    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "M.kt"]);
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", "M.kt"]);
     let (files, errors, _warnings, _cov) =
         notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
     assert_eq!(errors, 0);

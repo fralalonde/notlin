@@ -5,6 +5,37 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
+fn dump_ast_with_workspace_root_does_not_migrate_sources() {
+    let root = std::env::temp_dir().join(format!("notlin-dump-ast-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("Sample.kt");
+    let original = "package sample\nclass Sample\n";
+    fs::write(&source, original).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .current_dir(&root)
+        .arg("--root")
+        .arg(&root)
+        .arg("--dump-ast")
+        .arg("--in-place")
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("source_file"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), original);
+    assert!(!root.join("Sample.java").exists());
+    assert!(
+        !root.join(".notlin").exists(),
+        "AST inspection must bypass workspace indexing"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn root_is_separate_from_translation_roots() {
     let cli = Cli::parse_from([
         "notlin",

@@ -18,6 +18,58 @@ fn emitted(root: &Path, name: &str) -> String {
 }
 
 #[test]
+fn annotated_immutable_data_class_uses_fields_instead_of_record_components() {
+    let root = Path::new("tests/tmp_scratch_annotated_data_class");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("Weight.kt"),
+        r#"package neutral.weight
+
+data class Weight(
+    @Column(name = "WEIGHT")
+    val value: java.math.BigDecimal,
+    @Column(name = "WEIGHT_UNIT")
+    val unit: String,
+)
+"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.join("Weight.kt").to_str().unwrap())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "notlin failed:\n{stderr}");
+
+    let java = emitted(root, "Weight");
+    assert!(
+        java.contains("public class Weight"),
+        "annotated properties need independently annotatable fields:\n{java}"
+    );
+    assert!(!java.contains("record Weight"), "{java}");
+    for (annotation, field) in [
+        ("@Column(name = \"WEIGHT\")", "BigDecimal value;"),
+        ("@Column(name = \"WEIGHT_UNIT\")", "String unit;"),
+    ] {
+        let annotation_at = java.find(annotation).unwrap_or_else(|| {
+            panic!("expected {annotation} to survive on the generated field:\n{java}")
+        });
+        let field_at = java
+            .find(field)
+            .unwrap_or_else(|| panic!("expected {field}:\n{java}"));
+        assert!(
+            annotation_at < field_at && field_at - annotation_at < 80,
+            "{java}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn constructor_property_annotations_land_on_the_generated_field() {
     let root = Path::new("tests/tmp_scratch_ctor_annotations");
     let _ = fs::remove_dir_all(root);
@@ -197,6 +249,35 @@ class DeclaredGetter(val id: String) {
         declared.contains("@Binding(IKind.class)"),
         "`@get:` must not be dropped when the getter is user-declared:\n{declared}"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn positional_jpa_column_name_is_named_for_java() {
+    let root = Path::new("tests/tmp_scratch_positional_column");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("Entity.kt"),
+        r#"package neutral.column
+
+data class Entity(@Column("CLASS") val kind: String)
+"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.join("Entity.kt").to_str().unwrap())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "notlin failed:\n{stderr}");
+
+    let java = emitted(root, "Entity");
+    assert!(java.contains("@Column(name = \"CLASS\")"), "{java}");
+    assert!(!java.contains("@Column(\"CLASS\")"), "{java}");
 
     let _ = fs::remove_dir_all(root);
 }

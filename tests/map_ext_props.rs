@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[test]
 fn is_not_empty_stays_a_predicate_call() {
     let source = "package neutral.mape\nfun nonzero(m: Map<String, Int>) = m.isNotEmpty()\n";
-    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "M.kt"]);
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", "M.kt"]);
     let (files, errors, _warnings, _cov) =
         notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
     assert_eq!(errors, 0);

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[test]
 fn filter_not_null_lowers_to_stream() {
     let source = "package neutral.fnn\nfun clean(ctx: Array<String?>): List<String> = ctx.filterNotNull().map { it.length }\n";
-    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "M.kt"]);
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", "M.kt"]);
     let (files, errors, _warnings, _cov) =
         notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
     let m = files

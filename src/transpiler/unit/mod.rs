@@ -21,6 +21,7 @@ pub(crate) use types_infer::{instance_property_count, primitive_array_factory};
 
 pub struct Unit<'src, 'tree> {
     pub source: &'src str,
+    pub source_hash: [u8; 32],
     pub file: &'src Path,
     pub diags: &'src mut Diagnostics,
     pub annots: AnnotationSet,
@@ -29,11 +30,22 @@ pub struct Unit<'src, 'tree> {
     /// @Data classes (mutable), hand-rolled accessors become annotations.
     pub lombok: bool,
     pub in_place: bool,
+    pub allow_approximations: bool,
+    pub type_facts: Vec<(
+        crate::semantics::SourceLocation,
+        crate::semantics::FactStatus<crate::semantics::TypeRef>,
+    )>,
+    pub output_owners: std::collections::HashMap<String, Vec<crate::semantics::SymbolId>>,
+    pub semantic_provider: Option<&'src dyn crate::semantics::SemanticProvider>,
+    declaration_diagnostic_start: usize,
     /// Per-file coverage: which declarations translated, which didn't.
     pub coverage: FileCoverage,
     /// O(1) membership for untranslated declarations. Coverage keeps its
     /// ordered Vec for migration output and diagnostics.
     untranslated_names: std::collections::HashSet<String>,
+    /// Snapshot-local boundary identities. Names remain a conservative lookup
+    /// for unresolved calls, but overload ownership must not be name-based.
+    tainted_declarations: std::collections::HashSet<usize>,
     /// Name of the declaration currently being translated; diagnostics raised
     /// while this is Some are attributed to it for in-place migration policy.
     pub(crate) current_decl: Option<tree_sitter::Node<'tree>>,
@@ -150,7 +162,7 @@ pub struct Unit<'src, 'tree> {
     /// known to be retained in Kotlin for intrinsic reasons. When Some, the
     /// subtype rule consults it (`has_retained_kotlin_subtype`) instead of
     /// retaining on every Kotlin subtype; None = conservative catch-all.
-    pub(crate) retained_hint: Option<&'src std::collections::HashSet<String>>,
+    pub(crate) retained_hint: Option<&'src std::collections::HashSet<crate::semantics::SymbolId>>,
     /// node-id -> Java-native annotation texts hoisted from a preceding
     /// top-level annotated_expression wrapper (grammar quirk: a leading
     /// `@X("v") object T` parses the annotation outside the declaration).
@@ -178,9 +190,64 @@ pub struct UnitOptions {
     pub untranslatable_as_error: bool,
     pub lombok: bool,
     pub in_place: bool,
+    pub allow_approximations: bool,
 }
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    pub(crate) fn is_retained_type(&self, name: &str) -> bool {
+        let Some(retained) = self.retained_hint else {
+            return false;
+        };
+        if let Some(workspace) = self.workspace
+            && let Some(file) =
+                workspace.source_file(self.workspace_file.as_deref().unwrap_or(self.file))
+            && let Some(declaration) = workspace.resolve_type(file, name)
+        {
+            return workspace.declaration_retained(declaration, retained);
+        }
+        // An unresolved reference is conservatively blocked by any matching identity.
+        crate::transpiler::retention_queries::contains_name(retained, name)
+    }
+
+    pub(crate) fn known_declared_method(&self, receiver: &str, member: &str) -> bool {
+        let receiver = receiver.trim();
+        let ty = self
+            .var_types
+            .get(receiver)
+            .map(String::as_str)
+            .unwrap_or(receiver);
+        let ty = ty.trim().strip_prefix("new ").unwrap_or(ty);
+        let ty = ty.split(['(', '<']).next().unwrap_or(ty).trim();
+        let ty = ty
+            .strip_suffix(".Companion")
+            .or_else(|| ty.strip_suffix(".super"))
+            .unwrap_or(ty);
+        if let Some(workspace) = self.workspace
+            && let Some(file) =
+                workspace.source_file(self.workspace_file.as_deref().unwrap_or(self.file))
+            && let Some(declaration) = workspace.resolve_type(file, ty)
+        {
+            return declaration
+                .members
+                .iter()
+                .any(|m| m.name == member && m.kind == crate::workspace::MemberKind::Method);
+        }
+        use crate::semantics::SemanticProvider;
+        let provider = crate::semantics::SyntaxSemanticProvider::new([(
+            self.file.to_path_buf(),
+            self.source.to_string(),
+        )]);
+        provider
+            .symbols()
+            .iter()
+            .filter(|s| {
+                s.id.name == member
+                    && s.id.kind == "function"
+                    && s.id.owner_path.last().is_some_and(|owner| owner == ty)
+            })
+            .count()
+            == 1
+    }
     pub fn new(
         source: &'src str,
         file: &'src Path,
@@ -190,14 +257,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     ) -> Self {
         Self {
             source,
+            source_hash: *blake3::hash(source.as_bytes()).as_bytes(),
             file,
             diags,
             annots,
             untranslatable_as_error: options.untranslatable_as_error,
             lombok: options.lombok,
             in_place: options.in_place,
+            allow_approximations: options.allow_approximations,
+            declaration_diagnostic_start: 0,
             coverage: FileCoverage::default(),
             untranslated_names: std::collections::HashSet::new(),
+            type_facts: Vec::new(),
+            output_owners: std::collections::HashMap::new(),
+            semantic_provider: None,
+            tainted_declarations: std::collections::HashSet::new(),
             current_decl: None,
             decl_labels: std::collections::HashMap::new(),
             var_types: std::collections::HashMap::new(),
@@ -314,6 +388,54 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         None
     }
 
+    /// Kotlin's parser can represent a stacked class annotation block as a
+    /// chain of `annotated_expression` wrappers instead of putting the
+    /// annotations in the declaration's `modifiers`. Preserve every wrapper
+    /// separately so each one keeps its own argument list (notably for ORM
+    /// annotations with string or nested annotation arguments).
+    fn transpile_annotation_wrapper_chain(
+        &self,
+        wrapper: tree_sitter::Node<'tree>,
+    ) -> Option<Vec<String>> {
+        fn collect(
+            unit: &Unit<'_, '_>,
+            wrapper: tree_sitter::Node<'_>,
+            annotations: &mut Vec<String>,
+        ) -> Option<()> {
+            if wrapper.kind() != "annotated_expression" {
+                return None;
+            }
+            let mut cursor = wrapper.walk();
+            let children = wrapper.children(&mut cursor).collect::<Vec<_>>();
+            if children
+                .iter()
+                .filter(|child| child.kind() == "annotation")
+                .count()
+                != 1
+                || children.iter().any(|child| {
+                    child.is_named()
+                        && !matches!(
+                            child.kind(),
+                            "annotation" | "annotated_expression" | "parenthesized_expression"
+                        )
+                })
+            {
+                return None;
+            }
+            annotations.push(unit.transpile_declaration_annotation(wrapper)?);
+            for child in children {
+                if child.kind() == "annotated_expression" {
+                    collect(unit, child, annotations)?;
+                }
+            }
+            Some(())
+        }
+
+        let mut annotations = Vec::new();
+        collect(self, wrapper, &mut annotations)?;
+        Some(annotations)
+    }
+
     fn top_level_name(&self, decl: tree_sitter::Node<'_>) -> Option<String> {
         kt::field(decl, "name")
             .or_else(|| {
@@ -349,8 +471,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     fn begin_decl(&mut self, node: tree_sitter::Node<'tree>, label: String) {
+        self.declaration_diagnostic_start = self.diags.items.len();
         self.current_decl = Some(node);
-        self.coverage.translated.push(label.clone());
         self.decl_labels.insert(node.id(), label);
     }
 
@@ -362,8 +484,35 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 .get(&node.id())
                 .cloned()
                 .unwrap_or_default();
-            let tainted = self.is_untranslated(&label);
+            if !self.allow_approximations {
+                let unsupported: Vec<_> = self.diags.items[self.declaration_diagnostic_start..]
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.kind == DiagnosticKind::Approximated
+                            && crate::diagnostics::classify_approximation(&diagnostic.message)
+                                != crate::diagnostics::ApproximationClass::Informational
+                    })
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect();
+                if !unsupported.is_empty() {
+                    self.tainted_declarations.insert(node.id());
+                    if self.untranslated_names.insert(label.clone()) {
+                        self.coverage.untranslated.push(label.clone());
+                    }
+                    for message in unsupported {
+                        self.coverage.blockers.push((
+                            node.start_byte(),
+                            format!(
+                                "// NOTLIN: {} retained: {message}\n",
+                                warning_code(&message)
+                            ),
+                        ));
+                    }
+                }
+            }
+            let tainted = self.tainted_declarations.contains(&node.id());
             if !tainted {
+                self.coverage.translated.push(label.clone());
                 self.coverage
                     .translated_spans
                     .push((node.start_byte(), node.end_byte()));
@@ -382,19 +531,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 if let Some(ranges) = self.wrapper_spans.remove(&node.id()) {
                     self.coverage.translated_spans.extend(ranges);
                 }
-            } else {
-                // stays in the .kt file; not counted as translated
-                self.coverage.translated.retain(|l| l != &label);
             }
             self.decl_labels.remove(&node.id());
         }
     }
 
     pub(crate) fn taint_decl(&mut self, label: &str) {
+        if let Some(declaration) = self.current_decl {
+            self.tainted_declarations.insert(declaration.id());
+        }
         if self.untranslated_names.insert(label.to_string()) {
             self.coverage.untranslated.push(label.to_string());
         }
-        self.coverage.translated.retain(|l| l != label);
     }
 
     fn is_untranslated(&self, label: &str) -> bool {
@@ -545,8 +693,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return format!("declaration {name}");
         };
         let mut labels = workspace
-            .declarations()
-            .filter(|declaration| declaration.name == name)
+            .declarations_named(name)
             .map(|declaration| match declaration.kind {
                 crate::workspace::DeclarationKind::Class => "class",
                 crate::workspace::DeclarationKind::Interface => "interface",
@@ -609,6 +756,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     pub(crate) fn diag_approx(&mut self, node: tree_sitter::Node, msg: impl Into<String>) {
         // Console diagnostic (compiler-style listing)…
         let message = msg.into();
+        if !self.allow_approximations
+            && crate::diagnostics::classify_approximation(&message)
+                != crate::diagnostics::ApproximationClass::Informational
+        {
+            self.diag_untranslatable(node, format!("retained to avoid approximation: {message}"));
+            return;
+        }
         self.coverage.diags_approx.push((
             node.start_byte(),
             message.clone(),
@@ -655,9 +809,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             let last = head.rsplit('.').next().unwrap_or(head);
             let is_enum = self.enum_types.contains(last)
                 || self.workspace.map(|w| {
-                    w.declarations().any(|d| {
-                        d.name == last && d.kind == crate::workspace::DeclarationKind::Enum
-                    })
+                    w.declarations_named(last)
+                        .any(|d| d.kind == crate::workspace::DeclarationKind::Enum)
                 }) == Some(true);
             if is_enum {
                 return format!("static {head}.*");
@@ -701,16 +854,25 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
         // Workspace lookup is authoritative — the enum may live in another
         // file of the same translation root.
-        if let Some(workspace) = self.workspace {
-            for decl in workspace.declarations() {
-                if decl.name == parent_ty && decl.kind == crate::workspace::DeclarationKind::Enum {
-                    return true;
-                }
-            }
+        if let Some(workspace) = self.workspace
+            && workspace
+                .declarations_named(parent_ty)
+                .any(|decl| decl.kind == crate::workspace::DeclarationKind::Enum)
+        {
+            return true;
         }
         self.enum_types.contains(parent_ty)
     }
     pub fn run(&mut self, root: tree_sitter::Node<'tree>) -> Vec<(String, String)> {
+        let plan = crate::translation_plan::analyze(self.source, root, self.file);
+        self.run_planned(root, &plan)
+    }
+
+    pub(crate) fn run_planned(
+        &mut self,
+        root: tree_sitter::Node<'tree>,
+        plan: &crate::translation_plan::TranslationPlan,
+    ) -> Vec<(String, String)> {
         // Collect top-level structure
         let mut package = String::new();
         let mut imports: Vec<String> = Vec::new();
@@ -788,8 +950,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     // (an unstripped wrapper dangles in the residue and
                     // re-binds to the NEXT surviving declaration).
                     wrapper_spans_for_next.push((child.start_byte(), child.end_byte()));
-                    match self.transpile_declaration_annotation(child) {
-                        Some(text) => hoisted_annotations.push(text),
+                    match self.transpile_annotation_wrapper_chain(child) {
+                        Some(annotations) => hoisted_annotations.extend(annotations),
                         None => {
                             retained_annotations.push(annotation.to_string());
                             retain_next_declaration = true;
@@ -831,6 +993,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         child,
                         format!("top-level construct not supported: {}", child.kind()),
                     );
+                    self.coverage
+                        .untranslated
+                        .push(format!("top-level@{}", child.start_byte()));
                 }
             }
         }
@@ -838,6 +1003,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // Pre-pass: superclass -> subclass relations drive `permits` emission
         // for sealed classes and `final` on their subclasses.
         self.collect_type_relations(root);
+        // Preflight blockers must be visible even to declarations emitted
+        // before their callees. Name lookup remains conservative until calls
+        // carry resolved symbol identities.
+        for decl in &decls {
+            if decl.kind() == "function_declaration"
+                && plan
+                    .retain_reasons_at(decl.start_byte())
+                    .is_some_and(|reasons| !reasons.is_empty())
+                && let Some(name) = self.top_level_name(*decl)
+            {
+                self.retained_file_functions.insert(name);
+            }
+        }
 
         // Partition: named types each get their own file; loose functions and
         // top-level properties go into ONE file named after the .kt source.
@@ -853,6 +1031,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     let imports2 = imports.clone();
                     let package2 = package.clone();
                     self.begin_decl(*decl, type_name.clone());
+                    if self.apply_preflight_retention(*decl, plan) {
+                        self.end_decl();
+                        continue;
+                    }
                     if let Some(retained) = standalone_annotation_targets.get(&decl.id()) {
                         for annotation in retained {
                             self.diag_untranslatable_coded(
@@ -933,8 +1115,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         unit.transpile_type_decl(*decl, out);
                     });
                     self.end_decl();
-                    if !self.is_untranslated(&type_name) {
-                        files.push((format!("{}.java", type_name), out.finish()));
+                    if !self.tainted_declarations.contains(&decl.id()) {
+                        let path = format!("{}.java", type_name);
+                        self.output_owners.insert(
+                            path.clone(),
+                            plan.declarations
+                                .iter()
+                                .filter(|d| d.id.start_byte == decl.start_byte())
+                                .map(|d| d.symbol_id.clone())
+                                .collect(),
+                        );
+                        files.push((path, out.finish()));
                     } else {
                         log::info!(
                             "skipping {}.java — declaration has untranslatables",
@@ -969,6 +1160,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             if let Some(first) = chars.next() {
                 file_class_name = first.to_uppercase().collect::<String>() + chars.as_str();
             }
+            file_class_name = crate::function_callsite::non_conflicting_facade_name(
+                self.source,
+                &file_class_name,
+            );
 
             let mut out = JavaOut::new();
             self.transpile_type_decl_set(&mut out, &package, &imports, |unit, out| {
@@ -980,7 +1175,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         .top_level_name(**decl)
                         .unwrap_or_else(|| "<anonymous>".to_string());
                     unit.begin_decl(**decl, label.clone());
-                    if unit.workspace_requires_top_level_retention(&label) {
+                    // Each member lowers into its own transaction. A late
+                    // blocker cannot leak a partial method into a clean facade.
+                    let mut member = JavaOut::new();
+                    member.indent = out.indent;
+                    if unit.apply_preflight_retention(**decl, plan) {
+                        // The plan already owns this declaration in Kotlin.
+                    } else if decl.kind() == "property_declaration"
+                        && unit.workspace_requires_top_level_retention(&label)
+                    {
                         unit.diag_untranslatable(
                             **decl,
                             "top-level declaration is referenced by retained Kotlin source",
@@ -991,17 +1194,30 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                 let is_main = kt::field(**decl, "name")
                                     .map(|n| unit.text(n) == "main")
                                     .unwrap_or(false);
-                                unit.transpile_function_opts(**decl, true, true, is_main, out);
-                                out.blank();
+                                unit.transpile_function_opts(
+                                    **decl,
+                                    true,
+                                    true,
+                                    is_main,
+                                    &mut member,
+                                );
+                                member.blank();
                             }
                             "property_declaration" => {
-                                unit.transpile_toplevel_property(**decl, out, &file_class_name);
-                                out.blank();
+                                unit.transpile_toplevel_property(
+                                    **decl,
+                                    &mut member,
+                                    &file_class_name,
+                                );
+                                member.blank();
                             }
                             _ => {}
                         }
                     }
                     unit.end_decl();
+                    if !unit.tainted_declarations.contains(&decl.id()) {
+                        out.buf.push_str(&member.finish());
+                    }
                 }
                 out.close();
             });
@@ -1009,21 +1225,51 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             // loose declaration survived (clean members are in `translated`).
             let clean_count = loose
                 .iter()
-                .filter(|d| {
-                    let label = self
-                        .top_level_name(***d)
-                        .unwrap_or_else(|| "<anonymous>".to_string());
-                    !self.is_untranslated(&label)
-                })
+                .filter(|d| !self.tainted_declarations.contains(&d.id()))
                 .count();
             if clean_count > 0 {
-                files.push((format!("{}.java", file_class_name), out.finish()));
+                let path = format!("{}.java", file_class_name);
+                self.output_owners.insert(
+                    path.clone(),
+                    loose
+                        .iter()
+                        .filter(|decl| !self.tainted_declarations.contains(&decl.id()))
+                        .filter_map(|decl| {
+                            plan.declarations
+                                .iter()
+                                .find(|d| d.id.start_byte == decl.start_byte())
+                                .map(|d| d.symbol_id.clone())
+                        })
+                        .collect(),
+                );
+                files.push((path, out.finish()));
             } else {
                 log::info!("all top-level members untranslatable; skipping utility class");
             }
         }
 
         files
+    }
+
+    fn apply_preflight_retention(
+        &mut self,
+        declaration: tree_sitter::Node,
+        plan: &crate::translation_plan::TranslationPlan,
+    ) -> bool {
+        let reasons = plan
+            .retain_reasons_at(declaration.start_byte())
+            .unwrap_or(&[]);
+        if reasons.is_empty() {
+            return false;
+        }
+        for reason in reasons {
+            self.diag_untranslatable_coded(
+                declaration,
+                reason.message(),
+                Some(reason.code().to_string()),
+            );
+        }
+        true
     }
 
     pub(crate) fn visibility_of(&mut self, decl: tree_sitter::Node) -> String {

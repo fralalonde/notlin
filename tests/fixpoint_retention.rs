@@ -135,6 +135,68 @@ fn covariant_override_matches_the_full_overloaded_signature() {
 }
 
 #[test]
+fn retained_kotlin_interface_blocks_covariant_readonly_list_property_ownership() {
+    use notlin::semantics::workspace_symbol;
+    use notlin::workspace::{DeclarationKind, MemberKind, SourceIndex};
+
+    let root = Path::new("tests/tmp_scratch_retained_covariant_list");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    let file = root.join("types.kt");
+    fs::write(
+        &file,
+        "package neutral.fixpoint.covariant.retained\n\
+         interface Base {}\n\
+         enum class Child : Base { ONLY }\n\
+         interface Parent {\n\
+         \x20   val children: List<Base>\n\
+         }\n\
+         class Impl : Parent {\n\
+         \x20   override val children: List<Child> = listOf(Child.ONLY)\n\
+         }\n",
+    )
+    .unwrap();
+
+    let index = SourceIndex::discover(root).unwrap();
+    let parent = index
+        .declarations_named("Parent")
+        .find(|declaration| declaration.kind == DeclarationKind::Interface)
+        .unwrap();
+    let conflicts =
+        index.retained_supertype_member_conflicts_in_file(&file, &["Parent".to_string()], "Impl");
+    let conflict = conflicts
+        .iter()
+        .find(|conflict| {
+            conflict.member_name == "children" && conflict.kind == MemberKind::Property
+        })
+        .expect("readonly covariant list override should be classified");
+    assert!(conflict.blocks_java_override(), "{conflict:?}");
+
+    let roots = [root.to_path_buf()];
+    assert!(
+        index.selected_covariant_property_conflict_is_safe(
+            &file,
+            conflict,
+            &roots,
+            &HashSet::new(),
+        ),
+        "the hierarchy may translate together when its interface is not retained"
+    );
+
+    let retained_parent = HashSet::from([workspace_symbol(&index, parent)]);
+    assert!(
+        !index.selected_covariant_property_conflict_is_safe(
+            &file,
+            conflict,
+            &roots,
+            &retained_parent,
+        ),
+        "a Java-owned implementation must not rely on covariance against a retained Kotlin interface"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn translated_kotlin_caller_releases_enum_and_supertype_in_one_run() {
     let root = Path::new("tests/tmp_scratch_fixpoint_retained_enum");
     let _ = fs::remove_dir_all(root);
@@ -324,7 +386,10 @@ fn warm_retention_replanning_adds_names_missing_from_seed() {
     let index = SourceIndex::discover(root).unwrap();
     let cli = Cli::parse_from(["notlin", "--in-place", file.to_str().unwrap()]);
     let files = [(file.clone(), source.into())];
-    let seed = HashSet::from(["UnrelatedStaleName".to_string()]);
+    let mut stale =
+        notlin::semantics::workspace_symbol(&index, index.declarations().next().unwrap());
+    stale.name = "UnrelatedStaleName".into();
+    let seed = HashSet::from([stale]);
     let warm = fixpoint::plan_workspace_warm(
         &files,
         &cli,
@@ -339,7 +404,7 @@ fn warm_retention_replanning_adds_names_missing_from_seed() {
         fixpoint::plan_workspace_state(&files, &cli, &index, &[root.to_path_buf()], 16, false)
             .unwrap();
     assert_eq!(warm.retained, fresh.retained);
-    assert!(!warm.retained.contains("UnrelatedStaleName"));
+    assert!(!warm.retained.iter().any(|s| s.name == "UnrelatedStaleName"));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -390,12 +455,7 @@ fn deep_valid_retention_chain_uses_configurable_budget() {
         fs::write(
             scratch.join(format!("Chain{depth}.kt")),
             format!(
-                "package neutral.deep\ninterface Chain{depth}{supertype}{}\n",
-                if depth == 0 {
-                    " { val marker: Int get() = 0 }"
-                } else {
-                    ""
-                }
+                "package neutral.deep\ninterface Chain{depth}{supertype} {{ fun marker{depth}(): Int }}\n"
             ),
         )
         .unwrap();
@@ -440,24 +500,36 @@ fn deep_valid_retention_chain_uses_configurable_budget() {
 }
 
 #[test]
-fn silent_fixpoint_jobs_profile_reports_requested_worker_count() {
+fn library_fixpoint_reports_speculative_round_progress() {
+    use notlin::{cli::Cli, migration_pipeline::plan_workspace_migration, workspace::SourceIndex};
+
     let root = Path::new("tests/tmp_scratch_fixpoint_jobs");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
-    fs::write(root.join("Type.kt"), "class Type\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
-        .arg(root.as_os_str())
-        .env("NOTLIN_JOBS", "4")
-        .env("NOTLIN_PROFILE", "1")
-        .output()
-        .expect("run notlin");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "notlin failed:\n{stderr}");
+    let file = root.join("Type.kt");
+    fs::write(&file, "class Type\n").unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let file = root.join("Type.kt");
+    let index = SourceIndex::discover(&root).unwrap();
+    let cli = Cli::parse_from(["notlin", "--in-place", root.to_str().unwrap()]);
+    let source = fs::read_to_string(&file).unwrap();
+    let mut progress = Vec::new();
+    let plan = plan_workspace_migration(
+        vec![(file, source)],
+        &cli,
+        &index,
+        std::slice::from_ref(&root),
+        |message| progress.push(message),
+    )
+    .expect("library planning should converge");
     assert!(
-        stderr.contains("fixpoint jobs=4"),
-        "missing jobs profile line:\n{stderr}"
+        progress
+            .iter()
+            .any(|message| message.starts_with("pass 1 ·")),
+        "missing speculative pass progress: {progress:?}"
     );
+    assert_eq!(plan.rounds, progress.len());
+    assert!(!plan.generated_java.is_empty());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -473,7 +545,7 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
     .unwrap();
     fs::write(
         root.join("Chain1.kt"),
-        "package neutral.comments\ninterface Chain1 : Chain0\n",
+        "package neutral.comments\ninterface Chain1 : Chain0 { fun marker1(): Int }\n",
     )
     .unwrap();
     fs::write(
@@ -501,10 +573,10 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
         "notlin failed:\n{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let chain0 = fs::read_to_string(root.join("Chain0.kt")).unwrap();
+    let chain0 = fs::read_to_string(root.join("Chain0.java")).unwrap();
     let chain1 = fs::read_to_string(root.join("Chain1.kt")).unwrap();
     assert!(
-        chain0.contains("* NOTLIN N2142:") && chain0.contains("[neutral.comments.Chain1]"),
+        chain0.contains("interface Chain0") && chain0.contains("getMarker()"),
         "{chain0}"
     );
     assert!(
@@ -514,8 +586,14 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
         "{chain1}"
     );
 
+    let kept = fs::read_to_string(root.join("Kept.kt")).unwrap();
+    assert!(
+        kept.contains("* NOTLIN NE098:") && kept.contains("[neutral.comments.Chain1]"),
+        "{kept}"
+    );
+
     let before = [
-        fs::read_to_string(root.join("Chain0.kt")).unwrap(),
+        fs::read_to_string(root.join("Chain0.java")).unwrap(),
         fs::read_to_string(root.join("Chain1.kt")).unwrap(),
         fs::read_to_string(root.join("Kept.kt")).unwrap(),
     ];
@@ -526,7 +604,7 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
         String::from_utf8_lossy(&second.stderr)
     );
     let after = [
-        fs::read_to_string(root.join("Chain0.kt")).unwrap(),
+        fs::read_to_string(root.join("Chain0.java")).unwrap(),
         fs::read_to_string(root.join("Chain1.kt")).unwrap(),
         fs::read_to_string(root.join("Kept.kt")).unwrap(),
     ];
@@ -552,13 +630,17 @@ fn final_retention_markers_exclude_names_released_from_the_seed() {
     let index = SourceIndex::discover(root).unwrap();
     let cli = Cli::parse_from(["notlin", "--in-place", file.to_str().unwrap()]);
     let files = [(file.clone(), source.into())];
-    let seed = HashSet::from(["Free".to_string()]);
+    let seed = index
+        .declarations()
+        .filter(|d| d.name == "Free")
+        .map(|d| notlin::semantics::workspace_symbol(&index, d))
+        .collect();
 
     let planned =
         fixpoint::plan_workspace_warm(&files, &cli, &index, &[root.to_path_buf()], 16, true, &seed)
             .unwrap();
 
-    assert!(!planned.retained.contains("Free"));
+    assert!(!planned.retained.iter().any(|s| s.name == "Free"));
     let blockers = planned.plans[0]
         .coverage
         .blockers

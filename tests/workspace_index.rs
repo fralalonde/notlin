@@ -32,6 +32,36 @@ fn symlink_dir(target: &Path, link: &Path) -> bool {
 }
 
 #[test]
+fn relative_overlay_replaces_the_canonical_source_snapshot() {
+    use notlin::semantics::{FactStatus, SemanticProvider, SyntaxSemanticProvider};
+    let root = PathBuf::from(format!("target/overlay-identity-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("Symbols.kt");
+    fs::write(&path, "package overlay\nclass Original\n").unwrap();
+    let index = SourceIndex::discover(&root).unwrap();
+    let updated = index
+        .with_overlays(&[SourceOverlay::Replace {
+            path: path.clone(),
+            language: SourceLanguage::Kotlin,
+            source: "package overlay\nclass Replacement\n".into(),
+        }])
+        .unwrap();
+    assert_eq!(updated.kotlin_files().count(), 1);
+    let provider = SyntaxSemanticProvider::new(
+        updated
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.source_text().to_owned())),
+    );
+    assert_eq!(provider.resolve("Original"), FactStatus::Unknown);
+    assert!(matches!(
+        provider.resolve("Replacement"),
+        FactStatus::Established(_)
+    ));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn workspace_selection_detects_when_every_kotlin_file_is_selected() {
     let root = std::env::temp_dir().join(format!("notlin-all-selected-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
@@ -569,7 +599,7 @@ fn transpiler_retains_selected_base_with_residual_kotlin_subtype() {
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
-fn child_interface_stays_kotlin_with_retained_kotlin_supertype() {
+fn memberless_java_child_forwards_retained_kotlin_supertype() {
     let root =
         std::env::temp_dir().join(format!("notlin-retained-supertype-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
@@ -586,7 +616,11 @@ fn child_interface_stays_kotlin_with_retained_kotlin_supertype() {
     let index = SourceIndex::discover(&root).unwrap();
     let cli = Cli::parse_from(["notlin", "--in-place", child_path.to_str().unwrap()]);
     let source = fs::read_to_string(&child_path).unwrap();
-    let retained = std::collections::HashSet::from(["Base".to_string()]);
+    let retained = index
+        .declarations()
+        .filter(|d| d.name == "Base")
+        .map(|d| notlin::semantics::workspace_symbol(&index, d))
+        .collect();
     let (files, errors, warnings, coverage) = transpiler::transpile_with_workspace_hint(
         &source,
         &child_path,
@@ -600,12 +634,16 @@ fn child_interface_stays_kotlin_with_retained_kotlin_supertype() {
         true,
     );
     assert_eq!(errors, 0);
+    let leaf_java = files
+        .iter()
+        .find(|(name, _)| name.ends_with("Leaf.java"))
+        .map(|(_, contents)| contents);
     assert!(
-        files.is_empty(),
-        "a Java child must not inherit the retained Kotlin ABI"
+        leaf_java.is_some_and(|contents| contents.contains("interface Leaf extends Base")),
+        "a memberless Java child should forward the retained Kotlin ABI: {files:?}"
     );
-    assert!(warnings > 0);
-    assert!(coverage.untranslated.iter().any(|name| name == "Leaf"));
+    assert_eq!(warnings, 0);
+    assert!(!coverage.untranslated.iter().any(|name| name == "Leaf"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1330,6 +1368,44 @@ enum class Bridged : CategoryDefault, CategoryAbstract { ONE; }
             method_name: "getCategory".to_string(),
             return_type: "String".to_string(),
             provider: "CategoryDefault".to_string(),
+        }]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn enum_default_bridge_preserves_first_direct_interface_branch() {
+    let root =
+        std::env::temp_dir().join(format!("notlin-enum-default-branch-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("defaults.kt"),
+        r#"package defaults
+interface Root {
+    val baseAlias: String
+        get() = "root"
+}
+interface Equipment : Root {
+    override val baseAlias: String
+        get() = "equipment"
+}
+interface Workstation : Equipment
+interface Process : Root {
+    override val baseAlias: String
+        get() = super.baseAlias + "/process"
+}
+enum class WorkstationProcess : Workstation, Process { INSTANCE; }
+"#,
+    )
+    .unwrap();
+    let index = SourceIndex::discover(&root).unwrap();
+    let path = root.join("defaults.kt");
+    assert_eq!(
+        index.enum_default_property_bridges(&path, "WorkstationProcess"),
+        [notlin::workspace::EnumDefaultBridge {
+            method_name: "getBaseAlias".to_string(),
+            return_type: "String".to_string(),
+            provider: "Workstation".to_string(),
         }]
     );
     fs::remove_dir_all(root).unwrap();

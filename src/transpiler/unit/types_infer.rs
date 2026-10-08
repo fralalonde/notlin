@@ -12,6 +12,42 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
     pub fn infer_type(&mut self, expr: tree_sitter::Node) -> String {
         let t = self.infer_type_inner(expr);
+        let known = match expr.kind() {
+            "number_literal" | "boolean_literal" | "string_literal" => true,
+            "identifier" => self.var_types.contains_key(self.text(expr).trim()),
+            _ => false,
+        };
+        let kotlin_type = match t.as_str() {
+            "int" => "Int",
+            "long" => "Long",
+            "short" => "Short",
+            "byte" => "Byte",
+            "double" => "Double",
+            "float" => "Float",
+            "boolean" => "Boolean",
+            "char" => "Char",
+            other => other,
+        };
+        let fact = if t == "Object" && !known {
+            crate::semantics::FactStatus::Unknown
+        } else if known {
+            crate::semantics::FactStatus::Established(crate::semantics::TypeRef::parse(kotlin_type))
+        } else {
+            crate::semantics::FactStatus::Inferred(crate::semantics::TypeRef::parse(kotlin_type))
+        };
+        self.type_facts.push((
+            crate::semantics::SourceLocation {
+                file: self
+                    .workspace_file
+                    .as_deref()
+                    .unwrap_or(self.file)
+                    .to_path_buf(),
+                snapshot_hash: self.source_hash,
+                start_byte: expr.start_byte(),
+                end_byte: expr.end_byte(),
+            },
+            fact,
+        ));
         // Kotlin stdlib `Pair`/`Triple` don't exist in the JDK: the emitted
         // value is a SimpleImmutableEntry, so rewrite the recorded type too
         // (member reads .first/.second key off it).
@@ -36,10 +72,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 if matches!(self.text(expr).trim(), "true" | "false") {
                     return "boolean".to_string();
                 }
-                self.var_types
-                    .get(self.text(expr).trim())
-                    .cloned()
-                    .unwrap_or_else(|| "Object".to_string())
+                if let Some(ty) = self.var_types.get(self.text(expr).trim()).cloned() {
+                    ty
+                } else {
+                    self.diag_approx(expr, "required identifier type is unknown".to_string());
+                    "Object".to_string()
+                }
             }
             "navigation_expression" => self.infer_navigation(expr),
             // elvis arrives as binary_expression with `?:` — its Kotlin type
@@ -256,7 +294,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     }
                 }
             }
-            _ => "Object".to_string(),
+            "null_literal" => "Object".to_string(),
+            _ => {
+                self.diag_approx(
+                    expr,
+                    format!("required type is unknown for {}", expr.kind()),
+                );
+                "Object".to_string()
+            }
         }
     }
 

@@ -20,6 +20,15 @@ notlin --in-place src/main.kt
 
 # Whole tree at once:
 notlin -o build/java src/kotlin/
+
+# Keep uncertain or lossy declarations in Kotlin (the default):
+notlin --lombok --in-place .
+
+# Explicitly permit diagnosed approximate transformations:
+notlin --allow-approximations --in-place .
+
+# Compile the staged mixed sources before applying migration:
+notlin --validation-config validation.json --in-place .
 ```
 
 ## Install
@@ -46,6 +55,11 @@ cargo install --path .
 ## Status
 
 In development
+
+The Rust planner keeps ownership, bridges, caller repairs and checked edits
+explicit before accepting structured Java output. See
+[the partial translation architecture](docs/partial-transpiler-architecture.md)
+for the analysis contract, validation configuration and JVM comparison tests.
 
 ## LICENSE
 

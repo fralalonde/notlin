@@ -17,8 +17,13 @@ fn map_filter_on_overridden_interface_property_uses_entry_set_stream() {
     )
     .unwrap();
     fs::write(&path, source).unwrap();
-    let cli =
-        notlin::cli::Cli::parse_from(["notlin", "--root", root.to_str().unwrap(), "Properties.kt"]);
+    let cli = notlin::cli::Cli::parse_from([
+        "notlin",
+        "--allow-approximations",
+        "--root",
+        root.to_str().unwrap(),
+        "Properties.kt",
+    ]);
     let index = notlin::workspace::SourceIndex::discover(&root).unwrap();
     let (files, errors, _warnings, _coverage) = notlin::transpiler::transpile_with_workspace(
         source,

@@ -17,7 +17,12 @@ fn chained_stream_filter_keeps_open_chain() {
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--allow-approximations",
+        ])
         .arg(root.join("m.kt").to_str().unwrap())
         .output()
         .expect("run notlin");

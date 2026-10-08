@@ -17,6 +17,15 @@ fn transpile_src(source: &str, name: &str) -> (Vec<(String, String)>, usize) {
     (files, errors)
 }
 
+/// These cases assert behavior that intentionally exercises approximation.
+/// All other tests retain the strict default to catch accidental regressions.
+fn transpile_src_allow_approximations(source: &str, name: &str) -> (Vec<(String, String)>, usize) {
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", name]);
+    let path = PathBuf::from(name);
+    let (files, errors, _warnings, _coverage) = notlin::transpiler::transpile(source, &path, &cli);
+    (files, errors)
+}
+
 fn sample_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("samples")
@@ -43,7 +52,7 @@ fn all_samples_parse_without_errors() {
         count += 1;
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let source = std::fs::read_to_string(&path).unwrap();
-        let (files, errors) = transpile_src(&source, &name);
+        let (files, errors) = transpile_src_allow_approximations(&source, &name);
         assert_eq!(
             errors, 0,
             "sample {} produced transpiler errors: {:?}",
@@ -209,7 +218,7 @@ fn interface_inheritance_uses_java_extends() {
 #[test]
 fn basic_class_produces_expected_types() {
     let source = std::fs::read_to_string(sample_path("BasicClass.kt")).unwrap();
-    let (files, errors) = transpile_src(&source, "BasicClass.kt");
+    let (files, errors) = transpile_src_allow_approximations(&source, "BasicClass.kt");
     assert_eq!(errors, 0);
     let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
     // one file per type + file-level utility class
@@ -253,7 +262,7 @@ fn basic_class_produces_expected_types() {
 #[test]
 fn expressions_translate_operators_and_strings() {
     let source = std::fs::read_to_string(sample_path("Expressions.kt")).unwrap();
-    let (files, errors) = transpile_src(&source, "Expressions.kt");
+    let (files, errors) = transpile_src_allow_approximations(&source, "Expressions.kt");
     assert_eq!(errors, 0);
     let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
     // string interpolation
@@ -267,9 +276,28 @@ fn expressions_translate_operators_and_strings() {
 }
 
 #[test]
+fn adjacent_string_interpolations_are_lowered_individually() {
+    let source = r#"interface Named {
+    val baseAlias: String
+    val alias: String
+    fun getKey(): String = "$baseAlias/$alias".lowercase()
+}"#;
+    let (files, errors) = transpile_src_allow_approximations(source, "Named.kt");
+    assert_eq!(errors, 0);
+    let all = files
+        .iter()
+        .map(|(_, content)| content.as_str())
+        .collect::<String>();
+    assert!(
+        all.contains("(this.getBaseAlias() + \"/\" + this.getAlias()).toLowerCase"),
+        "adjacent interpolations must not remain literal Kotlin text:\n{all}"
+    );
+}
+
+#[test]
 fn elvis_becomes_optional() {
     let source = r#"fun pick(s: String?): String { return s ?: "d" }"#;
-    let (files, errors) = transpile_src(source, "Pick.kt");
+    let (files, errors) = transpile_src_allow_approximations(source, "Pick.kt");
     assert_eq!(errors, 0);
     let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
     assert!(all.contains("!= null ? ") && all.contains(" ? "));
@@ -283,7 +311,7 @@ fn when_becomes_switch_or_if_else() {
         else -> "many"
     }
 }"#;
-    let (files, errors) = transpile_src(source, "W.kt");
+    let (files, errors) = transpile_src_allow_approximations(source, "W.kt");
     assert_eq!(errors, 0);
     let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
     assert!(all.contains("switch (") || all.contains("if ("), "{all}");
@@ -317,7 +345,7 @@ fn when_throw_else_is_valid_java() {
         else -> throw IllegalArgumentException()
     }
 }"#;
-    let (files, errors) = transpile_src(source, "CreateId.kt");
+    let (files, errors) = transpile_src_allow_approximations(source, "CreateId.kt");
     assert_eq!(errors, 0);
     let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
     assert!(
@@ -550,7 +578,8 @@ fn companion_object_members_become_statics() {
     }
 }"#;
     let (files, errors, warnings, _cov) = {
-        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Counter.kt"]);
+        let cli =
+            notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", "Counter.kt"]);
         let path = PathBuf::from("Counter.kt");
         notlin::transpiler::transpile(source, &path, &cli)
     };
@@ -736,7 +765,13 @@ interface Child : Base {
         "inherited property must be indexed"
     );
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--lombok",
+            "--allow-approximations",
+        ])
         .arg(source_path.to_str().unwrap())
         .output()
         .expect("run notlin");
@@ -942,7 +977,7 @@ class Resolver {
         }
     }
 }"#;
-    let (files, errors) = transpile_src(source, "Resolver.kt");
+    let (files, errors) = transpile_src_allow_approximations(source, "Resolver.kt");
     assert_eq!(errors, 0);
     let resolver = files
         .iter()
@@ -1014,7 +1049,7 @@ fn class_body_properties_emit_accessors_not_records() {
     fun dot(o: Vec2): Int = x * o.x + y * o.y
 }"#;
     let (files, errors, _warnings, _cov) = {
-        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Vec2.kt"]);
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", "Vec2.kt"]);
         let path = PathBuf::from("Vec2.kt");
         notlin::transpiler::transpile(source, &path, &cli)
     };
@@ -1053,19 +1088,22 @@ fn record_component_implicit_reads_use_record_accessors() {
 }
 
 #[test]
-fn record_component_navigation_uses_record_accessors() {
+fn collection_data_class_navigation_uses_invariant_getter() {
     let source = r#"data class Basket(val items: List<String>) {
     fun first(): String = items.stream().findFirst().orElseThrow()
 }"#;
-    let (files, errors) = transpile_src(source, "Basket.kt");
+    let (files, errors) = transpile_src_allow_approximations(source, "Basket.kt");
     assert_eq!(errors, 0);
     let basket = files
         .iter()
         .find(|(name, _)| name == "Basket.java")
         .map(|(_, content)| content)
         .expect("record emitted");
-    assert!(basket.contains("this.items().stream()"), "{basket}");
-    assert!(!basket.contains("this.getItems()"), "{basket}");
+    assert!(basket.contains("this.getItems().stream()"), "{basket}");
+    assert!(
+        basket.contains("public List<String> getItems()"),
+        "{basket}"
+    );
 }
 
 #[test]
@@ -1098,7 +1136,7 @@ data class Entry(override val name: Label) : Named, Comparable<Entry> {
     fun normalized(): String = name.value.trim()
     override fun compareTo(other: Entry): Int = name.value.compareTo(other.name.value)
 }"#;
-    let (files, errors) = transpile_src(source, "Entry.kt");
+    let (files, errors) = transpile_src_allow_approximations(source, "Entry.kt");
     assert_eq!(errors, 0);
     let entry = files
         .iter()

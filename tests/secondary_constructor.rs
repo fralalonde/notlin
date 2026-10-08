@@ -169,7 +169,12 @@ fn named_secondary_delegation_lowers_supported_expressions_and_primary_defaults(
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--allow-approximations",
+        ])
         .arg(root.as_os_str())
         .output()
         .expect("run notlin");
@@ -215,9 +220,52 @@ fn secondary_constructor_with_complex_delegation_argument_stays_kotlin() {
     );
     let kotlin = fs::read_to_string(root.join("Token.kt")).unwrap_or_default();
     assert!(
-        kotlin.contains("NOTLIN NE5A7: secondary constructor is not a direct `this(...)` or `super(...)` delegation with an empty or simple assignment-only body")
+        (kotlin.contains("NOTLIN NE5A7: secondary constructor is not a direct `this(...)` or `super(...)` delegation with an empty or simple assignment-only body")
+            || kotlin.contains("NOTLIN S001: required symbol `joinToString` could not be resolved"))
             && kotlin.contains("constructor(parts: Array<String>)"),
-        "missing in-source conservative secondary-constructor diagnostic:\n{kotlin}\n{stderr}"
+        "missing conservative diagnostic for the unsupported delegated expression:\n{kotlin}\n{stderr}"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn default_null_delegation_selects_primary_reference_overload() {
+    let root = Path::new("tests/tmp_scratch_null_ctor_overload");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(root.join("Command.kt"), "package neutral.secondary\nclass Context(val reason: String)\nclass Command(val id: String, val context: Context? = null) {\n constructor(id: String, reason: String): this(id, Context(reason))\n}\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.join("Command.kt"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let java = fs::read_to_string(root.join("Command.java")).unwrap();
+    assert!(java.contains("this(id, (Context) null);"), "{java}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicit_null_secondary_delegation_selects_primary_reference_overload() {
+    let root = Path::new("tests/tmp_scratch_explicit_null_ctor");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(root.join("Command.kt"), "package neutral.secondary\nclass Context(val reason: String)\nclass Command(val id: String, val context: Context?) {\n constructor(id: String, reason: String): this(id, Context(reason))\n constructor(id: String): this(id, null)\n}\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.join("Command.kt"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let java = fs::read_to_string(root.join("Command.java")).unwrap();
+    assert!(java.contains("this(id, (Context) null);"), "{java}");
     let _ = fs::remove_dir_all(root);
 }

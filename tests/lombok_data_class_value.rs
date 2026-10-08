@@ -4,7 +4,7 @@
 //! the mutable form and is only right when a caller can actually write a
 //! property.
 //!
-//! Body instance fields also force `@Data`: `@Value` implies
+//! Initialized body fields require explicit Java: `@Value` implies
 //! `@AllArgsConstructor` over EVERY field, so a class with body fields would
 //! change the constructor arity Kotlin callers use.
 
@@ -117,9 +117,12 @@ data class WithBody(val id: String) {
 
     let with_body = emitted(root, "WithBody");
     assert!(
-        with_body.contains("@Data"),
-        "body instance fields change the arity @Value would construct:\n{with_body}"
+        !with_body.contains("@Data") && !with_body.contains("@Value"),
+        "initialized body fields require explicit Java:\n{with_body}"
     );
+    assert!(with_body.contains("public WithBody(String id)"));
+    assert!(with_body.contains("this.extra = null;"));
+    assert!(with_body.contains("getExtra()") && with_body.contains("setExtra("));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -205,6 +208,89 @@ class Flag(val enabled: Boolean) {
         flag.contains("return this.getEnabled();"),
         "same-name function must resolve the property through the Kotlin ABI getter:\n{flag}"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn lombok_value_keeps_kotlin_boolean_getter_abi() {
+    let root = Path::new("tests/tmp_scratch_lombok_value_boolean_getter");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("flag.kt"),
+        "package neutral.flag\ndata class Flag(val active: Boolean)\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.join("flag.kt").to_str().unwrap())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "notlin failed:\n{stderr}");
+
+    let flag = emitted(root, "Flag");
+    assert!(
+        flag.contains("public boolean getActive() { return active; }"),
+        "Lombok's primitive-boolean is-getter must coexist with Kotlin's get-getter ABI:\n{flag}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn lombok_collection_constructor_variance_keeps_storage_and_getters_invariant() {
+    let root = Path::new("tests/tmp_scratch_lombok_collection_constructor");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("model.kt"),
+        "package neutral.collection\n\
+         open class Item\n\
+         data class Batch(val items: List<Item>)\n\
+         class Holder(val items: List<Item>)\n\
+         class NullableHolder(val items: List<Item>?)\n\
+         class MutableHolder(var items: List<Item>, val mutableItems: MutableList<Item>)\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .arg(root.join("model.kt").to_str().unwrap())
+        .output()
+        .expect("run notlin");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "notlin failed:\n{stderr}");
+
+    for name in ["Batch", "Holder"] {
+        let java = emitted(root, name);
+        assert!(java.contains("List<Item> items;"), "{java}");
+        assert!(
+            java.contains("List<Item> getItems()") || (name == "Holder" && java.contains("@Data")),
+            "{java}"
+        );
+        assert!(java.contains("List<? extends Item> items"), "{java}");
+        assert!(java.contains("(List<Item>) (Object) items"), "{java}");
+        assert!(java.contains("@SuppressWarnings(\"unchecked\")"), "{java}");
+    }
+    let nullable = emitted(root, "NullableHolder");
+    assert!(
+        nullable.contains("@Nullable List<Item> items;"),
+        "{nullable}"
+    );
+    assert!(
+        nullable.contains("(List<Item>) (Object) items"),
+        "{nullable}"
+    );
+    assert!(!nullable.contains("this.items = (@Nullable"), "{nullable}");
+    let mutable = emitted(root, "MutableHolder");
+    assert!(mutable.contains("List<Item> items"), "{mutable}");
+    assert!(mutable.contains("@Data"), "{mutable}");
+    assert!(mutable.contains("List<Item> mutableItems"), "{mutable}");
+    assert!(!mutable.contains("(List<Item>) (Object)"), "{mutable}");
+    assert!(!mutable.contains("? extends Item"), "{mutable}");
 
     let _ = fs::remove_dir_all(root);
 }

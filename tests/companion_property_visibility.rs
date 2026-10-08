@@ -1,6 +1,6 @@
 use clap::Parser;
 use notlin::workspace::SourceIndex;
-use std::collections::HashSet;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -59,7 +59,11 @@ fn retained_kotlin_interface_companion_reads_use_companion_getter() {
     let cli =
         notlin::cli::Cli::parse_from(["notlin", "--root", root.to_str().unwrap(), "Consumer.kt"]);
     let index = SourceIndex::discover(&root).unwrap();
-    let retained = HashSet::from(["Contract".to_string()]);
+    let retained = index
+        .declarations()
+        .filter(|d| d.name == "Contract")
+        .map(|d| notlin::semantics::workspace_symbol(&index, d))
+        .collect();
     let (files, errors, _warnings, _coverage) = notlin::transpiler::transpile_with_workspace_hint(
         consumer,
         &consumer_path,

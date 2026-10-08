@@ -12,7 +12,7 @@ fn implicit_data_class_copy_rebuilds_current_instance() {
         "    fun renamed(name: String): Holder = copy(name = name)\n",
         "}\n"
     );
-    let cli = notlin::cli::Cli::parse_from(["notlin", "M.kt"]);
+    let cli = notlin::cli::Cli::parse_from(["notlin", "--allow-approximations", "M.kt"]);
     let (files, errors, _warnings, _coverage) =
         notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
     let java = files

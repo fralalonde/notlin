@@ -15,7 +15,12 @@ fn fixture_root(case: &str) -> PathBuf {
 
 fn run_in_place(root: &Path, file: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .args([
+            "--allow-approximations",
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+        ])
         .arg(root.join(file))
         .output()
         .expect("run notlin")

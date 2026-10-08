@@ -95,6 +95,43 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .copied()
             && let Some((base, member)) = self.unit.nav_base_member(nav)
         {
+            // Kotlin String.split is a literal-delimiter operation which
+            // keeps trailing empty fields. Java String.split is regex-based
+            // and drops them, so route the exact one-String form through the
+            // Kotlin stdlib. The receiver type gate avoids rewriting a
+            // user-defined `split` on an unrelated receiver.
+            if member == "split"
+                && args.len() == 1
+                && self.is_known_string_receiver(base)
+                && args_node.is_some_and(|arguments| {
+                    arguments
+                        .children(&mut arguments.walk())
+                        .find(|child| child.kind() == "value_argument")
+                        .filter(|argument| !self.unit.text(*argument).contains('='))
+                        .and_then(|argument| {
+                            argument
+                                .children(&mut argument.walk())
+                                .find(|child| child.is_named())
+                        })
+                        .is_some_and(|argument| self.is_known_string_expression(argument))
+                })
+            {
+                let receiver = self.transpile(base);
+                return format!(
+                    "kotlin.text.StringsKt.split((java.lang.CharSequence) ({}), new java.lang.String[]{{{}}}, false, 0)",
+                    receiver, args[0]
+                );
+            }
+            // `last()` on a known list, including the List returned above,
+            // must throw on an empty list and preserve a nullable last
+            // element. Stream.reduce(...).orElse(null) does neither.
+            if member == "last" && args.is_empty() {
+                let split_receiver = self.is_string_split_result(base);
+                if split_receiver || self.is_known_list_receiver(base) {
+                    let receiver = self.transpile(base);
+                    return format!("kotlin.collections.CollectionsKt.last({})", receiver);
+                }
+            }
             if self.unit.receiver_is_array(base) && matches!(member.as_str(), "size" | "length") {
                 // Kotlin `arr.size()`/`arr.size` -> Java `arr.length`.
                 return format!("{}.length", self.transpile(base));
@@ -1234,10 +1271,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     // `new Surname(...)` does not compile.
                     let mut ctor_args = args.clone();
                     if let Some(ws) = self.unit.workspace {
-                        let candidates: Vec<_> = ws
-                            .declarations()
-                            .filter(|d| d.name == callee_java)
-                            .collect();
+                        let candidates: Vec<_> = ws.declarations_named(&callee_java).collect();
                         // Kotlin named arguments have no Java form
                         // (`new MethodCall(name = "x", params = p)` is not
                         // Java). Lower them to the callee's declared parameter
@@ -1393,6 +1427,43 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 if self.unit.is_untranslated_file_function(&callee) {
                     self.unit
                         .diag_untranslatable(node, format!("call to `{callee}` resolves to a top-level function that remains Kotlin"));
+                }
+                if let Some(provider) = self.unit.semantic_provider {
+                    let targets = provider
+                        .symbols_named(&callee)
+                        .into_iter()
+                        .filter(|symbol| {
+                            symbol.id.kind == "function"
+                                && symbol.id.name == callee
+                                && symbol.id.owner_path.is_empty()
+                        })
+                        .collect::<Vec<_>>();
+                    if let [target] = targets.as_slice() {
+                        let retained = self.unit.retained_hint.is_some_and(|retained| {
+                            crate::transpiler::retention_queries::contains(retained, &target.id)
+                        });
+                        let selected = self.unit.workspace.is_none_or(|workspace| {
+                            workspace.is_selected(&target.id.file, self.unit.translation_roots)
+                        });
+                        if retained || !selected {
+                            self.unit.diag_untranslatable(node, format!("top-level function `{callee}` remains Kotlin; its callable facade is not accepted for Java ownership"));
+                        } else {
+                            let original = self
+                                .unit
+                                .workspace
+                                .and_then(|workspace| workspace.source_file(&target.id.file))
+                                .map(|file| file.source_text())
+                                .unwrap_or(self.unit.source);
+                            let facade =
+                                crate::function_callsite::facade_name(original, &target.id.file);
+                            let package = if target.id.package.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{}.", target.id.package)
+                            };
+                            return format!("{package}{facade}.{callee}");
+                        }
+                    }
                 }
                 callee
             }
@@ -1588,6 +1659,106 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             }
         }
         false
+    }
+
+    fn known_expression_type(&self, node: tree_sitter::Node) -> Option<String> {
+        if node.kind() == "string_literal" {
+            return Some("String".to_string());
+        }
+        let raw = self.unit.text(node).trim();
+        if let Some(ty) = self.unit.var_types.get(raw) {
+            return Some(ty.clone());
+        }
+        if node.kind() == "call_expression"
+            && let Some(workspace) = self.unit.workspace
+        {
+            let declaring = self
+                .unit
+                .workspace_file
+                .as_deref()
+                .unwrap_or(self.unit.file);
+            if let Some(ty) = workspace.method_return_type_in_file(declaring, raw) {
+                return Some(ty);
+            }
+            if let Some(callee) = node
+                .children(&mut node.walk())
+                .find(|child| child.is_named())
+            {
+                let name = self.unit.text(callee);
+                if let Some(ty) = workspace.method_return_type_in_file(declaring, name) {
+                    return Some(ty);
+                }
+            }
+        }
+        self.infer_operand_type(node).or_else(|| {
+            let name = raw.trim_start_matches("this.").trim_end_matches("()");
+            self.scope_property_type(name)
+        })
+    }
+
+    fn is_known_string_receiver(&self, node: tree_sitter::Node) -> bool {
+        self.known_expression_type(node).is_some_and(|ty| {
+            matches!(
+                ty.trim().trim_end_matches('?'),
+                "String" | "java.lang.String" | "CharSequence" | "kotlin.CharSequence"
+            )
+        })
+    }
+
+    fn is_known_string_expression(&self, node: tree_sitter::Node) -> bool {
+        self.is_known_string_receiver(node)
+            || (matches!(node.kind(), "identifier" | "simple_identifier")
+                && self
+                    .inline_same_file_string_const(self.unit.text(node).trim(), node)
+                    .is_some())
+    }
+
+    fn is_known_list_receiver(&self, node: tree_sitter::Node) -> bool {
+        self.known_expression_type(node).is_some_and(|ty| {
+            let ty = ty.trim().trim_end_matches('?');
+            [
+                "List<",
+                "MutableList<",
+                "java.util.List<",
+                "java.util.ArrayList<",
+            ]
+            .iter()
+            .any(|prefix| ty.starts_with(prefix))
+        })
+    }
+
+    fn is_string_split_result(&self, node: tree_sitter::Node) -> bool {
+        if node.kind() != "call_expression" {
+            return false;
+        }
+        let Some(navigation) = node
+            .children(&mut node.walk())
+            .find(|child| child.kind() == "navigation_expression")
+        else {
+            return false;
+        };
+        let Some((receiver, member)) = self.unit.nav_base_member(navigation) else {
+            return false;
+        };
+        if member != "split" || !self.is_known_string_receiver(receiver) {
+            return false;
+        }
+        let Some(arguments) = node
+            .children(&mut node.walk())
+            .find(|child| child.kind() == "value_arguments")
+        else {
+            return false;
+        };
+        let values = arguments
+            .children(&mut arguments.walk())
+            .filter(|child| child.kind() == "value_argument")
+            .collect::<Vec<_>>();
+        values.len() == 1
+            && !self.unit.text(values[0]).contains('=')
+            && values[0]
+                .children(&mut values[0].walk())
+                .find(|child| child.is_named())
+                .is_some_and(|argument| self.is_known_string_expression(argument))
     }
 }
 

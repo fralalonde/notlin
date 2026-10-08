@@ -82,7 +82,12 @@ fn interface_super_method_uses_java_qualified_dispatch() {
     fs::create_dir_all(root).unwrap();
     fs::write(root.join("m.kt"), "package neutral.supermethod\ninterface Base {\n fun value(): String = \"base\"\n}\nenum class Impl : Base {\n ONE;\n override fun value(): String = super.value()\n}\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--allow-approximations",
+        ])
         .arg(root)
         .output()
         .unwrap();
@@ -93,5 +98,48 @@ fn interface_super_method_uses_java_qualified_dispatch() {
     );
     let java = fs::read_to_string(root.join("Impl.java")).unwrap();
     assert!(java.contains("Base.super.value()"), "{java}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn enum_default_bridge_uses_first_direct_inherited_branch() {
+    let root = Path::new("tests/tmp_scratch_super_branch");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("m.kt"),
+        r#"package neutral.superbranch
+interface Root {
+    val baseAlias: String
+        get() = "root"
+}
+interface Equipment : Root {
+    override val baseAlias: String
+        get() = "equipment"
+}
+interface Workstation : Equipment
+interface Process : Root {
+    override val baseAlias: String
+        get() = super.baseAlias + "/process"
+}
+enum class WorkstationProcess : Workstation, Process { INSTANCE; }
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let java = fs::read_to_string(root.join("WorkstationProcess.java")).unwrap();
+    assert!(
+        java.contains("return Workstation.super.getBaseAlias();"),
+        "the bridge must preserve Kotlin's first direct interface branch:\n{java}"
+    );
     fs::remove_dir_all(root).unwrap();
 }

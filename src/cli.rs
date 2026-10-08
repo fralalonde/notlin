@@ -35,13 +35,20 @@ pub struct Cli {
     #[arg(long)]
     pub deny_warnings: bool,
 
+    /// Permit explicitly diagnosed semantic approximations instead of retaining Kotlin.
+    #[arg(long)]
+    pub allow_approximations: bool,
+
+    /// JSON module/toolchain configuration; compile the staged result before writing.
+    #[arg(long)]
+    pub validation_config: Option<PathBuf>,
+
     /// Nullability annotation set to emit
     #[arg(long, value_enum, default_value = "jetbrains")]
     pub annotations: Annotations,
 
-    /// Assume Lombok on the target classpath: data classes emit as
-    /// @Data classes with mutable fields instead of records; getter/setter
-    /// hand-rolling is replaced by Lombok annotations elsewhere.
+    /// Use Lombok annotations where they preserve the planned Java behavior.
+    /// Shapes requiring explicit initialization or accessors use ordinary Java.
     #[arg(long)]
     pub lombok: bool,
 

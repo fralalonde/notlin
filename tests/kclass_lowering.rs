@@ -31,7 +31,7 @@ fn kclass_declaration_translates_without_kotlin_consumers() {
     fs::write(&path, &source).unwrap();
 
     let index = SourceIndex::discover(&root).unwrap();
-    let cli = Cli::parse_from(["notlin", path.to_str().unwrap()]);
+    let cli = Cli::parse_from(["notlin", "--allow-approximations", path.to_str().unwrap()]);
     let (files, errors, warnings, _cov) = notlin::transpiler::transpile_with_workspace(
         &source,
         &path,

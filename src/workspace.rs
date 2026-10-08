@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 // 8: `SourceFile::smart_cast_sites` / `SourceFile::bindings` — the retained-Kotlin
 // smart-cast boundary now carries the site shapes and the file's own name->type
 // table instead of a bare property-name set.
-const CACHE_VERSION: u32 = 17;
+const CACHE_VERSION: u32 = 21;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -333,6 +333,9 @@ impl SourceFile {
 #[derive(Debug, Default)]
 pub struct SourceIndex {
     pub files: Vec<SourceFile>,
+    /// Symbols are populated together for a file on its first retention query.
+    /// Per-file cells avoid serializing independent Rayon planning workers.
+    declaration_symbols: Vec<std::sync::OnceLock<HashMap<usize, crate::semantics::SymbolId>>>,
     kotlin_subtypes: HashMap<String, Vec<PathBuf>>,
     /// Reverse subtype edges by SIMPLE name: `name -> [subtype simple names]`.
     /// Shallow but unambiguous enough for retention fixpointing: the
@@ -352,6 +355,10 @@ pub struct SourceIndex {
     /// while rebuilding speculative indexes, so avoid scanning every
     /// declaration for each supertype edge.
     qualified_declarations: HashMap<String, Vec<(usize, usize)>>,
+    /// Member-name lookup preserving workspace declaration/member order.
+    /// Expression lowering often asks for one member's type; this avoids a
+    /// full declaration/member scan for each such query.
+    member_names: HashMap<String, Vec<(usize, usize, usize)>>,
     /// Declaration address to its owning file. Declarations live in the boxed
     /// buffers owned by `files`, so these addresses remain stable for the
     /// lifetime of an index.
@@ -457,6 +464,43 @@ fn flatten_sources(root: &CachedDirectory) -> Vec<CachedPathSource> {
 }
 
 impl SourceIndex {
+    pub(crate) fn cached_declaration_symbol(
+        &self,
+        declaration: &Declaration,
+    ) -> Option<crate::semantics::SymbolId> {
+        let address = declaration as *const Declaration as usize;
+        let file_index = self.declaration_files.get(&address).copied();
+        file_index
+            .and_then(|file_index| {
+                self.declaration_symbols
+                    .get(file_index)
+                    .map(|cell| (file_index, cell))
+            })
+            .and_then(|(file_index, cell)| {
+                cell.get_or_init(|| {
+                    let file = &self.files[file_index];
+                    let ids = crate::semantics::workspace_symbols_for_file(file);
+                    file.declarations
+                        .iter()
+                        .zip(ids)
+                        .map(|(declaration, symbol)| {
+                            (declaration as *const Declaration as usize, symbol)
+                        })
+                        .collect()
+                })
+                .get(&address)
+                .cloned()
+            })
+    }
+
+    pub fn declaration_retained(
+        &self,
+        declaration: &Declaration,
+        retained: &HashSet<crate::semantics::SymbolId>,
+    ) -> bool {
+        let symbol = crate::semantics::workspace_symbol(self, declaration);
+        crate::transpiler::retention_queries::contains(retained, &symbol)
+    }
     pub fn discover(root: &Path) -> Result<Self, String> {
         Self::discover_with_stats(root).map(|(index, _)| index)
     }
@@ -503,14 +547,19 @@ impl SourceIndex {
     }
 
     fn from_files(files: Vec<SourceFile>) -> Self {
+        let declaration_symbols = std::iter::repeat_with(std::sync::OnceLock::new)
+            .take(files.len())
+            .collect();
         let mut index = Self {
             files,
+            declaration_symbols,
             kotlin_subtypes: HashMap::new(),
             subtype_names: HashMap::new(),
             all_subtype_names: HashMap::new(),
             unresolved_supertype_names: HashSet::new(),
             declaration_names: HashMap::new(),
             qualified_declarations: HashMap::new(),
+            member_names: HashMap::new(),
             declaration_files: HashMap::new(),
             ctor_uses: HashMap::new(),
             file_paths: HashMap::new(),
@@ -541,6 +590,13 @@ impl SourceIndex {
                     .entry(declaration_key(declaration))
                     .or_default()
                     .push((file_index, declaration_index));
+                for (member_index, member) in declaration.members.iter().enumerate() {
+                    index
+                        .member_names
+                        .entry(member.name.clone())
+                        .or_default()
+                        .push((file_index, declaration_index, member_index));
+                }
             }
         }
         let mut subtype_edges = Vec::new();
@@ -605,7 +661,7 @@ impl SourceIndex {
             let path = match overlay {
                 SourceOverlay::Delete { path } | SourceOverlay::Replace { path, .. } => path,
             };
-            by_path.insert(normalized_path(path), overlay);
+            by_path.insert(normalized_path(&absolute_source_path(path)), overlay);
         }
         let mut files = Vec::with_capacity(self.files.len() + overlays.len());
         files.extend(
@@ -636,7 +692,7 @@ impl SourceIndex {
                         ctor_calls,
                     ) = parse_declarations(source, *language, package.as_deref())?;
                     files.push(SourceFile {
-                        path: path.clone(),
+                        path: absolute_source_path(path),
                         language: *language,
                         source_text: source.clone(),
                         package,
@@ -905,7 +961,7 @@ impl SourceIndex {
         &self,
         declaring_file: &Path,
         name: &str,
-        retained: &HashSet<String>,
+        retained: &HashSet<crate::semantics::SymbolId>,
     ) -> bool {
         !self
             .retained_kotlin_referencers(declaring_file, name, retained)
@@ -920,7 +976,7 @@ impl SourceIndex {
         &self,
         declaring_file: &Path,
         name: &str,
-        retained: &HashSet<String>,
+        retained: &HashSet<crate::semantics::SymbolId>,
     ) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         for file in self.kotlin_files() {
@@ -932,7 +988,7 @@ impl SourceIndex {
             names.extend(
                 file.declarations
                     .iter()
-                    .filter(|decl| retained.contains(&decl.name))
+                    .filter(|decl| self.declaration_retained(decl, retained))
                     .map(|decl| decl.name.clone()),
             );
         }
@@ -975,7 +1031,7 @@ impl SourceIndex {
         &self,
         declaring_file: &Path,
         name: &str,
-        retained: &HashSet<String>,
+        retained: &HashSet<crate::semantics::SymbolId>,
         translation_roots: &[PathBuf],
     ) -> bool {
         self.kotlin_files().any(|file| {
@@ -990,9 +1046,9 @@ impl SourceIndex {
             if !self.is_selected(&file.path, translation_roots) {
                 return true;
             }
-            file.declarations
-                .iter()
-                .any(|decl| retained.contains(&decl.name) && !(same_file && decl.name == name))
+            file.declarations.iter().any(|decl| {
+                self.declaration_retained(decl, retained) && !(same_file && decl.name == name)
+            })
         })
     }
 
@@ -1126,6 +1182,63 @@ impl SourceIndex {
         )
     }
 
+    /// Whether one property getter return type is exact or covariant using the
+    /// source context that actually spells each type. This is needed for
+    /// inherited generic contracts, where substituted arguments originate in
+    /// the file declaring the inheritance edge rather than the contract owner.
+    pub fn property_getter_return_compatible_in_files(
+        &self,
+        implementation_file: &Path,
+        implementation_type: &str,
+        contract_file: &Path,
+        contract_type: &str,
+    ) -> bool {
+        if implementation_type.trim().ends_with('?') != contract_type.trim().ends_with('?') {
+            return false;
+        }
+        let (Some(own_file), Some(super_file)) = (
+            self.source_file(implementation_file),
+            self.source_file(contract_file),
+        ) else {
+            return false;
+        };
+        if !type_reference_is_visible(self, own_file, implementation_type)
+            || !type_reference_is_visible(self, super_file, contract_type)
+        {
+            return false;
+        }
+        if source_types_have_same_identity(
+            self,
+            own_file,
+            implementation_type.trim(),
+            super_file,
+            contract_type.trim(),
+        ) {
+            return true;
+        }
+        // Equal simple spellings are not sufficient across two source files:
+        // each may resolve the name to a different package type or type
+        // parameter. Exact generic trees are checked by the caller with both
+        // source contexts; this helper proves only ordinary reference
+        // covariance after exact identity has been established separately.
+        if implementation_type.trim() == contract_type.trim() {
+            return false;
+        }
+        declaration_covariant_return_is_subtype(
+            self,
+            own_file,
+            implementation_type,
+            super_file,
+            contract_type,
+        ) || proven_reference_subtype(
+            self,
+            own_file,
+            implementation_type.trim(),
+            super_file,
+            contract_type.trim(),
+        )
+    }
+
     /// A Kotlin read-only collection property is declaration-site covariant.
     /// When both sides move to Java together, Notlin can preserve that contract
     /// by emitting a wildcard return on the interface (`List<? extends Base>`)
@@ -1137,7 +1250,7 @@ impl SourceIndex {
         declaring: &Path,
         conflict: &MemberConflict,
         translation_roots: &[PathBuf],
-        _retained: &HashSet<String>,
+        retained: &HashSet<crate::semantics::SymbolId>,
     ) -> bool {
         if !conflict.legacy_mismatch || conflict.kind != MemberKind::Property {
             return false;
@@ -1151,6 +1264,9 @@ impl SourceIndex {
         let Some(super_file) = self.declaration_source_file(super_decl) else {
             return false;
         };
+        if self.declaration_retained(super_decl, retained) {
+            return false;
+        }
         if !self.is_selected(&super_file.path, translation_roots) {
             return false;
         }
@@ -1390,14 +1506,17 @@ impl SourceIndex {
                     if provider.kind != DeclarationKind::Interface {
                         return None;
                     }
-                    let member = provider.members.iter().find(|member| {
-                        !member.is_static
-                            && member.kind == MemberKind::Property
-                            && member.has_body
-                            && property_accessor_name(&member.name) == method_name
-                    })?;
+                    // Kotlin resolves the inherited implementation through the
+                    // first direct superinterface branch.  The implementation
+                    // may be declared by an ancestor of that direct interface;
+                    // Java's bridge must still qualify the direct interface so
+                    // that the same branch is selected.  Looking only at
+                    // members declared directly on `provider` accidentally
+                    // skipped such branches and selected a later interface.
+                    let (member_owner, member) =
+                        self.effective_default_property(provider, file, &method_name)?;
                     let raw_return_type = member.type_name.clone()?;
-                    let provider_file = self.declaration_source_file(provider).unwrap_or(file);
+                    let provider_file = self.declaration_source_file(member_owner).unwrap_or(file);
                     let return_type = self
                         .resolve_type(provider_file, raw_return_type.trim_end_matches('?'))
                         .map(declaration_key)
@@ -1415,6 +1534,58 @@ impl SourceIndex {
                 })
             })
             .collect()
+    }
+
+    /// Find the most-specific property implementation visible through one
+    /// direct interface branch. An abstract redeclaration deliberately returns
+    /// no provider because it shadows a concrete ancestor.
+    fn effective_default_property<'a>(
+        &'a self,
+        provider: &'a Declaration,
+        fallback_file: &'a SourceFile,
+        method_name: &str,
+    ) -> Option<(&'a Declaration, &'a Member)> {
+        let mut members = Vec::new();
+        let mut pending = vec![(fallback_file, provider)];
+        let mut visited = HashSet::new();
+        while let Some((context, declaration)) = pending.pop() {
+            if !visited.insert(declaration_key(declaration)) {
+                continue;
+            }
+            let declaration_file = self.declaration_source_file(declaration).unwrap_or(context);
+            pending.extend(declaration.supertypes.iter().filter_map(|supertype| {
+                self.resolve_type(declaration_file, supertype)
+                    .map(|parent| (declaration_file, parent))
+            }));
+            if declaration.kind != DeclarationKind::Interface {
+                continue;
+            }
+            members.extend(declaration.members.iter().filter_map(|member| {
+                (!member.is_static
+                    && member.kind == MemberKind::Property
+                    && property_accessor_name(&member.name) == method_name)
+                    .then_some((declaration, member))
+            }));
+        }
+
+        let mut most_specific = members.iter().copied().filter(|(declaration, _)| {
+            !members.iter().any(|(other, _)| {
+                declaration_key(other) != declaration_key(declaration)
+                    && proven_reference_subtype(
+                        self,
+                        self.declaration_source_file(other).unwrap_or(fallback_file),
+                        &declaration_key(other),
+                        self.declaration_source_file(declaration)
+                            .unwrap_or(fallback_file),
+                        &declaration_key(declaration),
+                    )
+            })
+        });
+        let result = most_specific.next()?;
+        if most_specific.next().is_some() || !result.1.has_body {
+            return None;
+        }
+        Some(result)
     }
 
     pub(crate) fn direct_supertype_for_member(
@@ -1452,7 +1623,7 @@ impl SourceIndex {
     pub fn has_retained_kotlin_supertype(
         &self,
         supertypes: &[String],
-        retained: &HashSet<String>,
+        retained: &HashSet<crate::semantics::SymbolId>,
     ) -> bool {
         !self
             .retained_kotlin_supertype_names(supertypes, retained)
@@ -1468,7 +1639,7 @@ impl SourceIndex {
     pub fn retained_kotlin_supertype_names(
         &self,
         supertypes: &[String],
-        retained: &HashSet<String>,
+        retained: &HashSet<crate::semantics::SymbolId>,
     ) -> Vec<String> {
         let mut names: Vec<String> = supertypes
             .iter()
@@ -1483,13 +1654,37 @@ impl SourceIndex {
                     .unwrap_or_default()
             })
             .filter(|name| {
-                retained.contains(*name)
+                self.declarations_named(name)
+                    .any(|declaration| self.declaration_retained(declaration, retained))
                     && self.declarations().any(|declaration| {
                         declaration.name == *name && declaration.language == SourceLanguage::Kotlin
                     })
             })
             .map(str::to_string)
             .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    pub fn retained_supertypes_of(
+        &self,
+        target: &Declaration,
+        retained: &HashSet<crate::semantics::SymbolId>,
+    ) -> Vec<String> {
+        let Some(file) = self.declaration_source_file(target) else {
+            return Vec::new();
+        };
+        let mut names = target
+            .supertypes
+            .iter()
+            .filter_map(|name| self.resolve_type(file, name))
+            .filter(|declaration| {
+                declaration.language == SourceLanguage::Kotlin
+                    && self.declaration_retained(declaration, retained)
+            })
+            .map(|declaration| declaration.name.clone())
+            .collect::<Vec<_>>();
         names.sort();
         names.dedup();
         names
@@ -1505,9 +1700,6 @@ impl SourceIndex {
             .is_empty()
     }
 
-    /// The recorded return type of a METHOD named exactly `name`, searching
-    /// the declaring file first, then any declaration. Used for receiver-type
-    /// checks on method calls (`this.getBaseUnit()` returning Optional).
     pub fn method_return_type_in_file(&self, declaring: &Path, method: &str) -> Option<String> {
         let m = method.trim_end_matches("()").trim_start_matches("this.");
         let getter_prop = m.strip_prefix("get").map(|rest| {
@@ -1533,29 +1725,26 @@ impl SourceIndex {
                 })
             })
         });
-        let wide = self.declarations().find_map(|d| {
-            d.members.iter().find_map(|mm| {
-                if mm.kind == MemberKind::Method
-                    && (mm.name == m || Some(&mm.name) == getter_prop.as_ref())
-                {
-                    mm.type_name.clone()
-                } else {
-                    None
-                }
-            })
-        });
+        let mut names = vec![m];
+        if let Some(getter_prop) = getter_prop.as_deref() {
+            names.push(getter_prop);
+        }
+        let wide = self
+            .members_named_any(&names)
+            .into_iter()
+            .find_map(|(_, member)| {
+                (member.kind == MemberKind::Method)
+                    .then(|| member.type_name.clone())
+                    .flatten()
+            });
         same.or(wide)
     }
 
     pub fn bare_property_type(&self, prop: &str) -> Option<String> {
-        self.declarations().find_map(|d| {
-            d.members.iter().find_map(|m| {
-                if m.kind == MemberKind::Property && m.name == prop {
-                    m.type_name.clone()
-                } else {
-                    None
-                }
-            })
+        self.members_named(prop).find_map(|(_, member)| {
+            (member.kind == MemberKind::Property)
+                .then(|| member.type_name.clone())
+                .flatten()
         })
     }
 
@@ -1582,22 +1771,26 @@ impl SourceIndex {
         // don't have `getX()` accessors, so an arbitrary first-hit type
         // silently changes the member's Java form. Everything else keeps
         // the deterministic first declaration order.
-        let candidates: Vec<Option<String>> = self
-            .declarations()
-            .filter_map(|d| {
-                d.members
-                    .iter()
-                    .find(|m| m.kind == MemberKind::Property && m.name == prop)
-                    .map(|m| m.type_name.clone())
-            })
-            .collect();
+        let mut candidates: Vec<Option<String>> = Vec::new();
+        let mut previous_declaration = None;
+        for (declaration, member) in self.members_named(prop) {
+            if member.kind != MemberKind::Property {
+                continue;
+            }
+            let declaration_address = declaration as *const Declaration as usize;
+            if previous_declaration == Some(declaration_address) {
+                continue;
+            }
+            previous_declaration = Some(declaration_address);
+            candidates.push(member.type_name.clone());
+        }
         let enum_typed = candidates.iter().flatten().find_map(|t| {
             let bare = t.split('<').next().unwrap_or("").trim().to_string();
             if bare.is_empty() {
                 return None;
             }
-            self.declarations()
-                .any(|d| d.name == bare && d.kind == crate::workspace::DeclarationKind::Enum)
+            self.declarations_named(&bare)
+                .any(|d| d.kind == crate::workspace::DeclarationKind::Enum)
                 .then(|| t.clone())
         });
         match enum_typed {
@@ -1620,14 +1813,10 @@ impl SourceIndex {
                 &prop[1..]
             )
         };
-        self.declarations().find_map(|d| {
-            d.members.iter().find_map(|m| {
-                if m.kind == MemberKind::Property && m.name == prop {
-                    m.type_name.clone()
-                } else {
-                    None
-                }
-            })
+        self.members_named(&prop).find_map(|(_, member)| {
+            (member.kind == MemberKind::Property)
+                .then(|| member.type_name.clone())
+                .flatten()
         })
     }
 
@@ -1637,11 +1826,9 @@ impl SourceIndex {
     /// translated (Java getter shed) or retained (Kotlin property ABI has
     /// the same getter shape).
     pub fn find_property_owner(&self, name: &str) -> Option<&Declaration> {
-        self.declarations().find(|d| {
-            d.members
-                .iter()
-                .any(|m| m.kind == MemberKind::Property && m.name == name && !m.is_static)
-        })
+        self.members_named(name)
+            .find(|(_, member)| member.kind == MemberKind::Property && !member.is_static)
+            .map(|(declaration, _)| declaration)
     }
 
     /// Non-static properties inherited by `type_name` in `declaring`'s import
@@ -1786,6 +1973,38 @@ impl SourceIndex {
             },
         )
     }
+    pub(crate) fn members_named(
+        &self,
+        name: &str,
+    ) -> impl Iterator<Item = (&Declaration, &Member)> {
+        self.member_names.get(name).into_iter().flatten().map(
+            |&(file_index, declaration_index, member_index)| {
+                let declaration = &self.files[file_index].declarations[declaration_index];
+                (declaration, &declaration.members[member_index])
+            },
+        )
+    }
+
+    /// Multiple exact names in original workspace order. Some lookups accept
+    /// both a method name and its property-getter form; sorting their indexed
+    /// hits together preserves the old declaration/member traversal order.
+    fn members_named_any(&self, names: &[&str]) -> Vec<(&Declaration, &Member)> {
+        let mut locations = names
+            .iter()
+            .filter_map(|name| self.member_names.get(*name))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        locations.sort_unstable();
+        locations.dedup();
+        locations
+            .into_iter()
+            .map(|(file_index, declaration_index, member_index)| {
+                let declaration = &self.files[file_index].declarations[declaration_index];
+                (declaration, &declaration.members[member_index])
+            })
+            .collect()
+    }
     /// Whether `name` resolves to a Kotlin `object` declaration that Java
     /// can also see (kind == Object). Java callers must reference the
     /// singleton as `Name.INSTANCE` (a bare `Name` would attempt a
@@ -1856,6 +2075,184 @@ impl SourceIndex {
     pub fn all_kotlin_selected(&self, translation_roots: &[PathBuf]) -> bool {
         self.kotlin_files()
             .all(|file| self.is_selected(&file.path, translation_roots))
+    }
+
+    /// Retain a Kotlin interface that supplies a default property getter when
+    /// an actually retained Kotlin concrete descendant would otherwise lose
+    /// its physical covariant getter bridge. Java's type system still resolves
+    /// the narrow default method correctly, but annotation processors may pick
+    /// a broad accessor inherited along another interface path instead.
+    ///
+    /// This is deliberately based on exact declaration identities for retained
+    /// descendants and exact resolved type declarations. Unselected Kotlin
+    /// descendants count as retained. Any differing or unresolved competing
+    /// property contract is treated conservatively as a collision.
+    pub fn default_property_provider_needs_physical_getter(
+        &self,
+        provider: &Declaration,
+        retained: &HashSet<crate::semantics::SymbolId>,
+        translation_roots: &[PathBuf],
+    ) -> Option<String> {
+        if provider.language != SourceLanguage::Kotlin
+            || provider.kind != DeclarationKind::Interface
+        {
+            return None;
+        }
+        self.declaration_source_file(provider)?;
+        for (property, property_name) in provider.members.iter().filter_map(|member| {
+            let name = member_property_contract_name(member)?;
+            (member.has_body
+                && !member.is_static
+                && member.visibility.as_deref() != Some("private"))
+            .then_some((member, name))
+        }) {
+            let property_type = property.type_name.as_deref();
+            let mut pending = vec![provider];
+            let mut visited = HashSet::new();
+            while let Some(current) = pending.pop() {
+                if !visited.insert(declaration_key(current)) {
+                    continue;
+                }
+                for descendant in self.direct_subtypes(current) {
+                    pending.push(descendant);
+                    if descendant.language != SourceLanguage::Kotlin
+                        || descendant.is_abstract
+                        || !matches!(
+                            descendant.kind,
+                            DeclarationKind::Class
+                                | DeclarationKind::Enum
+                                | DeclarationKind::Object
+                        )
+                    {
+                        continue;
+                    }
+                    let Some(descendant_file) = self.declaration_source_file(descendant) else {
+                        continue;
+                    };
+                    let retained_descendant = self.declaration_retained(descendant, retained)
+                        || !self.is_selected(&descendant_file.path, translation_roots);
+                    if !retained_descendant
+                        || declaration_declares_property_getter(descendant, &property_name)
+                    {
+                        continue;
+                    }
+
+                    // Inspect every inherited branch from this concrete owner,
+                    // including sibling paths outside the provider's own
+                    // ancestry. A same-spelled contract with a different or
+                    // unknown return type is enough to make inherited Java
+                    // accessor selection unsafe.
+                    let mut ancestors = vec![descendant];
+                    let mut ancestor_seen = HashSet::new();
+                    while let Some(owner) = ancestors.pop() {
+                        if !ancestor_seen.insert(declaration_key(owner)) {
+                            continue;
+                        }
+                        let Some(owner_file) = self.declaration_source_file(owner) else {
+                            continue;
+                        };
+                        for supertype in &owner.supertypes {
+                            let Some(parent) = self.resolve_type(owner_file, supertype) else {
+                                continue;
+                            };
+                            for inherited in parent.members.iter().filter(|member| {
+                                member_is_property_getter(member, &property_name)
+                                    && !member.is_static
+                            }) {
+                                if declaration_key(parent) == declaration_key(provider) {
+                                    continue;
+                                }
+                                let inherited_type = inherited.type_name.as_deref();
+                                if self.property_types_may_conflict(
+                                    provider,
+                                    property_type,
+                                    parent,
+                                    inherited_type,
+                                ) {
+                                    let return_shape = match (property_type, inherited_type) {
+                                        (Some(narrow), Some(wide)) => {
+                                            format!("`{narrow}` and `{wide}`")
+                                        }
+                                        _ => "an unresolved return type".to_string(),
+                                    };
+                                    return Some(format!(
+                                        "default property `{}` has competing inherited getter types {return_shape} on a retained Kotlin descendant",
+                                        property_name
+                                    ));
+                                }
+                            }
+                            ancestors.push(parent);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn property_types_may_conflict(
+        &self,
+        left_owner: &Declaration,
+        left_type: Option<&str>,
+        right_owner: &Declaration,
+        right_type: Option<&str>,
+    ) -> bool {
+        let (Some(left), Some(right)) = (left_type, right_type) else {
+            // An unknown return shape cannot establish that the competing
+            // accessor has the same JVM contract.
+            return true;
+        };
+        let normalize = |ty: &str| {
+            ty.trim()
+                .trim_end_matches('?')
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        };
+        let left = normalize(left);
+        let right = normalize(right);
+        if left == right {
+            let base = left.split(['<', '(']).next().unwrap_or(&left);
+            let left_file = self.declaration_source_file(left_owner);
+            let right_file = self.declaration_source_file(right_owner);
+            let left_parameter = left_owner.type_params.iter().any(|param| param == base);
+            let right_parameter = right_owner.type_params.iter().any(|param| param == base);
+            if left_parameter || right_parameter {
+                // The same type parameter from the same owner is equal. Equal
+                // spellings from different owners need substitution evidence.
+                return left_parameter != right_parameter
+                    || declaration_key(left_owner) != declaration_key(right_owner);
+            }
+            let Some((left_file, right_file)) = left_file.zip(right_file) else {
+                return true;
+            };
+            let type_argument_mentions_parameter = |ty: &str, owner: &Declaration| {
+                let (_, args) = split_generic(ty);
+                args.is_some_and(|args| {
+                    args.iter().any(|argument| {
+                        owner.type_params.iter().any(|parameter| {
+                            argument
+                                .split(|character: char| {
+                                    !character.is_alphanumeric() && character != '_'
+                                })
+                                .any(|part| part == parameter)
+                        })
+                    })
+                })
+            };
+            let left_generic_parameter = type_argument_mentions_parameter(&left, left_owner);
+            let right_generic_parameter = type_argument_mentions_parameter(&right, right_owner);
+            if (left_generic_parameter || right_generic_parameter)
+                && declaration_key(left_owner) != declaration_key(right_owner)
+            {
+                return true;
+            }
+            return !source_types_have_same_identity(self, left_file, &left, right_file, &right);
+        }
+        // Differing or unresolved returns are retained conservatively; the
+        // workspace index does not have enough information to substitute all
+        // generic arguments and prove their JVM contracts equivalent.
+        true
     }
 
     pub fn annotation_is_selected(&self, name: &str, translation_roots: &[PathBuf]) -> bool {
@@ -1972,7 +2369,7 @@ impl SourceIndex {
     pub fn has_retained_kotlin_subtype(
         &self,
         target: &Declaration,
-        retained: &HashSet<String>,
+        retained: &HashSet<crate::semantics::SymbolId>,
     ) -> bool {
         !self
             .retained_kotlin_subtype_names(target, retained)
@@ -1987,21 +2384,17 @@ impl SourceIndex {
     pub fn retained_kotlin_subtype_names(
         &self,
         target: &Declaration,
-        retained: &HashSet<String>,
+        retained: &HashSet<crate::semantics::SymbolId>,
     ) -> Vec<String> {
-        let key = declaration_key(target);
-        let target_name = key.rsplit_once('.').map(|(_, n)| n).unwrap_or(&key);
         let mut names: Vec<String> = self
-            .subtype_names
-            .get(target_name)
-            .map(|subtypes| {
-                subtypes
-                    .iter()
-                    .filter(|subtype| retained.contains(*subtype))
-                    .cloned()
-                    .collect()
+            .direct_subtypes(target)
+            .into_iter()
+            .filter(|declaration| {
+                declaration.language == SourceLanguage::Kotlin
+                    && self.declaration_retained(declaration, retained)
             })
-            .unwrap_or_default();
+            .map(|declaration| declaration.name.clone())
+            .collect();
         names.sort();
         names.dedup();
         names
@@ -2622,6 +3015,199 @@ impl SourceIndex {
     }
 }
 
+fn source_types_have_same_identity(
+    index: &SourceIndex,
+    own_file: &SourceFile,
+    own_type: &str,
+    contract_file: &SourceFile,
+    contract_type: &str,
+) -> bool {
+    let own_resolved = index.resolve_type(own_file, own_type);
+    let contract_resolved = index.resolve_type(contract_file, contract_type);
+    if own_type == "UUID"
+        && contract_type == "UUID"
+        && (own_file
+            .imports
+            .iter()
+            .any(|import| import == "java.util.*")
+            || contract_file
+                .imports
+                .iter()
+                .any(|import| import == "java.util.*"))
+    {
+        let explicit_import = |file: &SourceFile| {
+            file.imports
+                .iter()
+                .find(|import| import.rsplit('.').next() == Some("UUID"))
+                .cloned()
+        };
+        let own_explicit = explicit_import(own_file);
+        let contract_explicit = explicit_import(contract_file);
+        match (&own_explicit, &contract_explicit) {
+            (Some(left), Some(right)) if left == right => {
+                // The same explicit import wins over all wildcard imports.
+                return left == "java.util.UUID"
+                    || matches!(
+                        (index.resolve_type(own_file, own_type), index.resolve_type(contract_file, contract_type)),
+                        (Some(left), Some(right)) if declaration_key(left) == declaration_key(right)
+                    );
+            }
+            (Some(_), Some(_)) => return false,
+            (Some(left), None)
+                if left == "java.util.UUID"
+                    && contract_file
+                        .imports
+                        .iter()
+                        .any(|import| import == "java.util.*") => {}
+            (None, Some(right))
+                if right == "java.util.UUID"
+                    && own_file
+                        .imports
+                        .iter()
+                        .any(|import| import == "java.util.*") => {}
+            (None, None) => {}
+            _ => return false,
+        }
+        let indexed_uuid_collision = index
+            .declarations()
+            .any(|declaration| declaration.name == "UUID");
+        if indexed_uuid_collision {
+            // Allow a real same-package domain UUID to resolve normally below;
+            // never let the unqualified global-name fallback masquerade as a
+            // java.util wildcard import.
+            let same_package_domain_type = own_file.package == contract_file.package
+                && own_file.package.as_ref().is_some_and(|package| {
+                    index.declarations().any(|declaration| {
+                        declaration.name == "UUID" && declaration.package.as_ref() == Some(package)
+                    })
+                });
+            if !same_package_domain_type {
+                return false;
+            }
+        } else if (own_explicit.as_deref() == Some("java.util.UUID")
+            || own_file
+                .imports
+                .iter()
+                .any(|import| import == "java.util.*"))
+            && (contract_explicit.as_deref() == Some("java.util.UUID")
+                || contract_file
+                    .imports
+                    .iter()
+                    .any(|import| import == "java.util.*"))
+        {
+            return true;
+        }
+    }
+    if own_resolved.is_some_and(|declaration| {
+        !declaration_is_visible_from(index, own_file, own_type, declaration)
+    }) || contract_resolved.is_some_and(|declaration| {
+        !declaration_is_visible_from(index, contract_file, contract_type, declaration)
+    }) {
+        return false;
+    }
+    // Kotlin's scalar builtins resolve in the compiler rather than the source
+    // index. Their identical unshadowed spellings are exact JVM types across
+    // source files, so retain that exact identity proof without extending the
+    // same-name fallback to user declarations.
+    if own_type == contract_type
+        && matches!(
+            own_type,
+            "String" | "Boolean" | "Byte" | "Short" | "Int" | "Long" | "Float" | "Double" | "Char"
+        )
+        && own_resolved.is_none()
+        && contract_resolved.is_none()
+        && !index
+            .declarations()
+            .any(|declaration| declaration.name == own_type)
+        && !own_file
+            .imports
+            .iter()
+            .chain(contract_file.imports.iter())
+            .any(|import| import.rsplit('.').next() == Some(own_type))
+    {
+        return true;
+    }
+    let (Some(own), Some(contract)) = (own_resolved, contract_resolved) else {
+        if own_resolved.is_some() || contract_resolved.is_some() {
+            return false;
+        }
+        if own_type != contract_type {
+            return false;
+        }
+        let imported = |file: &SourceFile, name: &str| {
+            file.imports
+                .iter()
+                .find(|import| import.rsplit('.').next() == Some(name))
+                .cloned()
+        };
+        return (own_type.contains('.')
+            && contract_type.contains('.')
+            && own_type == contract_type)
+            || matches!(
+                (imported(own_file, own_type), imported(contract_file, contract_type)),
+                (Some(left), Some(right)) if left == right
+            );
+    };
+    declaration_key(own) == declaration_key(contract)
+}
+
+fn type_reference_is_visible(index: &SourceIndex, file: &SourceFile, ty: &str) -> bool {
+    let base = ty
+        .trim()
+        .trim_end_matches('?')
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if base == "UUID" && file.imports.iter().any(|import| import == "java.util.UUID") {
+        return true;
+    }
+    let Some(declaration) = index.resolve_type(file, base) else {
+        return true;
+    };
+    declaration_is_visible_from(index, file, base, declaration)
+}
+
+fn declaration_is_visible_from(
+    index: &SourceIndex,
+    file: &SourceFile,
+    type_name: &str,
+    declaration: &Declaration,
+) -> bool {
+    let base = type_name
+        .trim()
+        .trim_end_matches('?')
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let key = declaration_key(declaration);
+    if base.contains('.') {
+        return base == key;
+    }
+    let simple = base.rsplit('.').next().unwrap_or(base);
+    let explicit = file
+        .imports
+        .iter()
+        .filter(|import| import.rsplit('.').next() == Some(simple))
+        .collect::<Vec<_>>();
+    if !explicit.is_empty() {
+        return explicit
+            .iter()
+            .all(|import| import.as_str() == key.as_str());
+    }
+    let wildcard_matches = file
+        .imports
+        .iter()
+        .filter_map(|import| import.strip_suffix(".*"))
+        .filter_map(|package| index.find_qualified(&format!("{package}.{simple}")))
+        .collect::<Vec<_>>();
+    if !wildcard_matches.is_empty() {
+        return wildcard_matches.len() == 1 && declaration_key(wildcard_matches[0]) == key;
+    }
+    file.package.as_ref() == declaration.package.as_ref()
+}
+
 fn declaration_key(declaration: &Declaration) -> String {
     match &declaration.package {
         Some(package) => format!("{package}.{}", declaration.name),
@@ -2629,11 +3215,71 @@ fn declaration_key(declaration: &Declaration) -> String {
     }
 }
 
+fn property_getter_name(property: &str) -> String {
+    let mut chars = property.chars();
+    match chars.next() {
+        Some(first) => format!("get{}{}", first.to_uppercase(), chars.as_str()),
+        None => "get".to_string(),
+    }
+}
+
+fn property_name_from_getter(getter: &str) -> Option<String> {
+    let suffix = getter.strip_prefix("get")?;
+    let mut chars = suffix.chars();
+    let first = chars.next()?;
+    if !first.is_uppercase() {
+        return None;
+    }
+    let second = chars.clone().next();
+    if second.is_some_and(char::is_uppercase) {
+        return Some(suffix.to_string());
+    }
+    Some(first.to_lowercase().chain(chars).collect())
+}
+
+fn member_property_contract_name(member: &Member) -> Option<String> {
+    match member.kind {
+        MemberKind::Property => Some(member.name.clone()),
+        MemberKind::Method if member.parameter_types.is_empty() => {
+            property_name_from_getter(&member.name)
+        }
+        _ => None,
+    }
+}
+
+fn member_is_property_getter(member: &Member, property: &str) -> bool {
+    !member.is_static
+        && member.visibility.as_deref() != Some("private")
+        && (member.kind == MemberKind::Property && member.name == property
+            || member.kind == MemberKind::Method
+                && member.parameter_types.is_empty()
+                && property_name_from_getter(&member.name).as_deref() == Some(property)
+                && member.name == property_getter_name(property))
+}
+
+fn declaration_declares_property_getter(declaration: &Declaration, property: &str) -> bool {
+    declaration
+        .members
+        .iter()
+        .any(|member| member_is_property_getter(member, property))
+}
+
 fn paths_match(left: &Path, right: &Path) -> bool {
     normalized_path(left) == normalized_path(right)
 }
 
 fn normalized_path(path: &Path) -> String {
+    // Indexed files and declaration locations are already absolute canonical
+    // paths. Compatibility scans compare them many times; do not repeat a
+    // filesystem lookup for every comparison. Relative overlay inputs are
+    // canonicalized at ingestion, and source_file canonicalizes lookup inputs.
+    let absolute;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        absolute = absolute_source_path(path);
+        absolute.as_path()
+    };
     let value = path.to_string_lossy().replace('\\', "/");
     let value = value.strip_prefix("//?/").unwrap_or(&value);
     if cfg!(windows) {
@@ -2641,6 +3287,16 @@ fn normalized_path(path: &Path) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn absolute_source_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        }
+    })
 }
 
 fn cache_producer() -> u128 {
@@ -2932,8 +3588,8 @@ fn should_skip_directory(name: &Path) -> bool {
 
 fn package_name(source: &str) -> Option<String> {
     source.lines().map(str::trim).find_map(|line| {
-        let package = line.strip_prefix("package ")?.trim();
-        (!package.is_empty()).then(|| package.trim_end_matches(';').to_string())
+        let package = line.strip_prefix("package ")?.split(';').next()?.trim();
+        (!package.is_empty()).then(|| package.to_string())
     })
 }
 
@@ -3036,7 +3692,7 @@ fn parse_declarations(
                 type_aliases.insert(alias.to_string(), target.to_string());
             }
         }
-        if let Some((kind, name_node)) = declaration_shape(node, language) {
+        if let Some((kind, name_node)) = declaration_shape(node, language, source) {
             let name = node_text(name_node, source)?;
             if !declarations.iter().any(|d: &Declaration| d.name == name) {
                 let ctor_params = constructor_param_names(node, language, source);
@@ -3414,10 +4070,17 @@ fn has_default_constructor_parameter(
         })
 }
 
-fn declaration_shape(
-    node: tree_sitter::Node<'_>,
+fn declaration_shape<'a>(
+    node: tree_sitter::Node<'a>,
     language: SourceLanguage,
-) -> Option<(DeclarationKind, tree_sitter::Node<'_>)> {
+    source: &str,
+) -> Option<(DeclarationKind, tree_sitter::Node<'a>)> {
+    if language == SourceLanguage::Kotlin
+        && let Some((name, _)) = recovered_interface_parts(node, source)
+    {
+        let name_node = recovered_interface_name_node(node, source, &name)?;
+        return Some((DeclarationKind::Interface, name_node));
+    }
     match (language, node.kind()) {
         (SourceLanguage::Kotlin, "class_declaration") => {
             node.child_by_field_name("name").map(|name| {
@@ -3498,6 +4161,87 @@ fn declaration_shape(
             .map(|name| (DeclarationKind::Annotation, name)),
         _ => None,
     }
+}
+
+/// Recover only the parser's known annotated-interface shape: an
+/// `annotated_expression`/`ERROR` containing the infix expression
+/// `interface Name { ... }`, represented by direct `interface`, name, and
+/// lambda children. The declaration name is independently checked by the
+/// shared semantics recovery helper, which rejects multiple interface
+/// keywords and annotation identifiers masquerading as the name.
+fn recovered_interface_parts<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &str,
+) -> Option<(String, tree_sitter::Node<'tree>)> {
+    if !matches!(node.kind(), "annotated_expression" | "ERROR") {
+        return None;
+    }
+    let name = crate::semantics::recovered_interface_name(node, source)?;
+    let mut candidates = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.id() != node.id()
+            && matches!(
+                current.kind(),
+                "lambda_literal" | "class_declaration" | "object_declaration"
+            )
+        {
+            continue;
+        }
+        if current.kind() == "infix_expression" {
+            let children = current.children(&mut current.walk()).collect::<Vec<_>>();
+            let has_interface = children.iter().any(|child| {
+                child.kind() == "identifier"
+                    && child.utf8_text(source.as_bytes()).ok() == Some("interface")
+            });
+            let has_name = children.iter().any(|child| {
+                matches!(child.kind(), "identifier" | "simple_identifier")
+                    && child.utf8_text(source.as_bytes()).ok() == Some(name.as_str())
+            });
+            let lambdas = children
+                .iter()
+                .filter(|child| child.kind() == "lambda_literal")
+                .copied()
+                .collect::<Vec<_>>();
+            if has_interface && has_name && lambdas.len() == 1 {
+                candidates.push((name.clone(), lambdas[0]));
+            }
+        }
+        let mut walk = current.walk();
+        stack.extend(current.children(&mut walk));
+    }
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn recovered_interface_name_node<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "infix_expression" {
+            let children = current.children(&mut current.walk()).collect::<Vec<_>>();
+            let is_shape = children.iter().any(|child| {
+                child.kind() == "identifier"
+                    && child.utf8_text(source.as_bytes()).ok() == Some("interface")
+            }) && children
+                .iter()
+                .any(|child| child.kind() == "lambda_literal");
+            if is_shape {
+                return children.into_iter().find(|child| {
+                    matches!(child.kind(), "identifier" | "simple_identifier")
+                        && child.utf8_text(source.as_bytes()).ok() == Some(name)
+                });
+            }
+        }
+        if current.id() != node.id() && current.kind() == "lambda_literal" {
+            continue;
+        }
+        let mut walk = current.walk();
+        stack.extend(current.children(&mut walk));
+    }
+    None
 }
 
 fn supertypes(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) -> Vec<String> {
@@ -3613,6 +4357,29 @@ fn type_param_names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
         .children(&mut node.walk())
         .find(|child| child.kind() == "type_parameters")
     else {
+        if recovered_interface_parts(node, source).is_some() {
+            let mut stack = vec![node];
+            while let Some(current) = stack.pop() {
+                if current.kind() == "lambda_literal" {
+                    continue;
+                }
+                if current.kind() == "type_parameters" {
+                    return current
+                        .children(&mut current.walk())
+                        .filter(|child| child.kind() == "type_parameter")
+                        .filter_map(|child| {
+                            child
+                                .children(&mut child.walk())
+                                .find(|part| part.kind() == "identifier")
+                                .and_then(|id| node_text(id, source).ok())
+                        })
+                        .collect();
+                }
+                let mut walk = current.walk();
+                stack.extend(current.children(&mut walk));
+            }
+            return Vec::new();
+        }
         return Vec::new();
     };
     params
@@ -3629,6 +4396,14 @@ fn type_param_names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
 
 fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) -> Vec<Member> {
     let mut result = Vec::new();
+    if language == SourceLanguage::Kotlin
+        && let Some((_, body)) = recovered_interface_parts(node, source)
+    {
+        for child in body.children(&mut body.walk()) {
+            result.extend(member_from_node(child, language, source));
+        }
+        return result;
+    }
     // A Java record carries its state in the header, not the body: each component
     // is a final field whose accessor is named exactly like it. Translating the
     // owner of a Kotlin property turns the read into that accessor call, so the
@@ -3706,7 +4481,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 kind: MemberKind::Property,
                 visibility: None,
                 is_static: false,
-                is_jvm_field: false,
+                is_jvm_field: property_modifiers.contains("JvmField"),
                 is_mutable: parameter
                     .children(&mut parameter.walk())
                     .any(|child| child.kind() == "var"),
@@ -3716,7 +4491,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 // complete argument syntax stays within one lexical token;
                 // the source rewriter cannot safely rebuild split arguments.
                 has_unsupported_property_annotations: constructor_property_annotations_unsupported(
-                    &parameter_text,
+                    &parameter_text.replace("@JvmField", ""),
                 ),
                 has_unsupported_property_shape: property_modifiers.contains("open")
                     || property_modifiers.contains("lateinit")
@@ -3734,12 +4509,19 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
     }
     if let Some(body) = node.child_by_field_name("body").or_else(|| {
         node.children(&mut node.walk())
-            .find(|child| matches!(child.kind(), "class_body" | "enum_class_body"))
+            .find(|child| matches!(child.kind(), "class_body" | "enum_class_body" | "enum_body"))
     }) {
-        result.extend(
-            body.children(&mut body.walk())
-                .filter_map(|child| member_from_node(child, language, source)),
-        );
+        for child in body.children(&mut body.walk()) {
+            if child.kind() == "enum_body_declarations" {
+                result.extend(
+                    child
+                        .children(&mut child.walk())
+                        .filter_map(|member| member_from_node(member, language, source)),
+                );
+            } else {
+                result.extend(member_from_node(child, language, source));
+            }
+        }
         // Companion-object members are static members of the owner: Kotlin
         // `Owner.make` on the companion resolves through the owner name in
         // Java. Index them (marked static) so call sites can be resolved —
@@ -4476,4 +5258,361 @@ fn enum_typed_candidate(ws: &SourceIndex, candidates: &[String]) -> Option<Strin
         }
     }
     None
+}
+
+#[cfg(test)]
+mod declaration_symbol_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn java_package_ends_before_a_same_line_declaration() {
+        assert_eq!(
+            package_name("package example.annotations; public @interface Marker {}"),
+            Some("example.annotations".into())
+        );
+    }
+
+    #[test]
+    fn recovered_annotated_generic_interface_indexes_its_property_contract() {
+        let source = r#"
+@JsonTypeInfo(
+    use = JsonTypeInfo.Id.NAME,
+    include = JsonTypeInfo.As.PROPERTY,
+    property = "_class"
+)
+@JsonSubTypes(
+    JsonSubTypes.Type(value = ContextA::class),
+    JsonSubTypes.Type(value = ContextB::class),
+    JsonSubTypes.Type(value = ContextC::class)
+)
+interface Example<T> {
+    @get:GetterTag
+    val contextKind: T
+}
+
+@JsonSubTypes(
+    JsonSubTypes.Type(value = SiblingRequest::class),
+    JsonSubTypes.Type(value = SiblingContext::class),
+)
+interface SiblingContext {
+    val items: List<String>
+}
+"#;
+        let parsed = parse_declarations(source, SourceLanguage::Kotlin, Some("sample"))
+            .expect("fixture parses with recovery");
+        let declaration = parsed
+            .0
+            .iter()
+            .find(|declaration| declaration.name == "Example")
+            .expect("recovered interface is indexed");
+        assert_eq!(declaration.kind, DeclarationKind::Interface);
+        assert_eq!(declaration.type_params, ["T"]);
+        assert!(declaration.members.iter().any(|member| {
+            member.name == "contextKind"
+                && member.kind == MemberKind::Property
+                && member.type_name.as_deref() == Some("T")
+        }));
+    }
+
+    #[test]
+    fn recovered_annotated_interface_with_getter_annotation_indexes_member() {
+        let source = r#"
+@JsonTypeInfo(
+    use = JsonTypeInfo.Id.NAME,
+    include = JsonTypeInfo.As.PROPERTY,
+    property = "_class"
+)
+@JsonSubTypes(
+    JsonSubTypes.Type(value = ContextA::class),
+    JsonSubTypes.Type(value = ContextB::class),
+    JsonSubTypes.Type(value = ContextC::class)
+)
+interface ContextContract {
+    @get:GetterTag
+    val contextKind: String
+}
+
+@JsonSubTypes(
+    JsonSubTypes.Type(value = SiblingRequest::class),
+    JsonSubTypes.Type(value = SiblingContext::class),
+)
+interface SiblingContext {
+    val items: List<String>
+}
+"#;
+        let parsed = parse_declarations(source, SourceLanguage::Kotlin, Some("sample"))
+            .expect("fixture parses with recovery");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut has_recovered_context_contract = false;
+        while let Some(node) = stack.pop() {
+            has_recovered_context_contract |= recovered_interface_parts(node, source)
+                .is_some_and(|(name, _)| name == "ContextContract");
+            let mut walk = node.walk();
+            stack.extend(node.named_children(&mut walk));
+        }
+        assert!(
+            has_recovered_context_contract,
+            "the getter-annotated fixture must exercise parser recovery"
+        );
+        let declaration = parsed
+            .0
+            .iter()
+            .find(|declaration| declaration.name == "ContextContract")
+            .expect("annotated interface is indexed");
+        assert_eq!(declaration.kind, DeclarationKind::Interface);
+        assert!(declaration.members.iter().any(|member| {
+            member.name == "contextKind"
+                && member.kind == MemberKind::Property
+                && member.type_name.as_deref() == Some("String")
+        }));
+        assert!(
+            declaration
+                .members
+                .iter()
+                .all(|member| member.name != "items")
+        );
+    }
+
+    #[test]
+    fn per_file_symbols_match_direct_resolution_for_nested_overloaded_and_recovered_sources() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "notlin-symbol-cache-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let kotlin = root.join("Types.kt");
+        fs::write(
+            &kotlin,
+            "package sample\nclass Outer { class Nested; fun convert(x: String): String = x; fun convert(x: Int): Int = x }\nclass Duplicate\nclass Duplicate\nclass Recovered(\n",
+        )
+        .unwrap();
+        let java = root.join("Types.java");
+        fs::write(
+            &java,
+            "package sample; interface Api { String getName(); String getName(int n); class Child {} }\n",
+        )
+        .unwrap();
+
+        let index = SourceIndex::discover(&root).unwrap();
+        for file in &index.files {
+            let batched = crate::semantics::workspace_symbols_for_file(file);
+            assert_eq!(batched.len(), file.declarations.len());
+            for (declaration, cached) in file.declarations.iter().zip(batched) {
+                let direct = crate::semantics::workspace_symbol_uncached(&index, declaration);
+                assert_eq!(
+                    cached,
+                    direct,
+                    "{}: {}",
+                    file.path.display(),
+                    declaration.name
+                );
+                let retained = HashSet::from([direct.clone()]);
+                assert!(index.declaration_retained(declaration, &retained));
+                assert!(!index.declaration_retained(declaration, &HashSet::new()));
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn member_name_index_preserves_candidate_order_enum_preference_and_file_priority() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "notlin-member-index-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("A.kt"),
+            "package sample\nenum class Stage { READY }\nclass A { val status: String = \"a\"; fun getThing(): String = \"a\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("B.kt"),
+            "package sample\nclass B { val status: Stage = Stage.READY; fun thing(): Stage = status }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("C.kt"),
+            "package sample\nclass C { val status: String = \"local\"; fun local(): Int = 1 }\n",
+        )
+        .unwrap();
+        fs::write(root.join("D.kt"), "package sample\nclass D\n").unwrap();
+
+        let index = SourceIndex::discover(&root).unwrap();
+        assert_eq!(
+            index.bare_property_type("status").as_deref(),
+            Some("String")
+        );
+        assert_eq!(
+            index.property_type_of_getter("getStatus").as_deref(),
+            Some("String")
+        );
+        assert_eq!(
+            index
+                .property_type_in_file(&root.join("C.kt"), "status")
+                .as_deref(),
+            Some("String")
+        );
+        assert_eq!(
+            index
+                .property_type_in_file(&root.join("D.kt"), "status")
+                .as_deref(),
+            Some("Stage")
+        );
+        assert_eq!(
+            index
+                .method_return_type_in_file(&root.join("D.kt"), "getThing()")
+                .as_deref(),
+            Some("String")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn java_util_uuid_wildcards_share_identity_across_packages() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "notlin-jdk-uuid-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let left_path = root.join("Left.kt");
+        let right_path = root.join("Right.kt");
+        fs::write(
+            &left_path,
+            "package left\nimport java.util.*\ninterface Left<T> { val id: T }\ninterface LeftEvent : Left<UUID>\n",
+        )
+        .unwrap();
+        fs::write(
+            &right_path,
+            "package right\nimport java.util.*\ninterface Right { val id: UUID }\n",
+        )
+        .unwrap();
+        let index = SourceIndex::discover(&root).unwrap();
+        let left = index.source_file(&left_path).unwrap();
+        let right = index.source_file(&right_path).unwrap();
+        assert!(source_types_have_same_identity(
+            &index, left, "UUID", right, "UUID"
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wildcard_jdk_uuid_does_not_match_an_indexed_domain_uuid_collision() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "notlin-jdk-uuid-collision-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let left_path = root.join("Left.kt");
+        let right_path = root.join("Right.kt");
+        fs::write(
+            &left_path,
+            "package left\nimport java.util.*\ninterface Left { val id: UUID }\n",
+        )
+        .unwrap();
+        fs::write(
+            &right_path,
+            "package right\nimport java.util.*\ninterface Right { val id: UUID }\n",
+        )
+        .unwrap();
+        fs::write(root.join("Domain.kt"), "package domain\nclass UUID\n").unwrap();
+        let index = SourceIndex::discover(&root).unwrap();
+        let left = index.source_file(&left_path).unwrap();
+        let right = index.source_file(&right_path).unwrap();
+        assert!(!source_types_have_same_identity(
+            &index, left, "UUID", right, "UUID"
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_property_provider_is_retained_only_for_a_retained_conflicting_descendant() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        for (
+            retained_descendant,
+            explicit_getter,
+            explicit_overload,
+            repaired_method,
+            provider_type,
+            expected,
+        ) in [
+            (true, false, false, false, "NarrowRef", true),
+            (false, false, false, false, "NarrowRef", false),
+            (true, true, false, false, "NarrowRef", false),
+            (true, false, true, false, "NarrowRef", true),
+            (true, false, false, false, "BaseRef", false),
+            (true, false, false, true, "NarrowRef", true),
+        ] {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!(
+                    "notlin-default-provider-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+            fs::create_dir_all(&root).unwrap();
+            let provider_member = if repaired_method {
+                format!("override fun getRef(): {provider_type} = NarrowRef()")
+            } else {
+                format!("override val ref: {provider_type} get() = NarrowRef()")
+            };
+            fs::write(
+                root.join("Contracts.kt"),
+                format!("package sample\ninterface BaseRef\nclass NarrowRef : BaseRef\ninterface BroadContract {{\n    val ref: BaseRef\n}}\ninterface DefaultContract : BroadContract {{\n    {provider_member}\n}}\n"),
+            )
+            .unwrap();
+            let consumer_source = if explicit_getter {
+                "package sample\nclass Consumer : DefaultContract {\n    override val ref: NarrowRef get() = NarrowRef()\n}\n"
+            } else if explicit_overload {
+                "package sample\nclass Consumer : DefaultContract {\n    fun getRef(other: String): NarrowRef = NarrowRef()\n}\n"
+            } else {
+                "package sample\nclass Consumer : DefaultContract\n"
+            };
+            fs::write(root.join("Consumer.kt"), consumer_source).unwrap();
+
+            let index = SourceIndex::discover(&root).unwrap();
+            let provider = index
+                .declarations()
+                .find(|declaration| declaration.name == "DefaultContract")
+                .unwrap();
+            let consumer = index
+                .declarations()
+                .find(|declaration| declaration.name == "Consumer")
+                .unwrap();
+            let retained = if retained_descendant {
+                HashSet::from([crate::semantics::workspace_symbol(&index, consumer)])
+            } else {
+                HashSet::new()
+            };
+            let reason = index.default_property_provider_needs_physical_getter(
+                provider,
+                &retained,
+                std::slice::from_ref(&root),
+            );
+            assert_eq!(reason.is_some(), expected, "{reason:?}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
 }

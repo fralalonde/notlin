@@ -13,7 +13,13 @@ fn array_to_list_uses_only_the_jdk() {
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--lombok",
+            "--allow-approximations",
+        ])
         .arg(root.join("pkg").join("m.kt").to_str().unwrap())
         .output()
         .expect("run notlin");

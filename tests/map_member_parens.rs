@@ -24,14 +24,14 @@ fn character_literal_is_direct_java_without_warning() {
 }
 
 #[test]
-fn string_builder_append_is_a_direct_java_member_without_warning() {
+fn string_builder_calls_are_proven_standard_java_members() {
     let source =
         "package neutral.mapc\nfun build(): String = StringBuilder().append(\"a\").toString()\n";
     let cli = notlin::cli::Cli::parse_from(vec!["notlin", "M.kt"]);
     let (files, errors, warnings, _cov) =
         notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
     assert_eq!(errors, 0);
-    assert_eq!(warnings, 0, "append should not be approximated");
+    assert_eq!(warnings, 0, "standard StringBuilder calls are established");
     let m = files
         .iter()
         .find(|(n, _)| n == "M.java")
@@ -44,13 +44,16 @@ fn string_builder_append_is_a_direct_java_member_without_warning() {
 }
 
 #[test]
-fn pre_streamed_filter_is_a_direct_java_member_without_warning() {
+fn pre_streamed_filter_keeps_java_call_syntax_with_external_approximations() {
     let source = "package neutral.mapc\nfun select(items: List<String>): java.util.stream.Stream<String> = items.stream().filter { value -> value.startsWith(\"x\") }\n";
-    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "M.kt"]);
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", "M.kt"]);
     let (files, errors, warnings, _cov) =
         notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
     assert_eq!(errors, 0);
-    assert_eq!(warnings, 0, "Stream.filter should be a direct Java member");
+    assert_eq!(
+        warnings, 3,
+        "only the external Stream calls are approximated"
+    );
     let m = files
         .iter()
         .find(|(n, _)| n == "M.java")
@@ -62,7 +65,7 @@ fn pre_streamed_filter_is_a_direct_java_member_without_warning() {
 #[test]
 fn map_call_members_keep_parens() {
     let source = "package neutral.mapc\nfun has(m: Map<String, Int>) = m.containsKey(\"a\")\n";
-    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "M.kt"]);
+    let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", "M.kt"]);
     let (files, errors, _warnings, _cov) =
         notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
     assert_eq!(errors, 0);

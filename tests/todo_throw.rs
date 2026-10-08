@@ -46,7 +46,13 @@ fn todo_expression_body_is_emitted_as_a_bare_throw() {
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--lombok",
+            "--allow-approximations",
+        ])
         .arg(root.join("m.kt").to_str().unwrap())
         .output()
         .expect("run notlin");
