@@ -126,7 +126,7 @@ fn report_groups_by_kind_with_counts_and_locations() {
 
     // Headline: totals split into human-actionable and cascade fallout.
     assert!(report.contains("6 declaration(s)"), "{report}");
-    assert!(report.contains("4 need human input"), "{report}");
+    assert!(report.contains("4 direct blockers"), "{report}");
     assert!(
         report.contains("2 follow a closed type hierarchy"),
         "{report}"
@@ -353,7 +353,7 @@ fn rows_are_ordered_by_what_they_hold_back() {
     let report = retention_report().expect("a report once sites are recorded");
 
     // Two roots, two declarations that follow them.
-    assert!(report.contains("2 need human input"), "{report}");
+    assert!(report.contains("2 direct blockers"), "{report}");
     assert!(
         report.contains("2 follow a closed type hierarchy"),
         "{report}"
@@ -482,7 +482,7 @@ fn blockers_not_wording_decide_what_is_fallout() {
 
     let report = retention_report().expect("a report once sites are recorded");
     assert!(
-        report.contains("1 need human input"),
+        report.contains("1 direct blockers"),
         "only the intrinsic row is human work:\n{report}"
     );
     assert!(
@@ -526,7 +526,7 @@ fn one_kind_is_one_code_however_the_parameters_read() {
         "both sites of one kind collapse into one row:\n{report}"
     );
     assert!(
-        report.contains("2 need human input"),
+        report.contains("2 direct blockers"),
         "both are human work:\n{report}"
     );
 

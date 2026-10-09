@@ -31,6 +31,21 @@ notlin --allow-approximations --in-place .
 notlin --validation-config validation.json --in-place .
 ```
 
+Workspace migration also reports targeted source changes that may unlock more
+translation. `U001` identifies competing inherited getter contracts on a retained
+Kotlin implementation; `U002` identifies the actual constructor overloads that
+collide after erasure, with resolved caller locations when available. Each
+recommendation explains the constraint and a possible manual change. Parser
+errors, unknown types and conservative secondary-constructor checks do not
+produce source-change advice.
+
+Recommendations are ranked by related retained declarations using resolved
+symbol references, with at most ten shown per run. These counts are not promises
+of successful translation: review the suggested edit, rerun Notlin, and validate
+the mixed result. Locations refer to the input snapshots before migration edits.
+The library exposes the complete structured report through
+`translation_advice::analyze`.
+
 ## Install
 
 Linux/macOS (bash, zsh, fish):

@@ -19,6 +19,7 @@ pub mod property_callsite;
 pub mod retention_docs;
 pub mod semantics;
 pub mod smart_cast;
+pub mod translation_advice;
 pub mod translation_plan;
 pub mod transpiler;
 pub mod workspace;

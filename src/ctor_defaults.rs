@@ -334,19 +334,38 @@ pub fn plan_ctor_defaults(shape: &CtorShape<'_>) -> CtorDefaultPlan {
             .collect();
         (types.len(), erasure_key(&types))
     };
-    let mut seen: Vec<(usize, String)> = Vec::new();
+    let mut seen: Vec<((usize, String), &Vec<usize>)> = Vec::new();
     for pattern in needed.iter().chain(shape.ladder.iter()) {
         let signature = signature(pattern);
-        if seen.contains(&signature) {
+        if let Some((_, previous)) = seen.iter().find(|(key, _)| key == &signature) {
+            let describe = |omitted: &[usize]| {
+                (0..shape.param_names.len())
+                    .filter(|index| !omitted.contains(index))
+                    .map(|index| {
+                        format!(
+                            "{}: {}",
+                            shape.param_names[index],
+                            shape
+                                .param_types
+                                .get(index)
+                                .map(String::as_str)
+                                .unwrap_or("<unknown>")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             return CtorDefaultPlan {
                 overloads: Vec::new(),
-                blocked: Some(
-                    "the delegating overloads its callers need collide after type erasure"
-                        .to_string(),
-                ),
+                blocked: Some(format!(
+                    "the delegating overloads its callers need collide after type erasure: ({}) and ({}) both erase to ({})",
+                    describe(previous),
+                    describe(pattern),
+                    signature.1
+                )),
             };
         }
-        seen.push(signature);
+        seen.push((signature, pattern));
     }
     CtorDefaultPlan {
         overloads: needed,

@@ -831,7 +831,7 @@ pub fn retention_report() -> Option<String> {
 
     let mut out = String::new();
     out.push_str(&format!(
-        "\nnotlin: kotlin kept — {} declaration(s), {} blocker type(s): {} need human input, {} follow a closed type hierarchy\n\n",
+        "\nnotlin: kotlin kept — {} declaration(s), {} blocker type(s): {} direct blockers, {} follow a closed type hierarchy\n\n",
         sites.len(),
         rows.len(),
         primary,

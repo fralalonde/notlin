@@ -530,6 +530,14 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 item_count(plan.rounds, "pass", "passes"),
                 item_count(plan.generated_java.len(), "Java output", "Java outputs")
             ));
+            let advice = notlin::translation_advice::analyze(
+                &plan.final_plans,
+                &plan.translation_plans,
+                &index,
+                &translation_roots,
+                &notlin::diagnostics::retention_sites(),
+            );
+            eprint!("{}", notlin::translation_advice::render(&advice, 10));
             if let Some(config_path) = &cli.validation_config {
                 notlin::migration_pipeline::validate_workspace_plan(
                     &plan,

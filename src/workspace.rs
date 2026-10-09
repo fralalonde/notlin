@@ -265,6 +265,29 @@ pub struct CtorOmissionEvidence {
     pub unresolvable: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DefaultGetterConflict {
+    pub provider: crate::semantics::SymbolId,
+    pub implementation: crate::semantics::SymbolId,
+    pub competing_owner: crate::semantics::SymbolId,
+    pub property: String,
+    pub provider_type: Option<String>,
+    pub competing_type: Option<String>,
+}
+
+impl DefaultGetterConflict {
+    pub fn message(&self) -> String {
+        let shape = match (&self.provider_type, &self.competing_type) {
+            (Some(narrow), Some(wide)) => format!("`{narrow}` and `{wide}`"),
+            _ => "an unresolved return type".to_string(),
+        };
+        format!(
+            "default property `{}` has competing inherited getter types {shape} on a retained Kotlin descendant",
+            self.property
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFile {
     pub path: PathBuf,
@@ -2093,6 +2116,19 @@ impl SourceIndex {
         retained: &HashSet<crate::semantics::SymbolId>,
         translation_roots: &[PathBuf],
     ) -> Option<String> {
+        self.default_property_getter_conflict(provider, retained, translation_roots)
+            .map(|conflict| conflict.message())
+    }
+
+    /// Exact declarations and return shapes behind the annotation-processor
+    /// getter safeguard. Missing types still block translation, but must not
+    /// become source-change recommendations.
+    pub fn default_property_getter_conflict(
+        &self,
+        provider: &Declaration,
+        retained: &HashSet<crate::semantics::SymbolId>,
+        translation_roots: &[PathBuf],
+    ) -> Option<DefaultGetterConflict> {
         if provider.language != SourceLanguage::Kotlin
             || provider.kind != DeclarationKind::Interface
         {
@@ -2169,16 +2205,20 @@ impl SourceIndex {
                                     parent,
                                     inherited_type,
                                 ) {
-                                    let return_shape = match (property_type, inherited_type) {
-                                        (Some(narrow), Some(wide)) => {
-                                            format!("`{narrow}` and `{wide}`")
-                                        }
-                                        _ => "an unresolved return type".to_string(),
-                                    };
-                                    return Some(format!(
-                                        "default property `{}` has competing inherited getter types {return_shape} on a retained Kotlin descendant",
-                                        property_name
-                                    ));
+                                    return Some(DefaultGetterConflict {
+                                        provider: crate::semantics::workspace_symbol(
+                                            self, provider,
+                                        ),
+                                        implementation: crate::semantics::workspace_symbol(
+                                            self, descendant,
+                                        ),
+                                        competing_owner: crate::semantics::workspace_symbol(
+                                            self, parent,
+                                        ),
+                                        property: property_name.clone(),
+                                        provider_type: property_type.map(str::to_owned),
+                                        competing_type: inherited_type.map(str::to_owned),
+                                    });
                                 }
                             }
                             ancestors.push(parent);
