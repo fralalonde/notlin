@@ -7,6 +7,53 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+#[test]
+fn source_missing_after_indexing_is_removed_from_the_migration_snapshot() {
+    use clap::Parser;
+    use notlin::{cli::Cli, migration_pipeline, workspace::SourceIndex};
+
+    let root = std::env::temp_dir().join(format!("notlin-vanished-index-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let vanished = root.join("Vanished.kt");
+    let survivor = root.join("Survivor.kt");
+    fs::write(&vanished, "class Vanished\n").unwrap();
+    fs::write(&survivor, "class Survivor\n").unwrap();
+
+    let root = fs::canonicalize(&root).unwrap();
+    let vanished = root.join("Vanished.kt");
+    let survivor = root.join("Survivor.kt");
+    let index = SourceIndex::discover(&root).unwrap();
+    fs::remove_file(&vanished).unwrap();
+    let cli = Cli::parse_from(["notlin", "--root", root.to_str().unwrap(), "--in-place"]);
+
+    let plan = migration_pipeline::plan_workspace_migration(
+        vec![(survivor.clone(), fs::read_to_string(&survivor).unwrap())],
+        &cli,
+        &index,
+        std::slice::from_ref(&root),
+        |_| {},
+    )
+    .expect("the remaining source should still be planned");
+
+    assert!(
+        migration_pipeline::verify_original_snapshots(&plan).is_ok(),
+        "a source already gone before planning must not remain in the index snapshot"
+    );
+    assert!(
+        plan.generated_java
+            .iter()
+            .all(|generated| generated.origin != vanished)
+    );
+    assert!(
+        plan.generated_java
+            .iter()
+            .any(|generated| generated.origin == survivor),
+        "the surviving source should still be migrated"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 fn notlin() -> &'static str {
     env!("CARGO_BIN_EXE_notlin")
 }

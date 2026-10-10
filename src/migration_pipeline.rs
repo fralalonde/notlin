@@ -51,6 +51,26 @@ pub fn plan_workspace_migration<F>(
 where
     F: FnMut(String),
 {
+    // The workspace index is discovered before positional inputs are read.
+    // A file can disappear in that gap and consequently be absent from
+    // `sources` while still contributing stale declarations and snapshots.
+    // Drop only entries that now definitively return NotFound; other I/O
+    // failures remain visible to snapshot verification rather than being
+    // mistaken for concurrent deletion.
+    let vanished_sources = index
+        .kotlin_files()
+        .chain(index.java_files())
+        .filter(|file| {
+            file.path
+                .metadata()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
+        .map(|file| SourceOverlay::Delete {
+            path: file.path.clone(),
+        })
+        .collect::<Vec<_>>();
+    let index = index.with_overlays(&vanished_sources)?;
+
     let mut input_ids = HashSet::<PathBuf>::new();
     for (path, _) in &sources {
         if !input_ids.insert(normalized(path)) {
