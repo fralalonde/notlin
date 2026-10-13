@@ -246,12 +246,10 @@ fn record_generated_declarations(
         source_symbol_map.insert(decision.symbol_id.stable_key(), decision.symbol_id.clone());
     }
     if let Some(provider) = provider {
-        for symbol in provider
-            .symbols()
-            .iter()
-            .filter(|s| source_files.contains(&s.id.file))
-        {
-            source_symbol_map.insert(symbol.id.stable_key(), symbol.id.clone());
+        for file in &source_files {
+            for symbol in provider.symbols_in_file(file) {
+                source_symbol_map.insert(symbol.id.stable_key(), symbol.id.clone());
+            }
         }
     }
     let source_symbols: Vec<_> = source_symbol_map.into_values().collect();
@@ -1103,9 +1101,9 @@ fn resolve_target(
         match receiver_name(receiver) {
             Receiver::Type(receiver_type) => {
                 let classes: Vec<_> = provider
-                    .symbols()
-                    .iter()
-                    .filter(|s| s.id.name == receiver_type && s.id.kind == "class")
+                    .symbols_named(&receiver_type)
+                    .into_iter()
+                    .filter(|s| s.id.kind == "class")
                     .collect();
                 if classes.is_empty() && call {
                     return unique_origin(
@@ -1141,8 +1139,8 @@ fn resolve_target(
         None
     };
     let matches: Vec<_> = provider
-        .symbols()
-        .iter()
+        .symbols_named(&name)
+        .into_iter()
         .filter(|symbol| {
             symbol.id.name == name
                 && symbol.id.kind == kind

@@ -5,6 +5,55 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
+fn max_pass_preserves_default_and_requires_a_positive_count() {
+    assert_eq!(Cli::parse_from(["notlin"]).max_pass, None);
+    assert_eq!(
+        Cli::parse_from(["notlin", "--max-pass", "3"]).max_pass,
+        Some(3)
+    );
+    for value in ["0", "-1", "invalid"] {
+        assert!(Cli::try_parse_from(["notlin", "--max-pass", value]).is_err());
+    }
+}
+
+#[test]
+fn max_pass_stops_before_writes_and_allows_convergence_at_the_limit() {
+    let root = std::env::temp_dir().join(format!("notlin-max-pass-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("Sample.kt");
+    let original = "package sample\nclass Sample\n";
+    fs::write(&source, original).unwrap();
+    let run = |count: &str| {
+        Command::new(env!("CARGO_BIN_EXE_notlin"))
+            .current_dir(&root)
+            .args(["--in-place", "--max-pass", count, "."])
+            .output()
+            .unwrap()
+    };
+    let limited = run("1");
+    let stderr = String::from_utf8_lossy(&limited.stderr);
+    assert!(!limited.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("did not converge within 1 planning passes"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("pass 1"), "{stderr}");
+    assert!(!stderr.contains("pass 2"), "{stderr}");
+    assert_eq!(fs::read_to_string(&source).unwrap(), original);
+    assert!(!root.join("Sample.java").exists());
+    let converged = run("2");
+    assert!(
+        converged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&converged.stderr)
+    );
+    assert!(root.join("Sample.java").exists());
+    assert!(!source.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn dump_ast_with_workspace_root_does_not_migrate_sources() {
     let root = std::env::temp_dir().join(format!("notlin-dump-ast-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
@@ -153,7 +202,7 @@ fn default_run_reports_phases_without_listing_individual_files() {
 }
 
 #[test]
-fn verbose_run_lists_individual_source_activity() {
+fn debug_run_lists_individual_source_activity() {
     let root = std::env::temp_dir().join(format!("notlin-verbose-cli-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
@@ -167,14 +216,14 @@ fn verbose_run_lists_individual_source_activity() {
         .arg(&root)
         .arg("--out-dir")
         .arg(&output_dir)
-        .arg("-v")
+        .arg("-vv")
         .arg(&source)
         .output()
         .unwrap();
 
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("planned Sample.kt:"), "{stderr}");
+    assert!(stderr.contains("planned Sample.kt in "), "{stderr}");
     fs::remove_dir_all(root).unwrap();
 }
 

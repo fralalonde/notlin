@@ -31,7 +31,7 @@ notlin --allow-approximations --in-place .
 notlin --validation-config validation.json --in-place .
 ```
 
-Workspace migration also reports targeted source changes that may unlock more
+Use `--advice` during workspace migration to report targeted source changes that may unlock more
 translation. `U001` identifies competing inherited getter contracts on a retained
 Kotlin implementation; `U002` identifies the actual constructor overloads that
 collide after erasure, with resolved caller locations when available. Each
@@ -39,12 +39,26 @@ recommendation explains the constraint and a possible manual change. Parser
 errors, unknown types and conservative secondary-constructor checks do not
 produce source-change advice.
 
+Use `--max-pass <count>` to cap workspace planning passes. The default remains the
+automatic limit of twice the indexed Kotlin declaration count, with a minimum of
+16. If planning does not converge within the limit, migration fails without
+writing translated sources. The separate `--max-retention-passes` limit controls
+internal ownership resolution within each workspace pass.
+
 Recommendations are ranked by related retained declarations using resolved
 symbol references, with at most ten shown per run. These counts are not promises
 of successful translation: review the suggested edit, rerun Notlin, and validate
 the mixed result. Locations refer to the input snapshots before migration edits.
 The library exposes the complete structured report through
 `translation_advice::analyze`.
+
+Advice is disabled by default and does not change the translation plan. Add `-v`
+to show elapsed time since launch on log and progress lines
+(`-vv` adds file planning, diagnostic and skipping details; `-vvv` adds trace details). For example:
+
+```sh
+notlin --lombok --in-place --advice -v .
+```
 
 ## Install
 

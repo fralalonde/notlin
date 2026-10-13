@@ -13,6 +13,28 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 static PROGRESS_OUTPUT: OnceLock<Mutex<bool>> = OnceLock::new();
+static LAUNCH_STARTED: OnceLock<Instant> = OnceLock::new();
+static VERBOSE_TIMING: OnceLock<bool> = OnceLock::new();
+
+fn elapsed_log_label(elapsed: Duration) -> String {
+    format!(
+        "[+{:02}:{:02}.{:03}]",
+        elapsed.as_secs() / 60,
+        elapsed.as_secs() % 60,
+        elapsed.subsec_millis()
+    )
+}
+
+fn verbose_elapsed_prefix() -> String {
+    if VERBOSE_TIMING.get().copied().unwrap_or(false) {
+        format!(
+            "{} ",
+            elapsed_log_label(LAUNCH_STARTED.get_or_init(Instant::now).elapsed())
+        )
+    } else {
+        String::new()
+    }
+}
 
 fn finish_active_line(stderr: &mut impl Write, active: &mut bool) {
     if *active {
@@ -23,6 +45,7 @@ fn finish_active_line(stderr: &mut impl Write, active: &mut bool) {
 }
 
 fn progress_line(marker: &str, phase: &str, detail: impl std::fmt::Display) {
+    let elapsed = verbose_elapsed_prefix();
     let label = format!("{phase:<11}");
     let mut active = PROGRESS_OUTPUT
         .get_or_init(|| Mutex::new(false))
@@ -32,13 +55,14 @@ fn progress_line(marker: &str, phase: &str, detail: impl std::fmt::Display) {
     finish_active_line(&mut stderr, &mut active);
     let _ = writeln!(
         stderr,
-        "  {marker} {}{}",
+        "  {marker} {elapsed}{}{}",
         label.bold(),
         detail.to_string().bright_black()
     );
 }
 
 fn progress_active(phase: &str, detail: &str, spinner: char) {
+    let elapsed = verbose_elapsed_prefix();
     let label = format!("{phase:<11}");
     let mut active = PROGRESS_OUTPUT
         .get_or_init(|| Mutex::new(false))
@@ -48,7 +72,7 @@ fn progress_active(phase: &str, detail: &str, spinner: char) {
     finish_active_line(&mut stderr, &mut active);
     let _ = write!(
         stderr,
-        "  {} {}{} {spinner}",
+        "  {} {elapsed}{}{} {spinner}",
         "◇".cyan(),
         label.bold(),
         detail.bright_black()
@@ -213,6 +237,18 @@ mod progress_tests {
     }
 
     #[test]
+    fn verbose_timestamps_include_minutes_seconds_and_milliseconds() {
+        assert_eq!(
+            super::elapsed_log_label(Duration::from_millis(125678)),
+            "[+02:05.678]"
+        );
+        assert_eq!(
+            super::elapsed_log_label(Duration::from_millis(9)),
+            "[+00:00.009]"
+        );
+    }
+
+    #[test]
     fn spinner_cycles_through_four_frames() {
         assert_eq!(
             (0..6).map(super::spinner_frame).collect::<String>(),
@@ -312,6 +348,7 @@ fn print_run_summary(
 }
 
 fn main() -> ExitCode {
+    LAUNCH_STARTED.get_or_init(Instant::now);
     // Kotlin sources nest deeply — chained builders, large `when` subjects,
     // long string templates with interpolated expressions — and the expression
     // walker is recursive, so a real-world file can exhaust the default stack
@@ -336,15 +373,28 @@ fn main() -> ExitCode {
 
 fn run_cli() -> ExitCode {
     let cli = Cli::parse();
+    let _ = VERBOSE_TIMING.set(cli.verbose > 0);
     env_logger::Builder::new()
         .filter_level(match cli.verbose {
             0 => log::LevelFilter::Warn,
-            1 => log::LevelFilter::Debug,
+            1 => log::LevelFilter::Info,
+            2 => log::LevelFilter::Debug,
             _ => log::LevelFilter::Trace,
         })
-        .format(|buffer, record| writeln!(buffer, "  {} {}", "│".bright_black(), record.args()))
+        .format(|buffer, record| {
+            let mut active = PROGRESS_OUTPUT
+                .get_or_init(|| Mutex::new(false))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            finish_active_line(&mut std::io::stderr().lock(), &mut active);
+            let elapsed = verbose_elapsed_prefix();
+            for line in record.args().to_string().lines() {
+                writeln!(buffer, "  {} {elapsed}{line}", "│".bright_black())?;
+            }
+            Ok(())
+        })
         .init();
-    log::debug!("cli: {:?}", cli);
+    log::info!("cli: {:?}", cli);
 
     match run(&cli) {
         Ok(code) => code,
@@ -530,14 +580,30 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 item_count(plan.rounds, "pass", "passes"),
                 item_count(plan.generated_java.len(), "Java output", "Java outputs")
             ));
-            let advice = notlin::translation_advice::analyze(
-                &plan.final_plans,
-                &plan.translation_plans,
-                &index,
-                &translation_roots,
-                &notlin::diagnostics::retention_sites(),
-            );
-            eprint!("{}", notlin::translation_advice::render(&advice, 10));
+            if cli.advice {
+                let advice_started = Instant::now();
+                let advice_progress =
+                    ProgressReporter::start("advice", "checking targeted source recommendations");
+                let advice = notlin::translation_advice::analyze(
+                    &plan.final_plans,
+                    &plan.translation_plans,
+                    &index,
+                    &translation_roots,
+                    &notlin::diagnostics::retention_sites(),
+                );
+                advice_progress.finish(item_count(
+                    advice.len(),
+                    "recommendation",
+                    "recommendations",
+                ));
+                if std::env::var_os("NOTLIN_PROFILE").is_some() {
+                    eprintln!(
+                        "NOTLIN_PROFILE advice: {:.3}s",
+                        advice_started.elapsed().as_secs_f64()
+                    );
+                }
+                eprint!("{}", notlin::translation_advice::render(&advice, 10));
+            }
             if let Some(config_path) = &cli.validation_config {
                 notlin::migration_pipeline::validate_workspace_plan(
                     &plan,

@@ -1208,6 +1208,12 @@ pub struct TypeAliasDefinition {
 pub trait SemanticProvider: Send + Sync {
     fn resolve(&self, name: &str) -> FactStatus<SymbolId>;
     fn symbols(&self) -> &[SemanticSymbol];
+    fn symbols_in_file(&self, file: &Path) -> Vec<&SemanticSymbol> {
+        self.symbols()
+            .iter()
+            .filter(|symbol| symbol.id.file == file)
+            .collect()
+    }
     fn symbols_named(&self, name: &str) -> Vec<&SemanticSymbol> {
         self.symbols()
             .iter()
@@ -1246,8 +1252,11 @@ pub trait SemanticProvider: Send + Sync {
 pub struct SyntaxSemanticProvider {
     symbols: Vec<SemanticSymbol>,
     by_name: BTreeMap<String, Vec<usize>>,
+    by_file: BTreeMap<PathBuf, Vec<usize>>,
+    type_symbols_by_location: BTreeMap<(PathBuf, usize), usize>,
     aliases: BTreeMap<(String, String), TypeAliasDefinition>,
     sources: BTreeMap<PathBuf, String>,
+    imports_by_file: BTreeMap<PathBuf, Vec<String>>,
     parents: BTreeMap<SymbolId, Vec<SymbolId>>,
     companion_member_owners: BTreeMap<SymbolId, SymbolId>,
     java_static_member_locations: BTreeSet<(PathBuf, usize)>,
@@ -1265,10 +1274,12 @@ impl SyntaxSemanticProvider {
         for (file, source) in sources {
             let first = p.symbols.len();
             p.index_file(&file, &source);
-            p.sources.insert(file, source);
+            let imports = import_paths(&source);
+            p.sources.insert(file.clone(), source);
             for sym in &mut p.symbols[first..] {
                 sym.id.module = module.clone();
             }
+            p.imports_by_file.insert(file, imports);
         }
         p.index_inheritance();
         p.index_companion_members();
@@ -1324,6 +1335,15 @@ impl SyntaxSemanticProvider {
                 }
                 let idx = self.symbols.len();
                 self.by_name.entry(id.name.clone()).or_default().push(idx);
+                self.by_file
+                    .entry(file.to_path_buf())
+                    .or_default()
+                    .push(idx);
+                if is_type_symbol(&id) {
+                    self.type_symbols_by_location
+                        .entry((file.to_path_buf(), node.start_byte()))
+                        .or_insert(idx);
+                }
                 if node.kind() == "method_declaration"
                     && file
                         .extension()
@@ -1350,9 +1370,9 @@ impl SyntaxSemanticProvider {
     }
     pub fn resolve_in_file(&self, file: &Path, name: &str) -> FactStatus<SymbolId> {
         let found: Vec<_> = self
-            .symbols
-            .iter()
-            .filter(|s| s.id.file == file && s.id.name == name)
+            .symbols_named(name)
+            .into_iter()
+            .filter(|s| s.id.file == file)
             .map(|s| s.id.clone())
             .collect();
         match found.as_slice() {
@@ -1363,9 +1383,9 @@ impl SyntaxSemanticProvider {
     }
     pub fn resolve_signature(&self, name: &str, parameters: &[String]) -> FactStatus<SymbolId> {
         let found: Vec<_> = self
-            .symbols
-            .iter()
-            .filter(|s| s.id.name == name && s.id.parameters == parameters)
+            .symbols_named(name)
+            .into_iter()
+            .filter(|s| s.id.parameters == parameters)
             .map(|s| s.id.clone())
             .collect();
         match found.as_slice() {
@@ -1401,14 +1421,9 @@ impl SyntaxSemanticProvider {
                         | "enum_declaration"
                 ) {
                     let id = self
-                        .symbols
-                        .iter()
-                        .find(|symbol| {
-                            symbol.id.file == *file
-                                && symbol.location.start_byte == node.start_byte()
-                                && is_type_symbol(&symbol.id)
-                        })
-                        .map(|symbol| symbol.id.clone());
+                        .type_symbols_by_location
+                        .get(&(file.clone(), node.start_byte()))
+                        .map(|index| self.symbols[*index].id.clone());
                     if let Some(id) = id {
                         let names = declaration_supertypes(source, node, file);
                         if !names.is_empty() {
@@ -1442,9 +1457,11 @@ impl SyntaxSemanticProvider {
                 continue;
             }
             let file_symbols = self
-                .symbols
-                .iter()
-                .filter(|symbol| symbol.id.file == *file)
+                .by_file
+                .get(file)
+                .into_iter()
+                .flatten()
+                .map(|index| &self.symbols[*index])
                 .collect::<Vec<_>>();
             let Some(tree) = parse_source(file, source) else {
                 continue;
@@ -1459,13 +1476,10 @@ impl SyntaxSemanticProvider {
                             parent.kind(),
                             "class_declaration" | "interface_declaration" | "object_declaration"
                         ) {
-                            owner = file_symbols
-                                .iter()
-                                .find(|symbol| {
-                                    symbol.location.start_byte == parent.start_byte()
-                                        && is_type_symbol(&symbol.id)
-                                })
-                                .map(|symbol| symbol.id.clone());
+                            owner = self
+                                .type_symbols_by_location
+                                .get(&(file.clone(), parent.start_byte()))
+                                .map(|index| self.symbols[*index].id.clone());
                             break;
                         }
                         ancestor = parent.parent();
@@ -1514,6 +1528,14 @@ impl SemanticProvider for SyntaxSemanticProvider {
     fn symbols(&self) -> &[SemanticSymbol] {
         &self.symbols
     }
+    fn symbols_in_file(&self, file: &Path) -> Vec<&SemanticSymbol> {
+        self.by_file
+            .get(file)
+            .into_iter()
+            .flatten()
+            .map(|index| &self.symbols[*index])
+            .collect()
+    }
     fn symbols_named(&self, name: &str) -> Vec<&SemanticSymbol> {
         self.by_name
             .get(name)
@@ -1561,31 +1583,25 @@ impl SemanticProvider for SyntaxSemanticProvider {
     }
     fn resolve_type_in_file(&self, file: &Path, package: &str, name: &str) -> FactStatus<SymbolId> {
         let spelling = name.trim().trim_end_matches('?');
-        let type_symbols = self
-            .symbols
-            .iter()
-            .filter(|symbol| is_type_symbol(&symbol.id));
         let found = if spelling.contains('.') {
             let (pkg, simple) = spelling.rsplit_once('.').unwrap();
-            type_symbols
-                .filter(|symbol| symbol.id.package == pkg && symbol.id.name == simple)
+            self.symbols_named(simple)
+                .into_iter()
+                .filter(|symbol| is_type_symbol(&symbol.id) && symbol.id.package == pkg)
                 .map(|symbol| symbol.id.clone())
                 .collect::<Vec<_>>()
         } else {
-            let imports = self
-                .sources
-                .get(file)
-                .map(|source| {
-                    source
-                        .lines()
-                        .filter_map(|line| {
-                            let line = line.trim().strip_prefix("import ")?;
-                            let path = line.split(" as ").next().unwrap_or(line).trim();
-                            Some(path.to_owned())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            // A public `index_file` call does not register source text. Keep
+            // its old no-import behavior even though another cache may know
+            // about the same path.
+            let imports = if self.sources.contains_key(file) {
+                self.imports_by_file
+                    .get(file)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+            } else {
+                &[]
+            };
             let explicit = imports
                 .iter()
                 .filter_map(|path| {
@@ -1593,12 +1609,10 @@ impl SemanticProvider for SyntaxSemanticProvider {
                     (imported == spelling).then_some((pkg, imported))
                 })
                 .flat_map(|(pkg, simple)| {
-                    self.symbols
-                        .iter()
+                    self.symbols_named(simple)
+                        .into_iter()
                         .filter(move |symbol| {
-                            is_type_symbol(&symbol.id)
-                                && symbol.id.package == pkg
-                                && symbol.id.name == simple
+                            is_type_symbol(&symbol.id) && symbol.id.package == pkg
                         })
                         .map(|symbol| symbol.id.clone())
                 })
@@ -1607,13 +1621,9 @@ impl SemanticProvider for SyntaxSemanticProvider {
                 explicit
             } else {
                 let same_package = self
-                    .symbols
-                    .iter()
-                    .filter(|symbol| {
-                        is_type_symbol(&symbol.id)
-                            && symbol.id.package == package
-                            && symbol.id.name == spelling
-                    })
+                    .symbols_named(spelling)
+                    .into_iter()
+                    .filter(|symbol| is_type_symbol(&symbol.id) && symbol.id.package == package)
                     .map(|symbol| symbol.id.clone())
                     .collect::<Vec<_>>();
                 if !same_package.is_empty() {
@@ -1624,12 +1634,10 @@ impl SemanticProvider for SyntaxSemanticProvider {
                         .filter(|path| path.ends_with(".*"))
                         .flat_map(|path| {
                             let pkg = path.trim_end_matches(".*");
-                            self.symbols
-                                .iter()
+                            self.symbols_named(spelling)
+                                .into_iter()
                                 .filter(move |symbol| {
-                                    is_type_symbol(&symbol.id)
-                                        && symbol.id.package == pkg
-                                        && symbol.id.name == spelling
+                                    is_type_symbol(&symbol.id) && symbol.id.package == pkg
                                 })
                                 .map(|symbol| symbol.id.clone())
                         })
@@ -1640,16 +1648,13 @@ impl SemanticProvider for SyntaxSemanticProvider {
         fact_from_candidates(found)
     }
     fn companion_members<'a>(&'a self, owner: &SymbolId, name: &str) -> Vec<&'a SemanticSymbol> {
-        self.symbols
-            .iter()
-            .filter(|symbol| {
-                symbol.id.name == name
-                    && self.companion_member_owners.get(&symbol.id) == Some(owner)
-            })
+        self.symbols_named(name)
+            .into_iter()
+            .filter(|symbol| self.companion_member_owners.get(&symbol.id) == Some(owner))
             .collect()
     }
     fn is_java_static_member(&self, symbol: &SymbolId) -> bool {
-        self.symbols.iter().any(|indexed| {
+        self.symbols_named(&symbol.name).into_iter().any(|indexed| {
             indexed.id == *symbol
                 && self
                     .java_static_member_locations
@@ -2128,11 +2133,10 @@ fn resolve_required_call<P: SemanticProvider + ?Sized>(
                 return fact_from_candidates(members);
             }
             let owner_candidates = provider
-                .symbols()
-                .iter()
+                .symbols_in_file(file)
+                .into_iter()
                 .filter(|symbol| {
-                    symbol.id.file == file
-                        && symbol.id.name == owner_id.name
+                    symbol.id.name == owner_id.name
                         && symbol.id.owner_path == owner_id.owner_path
                         && is_type_symbol(&symbol.id)
                 })
@@ -2228,6 +2232,17 @@ fn parse_source(file: &Path, source: &str) -> Option<tree_sitter::Tree> {
     };
     parser.set_language(&language).ok()?;
     parser.parse(source, None)
+}
+
+fn import_paths(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim().strip_prefix("import ")?;
+            let path = line.split(" as ").next().unwrap_or(line).trim();
+            Some(path.to_owned())
+        })
+        .collect()
 }
 
 fn has_java_static_modifier(source: &str, node: tree_sitter::Node<'_>) -> bool {
@@ -3522,5 +3537,335 @@ pub fn analyze_request(r: AnalysisRequest) -> AnalysisResponse {
         jvm_signatures: vec![],
         diagnostics,
         capabilities: vec!["syntax-symbols".into(), "structured-kotlin-types".into()],
+    }
+}
+
+#[cfg(test)]
+mod syntax_provider_index_tests {
+    use super::*;
+
+    fn legacy_resolve_type_in_file(
+        provider: &SyntaxSemanticProvider,
+        file: &Path,
+        package: &str,
+        name: &str,
+    ) -> FactStatus<SymbolId> {
+        let spelling = name.trim().trim_end_matches('?');
+        let type_symbols = provider
+            .symbols
+            .iter()
+            .filter(|symbol| is_type_symbol(&symbol.id));
+        let candidates = if spelling.contains('.') {
+            let (pkg, simple) = spelling.rsplit_once('.').unwrap();
+            type_symbols
+                .filter(|symbol| symbol.id.package == pkg && symbol.id.name == simple)
+                .map(|symbol| symbol.id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            let imports = provider
+                .sources
+                .get(file)
+                .map(|source| import_paths(source))
+                .unwrap_or_default();
+            let explicit = imports
+                .iter()
+                .filter_map(|path| {
+                    let (pkg, imported) = path.rsplit_once('.')?;
+                    (imported == spelling).then_some((pkg, imported))
+                })
+                .flat_map(|(pkg, simple)| {
+                    provider
+                        .symbols
+                        .iter()
+                        .filter(move |symbol| {
+                            is_type_symbol(&symbol.id)
+                                && symbol.id.package == pkg
+                                && symbol.id.name == simple
+                        })
+                        .map(|symbol| symbol.id.clone())
+                })
+                .collect::<Vec<_>>();
+            if !explicit.is_empty() {
+                explicit
+            } else {
+                let same_package = provider
+                    .symbols
+                    .iter()
+                    .filter(|symbol| {
+                        is_type_symbol(&symbol.id)
+                            && symbol.id.package == package
+                            && symbol.id.name == spelling
+                    })
+                    .map(|symbol| symbol.id.clone())
+                    .collect::<Vec<_>>();
+                if !same_package.is_empty() {
+                    same_package
+                } else {
+                    imports
+                        .iter()
+                        .filter(|path| path.ends_with(".*"))
+                        .flat_map(|path| {
+                            let pkg = path.trim_end_matches(".*");
+                            provider
+                                .symbols
+                                .iter()
+                                .filter(move |symbol| {
+                                    is_type_symbol(&symbol.id)
+                                        && symbol.id.package == pkg
+                                        && symbol.id.name == spelling
+                                })
+                                .map(|symbol| symbol.id.clone())
+                        })
+                        .collect()
+                }
+            }
+        };
+        fact_from_candidates(candidates)
+    }
+
+    fn legacy_parents(provider: &SyntaxSemanticProvider) -> BTreeMap<SymbolId, Vec<SymbolId>> {
+        let mut parents = BTreeMap::<SymbolId, Vec<SymbolId>>::new();
+        for (file, source) in &provider.sources {
+            let Some(tree) = parse_source(file, source) else {
+                continue;
+            };
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                if matches!(
+                    node.kind(),
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "object_declaration"
+                        | "enum_declaration"
+                ) {
+                    let owner = provider
+                        .symbols
+                        .iter()
+                        .find(|symbol| {
+                            symbol.id.file == *file
+                                && symbol.location.start_byte == node.start_byte()
+                                && is_type_symbol(&symbol.id)
+                        })
+                        .map(|symbol| symbol.id.clone());
+                    if let Some(owner) = owner {
+                        for name in declaration_supertypes(source, node, file) {
+                            if let FactStatus::Established(parent) = legacy_resolve_type_in_file(
+                                provider,
+                                &owner.file,
+                                &owner.package,
+                                &name,
+                            ) {
+                                parents.entry(owner.clone()).or_default().push(parent);
+                            }
+                        }
+                    }
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+        }
+        for parents in parents.values_mut() {
+            parents.sort();
+            parents.dedup();
+        }
+        parents
+    }
+
+    fn legacy_companion_owners(provider: &SyntaxSemanticProvider) -> BTreeMap<SymbolId, SymbolId> {
+        let mut indexed = Vec::new();
+        for (file, source) in &provider.sources {
+            if !source.contains("companion") {
+                continue;
+            }
+            let file_symbols = provider
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.id.file == *file)
+                .collect::<Vec<_>>();
+            let Some(tree) = parse_source(file, source) else {
+                continue;
+            };
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "companion_object" {
+                    let mut ancestor = node.parent();
+                    let mut owner = None;
+                    while let Some(parent) = ancestor {
+                        if matches!(
+                            parent.kind(),
+                            "class_declaration" | "interface_declaration" | "object_declaration"
+                        ) {
+                            owner = file_symbols
+                                .iter()
+                                .find(|symbol| {
+                                    symbol.location.start_byte == parent.start_byte()
+                                        && is_type_symbol(&symbol.id)
+                                })
+                                .map(|symbol| symbol.id.clone());
+                            break;
+                        }
+                        ancestor = parent.parent();
+                    }
+                    if let Some(owner) = owner {
+                        let mut expected_path = owner.owner_path.clone();
+                        expected_path.push(owner.name.clone());
+                        for symbol in &file_symbols {
+                            let direct_path = symbol.id.owner_path == expected_path;
+                            let companion_path = symbol.id.owner_path.len()
+                                == expected_path.len() + 1
+                                && symbol.id.owner_path.starts_with(&expected_path)
+                                && symbol
+                                    .id
+                                    .owner_path
+                                    .last()
+                                    .is_some_and(|part| part == "Companion");
+                            if symbol.id.file == *file
+                                && symbol.location.start_byte >= node.start_byte()
+                                && symbol.location.end_byte <= node.end_byte()
+                                && matches!(symbol.id.kind.as_str(), "function" | "method")
+                                && (direct_path || companion_path)
+                            {
+                                indexed.push((symbol.id.clone(), owner.clone()));
+                            }
+                        }
+                    }
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+        }
+        indexed.into_iter().collect()
+    }
+
+    fn candidates(status: FactStatus<SymbolId>) -> Vec<SymbolId> {
+        match status {
+            FactStatus::Established(symbol) => vec![symbol],
+            FactStatus::Ambiguous(symbols) => symbols,
+            FactStatus::Inferred(symbol) => vec![symbol],
+            FactStatus::Unknown => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn indexed_resolvers_match_legacy_order_with_package_and_nested_collisions() {
+        let provider = SyntaxSemanticProvider::new(vec![
+            (
+                PathBuf::from("a.kt"),
+                "package a\nclass Same {}\ninterface Base {}\nclass Child : Base {}\nclass Dup {}\nclass Dup {}\nclass Outer {\n interface NestedBase {}\n class NestedChild : NestedBase {}\n companion object { fun create(): Same = TODO() }\n}\n".into(),
+            ),
+            (
+                PathBuf::from("b.kt"),
+                "package b\nclass Same {}\ninterface Base {}\nclass Child : Base {}\n".into(),
+            ),
+            (
+                PathBuf::from("explicit.kt"),
+                "package c\nimport b.Same\nclass Uses : Same {}\n".into(),
+            ),
+            (
+                PathBuf::from("wildcards.kt"),
+                "package d\nimport a.*\nimport b.*\nclass Uses : Same {}\n".into(),
+            ),
+        ]);
+        for (file, package, ty) in [
+            (Path::new("a.kt"), "a", "Same"),
+            (Path::new("a.kt"), "a", "Dup"),
+            (Path::new("b.kt"), "b", "Same"),
+            (Path::new("explicit.kt"), "c", "Same"),
+            (Path::new("wildcards.kt"), "d", "Same"),
+            (Path::new("a.kt"), "a", "a.Same"),
+            (Path::new("a.kt"), "a", "Outer"),
+            (Path::new("a.kt"), "a", "NestedBase"),
+        ] {
+            assert_eq!(
+                provider.resolve_type_in_file(file, package, ty),
+                legacy_resolve_type_in_file(&provider, file, package, ty),
+                "{file:?} / {package} / {ty}"
+            );
+        }
+        assert_eq!(provider.parents, legacy_parents(&provider));
+
+        let owner = provider
+            .symbols_named("Outer")
+            .into_iter()
+            .find(|symbol| symbol.id.file == Path::new("a.kt"))
+            .unwrap();
+        let new_members = provider.companion_members(&owner.id, "create");
+        assert_eq!(new_members.len(), 1);
+        assert_eq!(new_members[0].id.name, "create");
+        assert_eq!(
+            provider.companion_member_owners,
+            legacy_companion_owners(&provider)
+        );
+    }
+
+    #[test]
+    fn name_and_file_indexes_preserve_order_and_manual_index_file_import_scope() {
+        let provider = SyntaxSemanticProvider::new(vec![
+            (
+                PathBuf::from("first.kt"),
+                "package p\nclass Same {}\nclass Same {}\n".into(),
+            ),
+            (
+                PathBuf::from("second.kt"),
+                "package p\nclass Same {}\n".into(),
+            ),
+        ]);
+        let legacy_in_file: Vec<_> = provider
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.id.file == Path::new("first.kt") && symbol.id.name == "Same")
+            .map(|symbol| symbol.id.clone())
+            .collect();
+        let indexed_in_file = candidates(provider.resolve_in_file(Path::new("first.kt"), "Same"));
+        assert_eq!(indexed_in_file, legacy_in_file);
+        let legacy_signature: Vec<_> = provider
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.id.name == "Same" && symbol.id.parameters.is_empty())
+            .map(|symbol| symbol.id.clone())
+            .collect();
+        let indexed_signature = candidates(provider.resolve_signature("Same", &[]));
+        assert_eq!(indexed_signature, legacy_signature);
+
+        let mut manually_indexed = SyntaxSemanticProvider::default();
+        manually_indexed.index_file(Path::new("a.kt"), "package a\nclass Only {}\n");
+        manually_indexed.index_file(
+            Path::new("manual.kt"),
+            "package c\nimport a.Only\nclass Use : Only {}\n",
+        );
+        assert!(manually_indexed.sources.is_empty());
+        assert_eq!(
+            manually_indexed.resolve_type_in_file(Path::new("manual.kt"), "c", "Only"),
+            FactStatus::Unknown,
+            "manual index_file calls did not make import text visible before"
+        );
+        assert_eq!(
+            manually_indexed
+                .symbols_in_file(Path::new("manual.kt"))
+                .len(),
+            manually_indexed
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.id.file == Path::new("manual.kt"))
+                .count()
+        );
+
+        let mut duplicate_location = SyntaxSemanticProvider::default();
+        let source = "package repeated\nclass Same {}\n";
+        duplicate_location.index_file(Path::new("repeated.kt"), source);
+        let first = duplicate_location
+            .symbols
+            .iter()
+            .position(|symbol| is_type_symbol(&symbol.id))
+            .unwrap();
+        duplicate_location.index_file(Path::new("repeated.kt"), source);
+        let first_type_start = duplicate_location.symbols[first].location.start_byte;
+        assert_eq!(
+            duplicate_location
+                .type_symbols_by_location
+                .get(&(PathBuf::from("repeated.kt"), first_type_start)),
+            Some(&first),
+            "the first type symbol at a duplicated file/byte key remains the selected one"
+        );
     }
 }

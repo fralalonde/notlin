@@ -79,6 +79,7 @@ pub fn repair_virtual_calls(
     if targets.is_empty() {
         return report;
     }
+    let target_index = index_targets(&targets);
 
     let mut edits_by_file = BTreeMap::<PathBuf, Vec<PlannedSourceEdit>>::new();
     for (file, current) in residual_sources.iter() {
@@ -96,10 +97,19 @@ pub fn repair_virtual_calls(
                 && let Some(callee) = bare_callee(node)
             {
                 let spelling = callee.utf8_text(source.as_bytes()).unwrap_or("");
-                if spelling.is_empty() || local_shadow(node, spelling, source) {
-                } else if let Some(target) =
-                    resolve_target(spelling, &package, &imports, &targets, &provider)
+                if spelling.is_empty()
+                    || target_candidates(spelling, &package, &imports, &targets, &target_index)
+                        .is_empty()
+                    || local_shadow(node, spelling, source)
                 {
+                } else if let Some(target) = resolve_target(
+                    spelling,
+                    &package,
+                    &imports,
+                    &targets,
+                    &target_index,
+                    &provider,
+                ) {
                     if has_named_arguments(node, source) {
                         report.requires_replan = true;
                         report.diagnostics.push(CallsiteRepairDiagnostic{file:file.clone(),start_byte:node.start_byte(),code:"C002".into(),message:format!("call to migrated `{spelling}` uses named arguments, which cannot be preserved for a Java target; retain or replan the caller")});
@@ -131,13 +141,15 @@ pub fn repair_virtual_calls(
         // Import references are repaired only when they uniquely name the same
         // Java-owned declaration; aliases are preserved.
         for import in &imports {
-            let found: Vec<_> = targets
-                .iter()
-                .filter(|(id, _)| id.name == import.name && id.package == import.package)
+            let found: Vec<_> = target_index
+                .get(&(import.package.clone(), import.name.clone()))
+                .into_iter()
+                .flatten()
+                .filter_map(|position| targets.get(*position))
                 .collect();
             let declarations: Vec<_> = provider
-                .symbols()
-                .iter()
+                .symbols_named(&import.name)
+                .into_iter()
                 .filter(|symbol| {
                     symbol.id.kind == "function"
                         && symbol.id.receiver.is_none()
@@ -321,10 +333,10 @@ pub fn functions_requiring_kotlin_retention_with_provider(
             if node.kind() == "call_expression" {
                 if let Some(callee) = bare_callee(node) {
                     let name = callee.utf8_text(source.as_bytes()).unwrap_or("");
-                    if !name.is_empty() && !local_shadow(node, name, source) {
+                    if !name.is_empty() {
                         let candidates =
                             target_candidates(name, &package, &imports, &targets, &target_index);
-                        if !candidates.is_empty() {
+                        if !candidates.is_empty() && !local_shadow(node, name, source) {
                             let provider_count = provider
                                 .symbols_named(candidate_visible_name(name, &imports))
                                 .into_iter()
@@ -761,6 +773,7 @@ fn resolve_target<'a>(
     package: &str,
     imports: &[ImportRef],
     targets: &'a [(SymbolId, String)],
+    target_index: &BTreeMap<(String, String), Vec<usize>>,
     provider: &impl SemanticProvider,
 ) -> Option<&'a (SymbolId, String)> {
     let import = imports.iter().find(|i| i.visible_name == spelling);
@@ -769,13 +782,10 @@ fn resolve_target<'a>(
     } else {
         (spelling, package)
     };
-    let candidates: Vec<_> = targets
-        .iter()
-        .filter(|(id, _)| id.name == wanted_name && id.package == wanted_package)
-        .collect();
+    let candidates = target_candidates(spelling, package, imports, targets, target_index);
     let declarations: Vec<_> = provider
-        .symbols()
-        .iter()
+        .symbols_named(wanted_name)
+        .into_iter()
         .filter(|symbol| {
             symbol.id.kind == "function"
                 && symbol.id.receiver.is_none()

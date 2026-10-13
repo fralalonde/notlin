@@ -551,6 +551,7 @@ fn rewrite_implicit_this_reads(
         let mut bodies = Vec::new();
         collect_interface_bodies(declaration_node, source, &mut bodies);
         for (body, scope, method_name) in bodies {
+            let facts = BodyFacts::collect(body, scope, source);
             for contract in &declaration_contracts {
                 // Conflicting plans for one property do not identify a safe
                 // accessor. Identical duplicate plans are already deduplicated.
@@ -568,78 +569,134 @@ fn rewrite_implicit_this_reads(
                         .setter
                         .as_deref()
                         .is_some_and(|setter| method_name.as_deref() == Some(setter))
-                    || scope_declares(scope, source, &contract.property)
+                    || facts.declared_names.contains(&contract.property)
                 {
                     continue;
                 }
-                let mut body_stack = vec![body];
-                while let Some(node) = body_stack.pop() {
-                    if matches!(node.kind(), "class_declaration" | "object_declaration") {
-                        continue;
-                    }
-                    if node.kind() == "identifier"
-                        && kt::text(node, source) == contract.property
-                        && is_bare_expression_identifier(node)
-                    {
-                        edits.push(Edit {
-                            start: node.start_byte(),
-                            end: node.end_byte(),
-                            replacement: format!("{}()", contract.getter),
-                        });
-                        changed += 1;
-                        continue;
-                    }
-                    for child in node.named_children(&mut node.walk()) {
-                        body_stack.push(child);
-                    }
+                for node in facts
+                    .bare_identifiers
+                    .get(&contract.property)
+                    .into_iter()
+                    .flatten()
+                {
+                    edits.push(Edit {
+                        start: node.start_byte(),
+                        end: node.end_byte(),
+                        replacement: format!("{}()", contract.getter),
+                    });
+                    changed += 1;
                 }
-                changed += rewrite_short_string_templates(body, source, contract, edits);
+                changed +=
+                    rewrite_short_string_templates(&facts.string_literals, source, contract, edits);
             }
         }
     }
     changed
 }
 
+struct BodyFacts<'tree> {
+    declared_names: HashSet<String>,
+    bare_identifiers: HashMap<String, Vec<Node<'tree>>>,
+    string_literals: Vec<Node<'tree>>,
+}
+
+impl<'tree> BodyFacts<'tree> {
+    fn collect(body: Node<'tree>, scope: Node<'tree>, source: &str) -> Self {
+        let mut declared_names = HashSet::new();
+        let mut scope_stack = vec![scope];
+        while let Some(node) = scope_stack.pop() {
+            if node.id() != scope.id()
+                && matches!(node.kind(), "class_declaration" | "object_declaration")
+            {
+                continue;
+            }
+            let declared = match node.kind() {
+                "variable_declaration" | "parameter" | "class_parameter" => node
+                    .named_children(&mut node.walk())
+                    .find(|child| child.kind() == "identifier"),
+                "function_declaration" if node.id() != scope.id() => {
+                    node.child_by_field_name("name")
+                }
+                _ => None,
+            };
+            if let Some(declared) = declared {
+                declared_names.insert(kt::text(declared, source).to_string());
+            }
+            scope_stack.extend(node.named_children(&mut node.walk()));
+        }
+
+        let mut bare_identifiers = HashMap::<String, Vec<Node<'tree>>>::new();
+        let mut body_stack = vec![(body, false)];
+        while let Some((node, inside_nested_class)) = body_stack.pop() {
+            let inside_nested_class = inside_nested_class
+                || (node.id() != body.id()
+                    && matches!(node.kind(), "class_declaration" | "object_declaration"));
+            if !inside_nested_class
+                && node.kind() == "identifier"
+                && is_bare_expression_identifier(node)
+            {
+                bare_identifiers
+                    .entry(kt::text(node, source).to_string())
+                    .or_default()
+                    .push(node);
+            }
+            body_stack.extend(
+                node.named_children(&mut node.walk())
+                    .map(|child| (child, inside_nested_class)),
+            );
+        }
+        let mut string_literals = Vec::new();
+        let mut template_stack = vec![body];
+        while let Some(node) = template_stack.pop() {
+            if node.kind() == "string_literal" {
+                string_literals.push(node);
+                continue;
+            }
+            template_stack.extend(node.named_children(&mut node.walk()));
+        }
+        Self {
+            declared_names,
+            bare_identifiers,
+            string_literals,
+        }
+    }
+}
+
 fn rewrite_short_string_templates(
-    body: Node,
+    string_literals: &[Node<'_>],
     source: &str,
     contract: &PropertyAccessorContract,
     edits: &mut Vec<Edit>,
 ) -> usize {
     let mut changed = 0;
-    let mut stack = vec![body];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "string_literal" {
-            let content = &source[node.start_byte()..node.end_byte()];
-            let needle = format!("${}", contract.property);
-            let mut offset = 0;
-            while let Some(relative) = content[offset..].find(&needle) {
-                let start = offset + relative;
-                let end = start + needle.len();
-                let following_is_identifier = content[end..]
-                    .chars()
-                    .next()
-                    .is_some_and(is_kotlin_identifier_continue);
-                let is_braced = content[end..].starts_with('{');
-                let escaping_slashes = content[..start]
-                    .chars()
-                    .rev()
-                    .take_while(|ch| *ch == '\\')
-                    .count();
-                if !following_is_identifier && !is_braced && escaping_slashes % 2 == 0 {
-                    let absolute_start = node.start_byte() + start;
-                    edits.push(Edit {
-                        start: absolute_start,
-                        end: absolute_start + needle.len(),
-                        replacement: format!("${{{}()}}", contract.getter),
-                    });
-                    changed += 1;
-                }
-                offset = end;
+    for node in string_literals {
+        let content = &source[node.start_byte()..node.end_byte()];
+        let needle = format!("${}", contract.property);
+        let mut offset = 0;
+        while let Some(relative) = content[offset..].find(&needle) {
+            let start = offset + relative;
+            let end = start + needle.len();
+            let following_is_identifier = content[end..]
+                .chars()
+                .next()
+                .is_some_and(is_kotlin_identifier_continue);
+            let is_braced = content[end..].starts_with('{');
+            let escaping_slashes = content[..start]
+                .chars()
+                .rev()
+                .take_while(|ch| *ch == '\\')
+                .count();
+            if !following_is_identifier && !is_braced && escaping_slashes % 2 == 0 {
+                let absolute_start = node.start_byte() + start;
+                edits.push(Edit {
+                    start: absolute_start,
+                    end: absolute_start + needle.len(),
+                    replacement: format!("${{{}()}}", contract.getter),
+                });
+                changed += 1;
             }
-            continue;
+            offset = end;
         }
-        stack.extend(node.named_children(&mut node.walk()));
     }
     changed
 }
@@ -677,29 +734,6 @@ fn collect_interface_bodies<'tree>(
         }
         stack.extend(node.named_children(&mut node.walk()));
     }
-}
-
-fn scope_declares(scope: Node, source: &str, name: &str) -> bool {
-    let mut stack = vec![scope];
-    while let Some(node) = stack.pop() {
-        if node.id() != scope.id()
-            && matches!(node.kind(), "class_declaration" | "object_declaration")
-        {
-            continue;
-        }
-        let declared = match node.kind() {
-            "variable_declaration" | "parameter" | "class_parameter" => node
-                .named_children(&mut node.walk())
-                .find(|child| child.kind() == "identifier"),
-            "function_declaration" if node.id() != scope.id() => node.child_by_field_name("name"),
-            _ => None,
-        };
-        if declared.is_some_and(|declared| kt::text(declared, source) == name) {
-            return true;
-        }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
-    false
 }
 
 fn is_bare_expression_identifier(node: Node) -> bool {
@@ -1564,15 +1598,14 @@ fn inherits_exactly(
     owner: &Declaration,
 ) -> bool {
     let mut pending = vec![receiver];
-    let mut visited = Vec::new();
+    let mut visited = HashSet::new();
     while let Some(current) = pending.pop() {
         if std::ptr::eq(current, owner) {
             return true;
         }
-        if visited.iter().any(|seen| std::ptr::eq(*seen, current)) {
+        if !visited.insert(current as *const Declaration as usize) {
             continue;
         }
-        visited.push(current);
         let context = index.declaration_source_file(current).unwrap_or(use_file);
         pending.extend(
             current
@@ -2000,6 +2033,84 @@ mod tests {
         assert!(
             updated.contains("val payload = \"local\"; return payload"),
             "{updated}"
+        );
+    }
+
+    #[test]
+    fn implicit_this_body_cache_preserves_shadows_nested_classes_and_getters() {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "Api.kt",
+            r#"package sample
+interface Api {
+    val payload: String
+    val enabled: Boolean
+
+    fun reads(): String {
+        class Local {
+            fun read(): String = payload
+            fun render(): String = "$payload"
+        }
+        return "$payload:${payload.length}"
+    }
+
+    fun shadowed(): String {
+        fun local(payload: String): String = payload
+        return payload
+    }
+
+    val mirror: String
+        get() = payload
+
+    fun both(): String = "$payload:$enabled"
+
+    fun braced(): String = "${payload.length}"
+}
+"#,
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let contracts = [
+            PropertyAccessorContract {
+                owner_type: "sample.Api".into(),
+                property: "payload".into(),
+                getter: "getPayload".into(),
+                setter: None,
+            },
+            PropertyAccessorContract {
+                owner_type: "sample.Api".into(),
+                property: "enabled".into(),
+                getter: "isEnabled".into(),
+                setter: None,
+            },
+        ];
+        let (updated, count) = rewrite_file(&index, &path, &source, &contracts);
+        assert_eq!(count, 7, "{updated}");
+        assert!(
+            updated.contains("fun read(): String = payload"),
+            "nested class bare reads remain unchanged:\n{updated}"
+        );
+        assert!(
+            updated.contains("fun render(): String = \"${getPayload()}\""),
+            "nested class string templates retain their prior rewrite behavior:\n{updated}"
+        );
+        assert!(
+            updated.contains("return \"${getPayload()}:${getPayload().length}\""),
+            "{updated}"
+        );
+        assert!(
+            updated
+                .contains("fun local(payload: String): String = payload\n        return payload"),
+            "the nested function parameter conservatively shadows the outer read:\n{updated}"
+        );
+        assert!(updated.contains("get() = getPayload()"), "{updated}");
+        assert!(
+            updated.contains("fun both(): String = \"${getPayload()}:${isEnabled()}\""),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun braced(): String = \"${getPayload().length}\""),
+            "bare identifiers inside braced templates retain their accessor rewrite:\n{updated}"
         );
     }
 

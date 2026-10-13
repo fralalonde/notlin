@@ -985,7 +985,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return false;
         };
         let id = crate::semantics::workspace_symbol(workspace, supertype);
-        let Some(symbol) = provider.symbols().iter().find(|symbol| symbol.id == id) else {
+        let Some(symbol) = provider
+            .symbols_named(&id.name)
+            .into_iter()
+            .find(|symbol| symbol.id == id)
+        else {
             return false;
         };
         let Some(snapshot) = workspace.source_file(&symbol.location.file) else {

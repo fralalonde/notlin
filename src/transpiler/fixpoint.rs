@@ -100,11 +100,8 @@ impl SilentPlanner<'_> {
     ) -> CachedFilePlan {
         let (file, source) = &self.files[index];
         let probe = super::retention_queries::Probe::start();
-        let profile = self.cli.verbose > 0 && std::env::var_os("NOTLIN_PROFILE").is_some();
         let started = std::time::Instant::now();
-        if profile {
-            eprintln!("profile: planning {}", file.display());
-        }
+        log::debug!("planning {}", crate::paths::display(file));
         let PlannedTranslation {
             java_files,
             errors,
@@ -129,15 +126,13 @@ impl SilentPlanner<'_> {
             },
             true,
         );
-        if profile {
-            eprintln!(
-                "profile: planned {} in {:.3}s ({} Java files, {} retained declarations)",
-                file.display(),
-                started.elapsed().as_secs_f64(),
-                java_files.len(),
-                coverage.untranslated.len(),
-            );
-        }
+        log::debug!(
+            "planned {} in {:.3}s ({} Java files, {} retained declarations)",
+            crate::paths::display(file),
+            started.elapsed().as_secs_f64(),
+            java_files.len(),
+            coverage.untranslated.len(),
+        );
         let plan = FilePlan {
             emission_failed,
             file: file.clone(),
@@ -283,6 +278,7 @@ fn plan_workspace_cold_mode(
     mut forced_retained: BTreeMap<crate::semantics::SymbolId, usize>,
     incremental: bool,
 ) -> Result<(WorkspacePlan, usize), String> {
+    let setup_started = std::time::Instant::now();
     let trees: Vec<_> = files.iter().map(|(_, source)| parse_tree(source)).collect();
     let workspace_files: Vec<_> = files
         .iter()
@@ -295,6 +291,14 @@ fn plan_workspace_cold_mode(
             .map(|file| (file.path.clone(), file.source_text().to_owned())),
     );
     use crate::semantics::SemanticProvider;
+    if std::env::var_os("NOTLIN_PROFILE").is_some() {
+        eprintln!(
+            "NOTLIN_PROFILE semantic provider setup: {:.3}s, {} symbols",
+            setup_started.elapsed().as_secs_f64(),
+            semantic_provider.symbols().len()
+        );
+    }
+    let callsite_started = std::time::Instant::now();
     let snapshots = index
         .files
         .iter()
@@ -310,6 +314,12 @@ fn plan_workspace_cold_mode(
                 .collect::<Vec<_>>(),
             &semantic_provider,
         );
+    if std::env::var_os("NOTLIN_PROFILE").is_some() {
+        eprintln!(
+            "NOTLIN_PROFILE call-site eligibility: {:.3}s",
+            callsite_started.elapsed().as_secs_f64()
+        );
+    }
     let planner = SilentPlanner {
         semantic_provider: &semantic_provider,
         function_callsite_retention: &function_callsite_retention,

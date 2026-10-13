@@ -67,7 +67,17 @@ pub struct Cli {
     #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
     pub max_retention_passes: usize,
 
-    /// Show individual file activity (-v) and trace-level details (-vv)
+    /// Maximum workspace planning passes; defaults to the existing automatic limit.
+    /// Fails without applying migration if the plan has not converged.
+    #[arg(long, value_name = "COUNT", value_parser = parse_positive_usize)]
+    pub max_pass: Option<usize>,
+
+    /// Show targeted source-change suggestions that may unlock translation.
+    /// Suggestions are advisory and require manual review and replanning.
+    #[arg(long)]
+    pub advice: bool,
+
+    /// Show timestamped progress (-v), file and diagnostic details (-vv), or traces (-vvv)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 }

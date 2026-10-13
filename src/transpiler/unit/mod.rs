@@ -238,8 +238,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             self.source.to_string(),
         )]);
         provider
-            .symbols()
-            .iter()
+            .symbols_named(member)
+            .into_iter()
             .filter(|s| {
                 s.id.name == member
                     && s.id.kind == "function"
@@ -1127,7 +1127,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         );
                         files.push((path, out.finish()));
                     } else {
-                        log::info!(
+                        log::debug!(
                             "skipping {}.java — declaration has untranslatables",
                             type_name
                         );
@@ -1244,7 +1244,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 );
                 files.push((path, out.finish()));
             } else {
-                log::info!("all top-level members untranslatable; skipping utility class");
+                log::debug!("all top-level members untranslatable; skipping utility class");
             }
         }
 

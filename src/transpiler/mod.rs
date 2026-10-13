@@ -289,6 +289,7 @@ fn lower_with_plan(
     scope: WorkspaceScope<'_>,
     silent: bool,
 ) -> PlannedTranslation {
+    let facts_started = profile_enabled().then(Instant::now);
     let identity_path = scope
         .indexed_path
         .or_else(|| {
@@ -365,6 +366,15 @@ fn lower_with_plan(
         retained_hint.unwrap_or(&std::collections::HashSet::new()),
         &mut plan,
     );
+    if let Some(started) = facts_started
+        && started.elapsed().as_millis() >= 250
+    {
+        eprintln!(
+            "NOTLIN_PROFILE semantic facts {}: {:.3}s",
+            crate::paths::display(identity_path),
+            started.elapsed().as_secs_f64()
+        );
+    }
     let local_callsite_retention = scope.function_callsite_retention.is_none().then(|| {
         let mut snapshots =
             std::collections::BTreeMap::from([(identity_path.to_path_buf(), source.to_owned())]);
@@ -390,6 +400,7 @@ fn lower_with_plan(
         .function_callsite_retention
         .or(local_callsite_retention.as_ref())
         .expect("callsite facts are available");
+    let getter_started = profile_enabled().then(Instant::now);
     let default_provider_retention = scope.index.and_then(|index| {
         let source_file = index.source_file(identity_path)?;
         let empty_retained = std::collections::HashSet::new();
@@ -410,6 +421,15 @@ fn lower_with_plan(
         }
         Some(reasons)
     });
+    if let Some(started) = getter_started
+        && started.elapsed().as_millis() >= 250
+    {
+        eprintln!(
+            "NOTLIN_PROFILE getter contracts {}: {:.3}s",
+            crate::paths::display(identity_path),
+            started.elapsed().as_secs_f64()
+        );
+    }
     for declaration in &mut plan.declarations {
         if let Some(reasons) = callsite_retention.get(&declaration.symbol_id) {
             declaration.candidate_owner = crate::translation_plan::BackendOwner::Kotlin;
@@ -513,6 +533,13 @@ fn lower_with_plan(
     };
     if profile {
         record_profile(&PROFILE_UNIT_NS, started.elapsed());
+        if started.elapsed().as_millis() >= 250 {
+            eprintln!(
+                "NOTLIN_PROFILE lowering {}: {:.3}s",
+                crate::paths::display(identity_path),
+                started.elapsed().as_secs_f64()
+            );
+        }
     }
 
     let started = Instant::now();
@@ -542,6 +569,7 @@ fn lower_with_plan(
     plan.reconcile(source, &coverage)
         .expect("lowering uses the analyzed source snapshot");
     plan.type_facts.extend(type_facts);
+    let acceptance_started = profile_enabled().then(Instant::now);
     let (accepted, emission_failed) = match crate::planning::AcceptedTranslationPlan::accept(
         plan.clone(),
         candidate_java_files,
@@ -580,6 +608,15 @@ fn lower_with_plan(
     }
     let java_files = accepted.emit();
     let plan = accepted.translation().clone();
+    if let Some(started) = acceptance_started
+        && started.elapsed().as_millis() >= 250
+    {
+        eprintln!(
+            "NOTLIN_PROFILE structured acceptance {}: {:.3}s",
+            crate::paths::display(identity_path),
+            started.elapsed().as_secs_f64()
+        );
+    }
     let (errors, warnings) = (diags.error_count(), diags.warning_count());
     if !silent {
         diags.print();

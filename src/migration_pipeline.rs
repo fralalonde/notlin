@@ -67,7 +67,9 @@ where
         .kotlin_files()
         .map(|f| f.declarations.len())
         .sum::<usize>();
-    let limit = declaration_count.saturating_mul(2).max(16);
+    let limit = cli
+        .max_pass
+        .unwrap_or_else(|| declaration_count.saturating_mul(2).max(16));
     let mut converged_plans = None;
     let mut converged_round = 0usize;
     let mut retained_seed: Option<HashSet<crate::semantics::SymbolId>> = None;
@@ -430,7 +432,7 @@ where
     }
     let Some(mut final_plans) = converged_plans else {
         return Err(format!(
-            "workspace migration did not converge within {limit} speculative rounds"
+            "workspace migration did not converge within {limit} planning passes; increase --max-pass to allow more passes (no migration applied)"
         ));
     };
     transpiler::fixpoint::qualify_retention_markers(&mut final_plans);

@@ -34,7 +34,14 @@ pub fn display(path: impl AsRef<Path>) -> String {
     let stripped = text.strip_prefix(r"\\?\").unwrap_or(&text);
     let path = Path::new(stripped);
     let relative = root()
-        .and_then(|root| path.strip_prefix(root).ok())
+        .and_then(|root| {
+            // Canonical roots on Windows carry the same verbatim prefix as
+            // indexed files. Normalize both sides before comparing; otherwise
+            // every display call falls through to a filesystem cwd query.
+            let root_text = root.to_string_lossy();
+            let normalized_root = Path::new(root_text.strip_prefix(r"\\?\").unwrap_or(&root_text));
+            path.strip_prefix(normalized_root).ok()
+        })
         .or_else(|| {
             std::env::current_dir()
                 .ok()

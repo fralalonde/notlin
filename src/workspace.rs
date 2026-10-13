@@ -386,6 +386,10 @@ pub struct SourceIndex {
     /// buffers owned by `files`, so these addresses remain stable for the
     /// lifetime of an index.
     declaration_files: HashMap<usize, usize>,
+    /// Exact reverse subtype edges keyed by the indexed target declaration's
+    /// address. Descendants are ordered by simple name, then file and
+    /// declaration order to match `direct_subtypes`' former name-based walk.
+    direct_subtype_declarations: HashMap<usize, Vec<(usize, usize)>>,
     /// Constructor calls by callee simple name: `name -> [(file, call)]`.
     /// Derived from the files' recorded calls whenever the index is built (never
     /// cached): a declaration's omission evidence is then one lookup instead of a
@@ -584,6 +588,7 @@ impl SourceIndex {
             qualified_declarations: HashMap::new(),
             member_names: HashMap::new(),
             declaration_files: HashMap::new(),
+            direct_subtype_declarations: HashMap::new(),
             ctor_uses: HashMap::new(),
             file_paths: HashMap::new(),
         };
@@ -625,11 +630,21 @@ impl SourceIndex {
         let mut subtype_edges = Vec::new();
         let mut subtype_name_edges = Vec::new();
         let mut all_subtype_name_edges = Vec::new();
+        let mut direct_subtype_edges = Vec::new();
         let mut unresolved_supertype_names = Vec::new();
-        for file in &index.files {
-            for declaration in &file.declarations {
+        for (file_index, file) in index.files.iter().enumerate() {
+            for (declaration_index, declaration) in file.declarations.iter().enumerate() {
+                let mut resolved_supers = HashSet::new();
                 for supertype in &declaration.supertypes {
                     if let Some(target) = index.resolve_type(file, supertype) {
+                        let target_address = target as *const Declaration as usize;
+                        if resolved_supers.insert(target_address) {
+                            direct_subtype_edges.push((
+                                target_address,
+                                file_index,
+                                declaration_index,
+                            ));
+                        }
                         if file.language == SourceLanguage::Kotlin {
                             subtype_edges.push((declaration_key(target), file.path.clone()));
                             subtype_name_edges
@@ -649,6 +664,22 @@ impl SourceIndex {
                     }
                 }
             }
+        }
+        for (target, file_index, declaration_index) in direct_subtype_edges {
+            index
+                .direct_subtype_declarations
+                .entry(target)
+                .or_default()
+                .push((file_index, declaration_index));
+        }
+        for descendants in index.direct_subtype_declarations.values_mut() {
+            descendants.sort_by(|(left_file, left_decl), (right_file, right_decl)| {
+                index.files[*left_file].declarations[*left_decl]
+                    .name
+                    .cmp(&index.files[*right_file].declarations[*right_decl].name)
+                    .then(left_file.cmp(right_file))
+                    .then(left_decl.cmp(right_decl))
+            });
         }
         for (target, path) in subtype_edges {
             index.kotlin_subtypes.entry(target).or_default().push(path);
@@ -2360,6 +2391,28 @@ impl SourceIndex {
     }
 
     pub fn direct_subtypes<'a>(&'a self, target: &Declaration) -> Vec<&'a Declaration> {
+        let target_address = target as *const Declaration as usize;
+        if self.declaration_files.contains_key(&target_address) {
+            return self
+                .direct_subtype_declarations
+                .get(&target_address)
+                .into_iter()
+                .flatten()
+                .filter_map(|(file_index, declaration_index)| {
+                    self.files
+                        .get(*file_index)?
+                        .declarations
+                        .get(*declaration_index)
+                })
+                .collect();
+        }
+        self.direct_subtypes_fallback(target)
+    }
+
+    /// Preserve behavior for borrowed declarations that are not owned by this
+    /// index (for example a caller-provided clone). Indexed declarations take
+    /// the exact cached path above.
+    fn direct_subtypes_fallback<'a>(&'a self, target: &Declaration) -> Vec<&'a Declaration> {
         let target_path = self.declaration_source_file(target).map(|file| &file.path);
         self.direct_subtype_names(target)
             .into_iter()
@@ -5654,5 +5707,130 @@ interface SiblingContext {
             assert_eq!(reason.is_some(), expected, "{reason:?}");
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    fn reference_direct_subtypes<'a>(
+        index: &'a SourceIndex,
+        target: &Declaration,
+    ) -> Vec<&'a Declaration> {
+        let target_path = index.declaration_source_file(target).map(|file| &file.path);
+        index
+            .direct_subtype_names(target)
+            .into_iter()
+            .filter_map(|name| index.declaration_names.get(&name))
+            .flatten()
+            .filter_map(|(file_index, declaration_index)| {
+                let file = index.files.get(*file_index)?;
+                let declaration = file.declarations.get(*declaration_index)?;
+                declaration
+                    .supertypes
+                    .iter()
+                    .any(|supertype| {
+                        index.resolve_type(file, supertype).is_some_and(|resolved| {
+                            resolved.name == target.name
+                                && index.declaration_source_file(resolved).is_some_and(
+                                    |resolved_file| target_path == Some(&resolved_file.path),
+                                )
+                        })
+                    })
+                    .then_some(declaration)
+            })
+            .collect()
+    }
+
+    fn subtype_identities(
+        index: &SourceIndex,
+        declarations: Vec<&Declaration>,
+    ) -> Vec<(String, Option<String>, String)> {
+        declarations
+            .into_iter()
+            .map(|declaration| {
+                let file = index.declaration_source_file(declaration).unwrap();
+                (
+                    file.path.to_string_lossy().into_owned(),
+                    declaration.package.clone(),
+                    declaration.name.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn direct_subtype_cache_matches_legacy_order_collisions_dedup_and_overlays() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "notlin-direct-subtype-cache-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("00-q.kt"),
+            "package q\ninterface Hub {}\nclass Alpha : p.Hub {}\nclass Beta : Hub {}\n",
+        )
+        .unwrap();
+        let p_path = root.join("10-p.kt");
+        fs::write(
+            &p_path,
+            "package p\ninterface Hub {}\ninterface Other {}\nclass Alpha : Hub, Hub {}\nclass Zulu : Hub {}\nclass Moved : Other {}\n",
+        )
+        .unwrap();
+
+        let index = SourceIndex::discover(&root).unwrap();
+        let compare = |index: &SourceIndex| {
+            for target in index.declarations().filter(|item| item.name == "Hub") {
+                let cached = index.direct_subtypes(target);
+                let reference = reference_direct_subtypes(index, target);
+                assert_eq!(
+                    subtype_identities(index, cached),
+                    subtype_identities(index, reference),
+                    "target {:?}",
+                    crate::semantics::workspace_symbol(index, target)
+                );
+            }
+        };
+        compare(&index);
+
+        let p_hub = index
+            .declarations()
+            .find(|item| item.name == "Hub" && item.package.as_deref() == Some("p"))
+            .unwrap();
+        let cached = index.direct_subtypes(p_hub);
+        assert_eq!(
+            cached
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Alpha", "Zulu"],
+            "same-name descendants retain file order and repeated supertypes deduplicate"
+        );
+        let cloned_target = p_hub.clone();
+        assert_eq!(
+            subtype_identities(&index, index.direct_subtypes(&cloned_target)),
+            subtype_identities(&index, reference_direct_subtypes(&index, &cloned_target)),
+            "non-index declarations preserve the prior fallback behavior"
+        );
+
+        let rebuilt = index
+            .with_overlays(&[SourceOverlay::Replace {
+                path: p_path,
+                language: SourceLanguage::Kotlin,
+                source: "package p\ninterface Hub {}\ninterface Other {}\nclass Alpha : Hub, Hub {}\nclass Zulu : Other {}\nclass Moved : Hub {}\n".into(),
+            }])
+            .unwrap();
+        compare(&rebuilt);
+        let rebuilt_hub = rebuilt
+            .declarations()
+            .find(|item| item.name == "Hub" && item.package.as_deref() == Some("p"))
+            .unwrap();
+        assert_eq!(
+            rebuilt
+                .direct_subtypes(rebuilt_hub)
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Alpha", "Moved"]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

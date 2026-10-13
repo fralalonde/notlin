@@ -73,6 +73,70 @@ fn plans_for(index: &SourceIndex) -> (Vec<FilePlan>, HashMap<PathBuf, Translatio
     (files, plans)
 }
 
+/// Read-only analysis benchmark. Use an isolated committed-source snapshot,
+/// never an application workspace being migrated concurrently.
+#[test]
+#[ignore = "set NOTLIN_ADVICE_BENCH_ROOT to an isolated source snapshot"]
+fn workspace_advice_performance() {
+    let root = PathBuf::from(std::env::var_os("NOTLIN_ADVICE_BENCH_ROOT").expect("benchmark root"));
+    let started = std::time::Instant::now();
+    let index = SourceIndex::discover(&root).unwrap();
+    eprintln!("BENCH index {:.3}s", started.elapsed().as_secs_f64());
+    let (files, plans) = plans_for(&index);
+    let sites: Vec<_> = files
+        .iter()
+        .flat_map(|file| {
+            file.translation
+                .declarations
+                .iter()
+                .map(|decision| RetentionSite {
+                    kind: RetentionKind::RetainedSupertype,
+                    params: vec![],
+                    file: notlin::paths::display(&file.file),
+                    line: file.source[..decision.id.start_byte]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1,
+                    declaration: decision.symbol_id.name.clone(),
+                    name: decision.symbol_id.name.clone(),
+                    blockers: vec![],
+                    blocker_labels: vec![],
+                })
+        })
+        .collect();
+    let lookup_started = std::time::Instant::now();
+    let mut comparisons = 0usize;
+    for file in &files {
+        for decision in &file.translation.declarations {
+            let line = file.source[..decision.id.start_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let found = sites.iter().find(|site| {
+                comparisons += 1;
+                site.file == notlin::paths::display(&file.file)
+                    && site.line == line
+                    && site.kind == RetentionKind::MiddleDefaultParameter
+                    && site.blockers.is_empty()
+            });
+            assert!(found.is_none());
+        }
+    }
+    eprintln!(
+        "BENCH legacy site lookup {:.3}s, {comparisons} path comparisons",
+        lookup_started.elapsed().as_secs_f64()
+    );
+    let advice_started = std::time::Instant::now();
+    let advice = analyze(&files, &plans, &index, std::slice::from_ref(&root), &sites);
+    eprintln!(
+        "BENCH complete advice {:.3}s, {} recommendations",
+        advice_started.elapsed().as_secs_f64(),
+        advice.len()
+    );
+}
+
 fn site(kind: RetentionKind, file: &Path, line: usize, params: Vec<String>) -> RetentionSite {
     RetentionSite {
         kind,
@@ -330,6 +394,7 @@ fn cli_u002_reports_real_erased_signatures_and_exact_omitting_callers() {
             fixture.root.to_str().unwrap(),
             "--in-place",
             "--lombok",
+            "--advice",
         ])
         .arg(&fixture.root)
         .output()
@@ -356,6 +421,115 @@ fn cli_u002_reports_real_erased_signatures_and_exact_omitting_callers() {
     assert!(
         report.contains("left") && report.contains("right"),
         "the report should identify which parameter each caller omits:\n{report}"
+    );
+}
+
+#[test]
+fn advice_is_opt_in_and_does_not_change_migration_output() {
+    fn run(fixture: &Fixture, with_advice: bool) -> (String, Vec<(String, String)>) {
+        fixture.write(
+            "types.kt",
+            "package sample\nclass A {}\nclass B {}\nclass Payload(val first: String, val left: List<A> = emptyList(), val right: List<B> = emptyList(), val last: Boolean) {}\n",
+        );
+        fixture.write(
+            "callers.kt",
+            "package sample\ninline fun <reified T> omitLeft(): Payload = Payload(first = \"a\", right = emptyList(), last = true)\ninline fun <reified T> omitRight(): Payload = Payload(first = \"b\", left = emptyList(), last = false)\n",
+        );
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"));
+        command.args([
+            "--root",
+            fixture.root.to_str().unwrap(),
+            "--in-place",
+            "--lombok",
+        ]);
+        if with_advice {
+            command.arg("--advice");
+        }
+        let output = command.arg(&fixture.root).output().expect("run notlin");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "notlin failed:\n{stderr}");
+        let mut migrated = Vec::new();
+        for entry in fs::read_dir(&fixture.root).unwrap() {
+            let path = entry.unwrap().path();
+            if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("kt" | "java")
+            ) {
+                migrated.push((
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    fs::read_to_string(path).unwrap(),
+                ));
+            }
+        }
+        migrated.sort_by(|left, right| left.0.cmp(&right.0));
+        (stderr, migrated)
+    }
+
+    let default_fixture = Fixture::new();
+    let advice_fixture = Fixture::new();
+    let (default_stderr, default_migration) = run(&default_fixture, false);
+    let (advice_stderr, advice_migration) = run(&advice_fixture, true);
+    let heading = "notlin: targeted source changes that may unlock translation";
+    let phase = "checking targeted source recommendations";
+    assert!(!default_stderr.contains(heading), "{default_stderr}");
+    assert!(!default_stderr.contains(phase), "{default_stderr}");
+    assert!(advice_stderr.contains(heading), "{advice_stderr}");
+    assert!(advice_stderr.contains(phase), "{advice_stderr}");
+    assert_eq!(default_migration, advice_migration);
+}
+
+#[test]
+fn verbose_cli_timestamps_logger_and_progress_output() {
+    fn run(verbose: bool) -> String {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Sample.kt",
+            "package sample\nclass Sample(val value: String)\n",
+        );
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"));
+        command.args(["--root", fixture.root.to_str().unwrap()]);
+        if verbose {
+            command.arg("-v");
+        }
+        let output = command.arg(&fixture.root).output().expect("run notlin");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "notlin failed:\n{stderr}");
+        stderr
+    }
+
+    fn timestamped_line(stderr: &str, needle: &str) -> bool {
+        stderr.lines().any(|line| {
+            if !line.contains(needle) {
+                return false;
+            }
+            let Some(start) = line.find("[+") else {
+                return false;
+            };
+            let line = &line[start..];
+            let bytes = line.as_bytes();
+            bytes.len() >= 13
+                && bytes[2..4].iter().all(u8::is_ascii_digit)
+                && bytes[4] == b':'
+                && bytes[5..7].iter().all(u8::is_ascii_digit)
+                && bytes[7] == b'.'
+                && bytes[8..11].iter().all(u8::is_ascii_digit)
+                && bytes[11] == b']'
+        })
+    }
+
+    let verbose = run(true);
+    assert!(
+        timestamped_line(&verbose, "cli:"),
+        "missing logger timestamp:\n{verbose}"
+    );
+    assert!(
+        timestamped_line(&verbose, "scanning workspace"),
+        "missing progress timestamp:\n{verbose}"
+    );
+    let quiet = run(false);
+    assert!(
+        !quiet.contains("[+"),
+        "quiet output unexpectedly has timestamps:\n{quiet}"
     );
 }
 

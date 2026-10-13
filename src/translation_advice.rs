@@ -51,6 +51,9 @@ pub fn analyze(
         .collect();
     for file in index.kotlin_files() {
         for declaration in &file.declarations {
+            if declaration.kind != crate::workspace::DeclarationKind::Interface {
+                continue;
+            }
             let provider = crate::semantics::workspace_symbol(index, declaration);
             if !retained.contains(&provider) {
                 continue;
@@ -138,7 +141,34 @@ pub fn analyze(
     // matched to an exact final declaration location, not its simple name.
     const COLLISION: &str =
         "the delegating overloads its callers need collide after type erasure: ";
+    let constructor_sites: HashMap<&str, HashMap<usize, &RetentionSite>> = sites
+        .iter()
+        .filter(|site| {
+            site.kind == RetentionKind::MiddleDefaultParameter && site.blockers.is_empty()
+        })
+        .fold(HashMap::new(), |mut by_location, site| {
+            by_location
+                .entry(site.file.as_str())
+                .or_default()
+                .entry(site.line)
+                .or_insert(site);
+            by_location
+        });
     for file in files {
+        let displayed_file = crate::paths::display(&file.file);
+        // A file with no constructor root cannot produce U002. In particular,
+        // do not scan its declarations or recount source prefixes for fallout.
+        let Some(file_sites) = constructor_sites.get(displayed_file.as_str()) else {
+            continue;
+        };
+        let line_starts: Vec<_> = std::iter::once(0)
+            .chain(
+                file.source
+                    .bytes()
+                    .enumerate()
+                    .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+            )
+            .collect();
         for decision in &file.translation.declarations {
             if decision.final_owner != Some(BackendOwner::Kotlin) {
                 continue;
@@ -146,16 +176,11 @@ pub fn analyze(
             if uncertain(&decision.retention_reasons) {
                 continue;
             }
-            let Some(prefix) = file.source.get(..decision.id.start_byte) else {
+            if file.source.get(..decision.id.start_byte).is_none() {
                 continue;
-            };
-            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-            let Some(site) = sites.iter().find(|site| {
-                site.file == crate::paths::display(&file.file)
-                    && site.line == line
-                    && site.kind == RetentionKind::MiddleDefaultParameter
-                    && site.blockers.is_empty()
-            }) else {
+            }
+            let line = line_starts.partition_point(|start| *start <= decision.id.start_byte);
+            let Some(site) = file_sites.get(&line) else {
                 continue;
             };
             let Some(evidence) = site
