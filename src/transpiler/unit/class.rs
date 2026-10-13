@@ -660,32 +660,26 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if argument_text.contains("::class") {
             let mut lowered =
                 lower_annotation_arrays(&lower_annotation_raw_strings(&argument_text));
-            for part in argument_text.split(['(', ',', ')']) {
-                let trimmed = part.trim();
-                if let Some(token) = trimmed.strip_suffix("::class") {
-                    let class_name = token
-                        .rsplit('=')
-                        .next()
-                        .unwrap_or(token)
-                        .split_whitespace()
-                        .next_back()
-                        .unwrap_or(token)
-                        .trim();
-                    let simple = class_name.rsplit('.').next().unwrap_or(class_name);
-                    let java_visible = self.workspace.is_some_and(|ws| {
-                        ws.declarations_named(simple).any(|d| {
-                            d.name == simple
-                                && d.kind != crate::workspace::DeclarationKind::Annotation
-                        })
-                    });
-                    if !java_visible {
-                        return None;
-                    }
-                    lowered = lowered.replace(
-                        &format!("{class_name}::class"),
-                        &format!("{class_name}.class"),
-                    );
+            let class_literals = annotation_class_literal_names(node, self.source);
+            if class_literals.is_empty()
+                || class_literals.len() != argument_text.matches("::class").count()
+            {
+                return None;
+            }
+            for class_name in class_literals {
+                let simple = class_name.rsplit('.').next().unwrap_or(&class_name);
+                let java_visible = self.workspace.is_some_and(|ws| {
+                    ws.declarations_named(simple).any(|d| {
+                        d.name == simple && d.kind != crate::workspace::DeclarationKind::Annotation
+                    })
+                });
+                if !java_visible {
+                    return None;
                 }
+                lowered = lowered.replace(
+                    &format!("{class_name}::class"),
+                    &format!("{class_name}.class"),
+                );
             }
             if lowered.contains("::class") {
                 return None;
@@ -2835,11 +2829,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             let mut cursor = current.walk();
             for child in current.children(&mut cursor) {
                 if child.kind() == "annotation" {
-                    if self.text(child).contains("notlinProperty") {
+                    let annotation = self.text(child);
+                    // `@JvmField` changes Kotlin's JVM ABI but is not a Java
+                    // annotation. `transpile_property` reads the modifier to
+                    // emit a public field, so never pass the marker through.
+                    if annotation.contains("notlinProperty")
+                        || annotation_simple_name(annotation) == "JvmField"
+                    {
                         continue;
                     }
                     if let Some(text) = self.transpile_declaration_annotation(child) {
-                        if use_site_target(self.text(child)) == Some("get") {
+                        if use_site_target(annotation) == Some("get") {
                             getter.push(text);
                         } else {
                             field.push(text);
@@ -5348,6 +5348,39 @@ fn prefix_nested_annotations(argument_text: &str) -> String {
 /// it has none. Kotlin lets an annotation say which element it belongs to;
 /// dropping the prefix is required (Java has no such syntax) but dropping the
 /// TARGET is a decision, not a detail.
+fn annotation_class_literal_names(root: tree_sitter::Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && node
+                .utf8_text(source.as_bytes())
+                .is_ok_and(|text| text == "class")
+            && let Some(separator) = node.prev_sibling().filter(|sibling| sibling.kind() == "::")
+            && let Some(receiver) = separator.prev_sibling().filter(|receiver| {
+                matches!(
+                    receiver.kind(),
+                    "identifier" | "type_identifier" | "navigation_expression" | "user_type"
+                )
+            })
+            && let Ok(name) = receiver.utf8_text(source.as_bytes())
+            && name.split('.').all(|part| {
+                !part.is_empty()
+                    && part.chars().enumerate().all(|(position, ch)| {
+                        ch == '_'
+                            || ch == '$'
+                            || ch.is_alphabetic()
+                            || (position > 0 && ch.is_ascii_digit())
+                    })
+            })
+        {
+            names.push(name.to_string());
+        }
+        stack.extend(node.children(&mut node.walk()));
+    }
+    names
+}
+
 fn use_site_target(annotation: &str) -> Option<&str> {
     let rest = annotation.trim_start().strip_prefix('@')?;
     let target = rest.split(':').next()?;

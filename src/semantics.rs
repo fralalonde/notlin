@@ -175,6 +175,51 @@ pub(crate) fn recovered_interface_name(node: tree_sitter::Node, source: &str) ->
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
 }
+/// Recover an annotated interface only when the prefix parse establishes the
+/// same top-level declaration boundaries. Both planning and emission use this
+/// syntax evidence; an opaque or malformed boundary still remains Kotlin.
+pub(crate) fn recover_annotated_interface_tree(
+    source: &str,
+    wrapper: tree_sitter::Node<'_>,
+) -> Option<tree_sitter::Tree> {
+    if wrapper.kind() != "annotated_expression" {
+        return None;
+    }
+    let prefix = source.get(..wrapper.end_byte())?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(prefix, None)?;
+    recovered_annotated_interface_decl(source, wrapper, tree.root_node())?;
+    Some(tree)
+}
+
+pub(crate) fn recovered_annotated_interface_decl<'tree>(
+    source: &str,
+    wrapper: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'tree>,
+) -> Option<tree_sitter::Node<'tree>> {
+    let name = recovered_interface_name(wrapper, source)?;
+    let mut cursor = root.walk();
+    let mut declarations = root.named_children(&mut cursor).filter(|candidate| {
+        candidate.kind() == "class_declaration"
+            && !candidate.has_error()
+            && !candidate.is_missing()
+            && candidate.start_byte() == wrapper.start_byte()
+            && candidate.end_byte() == wrapper.end_byte()
+            && candidate
+                .children(&mut candidate.walk())
+                .any(|child| child.kind() == "interface")
+            && candidate
+                .child_by_field_name("name")
+                .and_then(|node| node.utf8_text(source.as_bytes()).ok())
+                == Some(name.as_str())
+    });
+    let declaration = declarations.next()?;
+    declarations.next().is_none().then_some(declaration)
+}
+
 fn parameter_signature(source: &str, node: tree_sitter::Node) -> String {
     let raw = node.utf8_text(source.as_bytes()).unwrap_or("");
     let mut ty = node

@@ -12,7 +12,9 @@ use std::time::UNIX_EPOCH;
 // 8: `SourceFile::smart_cast_sites` / `SourceFile::bindings` — the retained-Kotlin
 // smart-cast boundary now carries the site shapes and the file's own name->type
 // table instead of a bare property-name set.
-const CACHE_VERSION: u32 = 21;
+// 22: Java generic declaration type parameters recognize tree-sitter-java's
+// `type_identifier` nodes, so cached declarations must refresh `type_params`.
+const CACHE_VERSION: u32 = 22;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -4463,7 +4465,9 @@ fn type_param_names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
                         .filter_map(|child| {
                             child
                                 .children(&mut child.walk())
-                                .find(|part| part.kind() == "identifier")
+                                .find(|part| {
+                                    matches!(part.kind(), "identifier" | "type_identifier")
+                                })
                                 .and_then(|id| node_text(id, source).ok())
                         })
                         .collect();
@@ -4481,7 +4485,7 @@ fn type_param_names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
         .filter_map(|child| {
             child
                 .children(&mut child.walk())
-                .find(|inner| inner.kind() == "identifier")
+                .find(|inner| matches!(inner.kind(), "identifier" | "type_identifier"))
                 .and_then(|id| node_text(id, source).ok())
         })
         .collect()
@@ -5364,6 +5368,62 @@ mod declaration_symbol_cache_tests {
             package_name("package example.annotations; public @interface Marker {}"),
             Some("example.annotations".into())
         );
+    }
+
+    #[test]
+    fn java_type_parameter_bindings_flow_through_mixed_generic_supertypes() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "notlin-java-generic-edge-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Base.kt"),
+            "package sample\ninterface Identifier {}\ninterface RecordId : Identifier {}\ninterface RecordView {}\ninterface CreatedNotice<T, I> {\n    fun getPayload(): T\n}\nclass ConcreteRecord : RecordView {}\nclass ConcreteNotice : TypedNotice<ConcreteRecord> {\n    override fun getPayload(): ConcreteRecord = ConcreteRecord()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("GenericNotice.java"),
+            "package sample; public interface GenericNotice<V extends RecordView, I extends Identifier> extends CreatedNotice<V, I> {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("TypedNotice.java"),
+            "package sample; public interface TypedNotice<U extends RecordView> extends GenericNotice<U, RecordId> {}\n",
+        )
+        .unwrap();
+
+        let index = SourceIndex::discover(&root).unwrap();
+        let java_event = index
+            .declarations()
+            .find(|declaration| declaration.name == "TypedNotice")
+            .unwrap();
+        assert_eq!(java_event.type_params, ["U"]);
+        let implementation_file = root.join("Base.kt");
+        let implementation = index
+            .declarations()
+            .find(|declaration| declaration.name == "ConcreteNotice")
+            .unwrap();
+        let conflicts = index.retained_supertype_member_conflicts_in_file(
+            &implementation_file,
+            &implementation.supertypes,
+            &implementation.name,
+        );
+        let payload = conflicts
+            .iter()
+            .find(|conflict| conflict.member_name == "getPayload")
+            .expect("the inherited generic member should be considered");
+        assert_eq!(payload.inherited_type, "ConcreteRecord");
+        assert_eq!(payload.implementation_type, "ConcreteRecord");
+        assert!(
+            !payload.blocks_java_override(),
+            "the Java U binding must reach the inherited Kotlin member: {payload:?}"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

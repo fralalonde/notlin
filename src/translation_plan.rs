@@ -45,6 +45,11 @@ pub enum RetentionReason {
         start_byte: usize,
         end_byte: usize,
     },
+    MultiplatformLinkage {
+        modifier: String,
+        start_byte: usize,
+        end_byte: usize,
+    },
     ParseError {
         start_byte: usize,
         end_byte: usize,
@@ -74,6 +79,7 @@ impl RetentionReason {
     pub fn code(&self) -> &'static str {
         match self {
             Self::SuspendConstruct { .. } => "T001",
+            Self::MultiplatformLinkage { .. } => "M001",
             Self::ParseError { .. } => "T002",
             Self::PreparationBlocker {
                 kind: PreparationBlockerKind::SemanticLoss,
@@ -100,6 +106,9 @@ impl RetentionReason {
             Self::SuspendConstruct { .. } => {
                 "contains a Kotlin suspend construct whose coroutine semantics are not represented in Java".to_string()
             }
+            Self::MultiplatformLinkage { modifier, .. } => format!(
+                "`{modifier}` declaration participates in Kotlin Multiplatform linkage and must remain in Kotlin"
+            ),
             Self::ParseError { .. } => {
                 "contains syntax errors and cannot be safely planned for translation".to_string()
             }
@@ -449,21 +458,37 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         if !is_declaration_boundary(node.kind()) && !is_opaque_annotated_interface(node, source) {
             continue;
         }
+        let opaque_interface = is_opaque_annotated_interface(node, source);
+        let recovery_tree = opaque_interface
+            .then(|| crate::semantics::recover_annotated_interface_tree(source, node))
+            .flatten();
+        let recovered_node = recovery_tree.as_ref().and_then(|tree| {
+            crate::semantics::recovered_annotated_interface_decl(source, node, tree.root_node())
+        });
+        let syntax_node = recovered_node.unwrap_or(node);
         let mut reasons = Vec::new();
-        if has_unclassified_parse_error(node, source) {
+        if has_unclassified_parse_error(syntax_node, source) {
             reasons.push(RetentionReason::ParseError {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
             });
         }
-        if is_opaque_annotated_interface(node, source) {
+        if opaque_interface && recovered_node.is_none() {
             reasons.push(RetentionReason::OpaqueBoundary {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
             });
         }
-        if let Some((start_byte, end_byte)) = suspend_token(node, source) {
+        if let Some((start_byte, end_byte)) = suspend_token(syntax_node, source) {
             reasons.push(RetentionReason::SuspendConstruct {
+                start_byte,
+                end_byte,
+            });
+        }
+        if let Some((modifier, start_byte, end_byte)) = multiplatform_modifier(syntax_node, source)
+        {
+            reasons.push(RetentionReason::MultiplatformLinkage {
+                modifier,
                 start_byte,
                 end_byte,
             });
@@ -482,7 +507,7 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
             },
             symbol_id: symbol_id(root, node, source, file),
             qualified_name: qualified_name(root, node, source),
-            kind: declaration_kind(node.kind()),
+            kind: declaration_kind(syntax_node.kind()),
             candidate_owner,
             retention_reasons: reasons,
             preparation_outcome: None,
@@ -510,6 +535,40 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         }
     }
     plan
+}
+
+/// `expect` and `actual` declarations are linked by the Kotlin multiplatform
+/// compiler across source sets. Emitting either declaration as an independent
+/// Java type removes that linkage. Inspect only modifier syntax owned by this
+/// declaration so comments, annotation arguments, strings, and identifier uses
+/// cannot trigger retention.
+fn multiplatform_modifier(node: Node, source: &str) -> Option<(String, usize, usize)> {
+    let mut cursor = node.walk();
+    let modifiers = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")?;
+    let mut pending = vec![modifiers];
+    while let Some(current) = pending.pop() {
+        if current.kind().ends_with("_modifier") {
+            let mut descendants = vec![current];
+            while let Some(modifier_node) = descendants.pop() {
+                let token = modifier_node.utf8_text(source.as_bytes()).ok()?.trim();
+                if matches!(token, "expect" | "actual") {
+                    return Some((
+                        token.to_string(),
+                        modifier_node.start_byte(),
+                        modifier_node.end_byte(),
+                    ));
+                }
+                let mut cursor = modifier_node.walk();
+                descendants.extend(modifier_node.named_children(&mut cursor));
+            }
+        } else if current.kind() == "modifiers" {
+            let mut cursor = current.walk();
+            pending.extend(current.named_children(&mut cursor));
+        }
+    }
+    None
 }
 
 fn symbol_id(_root: Node, node: Node, source: &str, file: &Path) -> SymbolId {
@@ -854,6 +913,52 @@ mod tests {
         assert_eq!(plan.declarations.len(), 2);
         assert!(plan.declarations.iter().all(|d| {
             d.candidate_owner == BackendOwner::Java && d.retention_reasons.is_empty()
+        }));
+    }
+
+    #[test]
+    fn expect_actual_declarations_are_retained_but_text_uses_are_not() {
+        let source = r#"
+expect class PlatformType
+actual class PlatformType
+expect fun platformCall(): String
+actual fun platformCall(): String = "actual"
+@Tag("expect actual") class Ordinary {
+    val actual = "expect"
+}
+// expect fun commentOnly(): Unit
+val wording = "expect actual"
+"#;
+        let tree = parse(source);
+        let plan = analyze(source, tree.root_node(), Path::new("sample.kt"));
+        assert_eq!(plan.declarations.len(), 6);
+        for decision in &plan.declarations[..4] {
+            assert_eq!(decision.candidate_owner, BackendOwner::Kotlin);
+            let reason = decision
+                .retention_reasons
+                .iter()
+                .find_map(|reason| match reason {
+                    RetentionReason::MultiplatformLinkage { modifier, .. } => Some(modifier),
+                    _ => None,
+                })
+                .expect("multiplatform modifier should have a structured reason");
+            assert!(matches!(reason.as_str(), "expect" | "actual"));
+            assert_eq!(
+                decision
+                    .retention_reasons
+                    .iter()
+                    .find(|reason| matches!(reason, RetentionReason::MultiplatformLinkage { .. }))
+                    .unwrap()
+                    .code(),
+                "M001"
+            );
+        }
+        assert!(plan.declarations[4..].iter().all(|decision| {
+            decision.candidate_owner == BackendOwner::Java
+                && !decision
+                    .retention_reasons
+                    .iter()
+                    .any(|reason| matches!(reason, RetentionReason::MultiplatformLinkage { .. }))
         }));
     }
 

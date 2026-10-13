@@ -55,6 +55,27 @@ data class Item(final @JvmField val x: String) {
 }
 
 #[test]
+fn body_jvm_field_lowers_to_public_field_without_java_annotation() {
+    let java = transpile(
+        r#"package neutral.regression
+class Holder {
+    @JvmField val token: String = "ready"
+}
+"#,
+        "Holder.kt",
+    );
+
+    assert!(
+        !java.contains("@JvmField"),
+        "the Kotlin JVM marker must not leak into Java:\n{java}"
+    );
+    assert!(
+        java.contains("public String token = \"ready\";"),
+        "@JvmField must still produce a public Java field:\n{java}"
+    );
+}
+
+#[test]
 fn repaired_data_class_normalizes_plain_and_computed_property_bridges() {
     let java = transpile_lombok(
         r##"package neutral.regression

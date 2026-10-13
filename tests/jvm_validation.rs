@@ -302,6 +302,114 @@ fn real_toolchain_compiles_transpiled_java_with_retained_kotlin() {
     );
 }
 
+/// This guards generic type binding across Java intermediate interfaces and
+/// the bridge method javac emits for a concrete Kotlin override.
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_generic_getter_bridge_through_java_intermediates() {
+    let (Some(kotlinc), Some(javac), Some(java), Some(stdlib)) = (
+        std::env::var_os("NOTLIN_KOTLINC"),
+        std::env::var_os("NOTLIN_JAVAC"),
+        std::env::var_os("NOTLIN_JAVA"),
+        std::env::var_os("NOTLIN_KOTLIN_STDLIB"),
+    ) else {
+        panic!("set NOTLIN_KOTLINC, NOTLIN_JAVAC, NOTLIN_JAVA, and NOTLIN_KOTLIN_STDLIB");
+    };
+    let scratch = Scratch::new_under(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/jvm-validation"),
+        "generic getter bridge",
+    );
+    let root = scratch.0.join("source root");
+    fs::create_dir_all(&root).unwrap();
+    let source_interface = root.join("PayloadSource.kt");
+    let payload = root.join("Payload.kt");
+    let runner = root.join("Runner.kt");
+    let concrete = root.join("Concrete.kt");
+    let intermediate = root.join("Intermediate.java");
+    let leaf = root.join("Leaf.java");
+
+    fs::write(
+        &source_interface,
+        "package boundary\ninterface PayloadSource<U> {\n    fun readPayload(): U\n}\n",
+    )
+    .unwrap();
+    fs::write(&payload, "package boundary\nclass Payload\n").unwrap();
+    fs::write(
+        &runner,
+        "package boundary\nfun main() {\n    val payload = Payload()\n    val concrete = Concrete(payload)\n    val source: PayloadSource<Payload> = concrete\n    println(\"${concrete.readPayload() === payload}|${source.readPayload() === payload}\")\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &concrete,
+        "package boundary\nclass Concrete(private val payload: Payload) : Leaf<Payload> {\n    override fun readPayload(): Payload = payload\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        &intermediate,
+        "package boundary;\npublic interface Intermediate<U> extends PayloadSource<U> {}\n",
+    )
+    .unwrap();
+    fs::write(
+        &leaf,
+        "package boundary;\npublic interface Leaf<V> extends Intermediate<V> {}\n",
+    )
+    .unwrap();
+
+    let stdlib_path = PathBuf::from(stdlib.clone());
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("baseline classes"));
+    baseline.kotlin_sources.extend([
+        source_interface.clone(),
+        payload.clone(),
+        runner.clone(),
+        concrete.clone(),
+    ]);
+    baseline
+        .java_sources
+        .extend([intermediate.clone(), leaf.clone()]);
+    baseline.classpath.push(stdlib_path.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let baseline_report = validate_jvm_sources(&baseline).unwrap();
+    let baseline_stdout = baseline_report.commands[2].stdout.trim().to_owned();
+    assert_eq!(baseline_stdout, "true|true");
+
+    let transpile = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root"])
+        .arg(&root)
+        .args(["--annotations", "none"])
+        .arg("--in-place")
+        .arg(&concrete)
+        .output()
+        .expect("run notlin transpiler");
+    assert!(
+        transpile.status.success(),
+        "transpiler failed: {}",
+        String::from_utf8_lossy(&transpile.stderr)
+    );
+    let generated_concrete = root.join("Concrete.java");
+    assert!(
+        generated_concrete.is_file(),
+        "transpiler did not emit Concrete.java"
+    );
+
+    let mut migrated =
+        JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    migrated
+        .kotlin_sources
+        .extend([source_interface, payload, runner]);
+    migrated
+        .java_sources
+        .extend([intermediate, leaf, generated_concrete]);
+    migrated.classpath.push(stdlib_path);
+    migrated.run_main_class = Some("boundary.RunnerKt".into());
+    let migrated_report = validate_jvm_sources(&migrated).unwrap();
+    let migrated_stdout = migrated_report.commands[2].stdout.trim();
+    assert_eq!(
+        migrated_stdout, baseline_stdout,
+        "generic payload dispatch and identity must survive the Java bridge"
+    );
+}
+
 /// Exercise Java/Kotlin ownership seams together: synthesized properties,
 /// default constructors, companion dispatch, data-class equality, JVM argument
 /// evaluation order, and a translated subclass of a retained Kotlin base.
@@ -3020,5 +3128,197 @@ public final class AnnotationProbe {
             .starts_with("4|"),
         "all four mapped class annotations must be visible at runtime: {}",
         mixed_report.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_recovers_stacked_java_annotations_on_default_interface_getters() {
+    let (Some(kotlinc), Some(javac), Some(java), Some(stdlib)) = (
+        std::env::var_os("NOTLIN_KOTLINC"),
+        std::env::var_os("NOTLIN_JAVAC"),
+        std::env::var_os("NOTLIN_JAVA"),
+        std::env::var_os("NOTLIN_KOTLIN_STDLIB"),
+    ) else {
+        panic!("set NOTLIN_KOTLINC, NOTLIN_JAVAC, NOTLIN_JAVA, and NOTLIN_KOTLIN_STDLIB");
+    };
+    let scratch = Scratch::new_under(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/jvm-validation"),
+        "stacked annotations on interface getters",
+    );
+    let baseline_root = scratch.0.join("baseline source");
+    let mixed_root = scratch.0.join("mixed source");
+    let source = r#"package boundary
+
+interface Before {
+    fun before(): String
+}
+
+@Marker(label = "contract", one = TypeA::class, many = [TypeB::class, TypeC::class])
+@Qualifier(TypeD::class)
+interface Annotated {
+    @get:Marker(label = "getter", one = TypeE::class, many = [TypeF::class, TypeG::class])
+    val value: Any
+
+    val fallback: String
+        get() = "default-value"
+}
+
+interface After {
+    fun after(): String
+}
+"#;
+    let runner_source = r#"package boundary
+
+class Provider(private val payload: Any) : Annotated {
+    override val value: Any
+        get() = payload
+}
+
+fun main() {
+    val payload = Any()
+    val instance = Provider(payload)
+    val type = Annotated::class.java
+    val marker = type.getAnnotation(Marker::class.java)
+    val qualifier = type.getAnnotation(Qualifier::class.java)
+    val getterMarker = type.getMethod("getValue").getAnnotation(Marker::class.java)
+    val defaultGetter = type.getMethod("getFallback")
+    val types = marker.many.joinToString(",") { it.java.name }
+    val getterTypes = getterMarker.many.joinToString(",") { it.java.name }
+    println(listOf(
+        marker.label, marker.one.java.name, types,
+        qualifier.value.java.name,
+        getterMarker.label, getterMarker.one.java.name, getterTypes,
+        defaultGetter.isDefault.toString(), instance.fallback,
+        (instance.value === payload).toString()
+    ).joinToString("|"))
+}
+"#;
+
+    let marker_classes = [
+        "TypeA", "TypeB", "TypeC", "TypeD", "TypeE", "TypeF", "TypeG",
+    ];
+    for root in [&baseline_root, &mixed_root] {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("Declarations.kt"), source).unwrap();
+        fs::write(root.join("Runner.kt"), runner_source).unwrap();
+        fs::write(
+            root.join("Marker.java"),
+            "package boundary;\nimport java.lang.annotation.ElementType;\nimport java.lang.annotation.Retention;\nimport java.lang.annotation.RetentionPolicy;\nimport java.lang.annotation.Target;\n@Retention(RetentionPolicy.RUNTIME)\n@Target({ElementType.TYPE, ElementType.METHOD})\npublic @interface Marker { String label(); Class<?> one(); Class<?>[] many(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Qualifier.java"),
+            "package boundary;\nimport java.lang.annotation.ElementType;\nimport java.lang.annotation.Retention;\nimport java.lang.annotation.RetentionPolicy;\nimport java.lang.annotation.Target;\n@Retention(RetentionPolicy.RUNTIME)\n@Target(ElementType.TYPE)\npublic @interface Qualifier { Class<?> value(); }\n",
+        )
+        .unwrap();
+        for name in marker_classes {
+            fs::write(
+                root.join(format!("{name}.java")),
+                format!("package boundary;\npublic final class {name} {{}}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    let ast = notlin::transpiler::dump_ast(source);
+    assert!(
+        ast.contains("annotated_expression"),
+        "fixture must include the parser's annotated_expression recovery shape:\n{ast}"
+    );
+    assert!(
+        ast.contains("infix_expression"),
+        "fixture must reproduce the class-literal annotation's infix_expression ambiguity:\n{ast}"
+    );
+
+    let stdlib = PathBuf::from(stdlib);
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("baseline classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlinc_args.push("-Xjvm-default=all".into());
+    baseline.kotlin_sources = [
+        baseline_root.join("Declarations.kt"),
+        baseline_root.join("Runner.kt"),
+    ]
+    .into();
+    baseline.java_sources = vec![
+        baseline_root.join("Marker.java"),
+        baseline_root.join("Qualifier.java"),
+    ];
+    baseline.java_sources.extend(
+        marker_classes
+            .iter()
+            .map(|name| baseline_root.join(format!("{name}.java"))),
+    );
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let baseline_report = validate_jvm_sources(&baseline)
+        .expect("baseline Kotlin interface and runtime annotations compile");
+    let baseline_output = baseline_report.commands.last().unwrap().stdout.trim();
+
+    let transpile = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root"])
+        .arg(&mixed_root)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&mixed_root)
+        .output()
+        .expect("run notlin on the annotated interface declarations");
+    assert!(
+        transpile.status.success(),
+        "transpiler failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&transpile.stdout),
+        String::from_utf8_lossy(&transpile.stderr)
+    );
+    let generated = mixed_root.join("Annotated.java");
+    assert!(
+        generated.is_file(),
+        "annotated interface between declarations should be recovered and translated:\n{}",
+        String::from_utf8_lossy(&transpile.stderr)
+    );
+    let generated_source = fs::read_to_string(&generated).unwrap();
+    assert!(
+        generated_source.contains(
+            "@Marker(label = \"contract\", one = TypeA.class, many = {TypeB.class, TypeC.class})"
+        ),
+        "stacked annotation Class and Class[] values must be emitted:\n{generated_source}"
+    );
+    assert!(
+        generated_source.contains("@Qualifier(TypeD.class)"),
+        "second stacked annotation must be emitted:\n{generated_source}"
+    );
+    assert!(
+        generated_source.contains(
+            "@Marker(label = \"getter\", one = TypeE.class, many = {TypeF.class, TypeG.class})"
+        ),
+        "@get annotation with Class and Class[] values must decorate the Java getter:\n{generated_source}"
+    );
+
+    let mut mixed =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    mixed.kotlinc_args.push("-Xjvm-default=all".into());
+    mixed.kotlin_sources = fs::read_dir(&mixed_root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "kt"))
+        .collect();
+    mixed.java_sources = fs::read_dir(&mixed_root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "java")
+        })
+        .collect();
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let mixed_report = validate_jvm_sources(&mixed)
+        .expect("migrated annotated interface and retained Kotlin runner compile");
+    assert_eq!(
+        mixed_report.commands.last().unwrap().stdout.trim(),
+        baseline_output,
+        "reflection values, abstract payload getter identity, and default getter behavior must match"
     );
 }

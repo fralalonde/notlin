@@ -904,26 +904,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
                 "shebang_line" | ";" | "line_comment" | "multiline_comment" | "block_comment" => {}
                 "file_annotation" | "annotated_expression" => {
-                    // Kotlin NG can parse an annotated interface as an
-                    // annotated_expression containing an infix_expression
-                    // (`interface Name`) and a lambda_literal (its body),
-                    // rather than a class_declaration. This node owns source
-                    // beyond the annotation: never hoist it onto the next
-                    // type or strip it with that type. Keep the opaque region
-                    // in Kotlin until the grammar can expose its declaration.
+                    // Queue parser-recovered interfaces for the normal
+                    // declaration-dispatch pass below. That pass runs after
+                    // class-body facts and plans have been prepared.
                     if child.kind() == "annotated_expression"
-                        && let Some(name) = self.annotated_interface_parsed_as_expression(child)
+                        && self
+                            .annotated_interface_parsed_as_expression(child)
+                            .is_some()
                     {
-                        self.diag_untranslatable_coded(
-                            child,
-                            format!(
-                                "annotated top-level expression contains an unparsed declaration; retained in Kotlin; affected declaration: interface {name}"
-                            ),
-                            Some("N47BC".to_string()),
-                        );
-                        self.coverage
-                            .untranslated
-                            .push(format!("top-level@{}", child.start_byte()));
+                        decls.push(child);
                         wrapper_spans_for_next.clear();
                         hoisted_annotations.clear();
                         retain_next_declaration = false;
@@ -1023,22 +1012,66 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
         for decl in &decls {
             match decl.kind() {
-                "class_declaration" | "object_declaration" => {
-                    let type_name = kt::field(*decl, "name")
+                "class_declaration" | "object_declaration" | "annotated_expression" => {
+                    let original_decl = *decl;
+                    let recovery_name = if original_decl.kind() == "annotated_expression" {
+                        self.annotated_interface_parsed_as_expression(original_decl)
+                    } else {
+                        None
+                    };
+                    let recovered_tree = recovery_name.as_ref().and_then(|_| {
+                        crate::semantics::recover_annotated_interface_tree(
+                            self.source,
+                            original_decl,
+                        )
+                    });
+                    let recovered_decl = recovery_name.as_ref().and_then(|_| {
+                        recovered_tree.as_ref().and_then(|tree| {
+                            crate::semantics::recovered_annotated_interface_decl(
+                                self.source,
+                                original_decl,
+                                tree.root_node(),
+                            )
+                        })
+                    });
+                    if let Some(name) = recovery_name.as_ref().filter(|_| recovered_decl.is_none())
+                    {
+                        self.diag_untranslatable_coded(
+                            original_decl,
+                            format!(
+                                "annotated top-level expression contains an unparsed declaration; retained in Kotlin; affected declaration: interface {name}"
+                            ),
+                            Some("N47BC".to_string()),
+                        );
+                        self.coverage
+                            .untranslated
+                            .push(format!("top-level@{}", original_decl.start_byte()));
+                        continue;
+                    }
+                    let declaration = recovered_decl.unwrap_or(original_decl);
+                    let type_name = kt::field(declaration, "name")
                         .map(|n| self.text(n).to_string())
                         .unwrap_or_else(|| "Anonymous".to_string());
                     let mut out = JavaOut::new();
                     let imports2 = imports.clone();
                     let package2 = package.clone();
-                    self.begin_decl(*decl, type_name.clone());
-                    if self.apply_preflight_retention(*decl, plan) {
+                    self.begin_decl(original_decl, type_name.clone());
+                    if let Some(recovered) = recovered_decl {
+                        // Diagnostics from the recovered tree follow its own
+                        // parent chain; map that root to this transaction.
+                        self.decl_labels.insert(recovered.id(), type_name.clone());
+                    }
+                    if self.apply_preflight_retention(original_decl, plan) {
                         self.end_decl();
+                        if let Some(recovered) = recovered_decl {
+                            self.decl_labels.remove(&recovered.id());
+                        }
                         continue;
                     }
-                    if let Some(retained) = standalone_annotation_targets.get(&decl.id()) {
+                    if let Some(retained) = standalone_annotation_targets.get(&original_decl.id()) {
                         for annotation in retained {
                             self.diag_untranslatable_coded(
-                                *decl,
+                                original_decl,
                                 format!(
                                     "declaration annotation is retained in Kotlin; annotation: `{annotation}`; its type or argument expression cannot yet be lowered in this run"
                                 ),
@@ -1048,6 +1081,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             );
                         }
                         self.end_decl();
+                        if let Some(recovered) = recovered_decl {
+                            self.decl_labels.remove(&recovered.id());
+                        }
                         continue;
                     }
                     // Mixed-language accessor ABI: an abstract member of a
@@ -1056,7 +1092,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     // cannot be satisfied by a Java class (Java has no
                     // covariant cross-language absolvability) — retain.
                     if let Some(ws) = self.workspace {
-                        let supers: Vec<String> = kt::child(*decl, "delegation_specifiers")
+                        let supers: Vec<String> = kt::child(declaration, "delegation_specifiers")
                             .map(|dc| {
                                 let mut c = dc.walk();
                                 dc.children(&mut c)
@@ -1101,27 +1137,33 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             // conflicting members travel as PARAMS: one kind,
                             // one code, however many member lists turn up.
                             self.retain_decl(
-                                *decl,
+                                declaration,
                                 &type_name,
                                 RetentionKind::SupertypeMemberType,
                                 &conflicts,
                                 &[],
                             );
                             self.end_decl();
+                            if let Some(recovered) = recovered_decl {
+                                self.decl_labels.remove(&recovered.id());
+                            }
                             continue;
                         }
                     }
                     self.transpile_type_decl_set(&mut out, &package2, &imports2, |unit, out| {
-                        unit.transpile_type_decl(*decl, out);
+                        unit.transpile_type_decl(declaration, out);
                     });
                     self.end_decl();
-                    if !self.tainted_declarations.contains(&decl.id()) {
+                    if let Some(recovered) = recovered_decl {
+                        self.decl_labels.remove(&recovered.id());
+                    }
+                    if !self.tainted_declarations.contains(&original_decl.id()) {
                         let path = format!("{}.java", type_name);
                         self.output_owners.insert(
                             path.clone(),
                             plan.declarations
                                 .iter()
-                                .filter(|d| d.id.start_byte == decl.start_byte())
+                                .filter(|d| d.id.start_byte == original_decl.start_byte())
                                 .map(|d| d.symbol_id.clone())
                                 .collect(),
                         );

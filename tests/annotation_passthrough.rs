@@ -80,6 +80,94 @@ class Holder(val tag: Tagged)
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn stacked_class_literal_annotations_recover_interface_and_default_property() {
+    let root = Path::new("tests/tmp_scratch_annotated_interface_recovery");
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("JavaPeer.java"),
+        "package p;\npublic class JavaPeer {}\nclass OtherPeer {}\n",
+    )
+    .unwrap();
+    for (name, source) in [
+        (
+            "Read",
+            "package p; public @interface Read { Class<?> using(); }\n",
+        ),
+        (
+            "Write",
+            "package p; public @interface Write { Class<?> using(); }\n",
+        ),
+        (
+            "Info",
+            "package p; public @interface Info { String kind(); }\n",
+        ),
+        (
+            "Kinds",
+            "package p; public @interface Kinds { Class<?>[] value(); }\n",
+        ),
+    ] {
+        fs::write(root.join(format!("{name}.java")), source).unwrap();
+    }
+    let source = r#"package p
+
+interface Earlier { val id: String }
+enum class Reader { FIRST }
+enum class Writer { SECOND }
+
+@Read(using = Reader::class)
+@Write(using = Writer::class)
+@Info(kind = "context")
+@Kinds(value = [p.JavaPeer::class, OtherPeer::class])
+interface Tagged {
+    val contextClass: String
+        get() = "Tagged"
+    val fallback: String
+        get() = contextClass
+}
+
+class Later
+"#;
+    assert!(
+        notlin::transpiler::dump_ast(source).contains("infix_expression"),
+        "fixture must exercise the annotated-interface parser recovery"
+    );
+    fs::write(root.join("Tagged.kt"), source).unwrap();
+    let stderr = run(root, &root.join("Tagged.kt"));
+    let java = fs::read_to_string(root.join("Tagged.java")).unwrap_or_default();
+    assert!(
+        !java.is_empty(),
+        "the isolated interface should be recovered and translated:\n{stderr}"
+    );
+    assert!(java.contains("@Info(kind = \"context\")"), "{java}");
+    assert!(
+        java.contains("@Read(using = Reader.class)"),
+        "first stacked class-literal annotation must survive:\n{java}"
+    );
+    assert!(
+        java.contains("@Write(using = Writer.class)"),
+        "second stacked class-literal annotation must survive:\n{java}"
+    );
+    assert!(java.contains("@Info(kind = \"context\")"), "{java}");
+    assert!(
+        java.contains("@Kinds(value = {p.JavaPeer.class, OtherPeer.class})"),
+        "both class literals and their stacked annotation must survive:\n{java}"
+    );
+    assert!(java.contains("getContextClass()"), "{java}");
+    assert!(
+        java.contains("getFallback()") && java.contains("return this.getContextClass();"),
+        "default fallback getter should call the other default getter:\n{java}"
+    );
+    let residual = fs::read_to_string(root.join("Tagged.kt")).unwrap_or_default();
+    assert!(
+        !residual.contains("interface Tagged"),
+        "a recovered declaration must be removed with its annotations:\n{residual}"
+    );
+    assert!(!stderr.contains("N47BC"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A single-property string annotation on a data class with no workspace
 /// index (single-file probe): no Kotlin-only argument, so it passes through
 /// verbatim and the class translates.
