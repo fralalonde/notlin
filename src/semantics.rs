@@ -1290,6 +1290,11 @@ pub trait SemanticProvider: Send + Sync {
     fn is_java_static_member(&self, _symbol: &SymbolId) -> bool {
         false
     }
+    /// Prove that a resolved source member has the same callable JVM name.
+    /// Providers without JVM/source interoperability evidence fail closed.
+    fn is_java_callable_member(&self, _symbol: &SymbolId) -> bool {
+        false
+    }
 }
 
 /// A conservative index over already parsed source snapshots.
@@ -1307,6 +1312,98 @@ pub struct SyntaxSemanticProvider {
     java_static_member_locations: BTreeSet<(PathBuf, usize)>,
 }
 impl SyntaxSemanticProvider {
+    fn declaring_type(&self, method: &SemanticSymbol) -> Option<SymbolId> {
+        if method.id.owner_path.is_empty() {
+            return None;
+        }
+        let name = method.id.owner_path.last()?;
+        let path = &method.id.owner_path[..method.id.owner_path.len() - 1];
+        let mut owners = self
+            .by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|index| &self.symbols[*index])
+            .filter(|symbol| {
+                symbol.id.file == method.id.file
+                    && symbol.id.package == method.id.package
+                    && symbol.id.owner_path == path
+                    && symbol.id.name == name.as_str()
+                    && matches!(
+                        symbol.id.kind.as_str(),
+                        "class" | "interface" | "object" | "enum"
+                    )
+            });
+        let owner = owners.next()?.id.clone();
+        owners.next().is_none().then_some(owner)
+    }
+
+    fn inherits_type(&self, descendant: &SymbolId, ancestor: &SymbolId) -> bool {
+        if descendant == ancestor {
+            return false;
+        }
+        let mut queue = self.parents.get(descendant).cloned().unwrap_or_default();
+        let mut seen = BTreeSet::new();
+        while let Some(current) = queue.pop() {
+            if current == *ancestor {
+                return true;
+            }
+            if seen.insert(current.clone()) {
+                queue.extend(self.parents.get(&current).into_iter().flatten().cloned());
+            }
+        }
+        false
+    }
+
+    fn discard_overridden_inherited_methods<'a>(
+        &self,
+        candidates: Vec<&'a SemanticSymbol>,
+    ) -> Vec<&'a SemanticSymbol> {
+        if candidates.len() < 2 {
+            return candidates;
+        }
+        let owners = candidates
+            .iter()
+            .map(|method| {
+                (matches!(method.id.kind.as_str(), "function" | "method")
+                    && method.id.parameters.is_empty())
+                .then(|| self.declaring_type(method))
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(i, candidate)| {
+                let overridden = candidates.iter().enumerate().any(|(j, other)| {
+                    if i == j
+                        || !candidate.id.parameters.is_empty()
+                        || !other.id.parameters.is_empty()
+                        || !matches!(candidate.id.kind.as_str(), "function" | "method")
+                        || !matches!(other.id.kind.as_str(), "function" | "method")
+                        || candidate.id.name != other.id.name
+                        || candidate.id.parameters != other.id.parameters
+                        || candidate.id.receiver.is_some()
+                        || other.id.receiver.is_some()
+                        || self.is_java_static_member(&candidate.id)
+                        || self.is_java_static_member(&other.id)
+                        || !matches!((&candidate.ty, &other.ty),
+                        (FactStatus::Established(a), FactStatus::Established(b)) if a == b)
+                    {
+                        return false;
+                    }
+                    match (&owners[j], &owners[i]) {
+                        (Some(descendant), Some(ancestor)) => {
+                            descendant != ancestor && self.inherits_type(descendant, ancestor)
+                        }
+                        _ => false,
+                    }
+                });
+                (!overridden).then_some(*candidate)
+            })
+            .collect()
+    }
+
     pub fn new(sources: impl IntoIterator<Item = (PathBuf, String)>) -> Self {
         Self::new_in_module("", sources)
     }
@@ -1561,6 +1658,63 @@ impl SyntaxSemanticProvider {
     }
 }
 impl SemanticProvider for SyntaxSemanticProvider {
+    fn is_java_callable_member(&self, id: &SymbolId) -> bool {
+        if id.receiver.is_some() || !matches!(id.kind.as_str(), "function" | "method") {
+            return false;
+        }
+        let Some(symbol) = self
+            .symbols_named(&id.name)
+            .into_iter()
+            .find(|s| &s.id == id)
+        else {
+            return false;
+        };
+        if id
+            .file
+            .extension()
+            .is_some_and(|extension| extension == "java")
+        {
+            return !id.owner_path.is_empty();
+        }
+        // A Kotlin override of an indexed Java getter must expose the Java
+        // signature, including any compiler-generated forwarding bridge.
+        // Do not assume JVM names for other Kotlin methods (internal names,
+        // extensions and value-class signatures may be mangled).
+        if !id.parameters.is_empty() {
+            return false;
+        }
+        let Some(owner) = self.declaring_type(symbol) else {
+            return false;
+        };
+        let mut pending = self.parents.get(&owner).cloned().unwrap_or_default();
+        let mut seen = BTreeSet::new();
+        while let Some(parent) = pending.pop() {
+            if !seen.insert(parent.clone()) {
+                continue;
+            }
+            let mut path = parent.owner_path.clone();
+            path.push(parent.name.clone());
+            if parent
+                .file
+                .extension()
+                .is_some_and(|extension| extension == "java")
+                && self.symbols_named(&id.name).into_iter().any(|member| {
+                    member.id.file == parent.file
+                        && member.id.owner_path == path
+                        && member.id.receiver.is_none()
+                        && member.id.parameters == id.parameters
+                        && matches!(member.id.kind.as_str(), "function" | "method")
+                        && !self.is_java_static_member(&member.id)
+                        && matches!((&member.ty, &symbol.ty),
+                            (FactStatus::Established(a), FactStatus::Established(b)) if a == b)
+                })
+            {
+                return true;
+            }
+            pending.extend(self.parents.get(&parent).into_iter().flatten().cloned());
+        }
+        false
+    }
     fn resolve(&self, name: &str) -> FactStatus<SymbolId> {
         match self.by_name.get(name).map(|v| v.as_slice()) {
             Some([i]) => FactStatus::Established(self.symbols[*i].id.clone()),
@@ -1617,7 +1771,7 @@ impl SemanticProvider for SyntaxSemanticProvider {
                 }));
             }
             if !found.is_empty() {
-                return found;
+                return self.discard_overridden_inherited_methods(found);
             }
             level = level
                 .iter()
@@ -1947,6 +2101,11 @@ pub fn plan_required_calls(
                         && matches!(fact, FactStatus::Unknown)
                         && !locally_shadowed
                         && !has_wildcard_import(source)
+                        || matches!(fact, FactStatus::Unknown)
+                            && !locally_shadowed
+                            && known_collection_factory_from_java_util_wildcard(
+                                source, node, callee, &name,
+                            )
                         || matches!(fact, FactStatus::Unknown)
                             && !locally_shadowed
                             && known_external_member_call(
@@ -2477,6 +2636,12 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
     {
         return None;
     }
+    if spelling.chars().next().is_some_and(char::is_uppercase)
+        && explicit_receiver_node(call, callee)
+            .is_some_and(|receiver| is_proven_local_shadow(receiver, spelling, source))
+    {
+        return None;
+    }
     let indexed = provider
         .symbols_named(spelling)
         .into_iter()
@@ -2493,16 +2658,11 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
     if indexed.is_some() {
         return indexed;
     }
-    if provider.symbols_named(spelling).into_iter().any(|symbol| {
+    let has_untyped_indexed_binding = provider.symbols_named(spelling).into_iter().any(|symbol| {
         symbol.id.file == file
             && symbol.location.start_byte <= call.start_byte()
             && !is_type_symbol(&symbol.id)
-    }) {
-        // An indexed binding exists but has no established type. Preserve
-        // that shadow evidence instead of interpreting an uppercase variable
-        // name as a type qualifier.
-        return None;
-    }
+    });
     let mut enclosing = call.parent();
     while let Some(node) = enclosing {
         if matches!(
@@ -2551,19 +2711,60 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
                     }
                 })
                 .and_then(|type_node| type_node.utf8_text(source.as_bytes()).ok());
-            let mut descendants = vec![node];
-            let mut has_name = false;
-            while let Some(child) = descendants.pop() {
-                if child.kind() == "identifier"
-                    && child.utf8_text(source.as_bytes()).ok() == Some(spelling)
-                {
-                    has_name = true;
-                    break;
+            // Match the binding's declared LHS name only. Searching its whole
+            // initializer would mistake `val id = UUID.randomUUID()` for a
+            // local binding named UUID and recursively infer the same call.
+            let binding = match node.kind() {
+                "property_declaration" => {
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor)
+                        .find(|child| child.kind() == "variable_declaration")
+                        .and_then(|child| node_name(child, source))
                 }
-                let mut cursor = child.walk();
-                descendants.extend(child.named_children(&mut cursor));
-            }
-            if has_name && let Some(ty) = ty {
+                "local_variable_declaration" | "field_declaration" => {
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor)
+                        .filter(|child| child.kind() == "variable_declarator")
+                        .filter_map(|child| node_name(child, source))
+                        .find(|name| name == spelling)
+                }
+                _ => node_name(node, source),
+            };
+            let has_name = binding.as_deref() == Some(spelling);
+            let inferred_platform_type = if has_name && ty.is_none() {
+                node.utf8_text(source.as_bytes())
+                    .ok()
+                    .and_then(|declaration| {
+                        let (_, initializer) = declaration.split_once('=')?;
+                        let initializer = initializer.trim().trim_end_matches(';').trim();
+                        let mut pending = vec![node];
+                        while let Some(candidate) = pending.pop() {
+                            if matches!(candidate.kind(), "call_expression" | "method_invocation")
+                                && candidate.utf8_text(source.as_bytes()).ok() == Some(initializer)
+                            {
+                                let callee = call_callee_node(candidate)?;
+                                if callee.utf8_text(source.as_bytes()).ok() == Some("randomUUID")
+                                    && known_external_member_call(
+                                        source,
+                                        file,
+                                        candidate,
+                                        callee,
+                                        "randomUUID",
+                                        provider,
+                                    )
+                                {
+                                    return Some("java.util.UUID".to_string());
+                                }
+                            }
+                            let mut cursor = candidate.walk();
+                            pending.extend(candidate.named_children(&mut cursor));
+                        }
+                        None
+                    })
+            } else {
+                None
+            };
+            if has_name && let Some(ty) = ty.or(inferred_platform_type.as_deref()) {
                 let depth = node.start_byte();
                 if candidate
                     .as_ref()
@@ -2577,10 +2778,9 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
         stack.extend(node.named_children(&mut cursor));
     }
     candidate.map(|(_, ty)| ty.trim().to_owned()).or_else(|| {
-        spelling
-            .chars()
-            .next()
-            .is_some_and(char::is_uppercase)
+        // A binding whose initializer has no proven type must still shadow
+        // an imported class with the same uppercase name.
+        (!has_untyped_indexed_binding && spelling.chars().next().is_some_and(char::is_uppercase))
             .then(|| spelling.to_owned())
     })
 }
@@ -2593,6 +2793,9 @@ fn indexed_call_return_type<P: SemanticProvider + ?Sized>(
     provider: &P,
 ) -> Option<String> {
     let name = callee.utf8_text(source.as_bytes()).ok()?.trim();
+    if let Some(return_type) = established_platform_call_return_type(source, file, call, provider) {
+        return Some(return_type.to_string());
+    }
     let FactStatus::Established(id) =
         resolve_required_call(source, file, call, callee, name, provider)
     else {
@@ -2903,6 +3106,39 @@ fn enclosing_callable<'tree>(
     None
 }
 
+/// Exact platform return facts shared with Java emission. Never infer a
+/// platform factory from its simple name without a proven explicit receiver.
+pub(crate) fn established_platform_call_return_type<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<&'static str> {
+    let callee = call_callee_node(call)?;
+    let name = callee.utf8_text(source.as_bytes()).ok()?.trim();
+    (name == "randomUUID"
+        && explicit_receiver_node(call, callee).is_some()
+        && known_external_member_call(source, file, call, callee, name, provider))
+    .then_some("java.util.UUID")
+}
+
+pub(crate) fn established_java_callable_member<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    provider: &P,
+) -> bool {
+    let Some(callee) = call_callee_node(call) else {
+        return false;
+    };
+    if explicit_receiver_node(call, callee).is_none() {
+        return false;
+    }
+    let name = callee.utf8_text(source.as_bytes()).unwrap_or("");
+    matches!(resolve_required_call(source, file, call, callee, name, provider),
+        FactStatus::Established(id) if provider.is_java_callable_member(&id))
+}
+
 fn known_external_member_call<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
@@ -2934,7 +3170,8 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
     }
     matches!(
         (receiver_type.as_str(), name, arity),
-        ("java.util.UUID", "toString" | "hashCode", 0)
+        ("java.util.UUID", "randomUUID", 0)
+            | ("java.util.UUID", "toString" | "hashCode", 0)
             | ("java.util.UUID", "equals", 1)
             | (
                 "java.lang.String",
@@ -3177,6 +3414,66 @@ fn has_wildcard_import(source: &str) -> bool {
         })
     })
 }
+
+/// A Java `java.util.*` import cannot shadow Kotlin's collection factory
+/// functions, but arbitrary wildcard imports can. Keep unresolved wildcard
+/// calls conservative unless every wildcard import is exactly `java.util.*`.
+/// Restrict the proof to empty factories; populated factories need separate
+/// null-element and spread proofs. Kotlin read-only collections intentionally
+/// map to ordinary mutable Java collections.
+fn known_collection_factory_from_java_util_wildcard(
+    source: &str,
+    call: tree_sitter::Node,
+    callee: tree_sitter::Node,
+    name: &str,
+) -> bool {
+    if !matches!(
+        name,
+        "listOf"
+            | "mutableListOf"
+            | "arrayListOf"
+            | "emptyList"
+            | "setOf"
+            | "mutableSetOf"
+            | "hashSetOf"
+            | "emptySet"
+            | "mapOf"
+            | "mutableMapOf"
+            | "hashMapOf"
+            | "emptyMap"
+    ) || call_argument_count(call) != 0
+        || callee
+            .parent()
+            .is_some_and(|parent| parent.kind() == "navigation_expression")
+    {
+        return false;
+    }
+
+    let mut saw_java_util_wildcard = false;
+    for line in source.lines() {
+        let Some(import) = line.trim().strip_prefix("import ") else {
+            continue;
+        };
+        let path = import.split(" as ").next().unwrap_or(import).trim();
+        if path.ends_with(".*") {
+            if path != "java.util.*" || import.contains(" as ") {
+                return false;
+            }
+            saw_java_util_wildcard = true;
+        } else {
+            let imported_name = import
+                .split_once(" as ")
+                .map(|(_, alias)| alias.trim())
+                .or_else(|| path.rsplit('.').next())
+                .unwrap_or("");
+            if imported_name == name {
+                return false;
+            }
+        }
+    }
+    saw_java_util_wildcard
+}
+
 fn fact_from_candidates(mut candidates: Vec<SymbolId>) -> FactStatus<SymbolId> {
     candidates.sort();
     candidates.dedup();

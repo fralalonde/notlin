@@ -229,6 +229,7 @@ class TaskRunner : TaskContract {
         runTask()
     }
 }
+
 "#;
     let wrong_provider =
         SyntaxSemanticProvider::new(vec![(PathBuf::from("TaskRunner.kt"), wrong_arity.into())]);
@@ -270,6 +271,95 @@ class TaskRunner : LeftContract, RightContract {
         panic!("expected inherited diamond ambiguity, got {resolved:?}")
     };
     assert_eq!(candidates.len(), 2);
+}
+
+#[test]
+fn inherited_same_signature_method_prefers_proven_descendant_declaration() {
+    let java = "package sem; public interface ReferenceApi { String getReferenceNo(); }";
+    let context = r#"package sem
+interface RootContext : ReferenceApi
+interface NarrowContext : RootContext {
+    override fun getReferenceNo(): String
+}
+interface SiblingContext : RootContext, ReferenceApi
+interface NarrowBranch : NarrowContext
+interface Entry : NarrowBranch, SiblingContext
+fun readReferenceNo(entry: Entry) { entry.getReferenceNo() }
+"#;
+    let provider = SyntaxSemanticProvider::new(vec![
+        (PathBuf::from("ReferenceApi.java"), java.into()),
+        (PathBuf::from("Contexts.kt"), context.into()),
+    ]);
+    let resolved = required_call_dependency(context, "Contexts.kt", &provider, "getReferenceNo");
+    let FactStatus::Established(symbol) = resolved else {
+        panic!(
+            "expected descendant Kotlin override to dominate matching Java ancestor, got {resolved:?}"
+        )
+    };
+    assert_eq!(symbol.owner_path, vec!["NarrowContext"]);
+}
+
+#[test]
+fn inherited_same_language_override_dominates_its_ancestor() {
+    let source = r#"package sem
+interface RootContext {
+    fun getReferenceNo(): String
+}
+interface NarrowContext : RootContext {
+    override fun getReferenceNo(): String
+}
+interface SiblingContext : RootContext
+interface Entry : NarrowContext, SiblingContext
+fun readReferenceNo(entry: Entry) { entry.getReferenceNo() }
+"#;
+    let provider =
+        SyntaxSemanticProvider::new(vec![(PathBuf::from("Reference.kt"), source.into())]);
+    let resolved = required_call_dependency(source, "Reference.kt", &provider, "getReferenceNo");
+    let FactStatus::Established(symbol) = resolved else {
+        panic!("expected same-language descendant declaration, got {resolved:?}")
+    };
+    assert_eq!(symbol.owner_path, vec!["NarrowContext"]);
+}
+
+#[test]
+fn inherited_method_dominance_keeps_unrelated_and_different_signature_candidates() {
+    let source = r#"package sem
+interface LeftContext {
+    fun getReferenceNo(): String
+}
+interface RightContext {
+    fun getReferenceNo(): String
+}
+interface UnrelatedDiamond : LeftContext, RightContext
+interface RootContext {
+    fun getReferenceNo(value: Int): String
+}
+interface NarrowContext : RootContext {
+    fun getReferenceNo(): String
+}
+interface OverloadDiamond : NarrowContext, RootContext
+"#;
+    let provider =
+        SyntaxSemanticProvider::new(vec![(PathBuf::from("Negatives.kt"), source.into())]);
+    let diamond = provider
+        .symbols_named("UnrelatedDiamond")
+        .into_iter()
+        .find(|s| s.id.kind == "interface")
+        .unwrap();
+    let ambiguous = provider.inherited_members(&diamond.id, "getReferenceNo");
+    assert_eq!(ambiguous.len(), 2, "unrelated parents remain ambiguous");
+
+    let overload = provider
+        .symbols_named("OverloadDiamond")
+        .into_iter()
+        .find(|s| s.id.kind == "interface")
+        .unwrap();
+    let overloads = provider.inherited_members(&overload.id, "getReferenceNo");
+    assert_eq!(
+        overloads.len(),
+        2,
+        "a different parameter signature must not be discarded"
+    );
 }
 
 #[test]
@@ -1055,6 +1145,117 @@ fn wildcard_builtin_collision_and_unindexed_wildcard_stay_conservative() {
 }
 
 #[test]
+fn java_util_wildcard_does_not_block_unshadowed_kotlin_collection_factory() {
+    let source = "package p\nimport java.util.*\ninterface Event\ninterface Variant { val events: List<Event> get() = arrayListOf() }\n";
+    let provider = SyntaxSemanticProvider::new(vec![(PathBuf::from("Caller.kt"), source.into())]);
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let mut plan =
+        notlin::translation_plan::analyze(source, tree.root_node(), Path::new("Caller.kt"));
+    plan_required_calls(
+        source,
+        &tree,
+        Path::new("Caller.kt"),
+        &provider,
+        false,
+        &mut plan,
+    );
+    let decision = plan
+        .declarations
+        .iter()
+        .find(|declaration| declaration.symbol_id.name == "Variant")
+        .unwrap();
+    assert_eq!(
+        decision.candidate_owner,
+        notlin::translation_plan::BackendOwner::Java
+    );
+    assert!(!decision.retention_reasons.iter().any(|reason| matches!(
+        reason,
+        notlin::translation_plan::RetentionReason::UnknownRequiredFact { name }
+            if name == "arrayListOf"
+    )));
+}
+
+#[test]
+fn java_util_wildcard_collection_factory_collisions_remain_conservative() {
+    for imports in [
+        "import java.util.*\nimport external.*\n",
+        "import java.util.*\nimport external.arrayListOf as arrayListOf\n",
+        "import java.util.*\nimport external.arrayListOf\n",
+    ] {
+        let source = format!(
+            "package p\n{imports}interface Event\ninterface Variant {{ val events: List<Event> get() = arrayListOf() }}\n"
+        );
+        let provider =
+            SyntaxSemanticProvider::new(vec![(PathBuf::from("Caller.kt"), source.clone())]);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let mut plan =
+            notlin::translation_plan::analyze(&source, tree.root_node(), Path::new("Caller.kt"));
+        plan_required_calls(
+            &source,
+            &tree,
+            Path::new("Caller.kt"),
+            &provider,
+            false,
+            &mut plan,
+        );
+        let decision = plan
+            .declarations
+            .iter()
+            .find(|declaration| declaration.symbol_id.name == "Variant")
+            .unwrap();
+        assert_eq!(
+            decision.candidate_owner,
+            notlin::translation_plan::BackendOwner::Kotlin,
+            "colliding wildcard or explicit import must retain the caller: {imports}"
+        );
+        assert!(decision.retention_reasons.iter().any(|reason| matches!(
+            reason,
+            notlin::translation_plan::RetentionReason::UnknownRequiredFact { name }
+                if name == "arrayListOf"
+        )));
+    }
+}
+
+#[test]
+fn platform_wildcard_does_not_prove_populated_factory_behavior() {
+    for factory in ["arrayListOf(null)", "listOf(null)"] {
+        let source = format!(
+            "package p\nimport java.util.*\ninterface Variant {{\n val values: List<String?>\n  get() = {factory}\n}}\n"
+        );
+        let file = Path::new("Caller.kt");
+        let provider = SyntaxSemanticProvider::new(vec![(file.to_path_buf(), source.clone())]);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let mut plan = notlin::translation_plan::analyze(&source, tree.root_node(), file);
+        plan_required_calls(&source, &tree, file, &provider, false, &mut plan);
+        assert!(
+            plan.declarations
+                .iter()
+                .find(|decision| decision.symbol_id.name == "Variant")
+                .unwrap()
+                .retention_reasons
+                .iter()
+                .any(|reason| matches!(
+                    reason,
+                    notlin::translation_plan::RetentionReason::UnknownRequiredFact { .. }
+                )),
+            "factory needs a separate behavior proof: {factory}"
+        );
+    }
+}
+
+#[test]
 fn user_builtin_shadow_and_local_function_value_are_not_mislowered() {
     let source = "package p\nfun print() = Unit\nfun top() = Unit\nfun caller() { val top = { Unit }; top(); print() }\n";
     let provider = SyntaxSemanticProvider::new(vec![(PathBuf::from("a.kt"), source.into())]);
@@ -1246,6 +1447,105 @@ class ExternalId(val objectId: UUID) {
     );
 }
 
+fn uuid_factory_plan(source: &str, file: &str) -> notlin::translation_plan::TranslationPlan {
+    let path = Path::new(file);
+    let provider = SyntaxSemanticProvider::new(vec![(path.to_path_buf(), source.to_string())]);
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let mut plan = notlin::translation_plan::analyze(source, tree.root_node(), path);
+    plan_required_calls(source, &tree, path, &provider, false, &mut plan);
+    plan
+}
+
+#[test]
+fn uuid_random_uuid_is_a_resolved_platform_factory_with_explicit_or_wildcard_import() {
+    for import in ["import java.util.UUID", "import java.util.*"] {
+        let source = format!(
+            "package sem\n{import}\nclass Holder {{ fun chained(): String = UUID.randomUUID().toString(); fun local(): String {{ val id = UUID.randomUUID(); return id.toString() }} }}\n"
+        );
+        let plan = uuid_factory_plan(&source, "Holder.kt");
+        assert!(
+            !plan
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "S001"),
+            "UUID factory and its inferred receiver should resolve for {import}: {:?}",
+            plan.diagnostics
+        );
+        assert!(plan.declarations.iter().all(|declaration| {
+            declaration.candidate_owner == notlin::translation_plan::BackendOwner::Java
+        }));
+    }
+}
+
+#[test]
+fn uuid_random_uuid_platform_fact_requires_canonical_unshadowed_zero_arg_call() {
+    let custom_type = r#"package sem
+import java.util.*
+class UUID
+class Holder { fun make() = UUID.randomUUID() }
+"#;
+    assert!(
+        uuid_factory_plan(custom_type, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let local_shadow = r#"package sem
+import java.util.*
+class Other
+class Holder { fun make() { val UUID = Other(); UUID.randomUUID() } }
+"#;
+    assert!(
+        uuid_factory_plan(local_shadow, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let wrong_arity = r#"package sem
+import java.util.UUID
+class Holder { fun make() = UUID.randomUUID(1) }
+"#;
+    assert!(
+        uuid_factory_plan(wrong_arity, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+}
+
+#[test]
+fn bare_custom_random_uuid_call_infers_its_indexed_return_without_recursion() {
+    let source = r#"package sem
+class UUID {
+    override fun toString(): String = "custom"
+}
+fun randomUUID(): UUID { return UUID() }
+class Holder {
+    fun make(): String = randomUUID().toString()
+}
+"#;
+    let plan = uuid_factory_plan(source, "Holder.kt");
+    assert!(
+        !plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001"),
+        "bare custom function calls should resolve through the indexed function return: {:?}",
+        plan.diagnostics
+    );
+    assert!(plan.dependencies.iter().any(|dependency| {
+        dependency.spelling == "randomUUID"
+            && matches!(&dependency.resolution, FactStatus::Established(symbol)
+                if symbol.kind == "function" && symbol.name == "randomUUID")
+    }));
+}
+
 #[test]
 fn external_capabilities_match_exact_split_and_mutable_collection_forms() {
     let cases = [
@@ -1367,6 +1667,7 @@ class String
 class StringCaller(val value: String) {
     fun lower(): String = value.lowercase()
 }
+
 "#;
     let file = Path::new("ShadowString.kt");
     let provider = SyntaxSemanticProvider::new(vec![(file.to_path_buf(), source.into())]);
@@ -1380,4 +1681,37 @@ class StringCaller(val value: String) {
     assert!(plan.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "S001" && diagnostic.message.contains("lowercase")
     }));
+}
+
+#[test]
+fn java_callable_member_requires_a_proven_java_contract() {
+    let provider = SyntaxSemanticProvider::new([
+        (
+            PathBuf::from("ReferenceApi.java"),
+            "package sem; public interface ReferenceApi { String getReferenceNo(); }".into(),
+        ),
+        (
+            PathBuf::from("Members.kt"),
+            r#"package sem
+interface Bridge : ReferenceApi {
+    override fun getReferenceNo(): String = "reference"
+}
+class Internal {
+    internal fun getReferenceNo(): String = "internal"
+}
+fun Bridge.getOther(): String = "extension"
+"#
+            .into(),
+        ),
+    ]);
+    let methods = provider.symbols_named("getReferenceNo");
+    assert_eq!(methods.len(), 3);
+    for method in methods {
+        let expected = method.id.file.extension().is_some_and(|ext| ext == "java")
+            || method.id.owner_path == ["Bridge"];
+        assert_eq!(provider.is_java_callable_member(&method.id), expected);
+    }
+    let extension = provider.symbols_named("getOther");
+    assert_eq!(extension.len(), 1);
+    assert!(!provider.is_java_callable_member(&extension[0].id));
 }

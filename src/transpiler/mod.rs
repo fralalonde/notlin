@@ -189,6 +189,11 @@ pub struct PlannedTranslation {
     /// Accepted, strictly parsed Java syntax. Candidate source from the unit
     /// lowerer is never emitted directly.
     pub accepted: crate::planning::AcceptedTranslationPlan,
+    /// Declaration identities present in accepted Java output. Unlike planned
+    /// ownership, this excludes declarations the lowerer ultimately retained.
+    pub emitted_owners: Vec<crate::semantics::SymbolId>,
+    /// Accepted source declaration identities grouped by generated Java path.
+    pub emitted_file_owners: Vec<(String, Vec<crate::semantics::SymbolId>)>,
     pub java_files: Vec<(String, String)>,
     /// True when a prepared candidate could not be accepted as valid Java.
     pub emission_failed: bool,
@@ -607,6 +612,12 @@ fn lower_with_plan(
         coverage.attached_comment_spans.clear();
     }
     let java_files = accepted.emit();
+    let emitted_owners = accepted.emitted_owners().to_vec();
+    let emitted_file_owners = accepted
+        .files()
+        .iter()
+        .map(|file| (file.path.clone(), file.owners.clone()))
+        .collect();
     let plan = accepted.translation().clone();
     if let Some(started) = acceptance_started
         && started.elapsed().as_millis() >= 250
@@ -627,6 +638,8 @@ fn lower_with_plan(
     PlannedTranslation {
         plan,
         accepted,
+        emitted_owners,
+        emitted_file_owners,
         java_files,
         emission_failed,
         errors,

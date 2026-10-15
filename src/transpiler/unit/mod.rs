@@ -194,6 +194,44 @@ pub struct UnitOptions {
 }
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    pub(crate) fn established_java_callable_member(&self, node: tree_sitter::Node) -> bool {
+        let Some(provider) = self.semantic_provider else {
+            return false;
+        };
+        let call = if matches!(node.kind(), "call_expression" | "method_invocation") {
+            Some(node)
+        } else {
+            node.parent()
+                .filter(|parent| matches!(parent.kind(), "call_expression" | "method_invocation"))
+        };
+        call.is_some_and(|call| {
+            crate::semantics::established_java_callable_member(
+                self.source,
+                self.workspace_file.as_deref().unwrap_or(self.file),
+                call,
+                provider,
+            )
+        })
+    }
+
+    pub(crate) fn established_platform_call_return_type(
+        &self,
+        node: tree_sitter::Node,
+    ) -> Option<&'static str> {
+        let call = if matches!(node.kind(), "call_expression" | "method_invocation") {
+            node
+        } else {
+            node.parent()
+                .filter(|parent| matches!(parent.kind(), "call_expression" | "method_invocation"))?
+        };
+        crate::semantics::established_platform_call_return_type(
+            self.source,
+            self.workspace_file.as_deref().unwrap_or(self.file),
+            call,
+            self.semantic_provider?,
+        )
+    }
+
     pub(crate) fn is_retained_type(&self, name: &str) -> bool {
         let Some(retained) = self.retained_hint else {
             return false;
@@ -233,6 +271,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 .any(|m| m.name == member && m.kind == crate::workspace::MemberKind::Method);
         }
         use crate::semantics::SemanticProvider;
+        if let Some(provider) = self.semantic_provider {
+            let file = self.workspace_file.as_deref().unwrap_or(self.file);
+            return provider
+                .symbols_named(member)
+                .into_iter()
+                .filter(|symbol| {
+                    (symbol.id.file == file || symbol.id.file == self.file)
+                        && symbol.id.kind == "function"
+                        && symbol.id.owner_path.last().is_some_and(|owner| owner == ty)
+                })
+                .count()
+                == 1;
+        }
         let provider = crate::semantics::SyntaxSemanticProvider::new([(
             self.file.to_path_buf(),
             self.source.to_string(),

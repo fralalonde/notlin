@@ -48,6 +48,30 @@ pub fn repair_virtual_calls(
     plans: &[TranslationPlan],
     residual_sources: &mut BTreeMap<PathBuf, String>,
 ) -> CallsiteRepairReport {
+    let planned_owners = plans
+        .iter()
+        .flat_map(|plan| plan.declarations.iter())
+        .filter(|decision| decision.final_owner == Some(BackendOwner::Java))
+        .map(|decision| decision.symbol_id.clone())
+        .collect::<Vec<_>>();
+    repair_virtual_calls_with_emitted_owners(
+        original_sources,
+        plans,
+        residual_sources,
+        &planned_owners,
+    )
+}
+
+/// Like `repair_virtual_calls`, but only rewrite calls to top-level functions
+/// whose declaration identity is present in accepted Java output. Planned Java
+/// ownership alone is insufficient: late lowering can retain an individual
+/// function while another declaration in its file still emits Java.
+pub fn repair_virtual_calls_with_emitted_owners(
+    original_sources: &BTreeMap<PathBuf, String>,
+    plans: &[TranslationPlan],
+    residual_sources: &mut BTreeMap<PathBuf, String>,
+    emitted_owners: &[SymbolId],
+) -> CallsiteRepairReport {
     let mut report = CallsiteRepairReport::default();
     let input: Vec<_> = original_sources
         .iter()
@@ -58,6 +82,7 @@ pub fn repair_virtual_calls(
     for plan in plans {
         for decision in &plan.declarations {
             if decision.final_owner != Some(BackendOwner::Java)
+                || !emitted_owners.contains(&decision.symbol_id)
                 || decision.symbol_id.kind != "function"
                 || !decision.symbol_id.owner_path.is_empty()
                 || decision.symbol_id.receiver.is_some()

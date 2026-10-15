@@ -208,18 +208,21 @@ fn the_jpa_no_arg_constructor_clears_every_field() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// The `--lombok` shape: `@Data`/`@Value` classes with explicit fields.
+/// The `--lombok` shape: accessor/value annotations with explicit fields.
 #[test]
 fn the_lombok_forms_get_the_same_constructor() {
     let (root, _) = run("lombok", &["--lombok"]);
 
     let item = java_of(&root, "Item");
-    assert!(item.contains("@Data"), "expected the Lombok form:\n{item}");
+    assert!(
+        item.contains("@Getter") && !item.contains("@Data"),
+        "ordinary classes must keep identity equality:\n{item}"
+    );
     assert!(
         item.contains("public Item() {")
             && item.contains("this.name = null;")
             && item.contains("this.items = null;"),
-        "@Data does not generate a zero-argument constructor, so this one is \
+        "accessor annotations do not generate a zero-argument constructor, so this one is \
          required:\n{item}"
     );
 

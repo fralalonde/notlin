@@ -91,11 +91,13 @@ fn constructed_expressions_keep_precedence_and_escape_call_arguments() {
 
 #[test]
 fn prunes_only_unused_lombok_imports_from_structured_references() {
-    let source = "import lombok.Data;\nimport lombok.Value;\nclass Model {\n    @Data String field;\n    String note = \"Value\";\n}\n";
+    let source = "import lombok.Data;\nimport lombok.Getter;\nimport lombok.Setter;\nimport lombok.Value;\n@Data class Model {\n    @Getter String field;\n    String note = \"Value Setter\";\n}\n";
     let mut unit = parse_java(source).expect("valid Java");
-    assert_eq!(notlin::java_ir::remove_unused_lombok_imports(&mut unit), 1);
+    assert_eq!(notlin::java_ir::remove_unused_lombok_imports(&mut unit), 2);
     let rendered = render(&unit);
     assert!(rendered.contains("import lombok.Data;"));
     assert!(!rendered.contains("import lombok.Value;"));
-    assert!(rendered.contains("String note = \"Value\";"));
+    assert!(rendered.contains("import lombok.Getter;"));
+    assert!(!rendered.contains("import lombok.Setter;"));
+    assert!(rendered.contains("String note = \"Value Setter\";"));
 }

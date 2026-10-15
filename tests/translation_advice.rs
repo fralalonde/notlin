@@ -64,6 +64,8 @@ fn plans_for(index: &SourceIndex) -> (Vec<FilePlan>, HashMap<PathBuf, Translatio
             file: source_file.path.clone(),
             source,
             java_files: Vec::new(),
+            emitted_owners: Vec::new(),
+            emitted_file_owners: Vec::new(),
             errors: 0,
             warnings: 0,
             coverage: Default::default(),

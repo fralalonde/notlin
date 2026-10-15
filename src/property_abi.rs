@@ -1113,10 +1113,12 @@ fn property_type_matches(
         return false;
     }
     if !member.is_mutable
+        && contract.setter.is_none()
         && !member_type.trim().ends_with('?')
         && contract.type_name.trim().ends_with('?')
-        && is_scalar_reference_type(member_type)
-        && is_scalar_reference_type(&contract.type_name)
+        && ((is_scalar_reference_type(member_type)
+            && is_scalar_reference_type(&contract.type_name))
+            || (member_type.contains('<') && contract.type_name.contains('<')))
     {
         let Some(subtype_file) = index.declaration_source_file(subtype) else {
             return false;
@@ -1235,12 +1237,39 @@ fn is_scalar_reference_type(type_name: &str) -> bool {
         )
 }
 
+/// Parallel collection properties are repairable only for the builtin
+/// read-only collection declarations whose covariance is modeled by the
+/// workspace type checker. A matching simple name can be shadowed by a source
+/// declaration or import, so resolve it in the declaration's source context.
+fn is_readonly_collection_property_type(
+    index: &SourceIndex,
+    source_file: &SourceFile,
+    type_name: &str,
+) -> bool {
+    let type_name = type_name.trim().trim_end_matches('?').trim();
+    let (base, arguments) = split_type_arguments(type_name);
+    matches!(
+        base,
+        "List" | "Set" | "Collection" | "Iterable" | "Sequence"
+    ) && arguments.len() == 1
+        && crate::workspace::collection_base_is_unshadowed(index, source_file, base)
+}
+
 fn is_jvm_getter_return_type(type_name: &str) -> bool {
     is_scalar_reference_type(type_name)
         || matches!(
             type_name.trim().trim_end_matches('?').trim(),
             "String" | "Boolean" | "Byte" | "Short" | "Int" | "Long" | "Float" | "Double" | "Char"
         )
+}
+
+fn is_supported_parallel_getter_return_type(
+    index: &SourceIndex,
+    source_file: &SourceFile,
+    type_name: &str,
+) -> bool {
+    is_jvm_getter_return_type(type_name)
+        || is_readonly_collection_property_type(index, source_file, type_name)
 }
 
 fn qualify_simple_type_argument(
@@ -1294,13 +1323,20 @@ fn adapt_parallel_readonly_contracts(
             let Some(local_type) = member.type_name.as_deref() else {
                 return contract;
             };
+            let Some(contract_file) = index.source_file(&contract.type_source) else {
+                return contract;
+            };
             let local_is_type_parameter = declaration
                 .type_params
                 .iter()
                 .any(|parameter| parameter == local_type.trim().trim_end_matches('?').trim());
             if member.is_mutable
-                || !is_jvm_getter_return_type(local_type)
-                || !is_jvm_getter_return_type(&contract.type_name)
+                || !is_supported_parallel_getter_return_type(index, source_file, local_type)
+                || !is_supported_parallel_getter_return_type(
+                    index,
+                    contract_file,
+                    &contract.type_name,
+                )
                 || (!local_is_type_parameter
                     && !index.property_getter_return_compatible_in_files(
                         &contract.type_source,
@@ -1344,9 +1380,12 @@ fn parallel_readonly_contract_is_bridgeable(
     let Some(local_type) = member.type_name.as_deref() else {
         return false;
     };
+    let Some(contract_file) = index.source_file(&contract.type_source) else {
+        return false;
+    };
     if local_type.trim().ends_with('?') != contract.type_name.trim().ends_with('?')
-        || !is_jvm_getter_return_type(local_type)
-        || !is_jvm_getter_return_type(&contract.type_name)
+        || !is_supported_parallel_getter_return_type(index, declaration_file, local_type)
+        || !is_supported_parallel_getter_return_type(index, contract_file, &contract.type_name)
     {
         return false;
     }
@@ -1669,13 +1708,18 @@ fn class_supertype_properties_compatible(
                 let local_readonly_contract = parallel_contract
                     && member.kind == MemberKind::Property
                     && !member.is_mutable
-                    && is_scalar_reference_type(&specialized_member_type);
+                    && (is_scalar_reference_type(&specialized_member_type)
+                        || is_readonly_collection_property_type(
+                            index,
+                            parent_file,
+                            &specialized_member_type,
+                        ));
                 if parallel_contract
                     && (!index.is_selected(&parent_file.path, translation_roots)
                         || !local_readonly_contract)
                 {
                     log::debug!(
-                        "parallel property contract {}.{} rejected for {}: selected={}, readonly_scalar={}",
+                        "parallel property contract {}.{} rejected for {}: selected={}, readonly_supported={}",
                         parent.name,
                         member.name,
                         implementation.name,
@@ -1840,9 +1884,10 @@ fn class_supertype_properties_compatible(
     true
 }
 
-/// Find the nearest concrete read-only scalar property available to a class.
-/// Interface defaults are eligible only when they carry a getter body; an
-/// abstract declaration alone cannot satisfy a concrete getter contract.
+/// Find the concrete read-only scalar property or direct readonly collection
+/// property available to a class. Inherited defaults remain scalar-only and
+/// are eligible only when they carry a getter body; an abstract declaration
+/// alone cannot satisfy a concrete getter contract.
 fn effective_readonly_scalar_property<'a>(
     index: &'a SourceIndex,
     implementation: &'a Declaration,
@@ -1853,11 +1898,12 @@ fn effective_readonly_scalar_property<'a>(
         .iter()
         .find(|member| member.kind == MemberKind::Property && member.name == name)
     {
+        let implementation_file = index.declaration_source_file(implementation)?;
         return (!member.is_mutable
-            && member
-                .type_name
-                .as_deref()
-                .is_some_and(is_scalar_reference_type))
+            && member.type_name.as_deref().is_some_and(|type_name| {
+                is_scalar_reference_type(type_name)
+                    || is_readonly_collection_property_type(index, implementation_file, type_name)
+            }))
         .then_some((implementation, member));
     }
     let source_file = index.declaration_source_file(implementation)?;
@@ -3081,8 +3127,9 @@ fn contracts_for_repair_inner(
             }
             // Mutable JavaBean contracts carry a setter and use the ordinary
             // bridge path. This covariance closure applies only to readonly
-            // scalar properties; applying its fail-closed rules to a direct
-            // getter/setter contract would erase a valid setter bridge.
+            // scalar and supported readonly collection properties; applying
+            // its fail-closed rules to a direct getter/setter contract would
+            // erase a valid setter bridge.
             if contract.setter.is_some() && by_name.contains_key(&contract.name) {
                 continue;
             }
@@ -4812,6 +4859,217 @@ mod tests {
     }
 
     #[test]
+    fn planner_accepts_readonly_collection_covariance_across_parallel_contracts() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\ninterface BaseEntry\ninterface ChildEntry : BaseEntry\ninterface RootContract {\n val entries: List<ChildEntry>\n}\n",
+        );
+        fixture.write(
+            "Parallel.kt",
+            "package sample\ninterface ParallelContract {\n val entries: List<BaseEntry>\n}\n",
+        );
+        fixture.write(
+            "Impl.kt",
+            "package sample\nclass Concrete(override val entries: List<ChildEntry>) : RootContract, ParallelContract\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "RootContract")
+            .unwrap();
+        let retained = retained_names(&index, &["Concrete", "ParallelContract"]);
+        let result =
+            retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
+        assert!(result.is_ok(), "{result:?}");
+
+        let parallel = index
+            .declarations()
+            .find(|declaration| declaration.name == "ParallelContract")
+            .unwrap();
+        let adapted = adapt_parallel_readonly_contracts(
+            &index,
+            parallel,
+            vec![PropertyContract {
+                name: "entries".into(),
+                type_name: "List<ChildEntry>".into(),
+                type_source: fixture.0.join("Api.kt"),
+                getter: "getEntries".into(),
+                setter: None,
+            }],
+        );
+        assert_eq!(adapted[0].type_name, "List<BaseEntry>");
+        assert_eq!(
+            adapted[0].type_source,
+            fs::canonicalize(fixture.0.join("Parallel.kt")).unwrap()
+        );
+    }
+
+    #[test]
+    fn planner_rejects_readonly_collection_parallel_contract_without_element_subtyping() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\ninterface BaseEntry {}\ninterface ChildEntry {}\ninterface RootContract {\n val entries: List<ChildEntry>\n}\ninterface ParallelContract {\n val entries: List<BaseEntry>\n}\n",
+        );
+        fixture.write(
+            "Impl.kt",
+            "package sample\nclass Concrete(override val entries: List<ChildEntry>) : RootContract, ParallelContract\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "RootContract")
+            .unwrap();
+        let retained = retained_names(&index, &["Concrete"]);
+        let result =
+            retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
+        assert!(
+            result.is_err(),
+            "unrelated element types were accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_mutable_parallel_collection_contract() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\ninterface BaseEntry {}\ninterface RootContract {\n val entries: List<BaseEntry>\n}\ninterface ParallelContract {\n var entries: List<BaseEntry>\n}\n",
+        );
+        fixture.write(
+            "Impl.kt",
+            "package sample\nclass Concrete(override var entries: List<BaseEntry>) : RootContract, ParallelContract\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "RootContract")
+            .unwrap();
+        let retained = retained_names(&index, &["Concrete"]);
+        let result =
+            retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
+        assert!(
+            result.is_err(),
+            "mutable sibling contract was accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_unselected_parallel_collection_contract() {
+        let fixture = Fixture::new();
+        let selected = fixture.0.join("selected");
+        fixture.write(
+            "selected/Api.kt",
+            "package sample\nimport contracts.ParallelContract\ninterface BaseEntry\ninterface ChildEntry : BaseEntry\ninterface RootContract {\n val entries: List<ChildEntry>\n}\n",
+        );
+        fixture.write(
+            "contracts/Parallel.kt",
+            "package contracts\nimport sample.BaseEntry\ninterface ParallelContract {\n val entries: List<BaseEntry>\n}\n",
+        );
+        fixture.write(
+            "selected/Impl.kt",
+            "package sample\nimport contracts.ParallelContract\nclass Concrete(override val entries: List<ChildEntry>) : RootContract, ParallelContract\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "RootContract")
+            .unwrap();
+        let retained = retained_names(&index, &["Concrete"]);
+        let result = retained_subtypes_bridge(&index, target, &retained, &[selected]);
+        assert!(
+            result.is_err(),
+            "unselected sibling contract was accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn repair_keeps_parallel_collection_type_and_bridges_concrete_narrow_type() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Types.kt",
+            "package sample\ninterface BaseEntry\ninterface ChildEntry : BaseEntry\n",
+        );
+        let root_source = fixture.write(
+            "RootContract.kt",
+            "package sample\ninterface RootContract {\n val entries: List<ChildEntry>\n}\n",
+        );
+        let parallel = fixture.write(
+            "Parallel.kt",
+            "package sample\ninterface ParallelContract {\n val entries: List<BaseEntry>\n}\n",
+        );
+        let concrete = fixture.write(
+            "Concrete.kt",
+            "package sample\nclass Concrete(override val entries: List<ChildEntry>) : RootContract, ParallelContract\n",
+        );
+        let initial_index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = initial_index
+            .declarations()
+            .find(|declaration| declaration.name == "RootContract")
+            .unwrap();
+        let retained = retained_names(&initial_index, &["Concrete", "ParallelContract"]);
+        assert!(
+            retained_subtypes_bridge(
+                &initial_index,
+                target,
+                &retained,
+                std::slice::from_ref(&fixture.0)
+            )
+            .is_ok()
+        );
+
+        fs::remove_file(root_source).unwrap();
+        let java = fixture.write(
+            "translated/RootContract.java",
+            "// NOTLIN: generated from RootContract.kt\npackage sample;\nimport java.util.List;\npublic interface RootContract { List<ChildEntry> getEntries(); }\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let generated_java = HashSet::from([java]);
+        let mut sources = vec![
+            (parallel.clone(), fs::read_to_string(&parallel).unwrap()),
+            (concrete.clone(), fs::read_to_string(&concrete).unwrap()),
+        ];
+        let report = repair_virtual_sources_planned(&index, &mut sources, &generated_java);
+        assert!(report.count >= 2, "{report:?}");
+        assert!(
+            sources[0].1.contains("fun getEntries(): List<BaseEntry>"),
+            "parallel interface was narrowed to the generated root contract: {}",
+            sources[0].1
+        );
+        assert!(
+            sources[1].1.contains("getEntries(): List<ChildEntry>"),
+            "concrete getter did not retain its narrow element type: {}",
+            sources[1].1
+        );
+    }
+
+    #[test]
+    fn planner_rejects_shadowed_readonly_collection_name_in_parallel_contract() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\nclass List<T> {}\ninterface BaseEntry {}\ninterface ChildEntry : BaseEntry {}\ninterface RootContract {\n val entries: List<ChildEntry>\n}\ninterface ParallelContract {\n val entries: List<BaseEntry>\n}\n",
+        );
+        fixture.write(
+            "Impl.kt",
+            "package sample\nclass Concrete(override val entries: List<ChildEntry>) : RootContract, ParallelContract\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "RootContract")
+            .unwrap();
+        let retained = retained_names(&index, &["Concrete", "ParallelContract"]);
+        let result =
+            retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
+        assert!(
+            result.is_err(),
+            "shadowed List covariance was accepted: {result:?}"
+        );
+    }
+
+    #[test]
     fn planner_infers_unannotated_parallel_getter_from_instantiated_parent_contract() {
         let fixture = Fixture::new();
         fixture.write(
@@ -4954,6 +5212,53 @@ mod tests {
         let result =
             retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn planner_accepts_nonnull_covariant_collection_for_nullable_readonly_contract() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\ninterface BaseEntry {}\ninterface ChildEntry : BaseEntry {}\ninterface Api {\n    val entries: List<BaseEntry>?\n}\n",
+        );
+        fixture.write(
+            "Impl.kt",
+            "package sample\ndata class Impl(override val entries: List<ChildEntry>) : Api\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "Api")
+            .unwrap();
+        let retained = retained_names(&index, &["Impl"]);
+        let result =
+            retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn planner_rejects_nullable_collection_narrowing_for_mutable_contract() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\ninterface Entry {}\ninterface Api {\n    var entries: List<Entry>?\n}\n",
+        );
+        fixture.write(
+            "Impl.kt",
+            "package sample\nclass Impl(override var entries: List<Entry>) : Api\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "Api")
+            .unwrap();
+        let retained = retained_names(&index, &["Impl"]);
+        let result =
+            retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
+        assert!(
+            result.is_err(),
+            "mutable nullable contract was accepted: {result:?}"
+        );
     }
 
     #[test]
@@ -5680,7 +5985,7 @@ mod tests {
     }
 
     #[test]
-    fn non_generic_parallel_component_waits_for_complete_callsite_proof() {
+    fn parallel_readonly_collection_component_repairs_with_complete_callsite_proof() {
         let fixture = Fixture::new();
         fixture.write(
             "Api.kt",
@@ -5712,7 +6017,7 @@ mod tests {
             .find(|declaration| declaration.name == "Api")
             .unwrap();
         let retained = retained_names(&index, &["JobContainerInfo"]);
-        assert!(!retained_subtypes_repairable(
+        assert!(retained_subtypes_repairable(
             &index,
             target,
             &retained,

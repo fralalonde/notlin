@@ -19,6 +19,8 @@ pub struct FilePlan {
     pub file: PathBuf,
     pub source: String,
     pub java_files: Vec<(String, String)>,
+    pub emitted_owners: Vec<crate::semantics::SymbolId>,
+    pub emitted_file_owners: Vec<(String, Vec<crate::semantics::SymbolId>)>,
     pub errors: usize,
     pub warnings: usize,
     pub coverage: crate::diagnostics::FileCoverage,
@@ -104,6 +106,8 @@ impl SilentPlanner<'_> {
         log::debug!("planning {}", crate::paths::display(file));
         let PlannedTranslation {
             java_files,
+            emitted_owners,
+            emitted_file_owners,
             errors,
             warnings,
             coverage,
@@ -138,6 +142,8 @@ impl SilentPlanner<'_> {
             file: file.clone(),
             source: source.clone(),
             java_files,
+            emitted_owners,
+            emitted_file_owners,
             errors,
             warnings,
             coverage,
@@ -374,6 +380,8 @@ fn plan_workspace_cold_mode(
                 {
                     let PlannedTranslation {
                         java_files,
+                        emitted_owners,
+                        emitted_file_owners,
                         errors,
                         warnings,
                         coverage,
@@ -401,6 +409,8 @@ fn plan_workspace_cold_mode(
                         file: file.clone(),
                         source: source.clone(),
                         java_files,
+                        emitted_owners,
+                        emitted_file_owners,
                         errors,
                         warnings,
                         coverage,

@@ -69,12 +69,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             &owner.supertypes,
             &class_name,
         );
+        let retained = self.retained_hint.cloned().unwrap_or_default();
         for conflict in conflicts.into_iter().filter(|conflict| {
             conflict.member_name == fname
                 && conflict.kind == crate::workspace::MemberKind::Method
                 && conflict.parameter_types == parameter_types
                 && conflict.inherited_type != conflict.implementation_type
         }) {
+            if workspace.selected_covariant_property_conflict_is_safe(
+                declaring,
+                &conflict,
+                self.translation_roots,
+                &retained,
+            ) {
+                continue;
+            }
             match conflict.classification {
                 crate::workspace::MemberConflictClass::SupertypeTypeParameter => continue,
                 crate::workspace::MemberConflictClass::JavaCovariantReturn => {}
@@ -102,6 +111,45 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             }
         }
         None
+    }
+
+    fn covariant_interface_getter_return(&self, decl: tree_sitter::Node, ret: &str) -> String {
+        let Some(workspace) = self.workspace else {
+            return ret.to_string();
+        };
+        let Some(class_name) = self.enclosing_class_name(decl) else {
+            return ret.to_string();
+        };
+        let Some(declaring) = self.workspace_file.as_deref() else {
+            return ret.to_string();
+        };
+        let Some(owner) = workspace.source_file(declaring).and_then(|file| {
+            file.declarations
+                .iter()
+                .find(|candidate| candidate.name == class_name)
+        }) else {
+            return ret.to_string();
+        };
+        if owner.kind != crate::workspace::DeclarationKind::Interface {
+            return ret.to_string();
+        }
+        let name = kt::field(decl, "name")
+            .map(|node| self.text(node))
+            .unwrap_or_default();
+        if !name.starts_with("get")
+            || !name[3..].chars().next().is_some_and(char::is_uppercase)
+            || !self.function_parameter_types(decl).is_empty()
+        {
+            return ret.to_string();
+        }
+        let Some(source_file) = workspace.source_file(declaring) else {
+            return ret.to_string();
+        };
+        if workspace.readonly_interface_getter_is_covariant_source(source_file, owner, name) {
+            crate::transpiler::types::covariant_interface_return(ret)
+        } else {
+            ret.to_string()
+        }
     }
 
     pub(crate) fn transpile_function(
@@ -426,6 +474,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
         }
+        ret = self.covariant_interface_getter_return(decl, &ret);
         self.fn_rets.insert(fname_raw.clone(), ret.clone());
 
         // parameters

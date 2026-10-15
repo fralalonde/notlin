@@ -1308,7 +1308,14 @@ impl SourceIndex {
         translation_roots: &[PathBuf],
         retained: &HashSet<crate::semantics::SymbolId>,
     ) -> bool {
-        if !conflict.legacy_mismatch || conflict.kind != MemberKind::Property {
+        let property_conflict = conflict.kind == MemberKind::Property;
+        let getter_method_conflict = conflict.kind == MemberKind::Method
+            && conflict.parameter_types.is_empty()
+            && conflict
+                .member_name
+                .strip_prefix("get")
+                .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_uppercase));
+        if !conflict.legacy_mismatch || !(property_conflict || getter_method_conflict) {
             return false;
         }
         let Some(super_decl) = self
@@ -1323,12 +1330,55 @@ impl SourceIndex {
         if self.declaration_retained(super_decl, retained) {
             return false;
         }
+        if getter_method_conflict && super_decl.kind != DeclarationKind::Interface {
+            return false;
+        }
+        if getter_method_conflict
+            && !self.readonly_interface_getter_is_covariant_source(
+                super_file,
+                super_decl,
+                &conflict.member_name,
+            )
+        {
+            return false;
+        }
+        if getter_method_conflict {
+            let suffix = &conflict.member_name[3..];
+            let mut chars = suffix.chars();
+            let property = chars
+                .next()
+                .map(|ch| {
+                    format!(
+                        "{}{}",
+                        ch.to_lowercase().collect::<String>(),
+                        chars.as_str()
+                    )
+                })
+                .unwrap_or_default();
+            if super_decl.members.iter().any(|member| {
+                (member.kind == MemberKind::Method && member.name == format!("set{suffix}"))
+                    || (member.kind == MemberKind::Property
+                        && member.name == property
+                        && member.is_mutable)
+            }) {
+                return false;
+            }
+        }
         if !self.is_selected(&super_file.path, translation_roots) {
             return false;
         }
         let Some(own_file) = self.source_file(declaring) else {
             return false;
         };
+        // Covariant Java returns may narrow Kotlin nullability, but they may
+        // not widen a non-null supertype contract. The collection subtype
+        // proof below strips `?` while comparing generic arguments, so enforce
+        // the return-level nullability direction before relying on it.
+        if conflict.implementation_type.trim().ends_with('?')
+            && !conflict.inherited_type.trim().ends_with('?')
+        {
+            return false;
+        }
         declaration_covariant_return_is_subtype(
             self,
             own_file,
@@ -1336,6 +1386,111 @@ impl SourceIndex {
             super_file,
             &conflict.inherited_type,
         )
+    }
+
+    /// Whether an interface getter has Kotlin's read-only collection contract,
+    /// so Java can express its declaration-site variance with a wildcard.
+    /// This source-only proof is shared by interface emission and override
+    /// compatibility to keep their decisions aligned.
+    pub fn readonly_interface_getter_is_covariant_source(
+        &self,
+        source_file: &SourceFile,
+        owner: &Declaration,
+        getter: &str,
+    ) -> bool {
+        if owner.language != SourceLanguage::Kotlin
+            || owner.kind != DeclarationKind::Interface
+            || getter
+                .strip_prefix("get")
+                .is_none_or(|suffix| !suffix.chars().next().is_some_and(char::is_uppercase))
+        {
+            return false;
+        }
+        let mut getter_members = owner.members.iter().filter(|member| {
+            member.kind == MemberKind::Method
+                && member.name == getter
+                && !member.is_static
+                && member.parameter_types.is_empty()
+        });
+        let Some(member) = getter_members.next() else {
+            return false;
+        };
+        if getter_members.next().is_some() {
+            return false;
+        }
+        let Some(return_type) = member.type_name.as_deref() else {
+            return false;
+        };
+        let base = return_type
+            .trim()
+            .trim_end_matches('?')
+            .split('<')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !matches!(
+            base,
+            "List" | "Set" | "Collection" | "Iterable" | "Iterator" | "Sequence" | "Map"
+        ) || !collection_base_is_unshadowed(self, source_file, base)
+        {
+            return false;
+        }
+        let suffix = &getter[3..];
+        let mut chars = suffix.chars();
+        let property = chars
+            .next()
+            .map(|ch| {
+                format!(
+                    "{}{}",
+                    ch.to_lowercase().collect::<String>(),
+                    chars.as_str()
+                )
+            })
+            .unwrap_or_default();
+        let has_mutator = |decl: &Declaration| {
+            decl.members.iter().any(|member| {
+                (member.kind == MemberKind::Method && member.name == format!("set{suffix}"))
+                    || (member.kind == MemberKind::Property
+                        && member.name == property
+                        && member.is_mutable)
+            })
+        };
+        if has_mutator(owner) {
+            return false;
+        }
+        let mut pending: Vec<_> = owner
+            .supertypes
+            .iter()
+            .map(|s| (source_file, s.as_str()))
+            .collect();
+        let mut seen = HashSet::new();
+        while let Some((context, supertype)) = pending.pop() {
+            let Some(parent) = self.resolve_type(context, supertype) else {
+                // An unresolved edge might hide an invariant Java getter.
+                return false;
+            };
+            let key = declaration_key(parent);
+            if !seen.insert(key) {
+                continue;
+            }
+            if parent.language == SourceLanguage::Java
+                && parent.members.iter().any(|member| {
+                    member.kind == MemberKind::Method
+                        && member.name == getter
+                        && !member.is_static
+                        && member.parameter_types.is_empty()
+                })
+            {
+                return false;
+            }
+            if has_mutator(parent) {
+                return false;
+            }
+            if let Some(parent_file) = self.declaration_source_file(parent) {
+                pending.extend(parent.supertypes.iter().map(|s| (parent_file, s.as_str())));
+            }
+        }
+        true
     }
 
     fn member_conflicts_for(
@@ -5104,6 +5259,8 @@ fn declaration_covariant_return_is_subtype(
     };
     if let (own_base, Some(own_args)) = split_generic(own_ty.trim().trim_end_matches('?'))
         && covariant_collection_base(own_base, super_base)
+        && collection_base_is_unshadowed(index, own_file, own_base)
+        && collection_base_is_unshadowed(index, super_file, super_base)
         && covariant_collection_arguments(
             index,
             own_file,
@@ -5131,6 +5288,8 @@ fn declaration_covariant_return_is_subtype(
             return false;
         };
         covariant_collection_base(candidate_base, super_base)
+            && collection_base_is_unshadowed(index, wrapper_file, candidate_base)
+            && collection_base_is_unshadowed(index, super_file, super_base)
             && covariant_collection_arguments(
                 index,
                 wrapper_file,
@@ -5139,6 +5298,56 @@ fn declaration_covariant_return_is_subtype(
                 &super_args,
                 super_base,
             )
+    })
+}
+
+/// The covariance rules below describe Kotlin's standard read-only collection
+/// declarations. A user declaration or explicit import with the same simple
+/// name can be invariant, so its spelling alone cannot establish that rule.
+pub(crate) fn collection_base_is_unshadowed(
+    index: &SourceIndex,
+    source_file: &SourceFile,
+    base: &str,
+) -> bool {
+    if !matches!(
+        base,
+        "List"
+            | "ArrayList"
+            | "MutableList"
+            | "Set"
+            | "HashSet"
+            | "LinkedHashSet"
+            | "MutableSet"
+            | "Collection"
+            | "Iterable"
+            | "Iterator"
+            | "Sequence"
+            | "Map"
+            | "HashMap"
+            | "LinkedHashMap"
+            | "MutableMap"
+    ) {
+        return false;
+    }
+
+    if index.resolve_type(source_file, base).is_some() {
+        // The workspace index contains source declarations, not the Kotlin
+        // standard library. Any resolved declaration therefore shadows the
+        // builtin assumption and must be checked under its own variance.
+        return false;
+    }
+
+    // Reject explicit external shadows too. Wildcard imports with indexed
+    // shadows have already been rejected by resolution above.
+    source_file.imports.iter().all(|import| {
+        if import == &format!("kotlin.collections.{base}") || import == &format!("java.util.{base}")
+        {
+            return true;
+        }
+        if import.ends_with(&format!(".{base}")) {
+            return false;
+        }
+        true
     })
 }
 

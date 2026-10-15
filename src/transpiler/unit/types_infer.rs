@@ -333,6 +333,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         member: &str,
         node: tree_sitter::Node,
     ) -> String {
+        if let Some(return_type) = self.established_platform_call_return_type(node) {
+            return return_type.to_string();
+        }
         let recv_ty: Option<String> = match base.kind() {
             "identifier" => self.var_types.get(self.text(base).trim()).cloned(),
             "string_literal" => Some("String".to_string()),

@@ -1077,12 +1077,18 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 )
             }
             "mutableMapOf" | "mapOf" | "hashMapOf" => {
-                if args.is_empty() {
-                    "new HashMap<>()".to_string()
+                let map_type = if callee_java == "hashMapOf" {
+                    "HashMap"
                 } else {
-                    // args are `new SimpleImmutableEntry<>(k, v)` forms from
-                    // the `to` infix mapping — Map.ofEntries accepts them
-                    // (Map.Entry impl); immutable semantics match mapOf.
+                    "LinkedHashMap"
+                };
+                if args.is_empty() {
+                    format!("new {map_type}<>()")
+                } else {
+                    // Pair lowering supplies Map.Entry values. Expose the
+                    // result through a mutable Java map under the collection
+                    // mapping policy; existing approximation checks still
+                    // govern populated Pair/spread forms.
                     let entries: Vec<String> = args
                         .iter()
                         .map(|a| {
@@ -1092,27 +1098,35 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         })
                         .collect();
                     if args.len() == 1 {
-                        format!("java.util.Map.ofEntries({})", entries[0])
+                        format!("new {map_type}<>(java.util.Map.ofEntries({}))", entries[0])
                     } else {
                         self.unit.diags.warn_approx(
                             node,
                             self.unit.file,
                             "mapOf with multiple entries: Map.ofEntries(e1, e2, ...)",
                         );
-                        format!("java.util.Map.ofEntries({})", entries.join(", "))
+                        format!(
+                            "new {map_type}<>(java.util.Map.ofEntries({}))",
+                            entries.join(", ")
+                        )
                     }
                 }
             }
             "mutableSetOf" | "setOf" | "hashSetOf" => {
-                if args.is_empty() {
-                    "new HashSet<>()".to_string()
+                let set_type = if callee_java == "hashSetOf" {
+                    "HashSet"
                 } else {
-                    format!("new HashSet<>(Set.of({}))", args.join(", "))
+                    "LinkedHashSet"
+                };
+                if args.is_empty() {
+                    format!("new {set_type}<>()")
+                } else {
+                    format!("new {set_type}<>(Set.of({}))", args.join(", "))
                 }
             }
-            "emptyList" => "List.of()".to_string(),
-            "emptyMap" => "Map.of()".to_string(),
-            "emptySet" => "Set.of()".to_string(),
+            "emptyList" => "new ArrayList<>()".to_string(),
+            "emptyMap" => "new LinkedHashMap<>()".to_string(),
+            "emptySet" => "new LinkedHashSet<>()".to_string(),
             k if primitive_array_factory(k).is_some() => {
                 // Kotlin array literal factories -> Java array literals:
                 // `intArrayOf(1, 2)` -> `new int[]{1, 2}`, `arrayOf(...)` ->

@@ -564,6 +564,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if self.lombok {
             for want in [
                 "lombok.Data",
+                "lombok.Getter",
+                "lombok.Setter",
                 "lombok.Value",
                 "lombok.NonNull",
                 "lombok.AllArgsConstructor",
@@ -2445,14 +2447,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 && params
                     .iter()
                     .all(|(_, _, name, _)| self.param_parameter_annotations(decl, name).is_empty());
-            if self.lombok
+            let lombok_accessors = self.lombok
                 && !params.is_empty()
-                // Lombok would generate a second equals/hashCode/toString
-                // beside the user-defined one already in the body.
-                && !self.class_body_defines_lombok_generated(decl)
-            {
-                out.line("@Data");
-                self.emit_lombok_equals_call_super(decl, out);
+                && !self.class_body_defines_lombok_generated(decl);
+            if lombok_accessors {
+                // Ordinary Kotlin classes inherit identity equality unless
+                // they explicitly override it. @Data would introduce value
+                // equality, hashing, and toString as an unintended side effect.
+                out.line("@Getter");
                 // @AllArgsConstructor's synthesized ctor collides with the
                 // explicit super-forwarding ctor emitted below — only
                 // annotate when the explicit one is not being written.
@@ -2488,6 +2490,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 // to land and must stay on the field it is written on:
                 // dropping it would lose the very metadata the ORM reads.
                 let mut annotations = self.param_annotations(decl, fname);
+                if lombok_accessors && *is_mutable {
+                    annotations.push("@Setter".into());
+                }
                 let lombok_needs_kotlin_boolean_getter = self.lombok
                     && ftype == "boolean"
                     && !(fname.starts_with("is")

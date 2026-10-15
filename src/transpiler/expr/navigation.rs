@@ -1351,7 +1351,13 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                 );
                                 return format!("{}.{}()", base_java, getter);
                             }
-                            if !self.unit.known_declared_method(&base_java, &member) {
+                            if !self.unit.known_declared_method(&base_java, &member)
+                                && !self.unit.established_java_callable_member(node)
+                                && self
+                                    .unit
+                                    .established_platform_call_return_type(node)
+                                    .is_none()
+                            {
                                 self.unit.diags.warn_approx(
                                 node,
                                 self.unit.file,
@@ -1744,7 +1750,12 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         .map(|(base, _)| base)
                         .unwrap_or(""),
                     member,
-                ) {
+                ) && !self.unit.established_java_callable_member(node)
+                    && self
+                        .unit
+                        .established_platform_call_return_type(node)
+                        .is_none()
+                {
                     self.unit.diags.warn_approx(
                     node,
                     self.unit.file,

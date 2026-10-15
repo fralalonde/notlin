@@ -12,6 +12,7 @@ use crate::translation_plan::TranslationPlan;
 pub struct AcceptedJavaFile {
     pub path: String,
     pub unit: JavaCompilationUnit,
+    pub owners: Vec<SymbolId>,
 }
 
 /// Candidate syntax bound to the source snapshot and declaration transactions
@@ -46,6 +47,7 @@ impl std::error::Error for AcceptedPlanError {}
 pub struct AcceptedTranslationPlan {
     translation: TranslationPlan,
     files: Vec<AcceptedJavaFile>,
+    emitted_owners: Vec<SymbolId>,
 }
 
 impl AcceptedTranslationPlan {
@@ -72,6 +74,10 @@ impl AcceptedTranslationPlan {
                     })
                     .map(move |owner| (facade.clone(), owner.clone()))
             })
+            .collect::<Vec<_>>();
+        let emitted_owners = candidates
+            .iter()
+            .flat_map(|candidate| candidate.owners.iter().cloned())
             .collect::<Vec<_>>();
         let mut files = Vec::with_capacity(candidates.len());
         let mut assignments = Vec::new();
@@ -101,8 +107,8 @@ impl AcceptedTranslationPlan {
             if let Some(provider) = semantic_provider {
                 attach_resolved_targets(&mut unit.root, &[], provider, &facade_targets);
             }
-            assignments.push((path.clone(), owners, snapshot_hash));
-            files.push(AcceptedJavaFile { path, unit });
+            assignments.push((path.clone(), owners.clone(), snapshot_hash));
+            files.push(AcceptedJavaFile { path, unit, owners });
         }
         let mut assigned = std::collections::BTreeSet::new();
         let mut paths = std::collections::BTreeSet::new();
@@ -199,7 +205,11 @@ impl AcceptedTranslationPlan {
             })
             .collect();
         record_generated_declarations(&mut translation, &files, semantic_provider);
-        Ok(Self { translation, files })
+        Ok(Self {
+            translation,
+            files,
+            emitted_owners,
+        })
     }
 
     /// The sole final emitter: all content comes from accepted structured IR.
@@ -216,6 +226,9 @@ impl AcceptedTranslationPlan {
     pub fn files(&self) -> &[AcceptedJavaFile] {
         &self.files
     }
+    pub fn emitted_owners(&self) -> &[SymbolId] {
+        &self.emitted_owners
+    }
     pub fn translation(&self) -> &TranslationPlan {
         &self.translation
     }
@@ -223,6 +236,7 @@ impl AcceptedTranslationPlan {
         Self {
             translation,
             files: Vec::new(),
+            emitted_owners: Vec::new(),
         }
     }
 }

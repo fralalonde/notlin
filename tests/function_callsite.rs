@@ -1,6 +1,6 @@
 use notlin::function_callsite::{
     functions_requiring_kotlin_retention, functions_requiring_kotlin_retention_with_provider,
-    repair_virtual_calls,
+    repair_virtual_calls, repair_virtual_calls_with_emitted_owners,
 };
 use notlin::semantics::{SemanticProvider, SyntaxSemanticProvider};
 use notlin::translation_plan::{self, BackendOwner};
@@ -132,6 +132,36 @@ fn changed_residual_snapshot_is_used_and_edit_spans_match_it() {
         *blake3::hash(current.as_bytes()).as_bytes()
     );
     assert!(residual[&PathBuf::from("Use.kt")].contains("p.Fns.work()"));
+}
+
+#[test]
+fn facade_calls_are_rewritten_only_for_accepted_emitted_function_identities() {
+    let target = "package boundary\nfun readRootId(value: RootEvent) = value.id.text()\nfun readDisplay(value: BroadEvent<Id>) = value.display\n";
+    let caller = "package boundary\nfun run(root: RootEvent, broad: BroadEvent<Id>) = \"${readRootId(root)}:${readDisplay(broad)}\"\n";
+    let sources = BTreeMap::from([
+        (PathBuf::from("Callers.kt"), target.to_owned()),
+        (PathBuf::from("Runner.kt"), caller.to_owned()),
+    ]);
+    let plan = java_owned_plan("Callers.kt", target);
+    let emitted_root_id = plan
+        .declarations
+        .iter()
+        .find(|decision| decision.symbol_id.name == "readRootId")
+        .unwrap()
+        .symbol_id
+        .clone();
+    let mut residual = sources.clone();
+    let report = repair_virtual_calls_with_emitted_owners(
+        &sources,
+        &[plan],
+        &mut residual,
+        &[emitted_root_id],
+    );
+    let output = &residual[&PathBuf::from("Runner.kt")];
+    assert!(output.contains("Callers.readRootId(root)"));
+    assert!(output.contains("readDisplay(broad)"));
+    assert!(!output.contains("Callers.readDisplay"));
+    assert_eq!(report.repairs.len(), 1);
 }
 
 #[test]

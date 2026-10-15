@@ -268,7 +268,8 @@ fn lombok_collection_constructor_variance_keeps_storage_and_getters_invariant() 
         let java = emitted(root, name);
         assert!(java.contains("List<Item> items;"), "{java}");
         assert!(
-            java.contains("List<Item> getItems()") || (name == "Holder" && java.contains("@Data")),
+            java.contains("List<Item> getItems()")
+                || (name == "Holder" && java.contains("@Getter")),
             "{java}"
         );
         assert!(java.contains("List<? extends Item> items"), "{java}");
@@ -287,7 +288,10 @@ fn lombok_collection_constructor_variance_keeps_storage_and_getters_invariant() 
     assert!(!nullable.contains("this.items = (@Nullable"), "{nullable}");
     let mutable = emitted(root, "MutableHolder");
     assert!(mutable.contains("List<Item> items"), "{mutable}");
-    assert!(mutable.contains("@Data"), "{mutable}");
+    assert!(
+        mutable.contains("@Getter") && mutable.contains("@Setter") && !mutable.contains("@Data"),
+        "{mutable}"
+    );
     assert!(mutable.contains("List<Item> mutableItems"), "{mutable}");
     assert!(!mutable.contains("(List<Item>) (Object)"), "{mutable}");
     assert!(!mutable.contains("? extends Item"), "{mutable}");

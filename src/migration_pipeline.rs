@@ -8,7 +8,7 @@ use crate::cli::{Cli, UntranslatableMode};
 use crate::migrate::{self, MigrationProposal};
 use crate::transpiler;
 use crate::workspace::{SourceIndex, SourceLanguage, SourceOverlay};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -81,7 +81,10 @@ where
         }
     }
     let mut virtual_sources = sources.clone();
-    let mut cumulative: HashMap<PathBuf, (PathBuf, String, String)> = HashMap::new();
+    let mut cumulative: HashMap<
+        PathBuf,
+        (PathBuf, String, String, Vec<crate::semantics::SymbolId>),
+    > = HashMap::new();
     let mut output_identities = HashMap::<PathBuf, PathBuf>::new();
     let declaration_count = index
         .kotlin_files()
@@ -204,7 +207,7 @@ where
                 veto_translation_plan(&mut translation_plans, &plan.file);
                 let stale = cumulative
                     .iter()
-                    .filter(|(_, (origin, _, _))| normalized(origin) == normalized(&plan.file))
+                    .filter(|(_, (origin, _, _, _))| normalized(origin) == normalized(&plan.file))
                     .map(|(path, _)| path.clone())
                     .collect::<Vec<_>>();
                 for path in stale {
@@ -270,7 +273,7 @@ where
                     }
                 }
                 if let Some(previous_path) = output_identities.get(&identity)
-                    && let Some((origin, _old, _)) = cumulative.get(previous_path)
+                    && let Some((origin, _old, _, _)) = cumulative.get(previous_path)
                     && origin != &plan.file
                 {
                     return Err(format!(
@@ -278,7 +281,46 @@ where
                         crate::paths::display(&target)
                     ));
                 }
-                let value = (plan.file.clone(), content.clone(), name.clone());
+                let owners = plan
+                    .emitted_file_owners
+                    .iter()
+                    .find(|(path, _)| path == name)
+                    .map(|(_, owners)| owners.clone())
+                    .ok_or_else(|| {
+                        format!("accepted Java output {name} has no owner assignment")
+                    })?;
+                let value = if let Some((origin, old_source, old_name, old_owners)) =
+                    cumulative.get(&key)
+                {
+                    if origin != &plan.file {
+                        return Err(format!(
+                            "generated Java path conflict: {}",
+                            crate::paths::display(&target)
+                        ));
+                    }
+                    if same_owner_set(old_owners, &owners) {
+                        (origin.clone(), content.clone(), name.clone(), owners)
+                    } else {
+                        let merged = merge_cumulative_facade(
+                            &plan.file, old_source, content, name, old_name, old_owners, &owners,
+                        )
+                        .ok_or_else(|| {
+                            format!(
+                                "cannot safely merge repeated generated facade: {}",
+                                crate::paths::display(&target)
+                            )
+                        })?;
+                        let mut merged_owners = old_owners.clone();
+                        for owner in owners {
+                            if !merged_owners.contains(&owner) {
+                                merged_owners.push(owner);
+                            }
+                        }
+                        (origin.clone(), merged, name.clone(), merged_owners)
+                    }
+                } else {
+                    (plan.file.clone(), content.clone(), name.clone(), owners)
+                };
                 cumulative_changed |= cumulative.get(&key) != Some(&value);
                 cumulative.insert(key, value);
                 output_identities.insert(identity, target);
@@ -301,13 +343,18 @@ where
             .filter(|(path, _)| !vetoed_this_round.contains(&normalized(path)))
             .cloned()
             .collect::<std::collections::BTreeMap<_, _>>();
-        let callsite_report = crate::function_callsite::repair_virtual_calls(
+        let emitted_owners = plans
+            .iter()
+            .flat_map(|plan| plan.emitted_owners.iter().cloned())
+            .collect::<Vec<_>>();
+        let callsite_report = crate::function_callsite::repair_virtual_calls_with_emitted_owners(
             &original_by_path,
             &plans
                 .iter()
                 .map(|plan| plan.translation.clone())
                 .collect::<Vec<_>>(),
             &mut residual_by_path,
+            &emitted_owners,
         );
         profile_phase(
             profile_speculation,
@@ -511,7 +558,7 @@ where
     }
     let generated_java: Vec<GeneratedJava> = cumulative
         .into_iter()
-        .map(|(path, (origin, source, name))| GeneratedJava {
+        .map(|(path, (origin, source, name, _owners))| GeneratedJava {
             path,
             origin,
             name,
@@ -633,6 +680,13 @@ where
         source_edits,
         rounds: converged_round,
     })
+}
+
+fn same_owner_set(
+    left: &[crate::semantics::SymbolId],
+    right: &[crate::semantics::SymbolId],
+) -> bool {
+    left.len() == right.len() && left.iter().all(|owner| right.contains(owner))
 }
 
 fn profile_phase(enabled: bool, round: usize, started: &mut std::time::Instant, phase: &str) {
@@ -1229,7 +1283,7 @@ fn normalized(path: &Path) -> PathBuf {
 fn speculative_overlays(
     original: &[(PathBuf, String)],
     current: &[(PathBuf, String)],
-    generated: &HashMap<PathBuf, (PathBuf, String, String)>,
+    generated: &HashMap<PathBuf, (PathBuf, String, String, Vec<crate::semantics::SymbolId>)>,
 ) -> Vec<SourceOverlay> {
     let original_by_path = original
         .iter()
@@ -1256,7 +1310,7 @@ fn speculative_overlays(
     overlays.extend(
         generated
             .iter()
-            .map(|(p, (_, s, _))| SourceOverlay::Replace {
+            .map(|(p, (_, s, _, _))| SourceOverlay::Replace {
                 path: p.clone(),
                 language: SourceLanguage::Java,
                 source: s.clone(),
@@ -1265,12 +1319,386 @@ fn speculative_overlays(
     overlays
 }
 
+/// Merge successive accepted emissions for a top-level Kotlin file facade.
+/// The owner set is the identity boundary: methods are merged only when a
+/// generated name/arity maps to exactly one accepted SymbolId. Unsupported or
+/// ambiguous syntax fails closed so the caller can refuse the workspace plan.
+fn merge_cumulative_facade(
+    origin: &Path,
+    previous: &str,
+    incoming: &str,
+    generated_name: &str,
+    previous_name: &str,
+    previous_owners: &[crate::semantics::SymbolId],
+    incoming_owners: &[crate::semantics::SymbolId],
+) -> Option<String> {
+    use crate::java_ir::{JavaElement, parse_java, render};
+    use crate::semantics::SymbolId;
+    let generated_stem = Path::new(generated_name).file_stem()?.to_str()?;
+    if generated_name != previous_name
+        || origin.file_stem()?.to_str()? != generated_stem
+        || previous_owners.iter().chain(incoming_owners).any(|owner| {
+            owner.kind != "function" || !owner.owner_path.is_empty() || owner.receiver.is_some()
+        })
+    {
+        return None;
+    }
+    let mut base = parse_java(previous).ok()?;
+    let extra = parse_java(incoming).ok()?;
+    let base_class = sole_top_class(&base)?;
+    let extra_class = sole_top_class(&extra)?;
+    if node_name(base_class)? != generated_stem
+        || node_name(base_class)? != node_name(extra_class)?
+        || package_text(&base) != package_text(&extra)
+    {
+        return None;
+    }
+    let existing = {
+        let class = sole_top_class(&base)?;
+        let body = find_node(class, "class_body")?;
+        let mut entries = BTreeMap::new();
+        for node in body.children.iter().filter_map(element_node) {
+            if node.kind == "constructor_declaration"
+                || matches!(node.kind.as_str(), "line_comment" | "block_comment")
+            {
+                continue;
+            }
+            if node.kind != "method_declaration" {
+                return None;
+            }
+            let owner = owner_for_method(node, previous_owners)?;
+            if entries.insert(owner, render_node(node)).is_some() {
+                return None;
+            }
+        }
+        entries
+    };
+    let existing_signatures = {
+        let class = sole_top_class(&base)?;
+        let body = find_node(class, "class_body")?;
+        let mut entries = BTreeMap::<String, SymbolId>::new();
+        for node in body
+            .children
+            .iter()
+            .filter_map(element_node)
+            .filter(|node| node.kind == "method_declaration")
+        {
+            let owner = owner_for_method(node, previous_owners)?;
+            if entries
+                .insert(java_method_signature(node)?, owner)
+                .is_some()
+            {
+                return None;
+            }
+        }
+        entries
+    };
+    let incoming_methods = {
+        let class = sole_top_class(&extra)?;
+        let body = find_node(class, "class_body")?;
+        let mut entries = BTreeMap::new();
+        let mut signatures = BTreeMap::<String, SymbolId>::new();
+        for node in body.children.iter().filter_map(element_node) {
+            if node.kind == "constructor_declaration"
+                || matches!(node.kind.as_str(), "line_comment" | "block_comment")
+            {
+                continue;
+            }
+            if node.kind != "method_declaration" {
+                return None;
+            }
+            let owner = owner_for_method(node, incoming_owners)?;
+            if signatures
+                .insert(java_method_signature(node)?, owner.clone())
+                .is_some()
+            {
+                return None;
+            }
+            if entries.insert(owner, node.clone()).is_some() {
+                return None;
+            }
+        }
+        entries
+    };
+    let mut additions = Vec::new();
+    for (owner, node) in incoming_methods {
+        let signature = java_method_signature(&node)?;
+        if let Some(previous_owner) = existing_signatures.get(&signature)
+            && previous_owner != &owner
+        {
+            return None;
+        }
+        if let Some(old) = existing.get(&owner) {
+            if old != &render_node(&node) {
+                return None;
+            }
+        } else {
+            additions.push((owner, node));
+        }
+    }
+    let base_class = sole_top_class_mut(&mut base)?;
+    let body = find_node_mut(base_class, "class_body")?;
+    let close_brace = body
+        .children
+        .iter()
+        .rposition(|element| matches!(element, JavaElement::Token(token) if token.text == "}"))?;
+    for (offset, (_, method)) in additions.into_iter().enumerate() {
+        body.children
+            .insert(close_brace + offset, JavaElement::Declaration(method));
+    }
+    let mut import_texts = base
+        .root
+        .children
+        .iter()
+        .filter_map(element_node)
+        .filter(|node| node.kind == "import_declaration")
+        .map(render_node)
+        .collect::<HashSet<_>>();
+    let mut imports_to_add = Vec::new();
+    for element in &extra.root.children {
+        if let Some(node) = element_node(element)
+            && node.kind == "import_declaration"
+            && import_texts.insert(render_node(node))
+        {
+            imports_to_add.push(element.clone());
+        }
+    }
+    let class_index = base.root.children.iter().position(|element| {
+        element_node(element).is_some_and(|node| node.kind == "class_declaration")
+    })?;
+    for (offset, import) in imports_to_add.into_iter().enumerate() {
+        base.root.children.insert(class_index + offset, import);
+    }
+    Some(render(&base))
+}
+
+fn element_node(element: &crate::java_ir::JavaElement) -> Option<&crate::java_ir::JavaSyntaxNode> {
+    use crate::java_ir::JavaElement::*;
+    match element {
+        Declaration(n) | Type(n) | Expression(n) | Statement(n) | Annotation(n) | Import(n)
+        | Other(n) => Some(n),
+        Token(_) => None,
+    }
+}
+fn find_node<'a>(
+    node: &'a crate::java_ir::JavaSyntaxNode,
+    kind: &str,
+) -> Option<&'a crate::java_ir::JavaSyntaxNode> {
+    if node.kind == kind {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .filter_map(element_node)
+        .find_map(|child| find_node(child, kind))
+}
+fn find_node_mut<'a>(
+    node: &'a mut crate::java_ir::JavaSyntaxNode,
+    kind: &str,
+) -> Option<&'a mut crate::java_ir::JavaSyntaxNode> {
+    if node.kind == kind {
+        return Some(node);
+    }
+    for child in &mut node.children {
+        let child = match child {
+            crate::java_ir::JavaElement::Declaration(n)
+            | crate::java_ir::JavaElement::Type(n)
+            | crate::java_ir::JavaElement::Expression(n)
+            | crate::java_ir::JavaElement::Statement(n)
+            | crate::java_ir::JavaElement::Annotation(n)
+            | crate::java_ir::JavaElement::Import(n)
+            | crate::java_ir::JavaElement::Other(n) => n,
+            crate::java_ir::JavaElement::Token(_) => continue,
+        };
+        if let Some(found) = find_node_mut(child, kind) {
+            return Some(found);
+        }
+    }
+    None
+}
+fn sole_top_class(
+    unit: &crate::java_ir::JavaCompilationUnit,
+) -> Option<&crate::java_ir::JavaSyntaxNode> {
+    let classes = unit
+        .root
+        .children
+        .iter()
+        .filter_map(element_node)
+        .filter(|node| node.kind == "class_declaration")
+        .collect::<Vec<_>>();
+    if classes.len() != 1
+        || unit.root.children.iter().filter_map(element_node).any(|n| {
+            !matches!(
+                n.kind.as_str(),
+                "class_declaration"
+                    | "package_declaration"
+                    | "import_declaration"
+                    | "line_comment"
+                    | "block_comment"
+            )
+        })
+    {
+        return None;
+    }
+    classes.first().copied()
+}
+fn sole_top_class_mut(
+    unit: &mut crate::java_ir::JavaCompilationUnit,
+) -> Option<&mut crate::java_ir::JavaSyntaxNode> {
+    let indexes = unit
+        .root
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            element_node(e)
+                .filter(|n| n.kind == "class_declaration")
+                .map(|_| i)
+        })
+        .collect::<Vec<_>>();
+    if indexes.len() != 1 {
+        return None;
+    }
+    match &mut unit.root.children[indexes[0]] {
+        crate::java_ir::JavaElement::Declaration(n) => Some(n),
+        _ => None,
+    }
+}
+fn node_name(node: &crate::java_ir::JavaSyntaxNode) -> Option<String> {
+    fn visit(node: &crate::java_ir::JavaSyntaxNode) -> Option<String> {
+        for element in &node.children {
+            match element {
+                crate::java_ir::JavaElement::Token(token)
+                    if token.field_name.as_deref() == Some("name") =>
+                {
+                    return Some(token.text.clone());
+                }
+                _ => {
+                    if let Some(child) = element_node(element) {
+                        if child.field_name.as_deref() == Some("name") {
+                            if let Some(name) = visit(child) {
+                                return Some(name);
+                            }
+                        } else if let Some(name) = visit(child) {
+                            return Some(name);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    visit(node)
+}
+fn method_arity(node: &crate::java_ir::JavaSyntaxNode) -> Option<usize> {
+    let params = node
+        .children
+        .iter()
+        .filter_map(element_node)
+        .find(|n| n.field_name.as_deref() == Some("parameters"))?;
+    Some(
+        params
+            .children
+            .iter()
+            .filter_map(element_node)
+            .filter(|n| {
+                matches!(
+                    n.kind.as_str(),
+                    "formal_parameter" | "spread_parameter" | "receiver_parameter"
+                )
+            })
+            .count(),
+    )
+}
+fn java_method_signature(node: &crate::java_ir::JavaSyntaxNode) -> Option<String> {
+    // Type-variable erasure requires bounds from semantic analysis. Do not
+    // merge generic methods by their source spelling alone.
+    if node
+        .children
+        .iter()
+        .filter_map(element_node)
+        .any(|child| child.kind == "type_parameters")
+    {
+        return None;
+    }
+    let name = node_name(node)?;
+    let params = node
+        .children
+        .iter()
+        .filter_map(element_node)
+        .find(|n| n.field_name.as_deref() == Some("parameters"))?;
+    let mut types = Vec::new();
+    for parameter in params.children.iter().filter_map(element_node).filter(|n| {
+        matches!(
+            n.kind.as_str(),
+            "formal_parameter" | "spread_parameter" | "receiver_parameter"
+        )
+    }) {
+        let ty = parameter
+            .children
+            .iter()
+            .filter_map(element_node)
+            .find(|n| n.field_name.as_deref() == Some("type"))?;
+        let mut depth = 0usize;
+        let mut erased = String::new();
+        for ch in render_node(ty).chars() {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth = depth.checked_sub(1)?,
+                _ if depth == 0 && !ch.is_whitespace() => erased.push(ch),
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+        if parameter.kind == "spread_parameter" {
+            erased.push_str("[]");
+        }
+        types.push(erased);
+    }
+    Some(format!("{name}({})", types.join(",")))
+}
+fn owner_for_method(
+    node: &crate::java_ir::JavaSyntaxNode,
+    owners: &[crate::semantics::SymbolId],
+) -> Option<crate::semantics::SymbolId> {
+    let name = node_name(node)?;
+    let arity = method_arity(node)?;
+    let matches = owners
+        .iter()
+        .filter(|id| id.name == name && id.parameters.len() == arity)
+        .cloned()
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+fn package_text(unit: &crate::java_ir::JavaCompilationUnit) -> Option<String> {
+    let nodes = unit
+        .root
+        .children
+        .iter()
+        .filter_map(element_node)
+        .filter(|n| n.kind == "package_declaration")
+        .collect::<Vec<_>>();
+    if nodes.len() > 1 {
+        return None;
+    }
+    nodes.first().map(|node| render_node(node))
+}
+fn render_node(node: &crate::java_ir::JavaSyntaxNode) -> String {
+    crate::java_ir::render(&crate::java_ir::JavaCompilationUnit { root: node.clone() })
+}
+
 fn log_speculative_changes(
     round: usize,
     before_kotlin: &[(PathBuf, String)],
     after_kotlin: &[(PathBuf, String)],
-    before_java: &HashMap<PathBuf, (PathBuf, String, String)>,
-    after_java: &HashMap<PathBuf, (PathBuf, String, String)>,
+    before_java: &HashMap<PathBuf, (PathBuf, String, String, Vec<crate::semantics::SymbolId>)>,
+    after_java: &HashMap<PathBuf, (PathBuf, String, String, Vec<crate::semantics::SymbolId>)>,
     verbose: bool,
 ) {
     let before_kotlin: HashMap<_, _> = before_kotlin
@@ -1295,10 +1723,10 @@ fn log_speculative_changes(
         }
     }
     let (mut ja, mut jr, mut jc) = (Vec::new(), Vec::new(), Vec::new());
-    for (p, (_, s, _)) in after_java {
+    for (p, (_, s, _, _)) in after_java {
         match before_java.get(p) {
             None => ja.push(p.clone()),
-            Some((_, old, _)) if old != s => jc.push(p.clone()),
+            Some((_, old, _, _)) if old != s => jc.push(p.clone()),
             _ => {}
         }
     }
@@ -1362,6 +1790,103 @@ mod validation_snapshot_tests {
 #[cfg(test)]
 mod lineage_tests {
     use super::*;
+
+    fn top_function(name: &str, arity: usize) -> crate::semantics::SymbolId {
+        crate::semantics::SymbolId {
+            module: String::new(),
+            package: "boundary".into(),
+            file: PathBuf::from("Callers.kt"),
+            owner_path: Vec::new(),
+            kind: "function".into(),
+            name: name.into(),
+            receiver: None,
+            parameters: (0..arity).map(|i| format!("p{i}: String")).collect(),
+        }
+    }
+
+    fn typed_function(name: &str, ty: &str) -> crate::semantics::SymbolId {
+        let mut id = top_function(name, 1);
+        id.parameters = vec![format!("p: {ty}")];
+        id
+    }
+
+    #[test]
+    fn cumulative_facade_merge_preserves_disjoint_methods_by_symbol_identity() {
+        let display = top_function("readDisplay", 1);
+        let root = top_function("readRootId", 1);
+        let first = "package boundary;\npublic final class Callers {\n    public static String readDisplay(String value) { return value; }\n}\n";
+        let later = "package boundary;\npublic final class Callers {\n    public static String readRootId(String value) { return value; }\n}\n";
+        let merged = merge_cumulative_facade(
+            Path::new("Callers.kt"),
+            first,
+            later,
+            "Callers.java",
+            "Callers.java",
+            std::slice::from_ref(&display),
+            std::slice::from_ref(&root),
+        )
+        .expect("top-level facade outputs should merge");
+        assert!(merged.contains("readDisplay"));
+        assert!(merged.contains("readRootId"));
+    }
+
+    #[test]
+    fn cumulative_facade_merge_rejects_ambiguous_overload_identity() {
+        let one = top_function("read", 1);
+        let same_arity = top_function("read", 1);
+        let first = "package boundary;\npublic final class Callers {\n    public static String read(String value) { return value; }\n}\n";
+        let later = "package boundary;\npublic final class Callers {\n    public static String read(Integer value) { return value.toString(); }\n}\n";
+        assert!(
+            merge_cumulative_facade(
+                Path::new("Callers.kt"),
+                first,
+                later,
+                "Callers.java",
+                "Callers.java",
+                &[one],
+                &[same_arity],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cumulative_facade_merge_preserves_distinct_same_arity_overloads() {
+        let string = typed_function("read", "String");
+        let integer = typed_function("read", "Int");
+        let first = "package boundary;\npublic final class Callers {\n    public static String read(String value) { return value; }\n}\n";
+        let later = "package boundary;\npublic final class Callers {\n    public static String read(Integer value) { return value.toString(); }\n}\n";
+        let merged = merge_cumulative_facade(
+            Path::new("Callers.kt"),
+            first,
+            later,
+            "Callers.java",
+            "Callers.java",
+            &[string],
+            &[integer],
+        )
+        .expect("each accepted facade round identifies one overload owner");
+        assert!(merged.contains("read(String"));
+        assert!(merged.contains("read(Integer"));
+    }
+
+    #[test]
+    fn cumulative_facade_merge_rejects_erased_signature_collisions() {
+        let first = "package boundary; public final class Callers { public static int read(java.util.List<String> values) { return values.size(); } }";
+        let later = "package boundary; public final class Callers { public static int read(java.util.List<Integer> values) { return values.size(); } }";
+        assert!(
+            merge_cumulative_facade(
+                Path::new("Callers.kt"),
+                first,
+                later,
+                "Callers.java",
+                "Callers.java",
+                &[typed_function("read", "List<String>")],
+                &[typed_function("read", "List<Int>")],
+            )
+            .is_none()
+        );
+    }
 
     fn analyze(source: &str) -> crate::translation_plan::TranslationPlan {
         let tree = crate::transpiler::parse_tree(source);

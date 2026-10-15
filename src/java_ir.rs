@@ -425,6 +425,8 @@ pub fn render(unit: &JavaCompilationUnit) -> String {
 pub fn remove_unused_lombok_imports(unit: &mut JavaCompilationUnit) -> usize {
     const LOMBOK_TYPES: &[&str] = &[
         "Data",
+        "Getter",
+        "Setter",
         "Value",
         "NonNull",
         "AllArgsConstructor",
