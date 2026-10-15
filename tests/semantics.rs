@@ -1520,6 +1520,174 @@ class Holder { fun make() = UUID.randomUUID(1) }
 }
 
 #[test]
+fn locale_case_conversion_accepts_canonical_and_inferred_default_locale() {
+    for import in ["import java.util.Locale", "import java.util.*"] {
+        let source = format!(
+            "package sem\n{import}\nclass Holder(val text: String) {{\n    fun direct(): String = text.lowercase(Locale.getDefault())\n    fun local(): String {{ val defaultLocale = Locale.getDefault(); return text.uppercase(defaultLocale) }}\n}}\n"
+        );
+        let plan = uuid_factory_plan(&source, "Holder.kt");
+        assert!(
+            !plan
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "S001"),
+            "Locale case conversion and inferred defaultLocale should resolve for {import}: {:?}",
+            plan.diagnostics
+        );
+        assert!(plan.declarations.iter().all(|declaration| {
+            declaration.candidate_owner == notlin::translation_plan::BackendOwner::Java
+        }));
+    }
+}
+
+#[test]
+fn locale_platform_and_case_facts_reject_wrong_arity_and_shadows() {
+    let wrong_get_default = r#"package sem
+import java.util.Locale
+class Holder { fun make() = Locale.getDefault(1) }
+"#;
+    assert!(
+        uuid_factory_plan(wrong_get_default, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let wrong_case_arity = r#"package sem
+import java.util.Locale
+class Holder(val text: String) { fun lower() = text.lowercase(Locale.getDefault(), true) }
+"#;
+    assert!(
+        uuid_factory_plan(wrong_case_arity, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let arbitrary_argument = r#"package sem
+import java.util.Locale
+class Other
+class Holder(val text: String) { fun lower() = text.lowercase(Other()) }
+"#;
+    assert!(
+        uuid_factory_plan(arbitrary_argument, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let indexed_shadow = r#"package sem
+import java.util.*
+class Locale
+class Holder { fun make() = Locale.getDefault() }
+"#;
+    assert!(
+        uuid_factory_plan(indexed_shadow, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let local_shadow = r#"package sem
+import java.util.*
+class Other
+class Holder(val text: String) { fun lower() { val Locale = Other(); text.lowercase(Locale.getDefault()) } }
+"#;
+    assert!(
+        uuid_factory_plan(local_shadow, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let custom_wildcard = r#"package sem
+import external.*
+class Holder(val text: String) { fun lower() = text.lowercase(Locale.getDefault()) }
+"#;
+    assert!(
+        uuid_factory_plan(custom_wildcard, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+}
+
+#[test]
+fn instant_now_uses_explicit_canonical_import_before_unknown_wildcard() {
+    let source = r#"package sem
+import java.time.Instant
+import domain.*
+class Holder {
+    fun direct(): Instant = Instant.now()
+    fun local(): Instant { val currentInstant = Instant.now(); return currentInstant }
+}
+"#;
+    let plan = uuid_factory_plan(source, "Holder.kt");
+    assert!(
+        !plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001"),
+        "the explicit canonical Instant import should establish now() despite domain.*: {:?}",
+        plan.diagnostics
+    );
+    assert!(plan.declarations.iter().all(|declaration| {
+        declaration.candidate_owner == notlin::translation_plan::BackendOwner::Java
+    }));
+}
+
+#[test]
+fn instant_now_stays_unresolved_without_canonical_import_or_with_conflicts() {
+    let unknown_wildcard = r#"package sem
+import java.time.*
+import domain.*
+class Holder { fun make() = Instant.now() }
+"#;
+    assert!(
+        uuid_factory_plan(unknown_wildcard, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let wrong_arity = r#"package sem
+import java.time.Instant
+import domain.*
+class Holder { fun make() = Instant.now(1) }
+"#;
+    assert!(
+        uuid_factory_plan(wrong_arity, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let conflicting_imports = r#"package sem
+import java.time.Instant
+import domain.Instant
+class Holder { fun make() = Instant.now() }
+"#;
+    assert!(
+        uuid_factory_plan(conflicting_imports, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+
+    let indexed_shadow = r#"package sem
+import java.time.Instant
+class Instant
+class Holder { fun make() = Instant.now() }
+"#;
+    assert!(
+        uuid_factory_plan(indexed_shadow, "Holder.kt")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "S001")
+    );
+}
+
+#[test]
 fn bare_custom_random_uuid_call_infers_its_indexed_return_without_recursion() {
     let source = r#"package sem
 class UUID {

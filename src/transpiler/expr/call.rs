@@ -95,6 +95,23 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .copied()
             && let Some((base, member)) = self.unit.nav_base_member(nav)
         {
+            if matches!(member.as_str(), "lowercase" | "uppercase")
+                && args.len() <= 1
+                && self.unit.established_standard_string_case_call(node)
+            {
+                // Kotlin's no-argument case conversion uses the invariant
+                // locale; Java's no-argument methods use the process default.
+                let locale = args
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("java.util.Locale.ROOT");
+                let method = if member == "lowercase" {
+                    "toLowerCase"
+                } else {
+                    "toUpperCase"
+                };
+                return format!("({}).{}({})", self.transpile(base), method, locale);
+            }
             // Kotlin String.split is a literal-delimiter operation which
             // keeps trailing empty fields. Java String.split is regex-based
             // and drops them, so route the exact one-String form through the

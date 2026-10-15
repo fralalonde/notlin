@@ -2732,35 +2732,7 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
             };
             let has_name = binding.as_deref() == Some(spelling);
             let inferred_platform_type = if has_name && ty.is_none() {
-                node.utf8_text(source.as_bytes())
-                    .ok()
-                    .and_then(|declaration| {
-                        let (_, initializer) = declaration.split_once('=')?;
-                        let initializer = initializer.trim().trim_end_matches(';').trim();
-                        let mut pending = vec![node];
-                        while let Some(candidate) = pending.pop() {
-                            if matches!(candidate.kind(), "call_expression" | "method_invocation")
-                                && candidate.utf8_text(source.as_bytes()).ok() == Some(initializer)
-                            {
-                                let callee = call_callee_node(candidate)?;
-                                if callee.utf8_text(source.as_bytes()).ok() == Some("randomUUID")
-                                    && known_external_member_call(
-                                        source,
-                                        file,
-                                        candidate,
-                                        callee,
-                                        "randomUUID",
-                                        provider,
-                                    )
-                                {
-                                    return Some("java.util.UUID".to_string());
-                                }
-                            }
-                            let mut cursor = candidate.walk();
-                            pending.extend(candidate.named_children(&mut cursor));
-                        }
-                        None
-                    })
+                inferred_platform_initializer_type(source, file, node, provider)
             } else {
                 None
             };
@@ -3116,10 +3088,68 @@ pub(crate) fn established_platform_call_return_type<P: SemanticProvider + ?Sized
 ) -> Option<&'static str> {
     let callee = call_callee_node(call)?;
     let name = callee.utf8_text(source.as_bytes()).ok()?.trim();
-    (name == "randomUUID"
-        && explicit_receiver_node(call, callee).is_some()
-        && known_external_member_call(source, file, call, callee, name, provider))
-    .then_some("java.util.UUID")
+    if !matches!(name, "randomUUID" | "getDefault" | "now") || call_argument_count(call) != 0 {
+        return None;
+    }
+    if explicit_receiver_node(call, callee).is_none()
+        || !matches!(
+            resolve_required_call(source, file, call, callee, name, provider),
+            FactStatus::Unknown
+        )
+        || !known_external_member_call(source, file, call, callee, name, provider)
+    {
+        return None;
+    }
+    let receiver_type = explicit_receiver_type(source, call, callee, file, provider)?;
+    let receiver_type = standard_external_type(
+        source,
+        provider,
+        &receiver_type,
+        call.kind() == "method_invocation",
+    )?;
+    match (receiver_type.as_str(), name, call_argument_count(call)) {
+        ("java.util.UUID", "randomUUID", 0) => Some("java.util.UUID"),
+        ("java.util.Locale", "getDefault", 0) => Some("java.util.Locale"),
+        ("java.time.Instant", "now", 0) => Some("java.time.Instant"),
+        _ => None,
+    }
+}
+
+/// Shared proof for Kotlin String case conversion calls. The Locale overload
+/// is accepted only when its sole argument has a proven `java.util.Locale`
+/// type, and an indexed workspace extension takes precedence over this fact.
+pub(crate) fn established_standard_string_case_call<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    provider: &P,
+) -> bool {
+    let Some(callee) = call_callee_node(call) else {
+        return false;
+    };
+    let name = callee.utf8_text(source.as_bytes()).unwrap_or("").trim();
+    if !matches!(name, "lowercase" | "uppercase")
+        || explicit_receiver_node(call, callee).is_none()
+        || !matches!(
+            resolve_required_call(source, file, call, callee, name, provider),
+            FactStatus::Unknown
+        )
+    {
+        return false;
+    }
+    let Some(receiver_type) = explicit_receiver_type(source, call, callee, file, provider) else {
+        return false;
+    };
+    if standard_external_type(source, provider, &receiver_type, false).as_deref()
+        != Some("java.lang.String")
+    {
+        return false;
+    }
+    match call_argument_count(call) {
+        0 => true,
+        1 => known_locale_argument(source, file, call, provider),
+        _ => false,
+    }
 }
 
 pub(crate) fn established_java_callable_member<P: SemanticProvider + ?Sized>(
@@ -3168,9 +3198,17 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
         }
         return arity == 1 && known_string_split_argument(source, file, call, provider);
     }
+    if receiver_type == "java.lang.String"
+        && matches!(name, "lowercase" | "uppercase")
+        && arity == 1
+    {
+        return known_locale_argument(source, file, call, provider);
+    }
     matches!(
         (receiver_type.as_str(), name, arity),
         ("java.util.UUID", "randomUUID", 0)
+            | ("java.util.Locale", "getDefault", 0)
+            | ("java.time.Instant", "now", 0)
             | ("java.util.UUID", "toString" | "hashCode", 0)
             | ("java.util.UUID", "equals", 1)
             | (
@@ -3227,6 +3265,8 @@ fn standard_external_type<P: SemanticProvider + ?Sized>(
         .trim();
     let (simple, canonical, intrinsic) = match spelling {
         "UUID" | "java.util.UUID" => ("UUID", "java.util.UUID", false),
+        "Locale" | "java.util.Locale" => ("Locale", "java.util.Locale", false),
+        "Instant" | "java.time.Instant" => ("Instant", "java.time.Instant", false),
         "String" | "java.lang.String" | "kotlin.String" => ("String", "java.lang.String", true),
         "StringBuilder" | "java.lang.StringBuilder" => {
             ("StringBuilder", "java.lang.StringBuilder", true)
@@ -3267,7 +3307,8 @@ fn standard_external_type<P: SemanticProvider + ?Sized>(
     if spelling.contains('.') {
         return (spelling == canonical).then(|| canonical.to_owned());
     }
-    let mut matching_import = None;
+    let mut explicit_imports = Vec::new();
+    let mut matching_wildcard = None;
     for line in source.lines() {
         let Some(import) = line.trim().strip_prefix("import ") else {
             continue;
@@ -3278,9 +3319,15 @@ fn standard_external_type<P: SemanticProvider + ?Sized>(
             .map(|(path, alias)| (path.trim(), Some(alias.trim())))
             .unwrap_or((import, None));
         let imported_simple = alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path));
-        if imported_simple == simple || external_wildcard_covers(path, canonical) {
-            matching_import = Some(path);
+        if imported_simple == simple {
+            explicit_imports.push(path);
+        } else if alias.is_none() && external_wildcard_covers(path, canonical) {
+            matching_wildcard = Some(path);
         }
+    }
+    if !explicit_imports.is_empty() {
+        return (explicit_imports.len() == 1 && explicit_imports[0] == canonical)
+            .then(|| canonical.to_owned());
     }
     if source
         .lines()
@@ -3292,8 +3339,7 @@ fn standard_external_type<P: SemanticProvider + ?Sized>(
     {
         return None;
     }
-    match matching_import {
-        Some(path) if path == canonical => Some(canonical.to_owned()),
+    match matching_wildcard {
         Some(path) if external_wildcard_covers(path, canonical) => Some(canonical.to_owned()),
         Some(_) => None,
         None if intrinsic => Some(canonical.to_owned()),
@@ -3303,8 +3349,9 @@ fn standard_external_type<P: SemanticProvider + ?Sized>(
 
 fn external_wildcard_covers(path: &str, canonical: &str) -> bool {
     match canonical {
-        "java.util.UUID" | "java.util.Map" | "java.util.HashMap" | "java.util.List"
-        | "java.util.Set" => path == "java.util.*",
+        "java.util.UUID" | "java.util.Locale" | "java.util.Map" | "java.util.HashMap"
+        | "java.util.List" | "java.util.Set" => path == "java.util.*",
+        "java.time.Instant" => path == "java.time.*",
         "java.util.stream.Stream" => path == "java.util.stream.*",
         "java.lang.String" | "java.lang.StringBuilder" => path == "java.lang.*",
         _ => false,
@@ -3312,7 +3359,10 @@ fn external_wildcard_covers(path: &str, canonical: &str) -> bool {
 }
 
 fn is_known_jdk_wildcard(path: &str) -> bool {
-    matches!(path, "java.util.*" | "java.lang.*" | "java.util.stream.*")
+    matches!(
+        path,
+        "java.util.*" | "java.lang.*" | "java.util.stream.*" | "java.time.*"
+    )
 }
 
 fn explicit_receiver_spelling<'a>(
@@ -3369,6 +3419,184 @@ fn retain_matching_arity(candidates: &mut Vec<SymbolId>, call: tree_sitter::Node
     let argument_count = call_argument_count(call);
     candidates.retain(|candidate| candidate.parameters.len() == argument_count);
 }
+fn inferred_platform_initializer_type<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    declaration: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<String> {
+    let declaration_text = declaration.utf8_text(source.as_bytes()).ok()?;
+    let (_, initializer) = declaration_text.split_once('=')?;
+    let initializer = initializer.trim().trim_end_matches(';').trim();
+    let mut pending = vec![declaration];
+    while let Some(candidate) = pending.pop() {
+        if matches!(candidate.kind(), "call_expression" | "method_invocation")
+            && candidate.utf8_text(source.as_bytes()).ok() == Some(initializer)
+            && let Some(return_type) =
+                established_platform_call_return_type(source, file, candidate, provider)
+        {
+            return Some(return_type.to_string());
+        }
+        let mut cursor = candidate.walk();
+        pending.extend(candidate.named_children(&mut cursor));
+    }
+    None
+}
+
+fn known_locale_argument<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    provider: &P,
+) -> bool {
+    let Some(arguments) = call.child_by_field_name("value_arguments").or_else(|| {
+        call.child_by_field_name("arguments").or_else(|| {
+            let mut cursor = call.walk();
+            call.named_children(&mut cursor).find(|child| {
+                matches!(
+                    child.kind(),
+                    "arguments" | "argument_list" | "value_arguments" | "value_argument_list"
+                )
+            })
+        })
+    }) else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let values = arguments
+        .named_children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "value_argument" | "argument"))
+        .collect::<Vec<_>>();
+    let [argument] = values.as_slice() else {
+        return false;
+    };
+    let argument_text = argument
+        .utf8_text(source.as_bytes())
+        .unwrap_or_default()
+        .trim();
+    let mut pending = vec![*argument];
+    while let Some(candidate) = pending.pop() {
+        if matches!(candidate.kind(), "call_expression" | "method_invocation")
+            && candidate.utf8_text(source.as_bytes()).ok() == Some(argument_text)
+            && established_platform_call_return_type(source, file, candidate, provider)
+                == Some("java.util.Locale")
+        {
+            return true;
+        }
+        let mut cursor = candidate.walk();
+        pending.extend(candidate.named_children(&mut cursor));
+    }
+
+    let argument_text = argument_text
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    let name = argument_text.trim_matches('`');
+    if name.is_empty()
+        || !name.chars().enumerate().all(|(position, ch)| {
+            ch == '_' || ch.is_alphanumeric() && (position > 0 || ch.is_alphabetic())
+        })
+    {
+        return false;
+    }
+
+    let mut enclosing = call.parent();
+    while let Some(node) = enclosing {
+        if matches!(
+            node.kind(),
+            "method_declaration"
+                | "function_declaration"
+                | "constructor_declaration"
+                | "secondary_constructor"
+        ) {
+            break;
+        }
+        enclosing = node.parent();
+    }
+    let scope = enclosing.unwrap_or_else(|| {
+        let mut root = call;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        root
+    });
+    let mut pending = vec![scope];
+    let mut binding = None::<(usize, Option<String>, tree_sitter::Node<'_>)>;
+    while let Some(candidate) = pending.pop() {
+        if candidate.start_byte() < call.start_byte()
+            && matches!(
+                candidate.kind(),
+                "local_variable_declaration"
+                    | "field_declaration"
+                    | "property_declaration"
+                    | "formal_parameter"
+                    | "parameter"
+                    | "class_parameter"
+            )
+        {
+            let ty = candidate
+                .child_by_field_name("type")
+                .or_else(|| named_type_child(candidate))
+                .and_then(|type_node| type_node.utf8_text(source.as_bytes()).ok())
+                .map(str::to_owned);
+            let candidate_name = match candidate.kind() {
+                "property_declaration" => {
+                    let mut cursor = candidate.walk();
+                    candidate
+                        .named_children(&mut cursor)
+                        .find(|child| child.kind() == "variable_declaration")
+                        .and_then(|child| node_name(child, source))
+                }
+                "local_variable_declaration" | "field_declaration" => {
+                    let mut cursor = candidate.walk();
+                    candidate
+                        .named_children(&mut cursor)
+                        .filter(|child| child.kind() == "variable_declarator")
+                        .filter_map(|child| node_name(child, source))
+                        .find(|candidate_name| candidate_name == name)
+                }
+                _ => node_name(candidate, source),
+            };
+            if candidate_name.as_deref() == Some(name)
+                && binding
+                    .as_ref()
+                    .is_none_or(|(start, _, _)| candidate.start_byte() > *start)
+            {
+                binding = Some((candidate.start_byte(), ty, candidate));
+            }
+        }
+        let mut cursor = candidate.walk();
+        pending.extend(candidate.named_children(&mut cursor));
+    }
+
+    if let Some((_, Some(ty), _)) = binding.as_ref() {
+        return standard_external_type(source, provider, ty, false).as_deref()
+            == Some("java.util.Locale");
+    }
+    if let Some((_, None, declaration)) = binding {
+        return inferred_platform_initializer_type(source, file, declaration, provider).as_deref()
+            == Some("java.util.Locale");
+    }
+
+    provider
+        .symbols_named(name)
+        .into_iter()
+        .filter(|symbol| {
+            symbol.id.file == file
+                && symbol.location.start_byte <= call.start_byte()
+                && !is_type_symbol(&symbol.id)
+        })
+        .max_by_key(|symbol| symbol.location.start_byte)
+        .and_then(|symbol| match &symbol.ty {
+            FactStatus::Established(TypeRef {
+                ty: KotlinType::Named { name, .. },
+                ..
+            }) => standard_external_type(source, provider, name, false),
+            _ => None,
+        })
+        .is_some_and(|ty| ty == "java.util.Locale")
+}
+
 fn call_argument_count(call: tree_sitter::Node<'_>) -> usize {
     let argument_list = call.child_by_field_name("arguments").or_else(|| {
         call.child_by_field_name("value_arguments").or_else(|| {

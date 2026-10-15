@@ -9,6 +9,188 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 #[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_instant_factory_and_inferred_local() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("instant factory");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("Marker.kt"),
+            "package helpers\ninterface Marker\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("ClockSource.kt"),
+            r#"package boundary
+import helpers.*
+import java.time.Instant
+class ClockSource {
+    fun now(): Instant = Instant.now()
+    fun local(): Instant {
+        val instant = Instant.now()
+        return instant
+    }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Runner.kt"),
+            r#"package boundary
+import java.time.Instant
+fun main() {
+    val before = Instant.now()
+    val source = ClockSource()
+    val values = listOf(source.now(), source.local())
+    val after = Instant.now()
+    println(values.all { !it.isBefore(before) && !it.isAfter(after) })
+}
+"#,
+        )
+        .unwrap();
+    }
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlin_sources = ["Marker.kt", "ClockSource.kt", "Runner.kt"]
+        .iter()
+        .map(|name| original.join(name))
+        .collect();
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original clock source compiles");
+    assert_eq!(before.commands.last().unwrap().stdout.trim(), "true");
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place", "--lombok"])
+        .arg(migrated.join("ClockSource.kt"))
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        migrated.join("ClockSource.java").is_file(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    mixed.kotlin_sources = vec![migrated.join("Marker.kt"), migrated.join("Runner.kt")];
+    mixed.java_sources.push(migrated.join("ClockSource.java"));
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("translated clock source compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_locale_sensitive_string_case_conversion() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("locale sensitive string conversion");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("Casing.kt"),
+            r#"package boundary
+import java.util.*
+class Casing {
+    fun lowerInvariant(value: String): String = value.lowercase()
+    fun upperInvariant(value: String): String = value.uppercase()
+    fun lowerDefault(value: String): String = value.lowercase(Locale.getDefault())
+    fun upperDefault(value: String): String = value.uppercase(Locale.getDefault())
+    fun lowerLocal(value: String): String {
+        val locale = Locale.getDefault()
+        return value.lowercase(locale)
+    }
+    fun lowerExplicit(value: String, locale: Locale): String = value.lowercase(locale)
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Runner.kt"),
+            r#"package boundary
+import java.util.Locale
+fun main() {
+    Locale.setDefault(Locale.forLanguageTag("tr-TR"))
+    val casing = Casing()
+    val values = listOf(casing.lowerInvariant("TITLE"), casing.upperInvariant("title"),
+        casing.lowerDefault("TITLE"), casing.upperDefault("title"),
+        casing.lowerLocal("TITLE"), casing.lowerExplicit("TITLE", Locale.getDefault()))
+    println(values.map { text -> text.map { it.code }.joinToString(",") }.joinToString("|"))
+}
+"#,
+        )
+        .unwrap();
+    }
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlin_sources = vec![original.join("Casing.kt"), original.join("Runner.kt")];
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original locale conversion compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        "116,105,116,108,101|84,73,84,76,69|116,305,116,108,101|84,304,84,76,69|116,305,116,108,101|116,305,116,108,101"
+    );
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place", "--lombok"])
+        .arg(migrated.join("Casing.kt"))
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    let emitted = fs::read_to_string(migrated.join("Casing.java"))
+        .expect("locale conversion class translates");
+    assert!(
+        emitted.contains("toLowerCase(java.util.Locale.ROOT)"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("toUpperCase(java.util.Locale.ROOT)"),
+        "{emitted}"
+    );
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    mixed.kotlin_sources.push(migrated.join("Runner.kt"));
+    mixed.java_sources.push(migrated.join("Casing.java"));
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("translated locale conversion compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
 fn real_toolchain_preserves_covariant_collection_getter_methods() {
     let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
     let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");

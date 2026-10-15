@@ -194,6 +194,17 @@ pub struct UnitOptions {
 }
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    pub(crate) fn established_standard_string_case_call(&self, node: tree_sitter::Node) -> bool {
+        self.semantic_provider.is_some_and(|provider| {
+            crate::semantics::established_standard_string_case_call(
+                self.source,
+                self.workspace_file.as_deref().unwrap_or(self.file),
+                node,
+                provider,
+            )
+        })
+    }
+
     pub(crate) fn established_java_callable_member(&self, node: tree_sitter::Node) -> bool {
         let Some(provider) = self.semantic_provider else {
             return false;
