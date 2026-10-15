@@ -127,17 +127,22 @@ fn run_result_text(failed: bool, elapsed: Duration) -> String {
     )
 }
 
-#[cfg(test)]
-fn plan_progress_detail(round: usize, kotlin_remaining: usize, java_outputs: usize) -> String {
+fn kotlin_scope_counts(declarations: usize, files: usize) -> String {
     format!(
-        "pass {round} · {} · {} ready",
-        item_count(
-            kotlin_remaining,
-            "Kotlin source remains",
-            "Kotlin sources remain"
-        ),
-        item_count(java_outputs, "Java output", "Java outputs")
+        "{} ({})",
+        item_count(declarations, "declaration", "declarations"),
+        item_count(files, "Kotlin file", "Kotlin files")
     )
+}
+
+fn indexed_input_declarations(index: &SourceIndex, files: &[PathBuf]) -> Option<usize> {
+    files.iter().try_fold(0usize, |total, path| {
+        let file = index.source_file(path).or_else(|| {
+            let canonical = std::fs::canonicalize(path).ok()?;
+            index.source_file(&canonical)
+        })?;
+        Some(total + file.kotlin_declaration_count())
+    })
 }
 
 struct ProgressReporter {
@@ -269,14 +274,14 @@ mod progress_tests {
     }
 
     #[test]
-    fn plan_progress_keeps_pass_and_output_counts() {
+    fn kotlin_counts_put_declarations_before_files() {
         assert_eq!(
-            super::plan_progress_detail(3, 2, 9),
-            "pass 3 · 2 Kotlin sources remain · 9 Java outputs ready"
+            super::kotlin_scope_counts(9, 2),
+            "9 declarations (2 Kotlin files)"
         );
         assert_eq!(
-            super::plan_progress_detail(1, 1, 1),
-            "pass 1 · 1 Kotlin source remains · 1 Java output ready"
+            super::kotlin_scope_counts(1, 1),
+            "1 declaration (1 Kotlin file)"
         );
     }
 }
@@ -286,10 +291,7 @@ fn item_count(count: usize, singular: &str, plural: &str) -> String {
 }
 
 fn print_run_summary(
-    file_count: usize,
-    total_errors: usize,
-    total_warnings: usize,
-    java_written: usize,
+    counts: &RunCounts,
     outcomes: &[(PathBuf, MigrateOutcome)],
     failed: bool,
     run_elapsed: Duration,
@@ -312,28 +314,33 @@ fn print_run_summary(
     eprintln!(
         "  {} {:<11} {}",
         "├─".bright_black(),
-        "sources".bold(),
-        format!("{file_count} processed").bright_black()
+        "Kotlin".bold(),
+        format!(
+            "{} processed",
+            kotlin_scope_counts(counts.declarations, counts.sources)
+        )
+        .bright_black()
     );
     eprintln!(
         "  {} {:<11} {}",
         "├─".bright_black(),
         "java".bold(),
-        format!("{java_written} written").bright_black()
+        format!("{} written", counts.java_written).bright_black()
     );
     if !outcomes.is_empty() {
         eprintln!(
             "  {} {:<11} {}",
             "├─".bright_black(),
             "migration".bold(),
-            format!("{deleted} deleted · {trimmed} trimmed · {untouched} untouched").bright_black()
+            format!("{deleted} files deleted · {trimmed} trimmed · {untouched} untouched")
+                .bright_black()
         );
     }
     eprintln!(
         "  {} {:<11} {}",
         "├─".bright_black(),
         "diagnostics".bold(),
-        format!("{total_errors} errors · {total_warnings} warnings").bright_black()
+        format!("{} errors · {} warnings", counts.errors, counts.warnings).bright_black()
     );
     eprintln!(
         "  {} {:<11} {}",
@@ -472,7 +479,13 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         "index",
         format!(
             "{} · {} · {} parsed · {} cached",
-            item_count(index.kotlin_files().count(), "Kotlin file", "Kotlin files"),
+            kotlin_scope_counts(
+                index
+                    .kotlin_files()
+                    .map(|file| file.kotlin_declaration_count())
+                    .sum(),
+                index.kotlin_files().count(),
+            ),
             item_count(index.java_files().count(), "Java file", "Java files"),
             index_stats.parsed_files,
             index_stats.reused_files
@@ -502,9 +515,15 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     };
     progress_start("input", "discovering Kotlin sources");
     let files = collect_inputs(&cli.input)?;
+    let selected_declarations = indexed_input_declarations(&index, &files);
     progress_done(
         "input",
-        format!("{} selected", item_count(files.len(), "source", "sources")),
+        format!(
+            "{} selected",
+            selected_declarations
+                .map(|count| kotlin_scope_counts(count, files.len()))
+                .unwrap_or_else(|| item_count(files.len(), "input", "inputs"))
+        ),
     );
     let stdout = std::io::stdout();
     let mut stdout = BufWriter::new(stdout.lock());
@@ -566,7 +585,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             let files = sources.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>();
             let plan_progress = ProgressReporter::start(
                 "plan",
-                format!("resolving {}", item_count(files.len(), "source", "sources")),
+                format!(
+                    "resolving {}",
+                    indexed_input_declarations(&index, &files)
+                        .map(|count| kotlin_scope_counts(count, files.len()))
+                        .unwrap_or_else(|| item_count(files.len(), "Kotlin file", "Kotlin files"))
+                ),
             );
             let plan = notlin::migration_pipeline::plan_workspace_migration(
                 sources,
@@ -575,6 +599,11 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 &translation_roots,
                 |detail| plan_progress.update(detail),
             )?;
+            let declaration_count = plan
+                .translation_plans
+                .values()
+                .map(|plan| plan.declarations.len())
+                .sum();
             plan_progress.finish(format!(
                 "converged in {} · {}",
                 item_count(plan.rounds, "pass", "passes"),
@@ -683,9 +712,9 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             progress_done(
                 "write",
                 format!(
-                    "{} · {} migrated",
-                    item_count(java_written, "Java file", "Java files"),
-                    item_count(outcomes.len(), "source", "sources")
+                    "{} processed · {}",
+                    kotlin_scope_counts(declaration_count, files.len()),
+                    item_count(java_written, "Java file", "Java files")
                 ),
             );
             let repair_progress =
@@ -703,6 +732,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 cli,
                 RunCounts {
                     sources: files.len(),
+                    declarations: declaration_count,
                     errors: total_errors,
                     warnings: total_warnings,
                     java_written,
@@ -714,11 +744,15 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     }
 
+    let mut declaration_count = 0usize;
+    let mut parsed_files = 0usize;
     progress_start(
         "translate",
         format!(
             "processing {}",
-            item_count(files.len(), "source", "sources")
+            selected_declarations
+                .map(|count| kotlin_scope_counts(count, files.len()))
+                .unwrap_or_else(|| item_count(files.len(), "input", "inputs"))
         ),
     );
     for file in &files {
@@ -732,12 +766,32 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             continue;
         }
 
-        let (java_files, errors, warnings, coverage) = transpiler::transpile_with_workspace(
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .map_err(|error| error.to_string())?;
+        let tree = parser.parse(&source, None).ok_or("Kotlin parsing failed")?;
+        declaration_count +=
+            notlin::translation_plan::ownership_boundary_count(&source, tree.root_node());
+        parsed_files += 1;
+        progress_activity(
+            "translate",
+            format!(
+                "{} parsed",
+                kotlin_scope_counts(declaration_count, parsed_files)
+            ),
+        );
+        let (java_files, errors, warnings, coverage) = transpiler::transpile_with_tree_hint(
             &source,
+            &tree,
             file,
             cli,
-            Some(&index),
-            &translation_roots,
+            transpiler::WorkspaceScope {
+                index: Some(&index),
+                roots: &translation_roots,
+                ..Default::default()
+            },
+            true,
         );
         total_errors += errors;
         total_warnings += warnings;
@@ -872,6 +926,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         cli,
         RunCounts {
             sources: files.len(),
+            declarations: declaration_count,
             errors: total_errors,
             warnings: total_warnings,
             java_written,
@@ -975,6 +1030,7 @@ fn remove_stale_generated_outputs(
 #[derive(Default)]
 struct RunCounts {
     sources: usize,
+    declarations: usize,
     errors: usize,
     warnings: usize,
     java_written: usize,
@@ -993,15 +1049,7 @@ fn finish_run(
         || (cli.deny_warnings && counts.warnings > 0);
     stdout.flush().map_err(|error| format!("stdout: {error}"))?;
     print_retention_report();
-    print_run_summary(
-        counts.sources,
-        counts.errors,
-        counts.warnings,
-        counts.java_written,
-        outcomes,
-        failed,
-        run_started.elapsed(),
-    );
+    print_run_summary(&counts, outcomes, failed, run_started.elapsed());
     Ok(if failed {
         ExitCode::FAILURE
     } else {

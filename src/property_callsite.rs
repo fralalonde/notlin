@@ -78,6 +78,7 @@ impl IncrementalRepairState {
         let rewritten_accesses = if current_contracts.is_empty() || candidate_files == 0 {
             0
         } else {
+            let profile_slow_files = std::env::var_os("NOTLIN_PROFILE").is_some();
             crate::transpiler::fixpoint::install_parallel(|| {
                 sources
                     .par_iter_mut()
@@ -86,8 +87,19 @@ impl IncrementalRepairState {
                         if !candidate {
                             return None;
                         }
+                        let started = profile_slow_files.then(std::time::Instant::now);
                         let (rewritten, count) =
                             rewrite_file(index, path, source, &current_contracts);
+                        if let Some(started) = started {
+                            let elapsed = started.elapsed();
+                            if elapsed >= std::time::Duration::from_millis(250) {
+                                eprintln!(
+                                    "NOTLIN_PROFILE property call-site file {}: {:.3}s",
+                                    path.display(),
+                                    elapsed.as_secs_f64()
+                                );
+                            }
+                        }
                         *source = rewritten;
                         Some(count)
                     })
@@ -511,6 +523,26 @@ fn rewrite_implicit_this_reads(
     contracts: &[PropertyAccessorContract],
     edits: &mut Vec<Edit>,
 ) -> usize {
+    // Resolve each distinct contract owner once. A source file can contain
+    // many default bodies and each may refer to several repaired properties.
+    let resolved_contracts = contracts
+        .iter()
+        .filter_map(|contract| {
+            index
+                .resolve_type(source_file, &contract.owner_type)
+                .map(|owner| (contract, owner))
+        })
+        .collect::<Vec<_>>();
+
+    // Keep duplicate simple names ambiguous, matching the uniqueness check
+    // below, while avoiding a full declaration scan for every nested type.
+    let mut declarations_by_name = HashMap::<&str, Option<&Declaration>>::new();
+    for declaration in &source_file.declarations {
+        declarations_by_name
+            .entry(&declaration.name)
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(declaration));
+    }
     let mut declaration_nodes = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -520,14 +552,8 @@ fn rewrite_implicit_this_reads(
         ) && let Some(name) = node.child_by_field_name("name")
         {
             let name = kt::text(name, source);
-            let mut declarations = source_file
-                .declarations
-                .iter()
-                .filter(|declaration| declaration.name == name);
-            if let Some(declaration) = declarations.next()
-                && declarations.next().is_none()
-            {
-                declaration_nodes.push((node, declaration));
+            if let Some(Some(declaration)) = declarations_by_name.get(name) {
+                declaration_nodes.push((node, *declaration));
             }
         }
         for child in node.named_children(&mut node.walk()) {
@@ -537,13 +563,14 @@ fn rewrite_implicit_this_reads(
 
     let mut changed = 0;
     for (declaration_node, declaration) in declaration_nodes {
-        let declaration_contracts = contracts
+        // The exact ancestry closure is shared by all owner checks for this
+        // declaration. `inherits_exactly` performs this same graph walk once
+        // per owner, which multiplies quickly for declarations with bodies.
+        let ancestry = declaration_ancestry(index, source_file, declaration);
+        let declaration_contracts = resolved_contracts
             .iter()
-            .filter(|contract| {
-                index
-                    .resolve_type(source_file, &contract.owner_type)
-                    .is_some_and(|owner| inherits_exactly(index, source_file, declaration, owner))
-            })
+            .filter(|(_, owner)| ancestry.contains(&(*owner as *const Declaration as usize)))
+            .map(|(contract, _)| *contract)
             .collect::<Vec<_>>();
         if declaration_contracts.is_empty() {
             continue;
@@ -592,6 +619,28 @@ fn rewrite_implicit_this_reads(
         }
     }
     changed
+}
+
+fn declaration_ancestry(
+    index: &SourceIndex,
+    use_file: &SourceFile,
+    receiver: &Declaration,
+) -> HashSet<usize> {
+    let mut ancestry = HashSet::new();
+    let mut pending = vec![receiver];
+    while let Some(current) = pending.pop() {
+        if !ancestry.insert(current as *const Declaration as usize) {
+            continue;
+        }
+        let context = index.declaration_source_file(current).unwrap_or(use_file);
+        pending.extend(
+            current
+                .supertypes
+                .iter()
+                .filter_map(|supertype| index.resolve_type(context, supertype)),
+        );
+    }
+    ancestry
 }
 
 struct BodyFacts<'tree> {
@@ -1648,6 +1697,92 @@ mod tests {
         assert!(contains_any_identifier("obj.odd-name", &names));
         assert!(contains_any_identifier("obj.`with space`", &names));
         assert!(!contains_any_identifier("obj.odd-nameSuffix", &names));
+    }
+
+    #[test]
+    fn declaration_ancestry_matches_exact_inheritance_for_each_owner() {
+        let fixture = Fixture::new();
+        fixture.write("api/Api.kt", "package api\ninterface Api\n");
+        fixture.write(
+            "left/Left.kt",
+            "package left\nimport api.Api\ninterface Left : Api\n",
+        );
+        fixture.write(
+            "right/Right.kt",
+            "package right\nimport api.Api\ninterface Right : Api\n",
+        );
+        fixture.write(
+            "leaf/Diamond.kt",
+            "package leaf\nimport left.Left\nimport right.Right\ninterface Diamond : Left, Right\n",
+        );
+        fixture.write(
+            "leaf/Unresolved.kt",
+            "package leaf\ninterface Unresolved : MissingThing\n",
+        );
+        fixture.write(
+            "red/Types.kt",
+            "package red\ninterface Shared\ninterface Child : Shared\n",
+        );
+        fixture.write(
+            "blue/Types.kt",
+            "package blue\ninterface Shared\ninterface Child : Shared\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let declarations = index
+            .files
+            .iter()
+            .flat_map(|file| {
+                file.declarations
+                    .iter()
+                    .map(move |declaration| (file, declaration))
+            })
+            .collect::<Vec<_>>();
+        for (use_file, receiver) in &declarations {
+            let ancestry = declaration_ancestry(&index, use_file, receiver);
+            for (_, owner) in &declarations {
+                assert_eq!(
+                    ancestry.contains(&(*owner as *const Declaration as usize)),
+                    inherits_exactly(&index, use_file, receiver, owner),
+                    "ancestry result differed for {}.{} -> {}.{}",
+                    receiver.package.as_deref().unwrap_or(""),
+                    receiver.name,
+                    owner.package.as_deref().unwrap_or(""),
+                    owner.name
+                );
+            }
+        }
+
+        let declaration = |package: &str, name: &str| {
+            declarations
+                .iter()
+                .find(|(_, declaration)| {
+                    declaration.package.as_deref() == Some(package) && declaration.name == name
+                })
+                .map(|(_, declaration)| *declaration)
+                .unwrap()
+        };
+        let red_child = declaration("red", "Child");
+        let red_shared = declaration("red", "Shared");
+        let blue_shared = declaration("blue", "Shared");
+        let red_file = index.declaration_source_file(red_child).unwrap();
+        let red_ancestry = declaration_ancestry(&index, red_file, red_child);
+        assert!(red_ancestry.contains(&(red_shared as *const Declaration as usize)));
+        assert!(!red_ancestry.contains(&(blue_shared as *const Declaration as usize)));
+
+        let diamond = declaration("leaf", "Diamond");
+        let api = declaration("api", "Api");
+        let diamond_file = index.declaration_source_file(diamond).unwrap();
+        assert!(
+            declaration_ancestry(&index, diamond_file, diamond)
+                .contains(&(api as *const Declaration as usize))
+        );
+
+        let unresolved = declaration("leaf", "Unresolved");
+        let unresolved_file = index.declaration_source_file(unresolved).unwrap();
+        assert_eq!(
+            declaration_ancestry(&index, unresolved_file, unresolved).len(),
+            1
+        );
     }
 
     struct Fixture(PathBuf);

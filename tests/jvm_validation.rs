@@ -9,6 +9,96 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 #[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_bounded_generic_property_bridges() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("bounded generic property bridges");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("Identifier.kt"),
+            "package boundary\ninterface Identifier\nclass ConcreteId : Identifier\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("RootApi.kt"),
+            "package boundary\ninterface RootApi {\n    val identifier: Identifier\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("GenericEvent.kt"), "package boundary\ninterface GenericEvent<S : Identifier> : RootApi {\n    override val identifier: S\n    suspend fun pending(): String\n}\n").unwrap();
+        fs::write(root.join("KeptEvent.kt"), "package boundary\nclass KeptEvent(override val identifier: ConcreteId) : GenericEvent<ConcreteId> {\n    override suspend fun pending(): String = \"kept\"\n}\n").unwrap();
+        fs::write(
+            root.join("Runner.kt"),
+            r#"package boundary
+fun main() {
+    suspend fun retainedHarness() {}
+    val expected = ConcreteId()
+    val event: GenericEvent<ConcreteId> = KeptEvent(expected)
+    val root: RootApi = event
+    println("${event.identifier === expected}|${root.identifier === expected}")
+}
+"#,
+        )
+        .unwrap();
+    }
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlin_sources = fs::read_dir(&original)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before =
+        validate_jvm_sources(&baseline).expect("original bounded generic property compiles");
+    assert_eq!(before.commands.last().unwrap().stdout.trim(), "true|true");
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&migrated)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        migrated.join("RootApi.java").is_file(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    let retained = fs::read_to_string(migrated.join("GenericEvent.kt")).unwrap();
+    assert!(retained.contains("fun getIdentifier(): S"), "{retained}");
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    for entry in fs::read_dir(&migrated).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("kt") => mixed.kotlin_sources.push(path),
+            Some("java") => mixed.java_sources.push(path),
+            _ => {}
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after =
+        validate_jvm_sources(&mixed).expect("mixed bounded generic property bridge compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
 fn real_toolchain_preserves_instant_factory_and_inferred_local() {
     let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
     let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");

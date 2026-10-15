@@ -1084,15 +1084,12 @@ fn computed_class_property_bridgeable(index: &SourceIndex, owner: &Declaration) 
     let Some(file) = index.declaration_source_file(owner) else {
         return false;
     };
-    let Ok(source) = std::fs::read_to_string(&file.path) else {
-        return false;
-    };
     // Kotlin all-open plugins reject @JvmName on the virtual accessor. Until
     // component-wide call-site rewriting replaces computed properties with
     // methods, keep those annotated classes on the Kotlin side of the ABI.
     !["@Entity", "@MappedSuperclass", "@Embeddable"]
         .iter()
-        .any(|annotation| source.contains(annotation))
+        .any(|annotation| file.source_text().contains(annotation))
 }
 
 fn property_type_matches(
@@ -1111,6 +1108,25 @@ fn property_type_matches(
         || contract.type_name.contains("->")
     {
         return false;
+    }
+    // A getter returning a type parameter can satisfy a broader readonly
+    // property contract when its declaration gives that parameter one
+    // unambiguous, visible upper bound. Keep this proof local to the member's
+    // owning declaration: a same-named parameter elsewhere in the hierarchy
+    // says nothing about this getter's JVM return type.
+    if !member.is_mutable
+        && contract.setter.is_none()
+        && !member_type.trim().ends_with('?')
+        && !contract.type_name.trim().ends_with('?')
+        && type_parameter_bound_satisfies_contract(
+            index,
+            subtype,
+            member_type,
+            &contract.type_source,
+            &contract.type_name,
+        )
+    {
+        return true;
     }
     if !member.is_mutable
         && contract.setter.is_none()
@@ -1213,6 +1229,143 @@ fn property_type_matches(
                 )
         }
     }
+}
+
+/// Prove `S <: Contract` only from one explicit inline upper bound on the
+/// owning Kotlin declaration. Unbounded parameters, `where` clauses, multiple
+/// constraints, unresolved names, and nullable bounds stay conservative.
+fn type_parameter_bound_satisfies_contract(
+    index: &SourceIndex,
+    owner: &Declaration,
+    member_type: &str,
+    contract_file: &Path,
+    contract_type: &str,
+) -> bool {
+    let parameter = member_type.trim();
+    if !owner
+        .type_params
+        .iter()
+        .any(|candidate| candidate == parameter)
+        || parameter.is_empty()
+        || parameter.contains(['<', '>', '?', '.', ' '])
+        || contract_type.contains(['<', '>', '?'])
+        || owner
+            .type_params
+            .iter()
+            .any(|name| name == contract_type.trim())
+    {
+        return false;
+    }
+    let Some(owner_file) = index.declaration_source_file(owner) else {
+        return false;
+    };
+    let Some(bound) = inline_type_parameter_upper_bound(index, owner, parameter) else {
+        return false;
+    };
+    if owner.type_params.iter().any(|name| name == &bound) {
+        // A sibling parameter is a separate semantic fact, even if an indexed
+        // class elsewhere has the same spelling. This proof does not chase
+        // bounds through other type variables.
+        return false;
+    }
+    let Some(contract_source) = index.source_file(contract_file) else {
+        return false;
+    };
+    if index.resolve_type(owner_file, &bound).is_none()
+        || index.resolve_type(contract_source, contract_type).is_none()
+    {
+        // Matching unresolved imports establish a spelling, not the erased
+        // JVM return shape required for a generic accessor bridge.
+        return false;
+    }
+    // This initial proof deliberately handles a single named reference bound.
+    // Generic, nullable, intersection, and function bounds need substitution
+    // and JVM erasure analysis before they can be accepted.
+    // A generic `S : Int` is boxed on the JVM; it cannot implement the
+    // primitive `int` return emitted for an ordinary Kotlin Int property.
+    // Limit this proof to named reference contracts on both sides.
+    is_scalar_reference_type(bound.rsplit('.').next().unwrap_or(&bound))
+        && is_scalar_reference_type(contract_type.rsplit('.').next().unwrap_or(contract_type))
+        && !bound.contains(['<', '>', '?', '&', '(', ')', ' '])
+        && index.property_getter_return_compatible_in_files(
+            &owner_file.path,
+            &bound,
+            contract_file,
+            contract_type,
+        )
+}
+
+fn inline_type_parameter_upper_bound(
+    index: &SourceIndex,
+    owner: &Declaration,
+    parameter: &str,
+) -> Option<String> {
+    if !owner
+        .type_params
+        .iter()
+        .any(|candidate| candidate == parameter)
+    {
+        return None;
+    }
+    let owner_file = index.declaration_source_file(owner)?;
+    let source = owner_file.source_text();
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    let mut stack = vec![tree.root_node()];
+    let mut owners = Vec::new();
+    while let Some(node) = stack.pop() {
+        if declaration_node(node)
+            && declaration_name(node, source) == owner.name
+            && declaration_kind_matches(owner.kind, node)
+        {
+            owners.push(node);
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    let [owner_node] = owners.as_slice() else {
+        return None;
+    };
+    let type_parameters = owner_node
+        .child_by_field_name("type_parameters")
+        .or_else(|| {
+            let mut cursor = owner_node.walk();
+            owner_node
+                .named_children(&mut cursor)
+                .find(|node| node.kind() == "type_parameters")
+        })?;
+    let mut owner_cursor = owner_node.walk();
+    if owner_node
+        .named_children(&mut owner_cursor)
+        .any(|node| node.kind() == "type_constraints")
+    {
+        return None;
+    }
+    let mut cursor = type_parameters.walk();
+    let parameters = type_parameters
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "type_parameter")
+        .map(|node| node_text(node, source).to_string())
+        .filter(|text| type_parameter_name(text) == Some(parameter))
+        .collect::<Vec<_>>();
+    let [parameter_text] = parameters.as_slice() else {
+        return None;
+    };
+    let (name, bound) = parameter_text.split_once(':')?;
+    if name.trim() != parameter {
+        return None;
+    }
+    let bound = bound.trim();
+    (!bound.is_empty()).then(|| bound.to_string())
+}
+
+fn type_parameter_name(parameter: &str) -> Option<&str> {
+    let declaration = parameter.split(':').next()?.trim();
+    declaration
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .rfind(|token| !token.is_empty())
 }
 
 fn is_scalar_reference_type(type_name: &str) -> bool {
@@ -2071,81 +2224,10 @@ fn inferred_property_matches_receiver_bound(
     let Some(owner_file) = index.declaration_source_file(owner) else {
         return false;
     };
-    let source = owner_file.source_text();
-    let mut parser = tree_sitter::Parser::new();
-    if parser
-        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
-        .is_err()
-    {
-        return false;
-    }
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(bound) = inline_type_parameter_upper_bound(index, owner, type_parameter) else {
         return false;
     };
-    let mut stack = vec![tree.root_node()];
-    let mut owner_nodes = Vec::new();
-    while let Some(node) = stack.pop() {
-        if declaration_node(node)
-            && declaration_name(node, source) == owner.name
-            && declaration_kind_matches(owner.kind, node)
-        {
-            owner_nodes.push(node);
-        }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
-    let [owner_node] = owner_nodes.as_slice() else {
-        return false;
-    };
-    let owner_node = *owner_node;
-    let owner_text = node_text(owner_node, source);
-    let Some(parameters_start) = owner_text.find(&owner.name).and_then(|at| {
-        owner_text[at + owner.name.len()..]
-            .find('<')
-            .map(|open| at + owner.name.len() + open)
-    }) else {
-        return false;
-    };
-    let mut depth = 0usize;
-    let mut parameters_end = None;
-    for (offset, character) in owner_text[parameters_start..].char_indices() {
-        match character {
-            '<' => depth += 1,
-            '>' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    parameters_end = Some(parameters_start + offset);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let Some(parameters_end) = parameters_end else {
-        return false;
-    };
-    let parameters = &owner_text[parameters_start + 1..parameters_end];
-    let mut angle_depth = 0usize;
-    let mut parameter_parts = Vec::new();
-    let mut part_start = 0usize;
-    for (offset, character) in parameters.char_indices() {
-        match character {
-            '<' => angle_depth += 1,
-            '>' => angle_depth = angle_depth.saturating_sub(1),
-            ',' if angle_depth == 0 => {
-                parameter_parts.push(parameters[part_start..offset].trim());
-                part_start = offset + 1;
-            }
-            _ => {}
-        }
-    }
-    parameter_parts.push(parameters[part_start..].trim());
-    let Some(bound) = parameter_parts.iter().find_map(|part| {
-        let (name, bound) = part.split_once(':')?;
-        (name.trim() == type_parameter.as_str()).then_some(bound.trim())
-    }) else {
-        return false;
-    };
-    let Some(bound) = substitute_type_parameters(bound, owner_bindings) else {
+    let Some(bound) = substitute_type_parameters(&bound, owner_bindings) else {
         return false;
     };
     let (bound_name, bound_args) = split_type_arguments(&bound);
@@ -2387,7 +2469,7 @@ pub(crate) fn repaired_callsite_contracts_with_persisted(
     // the property, a shape declaration-repair discovery cannot report.
     for source_file in &index.files {
         if source_file.language != SourceLanguage::Java
-            || !is_generated_notlin_java(&source_file.path, generated_java)
+            || !is_generated_notlin_java(source_file, generated_java)
         {
             continue;
         }
@@ -2938,7 +3020,7 @@ fn inherited_generated_contracts(
             by_name.insert(contract.name.clone(), contract);
         }
         if resolved.language == SourceLanguage::Java
-            && is_generated_notlin_java(file.path.as_path(), generated_java)
+            && is_generated_notlin_java(file, generated_java)
             && let Some(contracts) = java_property_contracts(resolved, &file.path)
         {
             for mut contract in contracts {
@@ -3218,11 +3300,14 @@ fn has_inherited_setter(index: &SourceIndex, declaration: &Declaration, property
     false
 }
 
-fn is_generated_notlin_java(path: &Path, generated_java: &HashSet<std::path::PathBuf>) -> bool {
-    generated_java.contains(path)
-        || std::fs::read_to_string(path)
-            .ok()
-            .is_some_and(|source| source.starts_with("// NOTLIN: generated from "))
+fn is_generated_notlin_java(
+    source_file: &SourceFile,
+    generated_java: &HashSet<std::path::PathBuf>,
+) -> bool {
+    generated_java.contains(&source_file.path)
+        || source_file
+            .source_text()
+            .starts_with("// NOTLIN: generated from ")
 }
 
 fn java_property_contracts(
@@ -5459,6 +5544,37 @@ mod tests {
     }
 
     #[test]
+    fn all_open_safeguard_reads_speculative_source_overlay() {
+        let (fixture, index, _) = planner_fixture(
+            "package sample\ninterface Child : Api\nclass Impl : Child { override val name: String get() = \"name\"; override var enabled: Boolean = false }\n",
+        );
+        let implementation = fixture.0.join("Desc.kt");
+        let overlay = index
+            .with_overlays(&[crate::workspace::SourceOverlay::Replace {
+                path: implementation.clone(),
+                language: SourceLanguage::Kotlin,
+                source: "package sample\nimport jakarta.persistence.Entity\ninterface Child : Api\n@Entity class Impl : Child { override val name: String get() = \"name\"; override var enabled: Boolean = false }\n".to_string(),
+            }])
+            .unwrap();
+        let target = overlay
+            .declarations()
+            .find(|declaration| declaration.name == "Api")
+            .unwrap();
+        let retained = overlay
+            .declarations()
+            .filter(|declaration| declaration.name != "Api")
+            .map(|declaration| crate::semantics::workspace_symbol(&overlay, declaration))
+            .collect();
+
+        assert!(!retained_subtypes_repairable(
+            &overlay,
+            target,
+            &retained,
+            std::slice::from_ref(&fixture.0),
+        ));
+    }
+
+    #[test]
     fn planner_accepts_initialized_lifecycle_fields_on_an_entity_hierarchy() {
         let fixture = Fixture::new();
         fixture.write(
@@ -6630,6 +6746,30 @@ mod tests {
         assert_eq!(count, 2);
         assert!(rewritten.contains("@JvmField val enabled: Boolean"));
         assert!(rewritten.contains("override fun getEnabled(): Boolean = enabled"));
+    }
+
+    #[test]
+    fn generated_java_detection_uses_overlay_text_instead_of_stale_disk_text() {
+        let fixture = Fixture::new();
+        let java = fixture.write(
+            "Api.java",
+            "package sample; public interface Api { boolean getEnabled(); }\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let overlay = index
+            .with_overlays(&[crate::workspace::SourceOverlay::Replace {
+                path: java.clone(),
+                language: SourceLanguage::Java,
+                source: "// NOTLIN: generated from Api.kt\npackage sample; public interface Api { boolean getEnabled(); }\n".to_string(),
+            }])
+            .unwrap();
+        let source_file = overlay.source_file(&java).unwrap();
+
+        assert!(is_generated_notlin_java(source_file, &HashSet::new()));
+        assert!(!is_generated_notlin_java(
+            index.source_file(&java).unwrap(),
+            &HashSet::new()
+        ));
     }
 
     #[test]

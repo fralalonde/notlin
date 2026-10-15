@@ -455,7 +455,7 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
     };
     let mut cursor = root.walk();
     for node in root.named_children(&mut cursor) {
-        if !is_declaration_boundary(node.kind()) && !is_opaque_annotated_interface(node, source) {
+        if !is_ownership_boundary(node, source) {
             continue;
         }
         let opaque_interface = is_opaque_annotated_interface(node, source);
@@ -535,6 +535,20 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         }
     }
     plan
+}
+
+/// Count the top-level Kotlin ownership boundaries used by [`analyze`].
+/// Callers that already hold the parser tree can cache this without reparsing
+/// source or counting methods and nested declarations as separate owners.
+pub fn ownership_boundary_count(source: &str, root: Node<'_>) -> usize {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .filter(|node| is_ownership_boundary(*node, source))
+        .count()
+}
+
+fn is_ownership_boundary(node: Node<'_>, source: &str) -> bool {
+    is_declaration_boundary(node.kind()) || is_opaque_annotated_interface(node, source)
 }
 
 /// `expect` and `actual` declarations are linked by the Kotlin multiplatform
@@ -1005,6 +1019,7 @@ val wording = "expect actual"
         let source = "fun broken() { val x = }\nfun fine() = 2\n";
         let tree = parse(source);
         let plan = analyze(source, tree.root_node(), Path::new("sample.kt"));
+        assert_eq!(ownership_boundary_count(source, tree.root_node()), 2);
         assert_eq!(plan.declarations.len(), 2);
         assert_eq!(plan.declarations[0].candidate_owner, BackendOwner::Kotlin);
         assert!(matches!(
@@ -1012,6 +1027,36 @@ val wording = "expect actual"
             [RetentionReason::ParseError { .. }]
         ));
         assert_eq!(plan.declarations[1].candidate_owner, BackendOwner::Java);
+    }
+
+    #[test]
+    fn ownership_boundary_count_matches_planning_for_recovered_annotated_interfaces() {
+        let source = r#"
+@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "kind")
+@JsonSubTypes(
+    JsonSubTypes.Type(value = ContextA::class),
+    JsonSubTypes.Type(value = ContextB::class),
+)
+interface ContextContract<T> {
+    val context: T
+}
+
+class Container {
+    class Nested {
+        fun member() = 1
+    }
+    fun method() = 2
+}
+fun topLevel() = 3
+val topProperty = 4
+typealias Alias = String
+"#;
+        let tree = parse(source);
+        let plan = analyze(source, tree.root_node(), Path::new("sample.kt"));
+        let count = ownership_boundary_count(source, tree.root_node());
+
+        assert_eq!(count, plan.declarations.len());
+        assert_eq!(count, 5);
     }
 
     #[test]

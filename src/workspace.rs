@@ -14,7 +14,9 @@ use std::time::UNIX_EPOCH;
 // table instead of a bare property-name set.
 // 22: Java generic declaration type parameters recognize tree-sitter-java's
 // `type_identifier` nodes, so cached declarations must refresh `type_params`.
-const CACHE_VERSION: u32 = 22;
+// 23: cached top-level Kotlin ownership-boundary counts are now part of each
+// source snapshot.
+const CACHE_VERSION: u32 = 23;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -299,6 +301,11 @@ pub struct SourceFile {
     /// filesystem contents after an in-memory rewrite.
     #[serde(default)]
     source_text: String,
+    /// Top-level Kotlin ownership boundaries counted from the parser tree.
+    /// Java files always report zero. Stored in the workspace cache so display
+    /// statistics do not need to parse Kotlin source again.
+    #[serde(default)]
+    kotlin_declaration_count: usize,
     pub package: Option<String>,
     pub imports: Vec<String>,
     pub declarations: Vec<Declaration>,
@@ -332,6 +339,16 @@ pub struct SourceFile {
 impl SourceFile {
     pub fn source_text(&self) -> &str {
         &self.source_text
+    }
+
+    /// Number of top-level Kotlin declarations that translation plans own.
+    /// Class members and nested declarations belong to their containing owner.
+    pub fn kotlin_declaration_count(&self) -> usize {
+        if self.language == SourceLanguage::Kotlin {
+            self.kotlin_declaration_count
+        } else {
+            0
+        }
     }
 
     /// Constructor calls this file makes, as written.
@@ -746,11 +763,13 @@ impl SourceIndex {
                         bindings,
                         inferred_binding_calls,
                         ctor_calls,
+                        kotlin_declaration_count,
                     ) = parse_declarations(source, *language, package.as_deref())?;
                     files.push(SourceFile {
                         path: absolute_source_path(path),
                         language: *language,
                         source_text: source.clone(),
+                        kotlin_declaration_count,
                         package,
                         imports,
                         declarations,
@@ -3804,6 +3823,7 @@ fn scan_source(
         bindings,
         inferred_binding_calls,
         ctor_calls,
+        kotlin_declaration_count,
     ) = parse_declarations(&source, language, package.as_deref())?;
     stats.parsed_files += 1;
     Ok(CachedSource {
@@ -3814,6 +3834,7 @@ fn scan_source(
             path: canonical_path,
             language,
             source_text: source,
+            kotlin_declaration_count,
             package,
             imports,
             declarations,
@@ -3864,6 +3885,7 @@ type ParseDeclarations = (
     HashMap<String, String>,
     Vec<crate::smart_cast::InferredBindingCall>,
     Vec<CtorCall>,
+    usize,
 );
 
 fn java_annotation_target(source: &str, name: &str, element_type: &str) -> Option<bool> {
@@ -4015,6 +4037,11 @@ fn parse_declarations(
         Vec::new()
     };
     ctor_calls.shrink_to_fit();
+    let kotlin_declaration_count = if language == SourceLanguage::Kotlin {
+        crate::translation_plan::ownership_boundary_count(source, tree.root_node())
+    } else {
+        0
+    };
     Ok((
         declarations,
         type_aliases,
@@ -4025,6 +4052,7 @@ fn parse_declarations(
         bindings,
         inferred_binding_calls,
         ctor_calls,
+        kotlin_declaration_count,
     ))
 }
 
@@ -6099,6 +6127,122 @@ interface SiblingContext {
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
             ["Alpha", "Alpha", "Moved"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod kotlin_declaration_count_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn scratch() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "notlin-kotlin-declaration-count-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn cached_count_tracks_top_level_ownership_boundaries_only() {
+        let root = scratch();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("sample.kt"),
+            "package sample\n\
+             class Outer {\n\
+                 class Nested {\n\
+                     fun nestedMethod() = 1\n\
+                 }\n\
+                 fun memberMethod() = 2\n\
+                 val memberProperty = 3\n\
+             }\n\
+             object Singleton {\n\
+                 fun memberMethod() = 4\n\
+             }\n\
+             fun topLevelFunction() = 5\n\
+             val topLevelProperty = 6\n\
+             typealias Alias = String\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Sample.java"),
+            "package sample; public class Sample { public void method() {} }\n",
+        )
+        .unwrap();
+
+        let (index, first_stats) = SourceIndex::discover_with_stats(&root).unwrap();
+        assert_eq!(first_stats.parsed_files, 2);
+        let kotlin = index
+            .source_file(&root.join("sample.kt"))
+            .expect("Kotlin source indexed");
+        let java = index
+            .source_file(&root.join("Sample.java"))
+            .expect("Java source indexed");
+        assert_eq!(kotlin.kotlin_declaration_count(), 5);
+        assert_eq!(java.kotlin_declaration_count(), 0);
+
+        let (warm, warm_stats) = SourceIndex::discover_with_stats(&root).unwrap();
+        assert_eq!(warm_stats.parsed_files, 0);
+        assert_eq!(warm_stats.reused_files, 2);
+        assert_eq!(
+            warm.source_file(&root.join("sample.kt"))
+                .unwrap()
+                .kotlin_declaration_count(),
+            5,
+            "warm cache reads reuse the serialized count without reparsing"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn overlays_recompute_counts_from_the_overlay_parser_tree() {
+        let root = scratch();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sample.kt");
+        fs::write(
+            &path,
+            "package sample\nclass Before {\n    fun member() = 1\n}\n",
+        )
+        .unwrap();
+        let index = SourceIndex::discover(&root).unwrap();
+        assert_eq!(
+            index.source_file(&path).unwrap().kotlin_declaration_count(),
+            1
+        );
+
+        let overlay = index
+            .with_overlays(&[SourceOverlay::Replace {
+                path: path.clone(),
+                language: SourceLanguage::Kotlin,
+                source: "package sample\nclass After {\n    class Nested {\n        fun nested() = 2\n    }\n}\nfun top() = 3\nval property = 4\ntypealias Alias = String\n".into(),
+            }])
+            .unwrap();
+        assert_eq!(
+            overlay
+                .source_file(&path)
+                .unwrap()
+                .kotlin_declaration_count(),
+            4
+        );
+
+        let java_overlay = index
+            .with_overlays(&[SourceOverlay::Replace {
+                path: path.clone(),
+                language: SourceLanguage::Java,
+                source: "package sample; class Replacement { void method() {} }".into(),
+            }])
+            .unwrap();
+        assert_eq!(
+            java_overlay
+                .source_file(&path)
+                .unwrap()
+                .kotlin_declaration_count(),
+            0
         );
         let _ = fs::remove_dir_all(root);
     }

@@ -191,13 +191,56 @@ fn default_run_reports_phases_without_listing_individual_files() {
     assert!(stderr.contains("✓ index"), "{stderr}");
     assert!(stderr.contains("◇ plan"), "{stderr}");
     assert!(stderr.contains("notlin summary"), "{stderr}");
-    assert!(stderr.contains("├─ sources"), "{stderr}");
+    assert!(stderr.contains("├─ Kotlin"), "{stderr}");
+    assert!(
+        stderr.contains("1 declaration (1 Kotlin file) selected"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("1 declaration (1 Kotlin file) processed"),
+        "{stderr}"
+    );
     assert!(stderr.contains("├─ java"), "{stderr}");
     assert!(stderr.contains("├─ diagnostics"), "{stderr}");
     assert!(stderr.contains("└─ result"), "{stderr}");
     assert!(stderr.contains("success"), "{stderr}");
     assert!(!stderr.contains("Sample.kt"), "{stderr}");
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn progress_counts_declarations_and_keeps_file_counts_secondary() {
+    let root = std::env::temp_dir().join(format!(
+        "notlin-declaration-progress-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("Many.kt"), "package stats\nclass First {\n    fun member(): Int {\n        return 1\n    }\n}\nfun retained() {\n    suspend fun nested() {}\n}\n").unwrap();
+    fs::write(root.join("Other.kt"), "package stats\nclass Other\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .current_dir(&root)
+        .args(["--in-place", "."])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("3 declarations (2 Kotlin files) selected"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("resolving 3 declarations (2 Kotlin files)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("1 declaration remains (1 Kotlin file)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("3 declarations (2 Kotlin files) processed"),
+        "{stderr}"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

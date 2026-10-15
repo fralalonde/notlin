@@ -484,9 +484,38 @@ where
                 cli.verbose > 0,
             );
         }
+        let remaining_declarations: usize = plans
+            .iter()
+            .map(|plan| {
+                if !vetoed_this_round.is_empty()
+                    && vetoed_this_round.contains(&normalized(&plan.file))
+                {
+                    plan.translation.declarations.len()
+                } else {
+                    plan.translation
+                        .declarations
+                        .iter()
+                        .filter(|declaration| {
+                            declaration.final_owner
+                                != Some(crate::translation_plan::BackendOwner::Java)
+                        })
+                        .count()
+                }
+            })
+            .sum();
         progress(format!(
-            "pass {round} · {} Kotlin sources remain · {} Java outputs ready · {} call-site candidates",
+            "pass {round} · {remaining_declarations} {} ({} {}) · {} Java outputs ready · {} call-site candidates",
+            if remaining_declarations == 1 {
+                "declaration remains"
+            } else {
+                "declarations remain"
+            },
             next.len(),
+            if next.len() == 1 {
+                "Kotlin file"
+            } else {
+                "Kotlin files"
+            },
             cumulative.len(),
             callsite_stats.candidate_files
         ));
