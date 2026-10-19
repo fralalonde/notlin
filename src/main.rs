@@ -566,17 +566,17 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let mut java_written = 0usize;
     let mut outcomes: Vec<(PathBuf, MigrateOutcome)> = Vec::new();
 
-    // Workspace mode (index + more than one file): compute the retention
-    // fixpoint first (probe passes in memory, no writes, no printed
-    // diagnostics), then write each file's plan exactly once. The subtype
-    // retention rule then only fires for subtypes that are THEMSELVES
-    // retained, so clean hub-and-implementor families translate together.
-    if !cli.dump_ast
-        && (cli.workspace_root.is_some()
-            || files.len() > 1
-            || cli.migrates_in_place()
-            || cli.validation_config.is_some())
-    {
+    // Workspace mode (indexed inputs): compute the retention fixpoint first
+    // (probe passes in memory, no writes, no printed diagnostics), then write
+    // each file's plan exactly once. The subtype retention rule then only
+    // fires for subtypes that are THEMSELVES retained, so clean
+    // hub-and-implementor families translate together. This is the only path
+    // whose subtype and supertype rules are paired: the legacy hintless path
+    // retains a supertype conservatively but has no upward rule, so a Java
+    // child could be emitted against a Kotlin-retained parent. Every
+    // file-backed run — including a single file — goes through the fixpoint;
+    // stdin has no indexable path and keeps the legacy single-file path.
+    if !cli.dump_ast {
         // Read every source up front; stdin ('-') cannot participate in a
         // multi-file fixpoint (no path to index), so it keeps the old path.
         if files.iter().all(|f| f.as_os_str() != "-") {
