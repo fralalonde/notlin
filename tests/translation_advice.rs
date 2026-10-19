@@ -157,9 +157,14 @@ fn recommends_only_a_known_covariant_default_getter_conflict_on_retained_descend
     let fixture = Fixture::new();
     fixture.write(
         "types.kt",
-        "package sample\n\
+        "package types\n\
          interface Broad {}\n\
-         class Narrow : Broad {}\n\
+         class Narrow : Broad {}\n",
+    );
+    fixture.write(
+        "api.kt",
+        "package sample\n\
+         import types.*\n\
          interface BroadContract {\n\
              val ref: Broad\n\
          }\n\
@@ -257,6 +262,62 @@ fn recommends_only_a_known_covariant_default_getter_conflict_on_retained_descend
                 std::slice::from_ref(&edited.root)
             )
             .is_none()
+    );
+
+    // Known covariance still needs an explicit override when the competing
+    // Kotlin property contract is retained: a method repair cannot implement it.
+    let exact = Fixture::new();
+    exact.write(
+        "types.kt",
+        "package sample\n\
+         interface Broad {}\n\
+         class Narrow : Broad {}\n\
+         interface BroadContract {\n\
+             val ref: Broad\n\
+         }\n\
+         interface Provider : BroadContract {\n\
+             override val ref: Narrow get() = Narrow()\n\
+         }\n\
+         class RetainedChild : Provider {}\n",
+    );
+    let exact_index = exact.index();
+    let (exact_files, mut exact_plans) = plans_for(&exact_index);
+    let exact_advice = analyze(
+        &exact_files,
+        &exact_plans,
+        &exact_index,
+        std::slice::from_ref(&exact.root),
+        &[],
+    );
+    assert_eq!(
+        exact_advice
+            .iter()
+            .filter(|item| item.code == "U001")
+            .count(),
+        1,
+        "{exact_advice:#?}"
+    );
+
+    // Once that contract moves to Java, the planned method repair can preserve
+    // the concrete getter without asking the user to edit the descendant.
+    for decision in exact_plans
+        .values_mut()
+        .flat_map(|plan| &mut plan.declarations)
+    {
+        if decision.symbol_id.name == "BroadContract" {
+            decision.final_owner = Some(BackendOwner::Java);
+        }
+    }
+    assert!(
+        analyze(
+            &exact_files,
+            &exact_plans,
+            &exact_index,
+            std::slice::from_ref(&exact.root),
+            &[],
+        )
+        .iter()
+        .all(|item| item.code != "U001")
     );
 }
 
@@ -539,12 +600,20 @@ fn verbose_cli_timestamps_logger_and_progress_output() {
 fn impact_ranking_counts_only_exact_established_dependencies_and_terminates_cycles() {
     let fixture = Fixture::new();
     fixture.write(
+        "alpha_types.kt",
+        "package alphatypes\ninterface Broad {}\nclass Narrow : Broad {}\n",
+    );
+    fixture.write(
         "alpha.kt",
-        "package alpha\ninterface Broad {}\nclass Narrow : Broad {}\ninterface Contract {\n val ref: Broad\n}\ninterface Provider : Contract {\n override val ref: Narrow get() = Narrow()\n}\nclass Child : Provider {}\n",
+        "package alpha\nimport alphatypes.*\ninterface Contract {\n val ref: Broad\n}\ninterface Provider : Contract {\n override val ref: Narrow get() = Narrow()\n}\nclass Child : Provider {}\n",
+    );
+    fixture.write(
+        "beta_types.kt",
+        "package betatypes\ninterface Broad {}\nclass Narrow : Broad {}\n",
     );
     fixture.write(
         "beta.kt",
-        "package beta\ninterface Broad {}\nclass Narrow : Broad {}\ninterface Contract {\n val ref: Broad\n}\ninterface Provider : Contract {\n override val ref: Narrow get() = Narrow()\n}\nclass Child : Provider {}\n",
+        "package beta\nimport betatypes.*\ninterface Contract {\n val ref: Broad\n}\ninterface Provider : Contract {\n override val ref: Narrow get() = Narrow()\n}\nclass Child : Provider {}\n",
     );
     let index = fixture.index();
     let (files, mut plans) = plans_for(&index);

@@ -455,7 +455,7 @@ fn deep_valid_retention_chain_uses_configurable_budget() {
         fs::write(
             scratch.join(format!("Chain{depth}.kt")),
             format!(
-                "package neutral.deep\ninterface Chain{depth}{supertype} {{ fun marker{depth}(): Int }}\n"
+                "package neutral.deep\ninterface Chain{depth}{supertype} {{ fun marker{depth}(input: Int): Int }}\n"
             ),
         )
         .unwrap();
@@ -545,7 +545,7 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
     .unwrap();
     fs::write(
         root.join("Chain1.kt"),
-        "package neutral.comments\ninterface Chain1 : Chain0 { fun marker1(): Int }\n",
+        "package neutral.comments\ninterface Chain1 : Chain0 { fun marker1(input: Int): Int }\n",
     )
     .unwrap();
     fs::write(

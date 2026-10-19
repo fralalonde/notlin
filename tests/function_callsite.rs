@@ -88,6 +88,59 @@ fn honors_jvm_name_and_alias_but_leaves_local_shadow_and_named_arguments() {
 }
 
 #[test]
+fn local_call_shadowing_obeys_initializer_and_lexical_scope() {
+    let target = "package p\nfun singletonNull() = \"top\"\n";
+    let caller = "package q\nimport p.singletonNull\nfun initializer() {\n val singletonNull = singletonNull()\n}\nfun previousInitializer() {\n val previous = singletonNull()\n singletonNull()\n}\nfun earlierLocalFunction() {\n fun singletonNull() = \"local\"\n singletonNull()\n}\nfun laterLocalFunction() {\n singletonNull()\n fun singletonNull() = \"local\"\n singletonNull()\n}\nfun siblingBlock() {\n if (true) { val singletonNull = { \"local\" } }\n singletonNull()\n}\nfun nestedBlock() {\n val inner = run { val singletonNull = { \"local\" }; singletonNull() }\n singletonNull()\n}\nfun parameter(singletonNull: () -> Unit) = singletonNull()\nfun lambdaParameter() = ({ \"local\" }).let { singletonNull -> singletonNull() }\nfun loop(xs: List<() -> Unit>) { for (singletonNull in xs) singletonNull() }\nfun destructured() { val (singletonNull, other) = Pair({ \"local\" }, 1); singletonNull() }\n";
+    let targets = BTreeMap::from([
+        (PathBuf::from("Functions.kt"), target.to_owned()),
+        (PathBuf::from("Caller.kt"), caller.to_owned()),
+    ]);
+    let plans = vec![java_owned_plan("Functions.kt", target)];
+    let mut residual = targets.clone();
+    let report = repair_virtual_calls(&targets, &plans, &mut residual);
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let output = &residual[&PathBuf::from("Caller.kt")];
+    assert!(
+        output.contains("val singletonNull = p.Functions.singletonNull()"),
+        "the initializer call must resolve before its own local binding: {output}"
+    );
+    assert!(
+        output.contains("fun previousInitializer() {\n val previous = p.Functions.singletonNull()\n p.Functions.singletonNull()"),
+        "a prior initializer's RHS call is not a binding for later calls: {output}"
+    );
+    assert!(
+        output.contains(
+            "fun earlierLocalFunction() {\n fun singletonNull() = \"local\"\n singletonNull()"
+        ),
+        "a preceding local function shadows the imported function: {output}"
+    );
+    assert!(
+        output.contains(
+            "fun laterLocalFunction() {\n p.Functions.singletonNull()\n fun singletonNull()"
+        ),
+        "Kotlin local functions do not shadow calls before their declaration: {output}"
+    );
+    assert!(
+        output.contains("fun siblingBlock() {\n if (true) { val singletonNull = { \"local\" } }\n p.Functions.singletonNull()"),
+        "a binding in a nested sibling block does not escape: {output}"
+    );
+    assert!(
+        output.contains("val inner = run { val singletonNull = { \"local\" }; singletonNull() }\n p.Functions.singletonNull()"),
+        "nested lambda bindings shadow only within their lambda: {output}"
+    );
+    assert!(output.contains("fun parameter(singletonNull: () -> Unit) = singletonNull()"));
+    assert!(
+        output.contains("({ \"local\" }).let { singletonNull -> singletonNull() }"),
+        "a lambda parameter shadows the imported function inside its lambda: {output}"
+    );
+    assert!(output.contains("run { val singletonNull = { \"local\" }; singletonNull() }"));
+    assert!(output.contains("for (singletonNull in xs) singletonNull()"));
+    assert!(
+        output.contains("val (singletonNull, other) = Pair({ \"local\" }, 1); singletonNull()")
+    );
+}
+
+#[test]
 fn package_mismatch_and_overloads_are_not_guessed() {
     let one = "package p\nfun work(value: Int) = value\n";
     let two = "package p\nfun work(value: String) = value\n";

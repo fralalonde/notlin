@@ -161,16 +161,62 @@ pub struct TranslationPlan {
     pub source_hash: [u8; 32],
     pub declarations: Vec<DeclarationDecision>,
     pub bridges: Vec<PlannedBridge>,
+    /// Conditional contracts for accepted Java using default Lombok accessors.
+    /// The migration pipeline proves and snapshots configuration before use.
+    #[serde(default)]
+    pub generated_getters: Vec<crate::lombok_getter_contracts::GeneratedGetterContract>,
+    /// Concrete overrides preserving inherited covariant default getter APIs.
+    #[serde(default)]
+    pub default_getter_bridges: Vec<PlannedDefaultGetterBridge>,
     pub repairs: Vec<PlannedRepair>,
     pub outputs: Vec<PlannedOutput>,
     pub source_edits: Vec<PlannedSourceEdit>,
+    /// Generic JVM contract changes accepted together with their Java implementer.
+    #[serde(default)]
+    pub variance_contracts: Vec<PlannedVarianceContract>,
     pub provenance: Vec<crate::semantics::OriginMap>,
     pub dependencies: Vec<SymbolDependency>,
     pub type_facts: Vec<(
         crate::semantics::SourceLocation,
         crate::semantics::FactStatus<crate::semantics::TypeRef>,
     )>,
+    /// Proven enum switch expressions, bound to the exact source snapshot.
+    #[serde(default)]
+    pub enum_when_lowerings: Vec<crate::semantics::EnumWhenLowering>,
+    /// Exact stdlib TODO throws accepted for this snapshot.
+    #[serde(default)]
+    pub todo_lowerings: Vec<crate::semantics::TodoLowering>,
+    /// Snapshot-checked virtual reference calls accepted by semantic planning.
+    #[serde(default)]
+    pub reference_string_calls: Vec<crate::semantics::ReferenceStringCall>,
+    /// Canonical external container calls with wrapper-only return facts.
+    #[serde(default)]
+    pub container_calls: Vec<crate::semantics::ContainerMemberCall>,
+    /// Proven eager stdlib collection operations tied to this snapshot.
+    #[serde(default)]
+    pub eager_collection_calls: Vec<crate::semantics::EagerCollectionCall>,
+    /// Private loop helpers required by the planned ownership boundaries.
+    #[serde(default)]
+    pub eager_collection_helpers: Vec<PlannedEagerCollectionHelper>,
+    #[serde(default)]
+    pub exact_overload_calls: Vec<crate::semantics::ExactOverloadCall>,
+    #[serde(default)]
+    pub reified_class_calls: Vec<crate::semantics::ReifiedClassCall>,
+    /// Unambiguous secondary-to-secondary delegation, tied to this snapshot.
+    #[serde(default)]
+    pub constructor_delegations: Vec<PlannedConstructorDelegation>,
     pub diagnostics: Vec<crate::semantics::SemanticDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedConstructorDelegation {
+    pub symbol_id: SymbolId,
+    pub target_symbol_id: SymbolId,
+    pub location: crate::semantics::SourceLocation,
+    pub target: crate::semantics::SourceLocation,
+    pub owner: SymbolId,
+    /// Target parameter spellings, checked against the target before emission.
+    pub parameter_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +231,30 @@ pub struct PlannedBridge {
     pub id: SymbolId,
     pub origin: SymbolId,
     pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedEagerCollectionHelper {
+    pub id: SymbolId,
+    pub origin: SymbolId,
+    pub name: String,
+    pub parameter_name: String,
+    pub operation: crate::semantics::EagerCollectionOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedDefaultGetterBridge {
+    pub owner: SymbolId,
+    pub location: crate::semantics::SourceLocation,
+    /// Declaring interface of the effective default; this owner must use Java
+    /// method semantics before the bridge can be emitted or repaired.
+    pub target: SymbolId,
+    /// Direct interface qualifier for the super call. It may remain Kotlin
+    /// when it inherits the selected Java default without overriding it.
+    pub provider: SymbolId,
+    pub method_name: String,
+    pub return_type: String,
+    pub return_type_ref: crate::semantics::TypeRef,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedRepair {
@@ -204,7 +274,129 @@ pub struct PlannedSourceEdit {
     pub speculative: bool,
 }
 
+/// A source-level JVM variance annotation justified by one migrated owner.
+/// The edit is anchored to the original source snapshot; it is never applied
+/// when the implementer remains Kotlin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedVarianceContract {
+    pub implementer: SymbolId,
+    pub contract_owner: SymbolId,
+    pub accessor: String,
+    pub edit: PlannedSourceEdit,
+}
+
 impl TranslationPlan {
+    /// Preserve Kotlin's omitted-argument defaults for defaulted DTO
+    /// constructors observed through source-proven Jackson annotations.
+    pub fn plan_jackson_default_constructor_losses(
+        &mut self,
+        file: &Path,
+        provider: &dyn crate::semantics::SemanticProvider,
+        allow_approximations: bool,
+    ) {
+        for symbol in provider.symbols_in_file(file) {
+            if !matches!(symbol.id.kind.as_str(), "class" | "object" | "enum")
+                || !provider.has_jackson_default_constructor_semantics(&symbol.id)
+            {
+                continue;
+            }
+            // A nested Kotlin class cannot remain Kotlin inside a Java-owned
+            // outer declaration. Keep the outermost declaration boundary.
+            let Some(decision) = self
+                .declarations
+                .iter_mut()
+                .filter(|decision| {
+                    matches!(
+                        decision.kind,
+                        DeclarationKind::Class | DeclarationKind::Object
+                    ) && symbol.location.start_byte >= decision.id.start_byte
+                        && symbol.location.end_byte <= decision.id.end_byte
+                })
+                .max_by_key(|decision| decision.id.end_byte - decision.id.start_byte)
+            else {
+                continue;
+            };
+            let message = format!(
+                "semantic loss: Jackson observes Kotlin default constructor parameters on `{}`; Java constructor binding cannot distinguish omitted properties from explicit nulls",
+                symbol.id.name
+            );
+            if allow_approximations {
+                self.diagnostics.push(crate::semantics::SemanticDiagnostic {
+                    code: "A001".into(),
+                    message,
+                    location: symbol.location.clone(),
+                });
+            } else {
+                let reason = RetentionReason::PreparationBlocker {
+                    kind: PreparationBlockerKind::SemanticLoss,
+                    message,
+                };
+                if !decision.retention_reasons.contains(&reason) {
+                    decision.retention_reasons.push(reason);
+                }
+                decision.candidate_owner = BackendOwner::Kotlin;
+            }
+        }
+    }
+
+    /// Preserve the complete ownership boundary when any nested class needs
+    /// Kotlin constructor metadata observed by an indexed generic factory.
+    pub fn plan_constructor_metadata_losses(
+        &mut self,
+        file: &Path,
+        provider: &dyn crate::semantics::SemanticProvider,
+        allow_approximations: bool,
+    ) {
+        for symbol in provider.symbols_in_file(file) {
+            let Some(dependency) = provider.kotlin_constructor_metadata_dependency(&symbol.id)
+            else {
+                continue;
+            };
+            let Some(decision) = self.declarations.iter_mut().find(|decision| {
+                symbol.location.start_byte >= decision.id.start_byte
+                    && symbol.location.end_byte <= decision.id.end_byte
+            }) else {
+                continue;
+            };
+            let factory = dependency
+                .factory
+                .owner_path
+                .iter()
+                .chain(std::iter::once(&dependency.factory.name))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(".");
+            let message = format!(
+                "semantic loss: Kotlin constructor metadata is observed through `{factory}` for `{}`; Java constructors do not preserve primary constructors, optional parameters, or callBy defaults",
+                dependency.bound.name,
+            );
+            let edge = SymbolDependency {
+                from: decision.symbol_id.clone(),
+                spelling: format!("Kotlin constructor metadata via {factory}"),
+                resolution: crate::semantics::FactStatus::Established(dependency.factory.clone()),
+            };
+            if !self.dependencies.contains(&edge) {
+                self.dependencies.push(edge);
+            }
+            if allow_approximations {
+                self.diagnostics.push(crate::semantics::SemanticDiagnostic {
+                    code: "A001".into(),
+                    message,
+                    location: symbol.location.clone(),
+                });
+            } else {
+                let reason = RetentionReason::PreparationBlocker {
+                    kind: PreparationBlockerKind::SemanticLoss,
+                    message,
+                };
+                if !decision.retention_reasons.contains(&reason) {
+                    decision.retention_reasons.push(reason);
+                }
+                decision.candidate_owner = BackendOwner::Kotlin;
+            }
+        }
+    }
+
     /// Losses known independently of Kotlin resolution belong to eligibility,
     /// before any candidate Java is prepared.
     pub fn plan_type_losses(&mut self, source: &str, root: Node, allow_approximations: bool) {
@@ -445,12 +637,24 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         source_hash,
         declarations: Vec::new(),
         bridges: Vec::new(),
+        generated_getters: Vec::new(),
+        default_getter_bridges: Vec::new(),
         repairs: Vec::new(),
         outputs: Vec::new(),
         source_edits: Vec::new(),
+        variance_contracts: Vec::new(),
         provenance: Vec::new(),
         dependencies: Vec::new(),
         type_facts: Vec::new(),
+        enum_when_lowerings: Vec::new(),
+        todo_lowerings: Vec::new(),
+        reference_string_calls: Vec::new(),
+        container_calls: Vec::new(),
+        eager_collection_calls: Vec::new(),
+        eager_collection_helpers: Vec::new(),
+        exact_overload_calls: Vec::new(),
+        reified_class_calls: Vec::new(),
+        constructor_delegations: Vec::new(),
         diagnostics: Vec::new(),
     };
     let mut cursor = root.walk();
@@ -473,7 +677,9 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
                 end_byte: node.end_byte(),
             });
         }
-        if opaque_interface && recovered_node.is_none() {
+        if (opaque_interface && recovered_node.is_none())
+            || crate::semantics::recovered_annotation_class_name_node(node, source).is_some()
+        {
             reasons.push(RetentionReason::OpaqueBoundary {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
@@ -548,7 +754,9 @@ pub fn ownership_boundary_count(source: &str, root: Node<'_>) -> usize {
 }
 
 fn is_ownership_boundary(node: Node<'_>, source: &str) -> bool {
-    is_declaration_boundary(node.kind()) || is_opaque_annotated_interface(node, source)
+    is_declaration_boundary(node.kind())
+        || is_opaque_annotated_interface(node, source)
+        || crate::semantics::recovered_annotation_class_name_node(node, source).is_some()
 }
 
 /// `expect` and `actual` declarations are linked by the Kotlin multiplatform
@@ -605,7 +813,7 @@ fn is_declaration_boundary(kind: &str) -> bool {
 /// expression-bodied member at the end of a class. It is recovery metadata,
 /// not evidence that the declaration is unsafe. Other ERROR or missing nodes
 /// remain blockers.
-fn has_unclassified_parse_error(node: Node, source: &str) -> bool {
+pub(crate) fn has_unclassified_parse_error(node: Node, source: &str) -> bool {
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
         if current.is_error() {
@@ -737,6 +945,9 @@ fn declaration_kind(kind: &str) -> DeclarationKind {
 }
 
 fn declaration_name(node: Node, source: &str) -> Option<String> {
+    if let Some(name) = crate::semantics::recovered_annotation_class_name(node, source) {
+        return Some(name);
+    }
     if let Some(name) = node.child_by_field_name("name") {
         return name.utf8_text(source.as_bytes()).ok().map(str::to_string);
     }

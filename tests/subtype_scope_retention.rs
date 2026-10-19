@@ -1,10 +1,10 @@
 //! A Kotlin interface whose every subtype is INSIDE the selected translation
 //! roots must not be retained merely for having Kotlin subtypes: those
 //! subtypes translate in the same run, so the interface's Java ABI will have
-//! Java clients. Retention stays correct when a Kotlin subtype lives OUTSIDE
-//! the selection (its residual Kotlin `implements` would target a Java
-//! interface and fail) — that case is covered by has_unselected_kotlin_subtype
-//! and the retained-property fake-override rules.
+//! Java clients. Retention remains necessary when an unselected Kotlin subtype
+//! has a contract that is not proven safe for the emitted Java ABI; the bounded
+//! parameterized-method case is covered by has_unselected_kotlin_subtype and
+//! the retained-property fake-override rules.
 
 use notlin::diagnostics::RetentionKind;
 use std::fs;
@@ -56,7 +56,7 @@ fn interface_with_only_selected_kotlin_subtypes_translate_via_fixpoint() {
 }
 
 #[test]
-fn interface_with_unselected_kotlin_subtype_still_retained() {
+fn interface_with_unselected_kotlin_subtype_and_unproven_method_stays_retained() {
     let root = Path::new("tests/tmp_scratch_subtype_scope2");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root.join("selected")).unwrap();
@@ -66,7 +66,7 @@ fn interface_with_unselected_kotlin_subtype_still_retained() {
         "package neutral.subtype2\n\
          \n\
          interface Speaker {\n\
-         \x20   fun speak(): String\n\
+         \x20   fun speak(volume: Int): String\n\
          }\n",
     )
     .unwrap();
@@ -75,13 +75,20 @@ fn interface_with_unselected_kotlin_subtype_still_retained() {
         "package neutral.subtype2\n\
          \n\
          class Cat : Speaker {\n\
-         \x20   override fun speak(): String = \"meow\"\n\
+         \x20   override fun speak(volume: Int): String = \"meow\"\n\
          }\n",
     )
     .unwrap();
     // Translate ONLY the selected subtree; the Cat file stays Kotlin outside it.
+    // This parameterized method shape remains an unproven JVM ABI contract.
     let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--in-place",
+            "--lombok",
+            "-vv",
+        ])
         .arg(root.join("selected").join("hub.kt").to_str().unwrap())
         .output()
         .expect("run notlin");

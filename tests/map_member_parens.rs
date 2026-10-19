@@ -51,8 +51,8 @@ fn pre_streamed_filter_keeps_java_call_syntax_with_external_approximations() {
         notlin::transpiler::transpile(source, &PathBuf::from("M.kt"), &cli);
     assert_eq!(errors, 0);
     assert_eq!(
-        warnings, 3,
-        "only the external Stream calls are approximated"
+        warnings, 1,
+        "Stream dispatch is proven; the lambda parameter's startsWith call still needs an approximation"
     );
     let m = files
         .iter()

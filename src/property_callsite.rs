@@ -1,17 +1,15 @@
 //! Rewrite retained Kotlin property syntax when a workspace contract has been
 //! repaired to explicit JavaBean methods or translated to Java.
 //!
-//! The pass is deliberately conservative. It handles `name.property` for a
-//! simple, explicitly typed receiver whose type is proven to inherit the
-//! listed contract, plus bare reads in executable bodies of retained Kotlin
-//! declarations that inherit the contract. Parameters and locals that shadow a bare
-//! property, safe calls, callables, compound writes, unknown receiver types,
-//! and ambiguous contracts are left as-is. Passing a [`SourceIndex`] built
-//! with speculative overlays works the same as passing a disk-backed index.
+//! Indexed type facts resolve explicit receivers and inherited bare accesses.
+//! Reads (including safe navigation) become getter calls; plain assignments
+//! become setter calls. Shadowing bindings, compound writes, unknown receiver
+//! types, and ambiguous contracts remain unchanged. A [`SourceIndex`] built
+//! with speculative overlays works the same as a disk-backed index.
 
 use crate::smart_cast;
 use crate::transpiler::kt;
-use crate::workspace::{Declaration, SourceFile, SourceIndex, SourceLanguage};
+use crate::workspace::{Declaration, Member, SourceFile, SourceIndex, SourceLanguage};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -268,58 +266,44 @@ pub fn rewrite_file(
         let Some(left) = node.child_by_field_name("left") else {
             continue;
         };
-        let Some(right) = node.child_by_field_name("right") else {
+        let Some((receiver_node, property, member)) = property_access_nodes(left, source) else {
             continue;
         };
-        let Some((receiver, property)) = property_access(left, source) else {
+        if receiver_node.kind() == "this_expression" && has_unknown_implicit_receiver_scope(node) {
             continue;
-        };
-        let contract = if receiver == "super" {
+        }
+        if safe_navigation_operator(source, receiver_node, member) != Some(".") {
+            continue;
+        }
+        let receiver = kt::text(receiver_node, source);
+        let contract = if receiver_node.kind() == "super_expression" {
             contract_for_super(index, source_file, source, node, &property, contracts)
         } else {
-            contract_for(&context, node, &receiver, &property)
+            contract_for_read_receiver(&context, node, receiver_node, &property)
         };
         let Some(contract) = contract else {
             continue;
         };
-        let Some(setter) = contract.setter.as_deref() else {
-            continue;
-        };
-        let between = &source[left.end_byte()..right.start_byte()];
-        let Some(equal_at) = between.rfind('=') else {
-            continue;
-        };
-        if between[..equal_at]
-            .chars()
-            .any(|ch| matches!(ch, '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '?'))
-            || between[equal_at + 1..].contains('=')
+        if receiver_node.kind() == "this_expression"
+            && inside_canonical_accessor(node, source, contract)
         {
             continue;
         }
-        if !between[..equal_at].trim().is_empty() || !between[equal_at + 1..].trim().is_empty() {
+        let Some(setter) = contract.setter.as_deref() else {
             continue;
-        }
-        if between.contains("//") || between.contains("/*") {
-            continue;
-        }
-        edits.push(Edit {
-            start: left.start_byte(),
-            end: right.start_byte(),
-            replacement: format!("{receiver}.{setter}("),
-        });
-        edits.push(Edit {
-            start: right.end_byte(),
-            end: right.end_byte(),
-            replacement: ")".to_string(),
-        });
-        rewritten += 1;
+        };
+        rewritten += usize::from(rewrite_plain_assignment(
+            node,
+            source,
+            &format!("{receiver}.{setter}"),
+            &mut edits,
+        ));
     }
 
     // Repaired Kotlin properties no longer provide property syntax to default
     // members on their owner or retained descendants. Those references are
     // unqualified, so the receiver-type pass above cannot resolve them.
-    rewritten +=
-        rewrite_implicit_this_reads(index, source_file, source, &tree, contracts, &mut edits);
+    rewritten += rewrite_implicit_this_accesses(&context, &tree, contracts, &mut edits);
 
     // Read edits replace only the member token, preserving whitespace and
     // comments around the receiver and dot. Reads inside a converted lvalue are
@@ -329,12 +313,18 @@ pub fn rewrite_file(
         for child in node.named_children(&mut node.walk()) {
             stack.push(child);
         }
-        if node.kind() != "navigation_expression" || is_assignment_lvalue(node) {
+        if node.kind() != "navigation_expression"
+            || is_assignment_lvalue(node)
+            || is_increment_lvalue(node)
+        {
             continue;
         }
         let Some((receiver_node, property, member)) = property_access_nodes(node, source) else {
             continue;
         };
+        if receiver_node.kind() == "this_expression" && has_unknown_implicit_receiver_scope(node) {
+            continue;
+        }
         // A navigation followed by call arguments is a function call, not a
         // property read. Do not turn `receiver.property()` into `getProperty()()`.
         if node
@@ -365,6 +355,11 @@ pub fn rewrite_file(
             }
             continue;
         };
+        if receiver_node.kind() == "this_expression"
+            && inside_canonical_accessor(node, source, contract)
+        {
+            continue;
+        }
         edits.push(Edit {
             start: member.start_byte(),
             end: member.end_byte(),
@@ -391,26 +386,214 @@ pub fn rewrite_file(
     (output, rewritten)
 }
 
+/// A stored override can become private storage only when every access that
+/// previously dispatched through its property accessor has a supported repair.
+/// This uses the same executable scopes and lexical bindings as caller repair;
+/// constructor defaults and delegation arguments deliberately stay outside them.
+pub(crate) fn private_storage_accesses_supported(
+    index: &SourceIndex,
+    owner: &Declaration,
+    member: &Member,
+) -> bool {
+    let Some(source_file) = index.declaration_source_file(owner) else {
+        return false;
+    };
+    let source = source_file.source_text();
+    let tree = crate::transpiler::parse_tree(source);
+    let mut declarations = Vec::new();
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "class_declaration" | "object_declaration")
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| kt::text(name, source) == owner.name)
+        {
+            declarations.push(node);
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    let [declaration] = declarations.as_slice() else {
+        return false;
+    };
+    if crate::translation_plan::has_unclassified_parse_error(*declaration, source) {
+        return false;
+    }
+    let Some(body) = kt::child(*declaration, "class_body") else {
+        return true;
+    };
+    let bindings = smart_cast::bindings_in(&tree, source);
+    let context = RewriteContext {
+        index,
+        source_file,
+        source,
+        bindings: &bindings,
+        contracts_by_property: HashMap::new(),
+        inheritance_cache: RefCell::new(HashMap::new()),
+    };
+    let mut scopes = Vec::new();
+    collect_interface_bodies(*declaration, source, &mut scopes);
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "annotation" {
+            continue;
+        }
+        if matches!(node.kind(), "callable_reference" | "navigation_expression")
+            && kt::text(node, source)
+                .rsplit_once("::")
+                .is_some_and(|(_, target)| target.trim().trim_matches('`') == member.name)
+        {
+            return false;
+        }
+        let short_template = node.kind() == "string_literal"
+            && !short_template_spans(node, source, &member.name).is_empty();
+        let identifier = node.kind() == "identifier" && kt::text(node, source) == member.name;
+        let navigation = node.kind() == "navigation_expression"
+            && property_access_nodes(node, source)
+                .is_some_and(|(_, property, _)| property == member.name);
+        let bare = identifier
+            && (is_bare_expression_identifier(node)
+                || is_assignment_lvalue(node)
+                || is_increment_lvalue(node)
+                || node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "callable_reference"));
+        if bare || navigation || short_template {
+            if !navigation && scoped_binding_at(&context, node, &member.name).is_some() {
+                pending.extend(node.named_children(&mut node.walk()));
+                continue;
+            }
+            // A known other receiver's property is unrelated to this storage.
+            if navigation {
+                let Some((receiver, _, _)) = property_access_nodes(node, source) else {
+                    return false;
+                };
+                if !matches!(receiver.kind(), "this_expression" | "super_expression") {
+                    let Some(ty) = expression_type(&context, node, receiver) else {
+                        return false;
+                    };
+                    let Some(receiver_owner) = index.resolve_type(source_file, &ty) else {
+                        return false;
+                    };
+                    if !context.inherits_exactly(receiver_owner, owner) {
+                        pending.extend(node.named_children(&mut node.walk()));
+                        continue;
+                    }
+                } else if kt::text(receiver, source).contains('@') {
+                    return false;
+                }
+            }
+            if !scopes.iter().any(|(scope, _, _)| {
+                scope.start_byte() <= node.start_byte() && scope.end_byte() >= node.end_byte()
+            }) || !private_storage_access_scope_supported(node, *declaration, source)
+            {
+                return false;
+            }
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    true
+}
+
+fn private_storage_access_scope_supported(node: Node<'_>, owner: Node<'_>, source: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.id() == owner.id() {
+            return true;
+        }
+        match parent.kind() {
+            "lambda_literal" | "callable_reference" | "class_declaration"
+            | "object_declaration" | "object_literal" => return false,
+            "function_declaration" => {
+                if function_has_extension_receiver(parent) {
+                    return false;
+                }
+            }
+            "assignment"
+                if parent
+                    .child_by_field_name("left")
+                    .is_some_and(|left| left.id() == current.id()) =>
+            {
+                let Some(right) = parent.child_by_field_name("right") else {
+                    return false;
+                };
+                if source[current.end_byte()..right.start_byte()].trim() != "=" {
+                    return false;
+                }
+            }
+            "unary_expression"
+                if parent
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| matches!(kt::text(operator, source), "++" | "--")) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+    false
+}
+
+fn function_has_extension_receiver(function: Node<'_>) -> bool {
+    let Some(name) = function.child_by_field_name("name") else {
+        return true;
+    };
+    function.named_children(&mut function.walk()).any(|child| {
+        child.end_byte() <= name.start_byte()
+            && matches!(
+                child.kind(),
+                "user_type" | "nullable_type" | "function_type" | "parenthesized_type"
+            )
+    })
+}
+
+/// Without resolved lambda/extension receiver facts, a bare name or `this`
+/// may refer to a nearer receiver. Leave Kotlin to resolve those accesses.
+fn has_unknown_implicit_receiver_scope(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "lambda_literal" | "object_literal" => return true,
+            "function_declaration" if function_has_extension_receiver(parent) => return true,
+            "class_declaration" | "object_declaration" => return false,
+            _ => {}
+        }
+        node = parent;
+    }
+    false
+}
+
 struct Edit {
     start: usize,
     end: usize,
     replacement: String,
 }
 
-fn property_access(node: Node, source: &str) -> Option<(String, String)> {
-    if node.kind() != "navigation_expression" {
-        return None;
+fn inside_canonical_accessor(
+    mut node: Node<'_>,
+    source: &str,
+    contract: &PropertyAccessorContract,
+) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "function_declaration" {
+            let Some(name) = parent.child_by_field_name("name") else {
+                return false;
+            };
+            let arity = crate::workspace::member_callable_arity(parent, SourceLanguage::Kotlin);
+            return is_canonical_accessor(kt::text(name, source), arity, contract);
+        }
+        node = parent;
     }
-    let parts: Vec<Node> = node.named_children(&mut node.walk()).collect();
-    if parts.len() != 2
-        || !matches!(parts[0].kind(), "identifier" | "super_expression")
-        || parts[1].kind() != "identifier"
-    {
-        return None;
-    }
-    let receiver = kt::text(parts[0], source).to_string();
-    let property = kt::text(parts[1], source).to_string();
-    (kt::text(node, source) == format!("{receiver}.{property}")).then_some((receiver, property))
+    false
+}
+
+fn is_canonical_accessor(
+    method: &str,
+    arity: Option<crate::workspace::CallableArity>,
+    contract: &PropertyAccessorContract,
+) -> bool {
+    (method == contract.getter && arity.is_none_or(|shape| shape.accepts_arity(0)))
+        || (contract.setter.as_deref() == Some(method)
+            && arity.is_none_or(|shape| shape.accepts_arity(1)))
 }
 
 fn property_access_nodes<'tree>(
@@ -467,11 +650,31 @@ fn contract_for_super<'a>(
             hierarchy_declares_method(index, source_file, &direct_parents, &contract.getter)
         })
         .collect::<Vec<_>>();
-    let first = *matching.first()?;
-    matching
-        .iter()
-        .all(|candidate| candidate.getter == first.getter && candidate.setter == first.setter)
-        .then_some(first)
+    compatible_accessor_contract(matching)
+}
+
+/// A readonly ancestor and a mutable implementation share a getter. The
+/// missing setter on the ancestor is not a conflicting setter declaration.
+fn compatible_accessor_contract<'a>(
+    contracts: impl IntoIterator<Item = &'a PropertyAccessorContract>,
+) -> Option<&'a PropertyAccessorContract> {
+    let mut contracts = contracts.into_iter();
+    let mut selected = contracts.next()?;
+    for candidate in contracts {
+        if candidate.getter != selected.getter
+            || candidate
+                .setter
+                .as_ref()
+                .zip(selected.setter.as_ref())
+                .is_some_and(|(candidate, selected)| candidate != selected)
+        {
+            return None;
+        }
+        if selected.setter.is_none() && candidate.setter.is_some() {
+            selected = candidate;
+        }
+    }
+    Some(selected)
 }
 
 fn hierarchy_declares_method(
@@ -515,14 +718,36 @@ fn is_assignment_lvalue(node: Node) -> bool {
     })
 }
 
-fn rewrite_implicit_this_reads(
-    index: &SourceIndex,
-    source_file: &SourceFile,
-    source: &str,
+fn is_increment_lvalue(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() != "parenthesized_expression" {
+            break;
+        }
+        node = parent;
+    }
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "unary_expression"
+            && parent
+                .child_by_field_name("argument")
+                .is_some_and(|argument| argument.id() == node.id())
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| matches!(operator.kind(), "++" | "--"))
+    })
+}
+
+fn rewrite_implicit_this_accesses(
+    context: &RewriteContext<'_>,
     tree: &tree_sitter::Tree,
     contracts: &[PropertyAccessorContract],
     edits: &mut Vec<Edit>,
 ) -> usize {
+    let RewriteContext {
+        index,
+        source_file,
+        source,
+        ..
+    } = context;
     // Resolve each distinct contract owner once. A source file can contain
     // many default bodies and each may refer to several repaired properties.
     let resolved_contracts = contracts
@@ -567,36 +792,34 @@ fn rewrite_implicit_this_reads(
         // declaration. `inherits_exactly` performs this same graph walk once
         // per owner, which multiplies quickly for declarations with bodies.
         let ancestry = declaration_ancestry(index, source_file, declaration);
-        let declaration_contracts = resolved_contracts
-            .iter()
-            .filter(|(_, owner)| ancestry.contains(&(*owner as *const Declaration as usize)))
-            .map(|(contract, _)| *contract)
+        let mut by_property = HashMap::<&str, Vec<&PropertyAccessorContract>>::new();
+        for (contract, owner) in &resolved_contracts {
+            if ancestry.contains(&(*owner as *const Declaration as usize)) {
+                by_property
+                    .entry(&contract.property)
+                    .or_default()
+                    .push(contract);
+            }
+        }
+        let mut declaration_contracts = by_property
+            .into_values()
+            .filter_map(compatible_accessor_contract)
             .collect::<Vec<_>>();
+        declaration_contracts.sort_by(|left, right| left.property.cmp(&right.property));
         if declaration_contracts.is_empty() {
             continue;
         }
         let mut bodies = Vec::new();
         collect_interface_bodies(declaration_node, source, &mut bodies);
         for (body, scope, method_name) in bodies {
-            let facts = BodyFacts::collect(body, scope, source);
+            let facts = BodyFacts::collect(body, source);
+            let arity = crate::workspace::member_callable_arity(scope, SourceLanguage::Kotlin);
             for contract in &declaration_contracts {
-                // Conflicting plans for one property do not identify a safe
-                // accessor. Identical duplicate plans are already deduplicated.
-                if declaration_contracts.iter().any(|other| {
-                    other.property == contract.property
-                        && (other.getter != contract.getter || other.setter != contract.setter)
-                }) {
-                    continue;
-                }
-                // If a parameter, local, or nested local declaration shadows
-                // this property anywhere in the method, fail closed for it.
-                if method_name.as_deref() == Some(contract.property.as_str())
-                    || method_name.as_deref() == Some(contract.getter.as_str())
-                    || contract
-                        .setter
-                        .as_deref()
-                        .is_some_and(|setter| method_name.as_deref() == Some(setter))
-                    || facts.declared_names.contains(&contract.property)
+                // Canonical accessor bodies must keep their storage access;
+                // a disjoint overload still needs normal virtual dispatch.
+                if method_name
+                    .as_deref()
+                    .is_some_and(|method| is_canonical_accessor(method, arity, contract))
                 {
                     continue;
                 }
@@ -606,6 +829,11 @@ fn rewrite_implicit_this_reads(
                     .into_iter()
                     .flatten()
                 {
+                    if scoped_binding_at(context, *node, &contract.property).is_some()
+                        || has_unknown_implicit_receiver_scope(*node)
+                    {
+                        continue;
+                    }
                     edits.push(Edit {
                         start: node.start_byte(),
                         end: node.end_byte(),
@@ -613,8 +841,32 @@ fn rewrite_implicit_this_reads(
                     });
                     changed += 1;
                 }
-                changed +=
-                    rewrite_short_string_templates(&facts.string_literals, source, contract, edits);
+                if let Some(setter) = &contract.setter {
+                    for assignment in facts
+                        .bare_assignments
+                        .get(&contract.property)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if scoped_binding_at(context, *assignment, &contract.property).is_some()
+                            || has_unknown_implicit_receiver_scope(*assignment)
+                        {
+                            continue;
+                        }
+                        changed += usize::from(rewrite_plain_assignment(
+                            *assignment,
+                            source,
+                            setter,
+                            edits,
+                        ));
+                    }
+                }
+                changed += rewrite_short_string_templates(
+                    &facts.string_literals,
+                    context,
+                    contract,
+                    edits,
+                );
             }
         }
     }
@@ -644,110 +896,131 @@ fn declaration_ancestry(
 }
 
 struct BodyFacts<'tree> {
-    declared_names: HashSet<String>,
     bare_identifiers: HashMap<String, Vec<Node<'tree>>>,
+    bare_assignments: HashMap<String, Vec<Node<'tree>>>,
     string_literals: Vec<Node<'tree>>,
 }
 
 impl<'tree> BodyFacts<'tree> {
-    fn collect(body: Node<'tree>, scope: Node<'tree>, source: &str) -> Self {
-        let mut declared_names = HashSet::new();
-        let mut scope_stack = vec![scope];
-        while let Some(node) = scope_stack.pop() {
-            if node.id() != scope.id()
+    fn collect(body: Node<'tree>, source: &str) -> Self {
+        let mut bare_identifiers = HashMap::<String, Vec<Node<'tree>>>::new();
+        let mut bare_assignments = HashMap::<String, Vec<Node<'tree>>>::new();
+        let mut string_literals = Vec::new();
+        let mut body_stack = vec![body];
+        while let Some(node) = body_stack.pop() {
+            if node.kind() == "annotation" {
+                continue;
+            }
+            if node.id() != body.id()
                 && matches!(node.kind(), "class_declaration" | "object_declaration")
             {
                 continue;
             }
-            let declared = match node.kind() {
-                "variable_declaration" | "parameter" | "class_parameter" => node
-                    .named_children(&mut node.walk())
-                    .find(|child| child.kind() == "identifier"),
-                "function_declaration" if node.id() != scope.id() => {
-                    node.child_by_field_name("name")
-                }
-                _ => None,
-            };
-            if let Some(declared) = declared {
-                declared_names.insert(kt::text(declared, source).to_string());
+            if node.kind() == "string_literal" {
+                string_literals.push(node);
             }
-            scope_stack.extend(node.named_children(&mut node.walk()));
-        }
-
-        let mut bare_identifiers = HashMap::<String, Vec<Node<'tree>>>::new();
-        let mut body_stack = vec![(body, false)];
-        while let Some((node, inside_nested_class)) = body_stack.pop() {
-            let inside_nested_class = inside_nested_class
-                || (node.id() != body.id()
-                    && matches!(node.kind(), "class_declaration" | "object_declaration"));
-            if !inside_nested_class
-                && node.kind() == "identifier"
-                && is_bare_expression_identifier(node)
-            {
+            if node.kind() == "identifier" && is_bare_expression_identifier(node) {
                 bare_identifiers
                     .entry(kt::text(node, source).to_string())
                     .or_default()
                     .push(node);
             }
-            body_stack.extend(
-                node.named_children(&mut node.walk())
-                    .map(|child| (child, inside_nested_class)),
-            );
-        }
-        let mut string_literals = Vec::new();
-        let mut template_stack = vec![body];
-        while let Some(node) = template_stack.pop() {
-            if node.kind() == "string_literal" {
-                string_literals.push(node);
-                continue;
+            if node.kind() == "assignment"
+                && let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "identifier"
+            {
+                bare_assignments
+                    .entry(kt::text(left, source).to_string())
+                    .or_default()
+                    .push(node);
             }
-            template_stack.extend(node.named_children(&mut node.walk()));
+            body_stack.extend(node.named_children(&mut node.walk()));
         }
         Self {
-            declared_names,
             bare_identifiers,
+            bare_assignments,
             string_literals,
         }
     }
 }
 
+/// Replace only an assignment's delimiters, leaving RHS reads available for
+/// their own edits and preserving their original evaluation order.
+fn rewrite_plain_assignment(
+    assignment: Node<'_>,
+    source: &str,
+    setter: &str,
+    edits: &mut Vec<Edit>,
+) -> bool {
+    let Some(left) = assignment.child_by_field_name("left") else {
+        return false;
+    };
+    let Some(right) = assignment.child_by_field_name("right") else {
+        return false;
+    };
+    if source[left.end_byte()..right.start_byte()].trim() != "=" {
+        return false;
+    }
+    edits.push(Edit {
+        start: left.start_byte(),
+        end: right.start_byte(),
+        replacement: format!("{setter}("),
+    });
+    edits.push(Edit {
+        start: right.end_byte(),
+        end: right.end_byte(),
+        replacement: ")".into(),
+    });
+    true
+}
+
 fn rewrite_short_string_templates(
     string_literals: &[Node<'_>],
-    source: &str,
+    context: &RewriteContext<'_>,
     contract: &PropertyAccessorContract,
     edits: &mut Vec<Edit>,
 ) -> usize {
+    let source = context.source;
     let mut changed = 0;
     for node in string_literals {
-        let content = &source[node.start_byte()..node.end_byte()];
-        let needle = format!("${}", contract.property);
-        let mut offset = 0;
-        while let Some(relative) = content[offset..].find(&needle) {
-            let start = offset + relative;
-            let end = start + needle.len();
+        if scoped_binding_at(context, *node, &contract.property).is_some()
+            || has_unknown_implicit_receiver_scope(*node)
+        {
+            continue;
+        }
+        for (start, end) in short_template_spans(*node, source, &contract.property) {
+            edits.push(Edit {
+                start,
+                end,
+                replacement: format!("${{{}()}}", contract.getter),
+            });
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn short_template_spans(node: Node<'_>, source: &str, property: &str) -> Vec<(usize, usize)> {
+    let content = &source[node.start_byte()..node.end_byte()];
+    let needle = format!("${property}");
+    let raw = content.starts_with("\"\"\"");
+    content
+        .match_indices(&needle)
+        .filter_map(|(start, matched)| {
+            let end = start + matched.len();
             let following_is_identifier = content[end..]
                 .chars()
                 .next()
                 .is_some_and(is_kotlin_identifier_continue);
-            let is_braced = content[end..].starts_with('{');
             let escaping_slashes = content[..start]
                 .chars()
                 .rev()
                 .take_while(|ch| *ch == '\\')
                 .count();
-            if !following_is_identifier && !is_braced && escaping_slashes % 2 == 0 {
-                let absolute_start = node.start_byte() + start;
-                edits.push(Edit {
-                    start: absolute_start,
-                    end: absolute_start + needle.len(),
-                    replacement: format!("${{{}()}}", contract.getter),
-                });
-                changed += 1;
-            }
-            offset = end;
-        }
-    }
-    changed
+            (!following_is_identifier && (raw || escaping_slashes % 2 == 0))
+                .then_some((node.start_byte() + start, node.start_byte() + end))
+        })
+        .collect()
 }
 
 fn is_kotlin_identifier_continue(ch: char) -> bool {
@@ -777,9 +1050,33 @@ fn collect_interface_bodies<'tree>(
             }
             continue;
         }
-        if node.kind() == "getter" {
+        if matches!(node.kind(), "getter" | "setter") {
             out.push((node, node, None));
             continue;
+        }
+        // Initializers run on `this`, unlike primary constructor defaults and
+        // constructor delegation arguments. Their property reads must retain
+        // virtual dispatch when a property becomes private backing storage.
+        if matches!(
+            node.kind(),
+            "anonymous_initializer" | "secondary_constructor"
+        ) {
+            if let Some(body) = kt::child(node, "block") {
+                out.push((body, node, None));
+            }
+            continue;
+        }
+        if node.kind() == "property_declaration" {
+            let mut after_equals = false;
+            for child in node.children(&mut node.walk()) {
+                if kt::text(child, source) == "=" {
+                    after_equals = true;
+                } else if after_equals && child.is_named() {
+                    out.push((child, node, None));
+                    break;
+                }
+            }
+            // Keep walking so explicit getters are collected as well.
         }
         stack.extend(node.named_children(&mut node.walk()));
     }
@@ -792,23 +1089,25 @@ fn is_bare_expression_identifier(node: Node) -> bool {
     // Exclude declarations, qualified members, type names, and callable
     // names. A bare property may be the receiver of a chain (`payload.size`),
     // but must be the first named child of that navigation expression.
-    !matches!(
-        parent.kind(),
-        "variable_declaration"
-            | "parameter"
-            | "class_parameter"
-            | "function_declaration"
-            | "user_type"
-            | "nullable_type"
-            | "type_arguments"
-            | "type_parameters"
-            | "annotation"
-            | "call_expression"
-    ) && !(parent.kind() == "navigation_expression"
-        && parent
-            .named_children(&mut parent.walk())
-            .next()
-            .is_none_or(|receiver| receiver.id() != node.id()))
+    !is_increment_lvalue(node)
+        && !matches!(
+            parent.kind(),
+            "variable_declaration"
+                | "parameter"
+                | "class_parameter"
+                | "function_declaration"
+                | "user_type"
+                | "nullable_type"
+                | "type_arguments"
+                | "type_parameters"
+                | "annotation"
+                | "call_expression"
+        )
+        && !(parent.kind() == "navigation_expression"
+            && parent
+                .named_children(&mut parent.walk())
+                .next()
+                .is_none_or(|receiver| receiver.id() != node.id()))
         && !(parent.kind() == "assignment"
             && parent
                 .child_by_field_name("left")
@@ -877,11 +1176,7 @@ fn contract_for<'a>(
             context.inherits_exactly(receiver_decl, owner)
         })
         .collect::<Vec<_>>();
-    let first = *matching.first()?;
-    matching
-        .iter()
-        .all(|candidate| candidate.getter == first.getter && candidate.setter == first.setter)
-        .then_some(first)
+    compatible_accessor_contract(matching)
 }
 
 fn contract_for_read_receiver<'a>(
@@ -906,11 +1201,7 @@ fn contract_for_read_receiver<'a>(
                 .is_some_and(|owner| context.inherits_exactly(receiver_decl, owner))
         })
         .collect::<Vec<_>>();
-    let first = *matching.first()?;
-    matching
-        .iter()
-        .all(|candidate| candidate.getter == first.getter && candidate.setter == first.setter)
-        .then_some(first)
+    compatible_accessor_contract(matching)
 }
 
 fn receiver_property_fallback_is_safe(
@@ -1164,13 +1455,12 @@ fn scoped_binding_at(
     while let Some(parent) = current.parent() {
         match parent.kind() {
             "block" => {
-                let mut bindings = parent
+                let binding = parent
                     .named_children(&mut parent.walk())
                     .filter(|child| child.end_byte() < node.start_byte())
-                    .filter_map(|child| declared_binding(child, source))
-                    .filter(|(declared, _)| declared == name)
-                    .collect::<Vec<_>>();
-                if let Some((_, ty)) = bindings.pop() {
+                    .filter_map(|child| declared_binding_named(child, name, source))
+                    .last();
+                if let Some((_, ty)) = binding {
                     return Some(ty);
                 }
             }
@@ -1181,9 +1471,7 @@ fn scoped_binding_at(
                         .find(|child| child.kind() == "function_value_parameters")
                 }) {
                     for parameter in parameters.named_children(&mut parameters.walk()) {
-                        if let Some((declared, ty)) = declared_binding(parameter, source)
-                            && declared == name
-                        {
+                        if let Some((_, ty)) = declared_binding_named(parameter, name, source) {
                             return Some(ty);
                         }
                     }
@@ -1192,30 +1480,25 @@ fn scoped_binding_at(
             "getter" | "setter" => {
                 if parent.kind() == "setter" {
                     for parameter in parent.named_children(&mut parent.walk()) {
-                        if let Some((declared, ty)) = declared_binding(parameter, source)
-                            && declared == name
-                        {
+                        if let Some((_, ty)) = declared_binding_named(parameter, name, source) {
                             return Some(ty);
                         }
                     }
                 }
             }
             "lambda_literal" => {
-                let mut bindings = parent
+                let binding = parent
                     .named_children(&mut parent.walk())
                     .filter(|child| child.end_byte() < node.start_byte())
-                    .filter_map(|child| declared_binding(child, source))
-                    .filter(|(declared, _)| declared == name)
-                    .collect::<Vec<_>>();
-                if let Some((_, ty)) = bindings.pop() {
+                    .filter_map(|child| declared_binding_named(child, name, source))
+                    .last();
+                if let Some((_, ty)) = binding {
                     return Some(ty);
                 }
                 for child in parent.named_children(&mut parent.walk()) {
                     if child.kind() == "lambda_parameters" {
                         for parameter in child.named_children(&mut child.walk()) {
-                            if let Some((declared, ty)) = declared_binding(parameter, source)
-                                && declared == name
-                            {
+                            if let Some((_, ty)) = declared_binding_named(parameter, name, source) {
                                 return Some(ty);
                             }
                         }
@@ -1223,11 +1506,20 @@ fn scoped_binding_at(
                 }
             }
             "for_statement" => {
+                // The loop variable is not in scope in its own iterable.
+                if parent
+                    .named_children(&mut parent.walk())
+                    .last()
+                    .is_none_or(|body| node.start_byte() < body.start_byte())
+                {
+                    current = parent;
+                    continue;
+                }
                 let mut cursor = parent.walk();
                 let mut children = parent.named_children(&mut cursor);
                 let variable = children.next();
                 let Some((declared, _)) =
-                    variable.and_then(|child| declared_binding(child, source))
+                    variable.and_then(|child| declared_binding_named(child, name, source))
                 else {
                     current = parent;
                     continue;
@@ -1236,6 +1528,26 @@ fn scoped_binding_at(
                     return Some(for_loop_element_type(context, parent));
                 }
             }
+            "catch_block" => {
+                if parent
+                    .named_children(&mut parent.walk())
+                    .any(|child| child.kind() == "identifier" && kt::text(child, source) == name)
+                {
+                    return Some(None);
+                }
+            }
+            "when_expression" if current.kind() != "when_subject" => {
+                if let Some(subject) = kt::child(parent, "when_subject") {
+                    for child in subject.named_children(&mut subject.walk()) {
+                        if declared_binding_named(child, name, source).is_some() {
+                            return Some(None);
+                        }
+                    }
+                }
+            }
+            "class_declaration" | "object_declaration" => {
+                return primary_initializer_binding(parent, node, name, source);
+            }
             _ => {}
         }
         current = parent;
@@ -1243,7 +1555,59 @@ fn scoped_binding_at(
     None
 }
 
+fn primary_initializer_binding(
+    owner: Node<'_>,
+    access: Node<'_>,
+    name: &str,
+    source: &str,
+) -> Option<Option<String>> {
+    let mut current = access;
+    let in_initializer = loop {
+        let parent = current.parent()?;
+        if parent.id() == owner.id()
+            || matches!(
+                parent.kind(),
+                "function_declaration" | "getter" | "setter" | "secondary_constructor"
+            )
+        {
+            break false;
+        }
+        if parent.kind() == "anonymous_initializer"
+            || (parent.kind() == "property_declaration"
+                && parent
+                    .parent()
+                    .is_some_and(|scope| scope.kind() == "class_body"))
+        {
+            break true;
+        }
+        current = parent;
+    };
+    if !in_initializer {
+        return None;
+    }
+    let constructor = kt::child(owner, "primary_constructor")?;
+    let parameters = kt::child(constructor, "class_parameters")?;
+    for parameter in parameters.named_children(&mut parameters.walk()) {
+        // `val`/`var` parameters declare properties: their reads dispatch even
+        // during initialization. A plain parameter stays a constructor value.
+        if !parameter
+            .children(&mut parameter.walk())
+            .any(|child| matches!(kt::text(child, source), "val" | "var"))
+            && let Some((_, ty)) = declared_binding_named(parameter, name, source)
+        {
+            return Some(ty);
+        }
+    }
+    None
+}
+
 fn declared_binding(node: Node, source: &str) -> Option<(String, Option<String>)> {
+    if !matches!(
+        node.kind(),
+        "property_declaration" | "variable_declaration" | "parameter" | "class_parameter"
+    ) {
+        return None;
+    }
     let declaration = if node.kind() == "property_declaration" {
         kt::child(node, "variable_declaration")?
     } else {
@@ -1264,6 +1628,34 @@ fn declared_binding(node: Node, source: &str) -> Option<(String, Option<String>)
         }
     }
     Some((name?, ty))
+}
+
+fn declared_binding_named(
+    node: Node<'_>,
+    name: &str,
+    source: &str,
+) -> Option<(String, Option<String>)> {
+    if let Some(binding) = declared_binding(node, source)
+        && binding.0 == name
+    {
+        return Some(binding);
+    }
+    // Destructuring declares each component, even when its type is not known.
+    if matches!(
+        node.kind(),
+        "property_declaration" | "multi_variable_declaration"
+    ) {
+        for child in node.named_children(&mut node.walk()) {
+            if matches!(
+                child.kind(),
+                "variable_declaration" | "multi_variable_declaration"
+            ) && let Some(binding) = declared_binding_named(child, name, source)
+            {
+                return Some(binding);
+            }
+        }
+    }
+    None
 }
 
 fn for_loop_element_type(context: &RewriteContext<'_>, loop_node: Node) -> Option<String> {
@@ -1823,6 +2215,227 @@ mod tests {
     }
 
     #[test]
+    fn private_storage_repairs_initializers_but_preserves_constructor_bindings() {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "Api.kt",
+            r#"package sample
+interface Api { var id: String }
+open class Base(override var id: String, val original: String = id) : Api {
+    val initial = id
+    val explicit = this.id
+    init { println(id); println(this.id) }
+    constructor(id: String, marker: Int) : this(id, id) { println(id); println(this.id) }
+    fun update() { id = "next"; println(id) }
+    fun shadowed() {
+        println(id)
+        val (unused, id) = Pair("first", "local")
+        println(id)
+    }
+
+    fun caught() { try { println(id) } catch (id: Exception) { println(id) } }
+    fun loop() { for (id in listOf(id)) { println(id) } }
+    fun choice() = when (val id = id) { else -> id }
+}
+class Child(override var id: String) : Base(id) {
+    suspend fun keep() {}
+    fun read() = id
+    fun write(next: String) { id = next }
+}
+class Captured(id: String) : Base(id) {
+    val raw = id
+    val virtual = this.id
+    init { println(id); println(this.id) }
+    fun member() = id
+}
+"#,
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let file = index.source_file(&path).unwrap();
+        let owner = file
+            .declarations
+            .iter()
+            .find(|decl| decl.name == "Base")
+            .unwrap();
+        let member = owner
+            .members
+            .iter()
+            .find(|member| member.name == "id")
+            .unwrap();
+        assert!(private_storage_accesses_supported(&index, owner, member));
+        let child = file
+            .declarations
+            .iter()
+            .find(|decl| decl.name == "Child")
+            .unwrap();
+        let child_member = child
+            .members
+            .iter()
+            .find(|member| member.name == "id")
+            .unwrap();
+        assert!(private_storage_accesses_supported(
+            &index,
+            child,
+            child_member
+        ));
+        let accessor = PropertyAccessorContract {
+            owner_type: "sample.Api".into(),
+            property: "id".into(),
+            getter: "getId".into(),
+            setter: Some("setId".into()),
+        };
+        let (updated, _) = rewrite_file(&index, &path, &source, &[accessor]);
+        assert!(updated.contains("val original: String = id"), "{updated}");
+        assert!(updated.contains("val initial = getId()"), "{updated}");
+        assert!(updated.contains("val explicit = this.getId()"), "{updated}");
+        assert!(
+            updated.contains("init { println(getId()); println(this.getId()) }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains(": this(id, id) { println(id); println(this.getId()) }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("setId(\"next\"); println(getId())"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("val (unused, id) = Pair(\"first\", \"local\")\n        println(id)"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("try { println(getId()) } catch (id: Exception) { println(id) }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("for (id in listOf(getId())) { println(id) }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("when (val id = getId()) { else -> id }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("val raw = id\n    val virtual = this.getId()"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains(
+                "init { println(id); println(this.getId()) }\n    fun member() = getId()"
+            ),
+            "{updated}"
+        );
+    }
+
+    #[test]
+    fn implicit_receiver_scopes_keep_their_original_property_binding() {
+        let fixture = Fixture::new();
+        let source = r#"package sample
+interface Api { var id: String }
+class Other(val id: String)
+class Child : Api {
+    override var id: String = "child"
+    fun read(other: Other) = with(other) { id + this.id }
+    fun Other.extension() = id + this.id
+    fun outside(): String {
+        fun id() = "function"
+        return id
+    }
+}
+"#;
+        let path = fixture.write("Api.kt", source);
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let contract = PropertyAccessorContract {
+            owner_type: "sample.Api".into(),
+            property: "id".into(),
+            getter: "getId".into(),
+            setter: Some("setId".into()),
+        };
+        let (updated, count) = rewrite_file(&index, &path, source, &[contract]);
+        assert_eq!(count, 1, "{updated}");
+        assert!(
+            updated.contains("with(other) { id + this.id }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun Other.extension() = id + this.id"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("return getId()"),
+            "a same-named function is not a variable shadow:\n{updated}"
+        );
+    }
+
+    #[test]
+    fn mutable_storage_and_readonly_ancestor_contracts_merge_without_duplicate_edits() {
+        let fixture = Fixture::new();
+        let source = "package sample\ninterface Api { val id: String }\nopen class Base(override var id: String) : Api {\n    val initial: String = id\n    fun read() = this.id\n    fun update(next: String) { id = next }\n}\n";
+        let path = fixture.write("Api.kt", source);
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let readonly = PropertyAccessorContract {
+            owner_type: "sample.Api".into(),
+            property: "id".into(),
+            getter: "getId".into(),
+            setter: None,
+        };
+        let mutable = PropertyAccessorContract {
+            owner_type: "sample.Base".into(),
+            setter: Some("setId".into()),
+            ..readonly.clone()
+        };
+        let (updated, count) =
+            rewrite_file(&index, &path, source, &[readonly.clone(), mutable.clone()]);
+        assert_eq!(count, 3, "{updated}");
+        assert!(
+            updated.contains("val initial: String = getId()"),
+            "{updated}"
+        );
+        assert!(updated.contains("fun read() = this.getId()"), "{updated}");
+        assert!(updated.contains("{ setId(next) }"), "{updated}");
+        let conflicting = PropertyAccessorContract {
+            setter: Some("updateId".into()),
+            ..mutable.clone()
+        };
+        let (unmodified, count) =
+            rewrite_file(&index, &path, source, &[readonly, mutable, conflicting]);
+        assert_eq!(count, 0);
+        assert_eq!(unmodified, source);
+    }
+
+    #[test]
+    fn increments_keep_property_lvalues_and_veto_private_storage() {
+        let fixture = Fixture::new();
+        let source = "package sample\ninterface Api { var id: Int }\nclass Base(override var id: Int) : Api {\n    fun advance() { id++; ++this.id; (id)++; (this.id)-- }\n    fun read() = id\n}\n";
+        let path = fixture.write("Api.kt", source);
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let accessor = PropertyAccessorContract {
+            owner_type: "sample.Api".into(),
+            property: "id".into(),
+            getter: "getId".into(),
+            setter: Some("setId".into()),
+        };
+        let (updated, count) = rewrite_file(&index, &path, source, &[accessor]);
+        assert_eq!(count, 1, "{updated}");
+        assert!(
+            updated.contains("{ id++; ++this.id; (id)++; (this.id)-- }"),
+            "{updated}"
+        );
+        let owner = index
+            .declarations()
+            .find(|decl| decl.name == "Base")
+            .unwrap();
+        let member = owner
+            .members
+            .iter()
+            .find(|member| member.name == "id")
+            .unwrap();
+        assert!(!private_storage_accesses_supported(&index, owner, member));
+    }
+
+    #[test]
     fn rewrites_property_reads_on_resolved_method_return_receivers() {
         let fixture = Fixture::new();
         let category = fixture.write(
@@ -2147,7 +2760,7 @@ mod tests {
             setter: Some("setPayload".into()),
         };
         let (updated, count) = rewrite_file(&index, &path, &source, &[contract]);
-        assert_eq!(count, 4, "{updated}");
+        assert_eq!(count, 5, "{updated}");
         assert!(
             updated.contains("\"${getPayload()}:${getPayload().length}\""),
             "{updated}"
@@ -2156,7 +2769,7 @@ mod tests {
             updated.contains("fun chained(): Int = getPayload().length"),
             "{updated}"
         );
-        assert!(updated.contains("payload = value"), "{updated}");
+        assert!(updated.contains("setPayload(value)"), "{updated}");
         assert!(
             updated.contains("fun childRead(): Int = getPayload().length"),
             "{updated}"
@@ -2167,6 +2780,116 @@ mod tests {
         );
         assert!(
             updated.contains("val payload = \"local\"; return payload"),
+            "{updated}"
+        );
+    }
+
+    #[test]
+    fn explicit_this_storage_access_stays_only_in_canonical_accessors() {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "Api.kt",
+            r#"package sample
+interface Api { var id: String }
+open class Base(@JvmField var id: String) : Api {
+    fun getId(): String = this.id
+    fun setId(value: String) { this.id = value }
+    fun getId(type: Class<*>): String = this.id
+    fun setId(value: String, revision: Int) { this.id = value }
+    fun update(value: String) { this.id = this.id + value }
+}
+"#,
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let contract = PropertyAccessorContract {
+            owner_type: "sample.Api".into(),
+            property: "id".into(),
+            getter: "getId".into(),
+            setter: Some("setId".into()),
+        };
+        let (updated, count) = rewrite_file(&index, &path, &source, &[contract]);
+        assert_eq!(count, 4, "{updated}");
+        assert!(
+            updated.contains("fun getId(): String = this.id"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun setId(value: String) { this.id = value }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun getId(type: Class<*>): String = this.getId()"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun setId(value: String, revision: Int) { this.setId(value) }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun update(value: String) { this.setId(this.getId() + value) }"),
+            "{updated}"
+        );
+    }
+
+    #[test]
+    fn implicit_reads_in_disjoint_accessor_overloads_keep_virtual_dispatch() {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "Api.kt",
+            r#"package sample
+interface Api { var id: String }
+open class Base(override var id: String) : Api {
+    fun getId(): String = id
+    fun <T> getId(type: Class<T>): String = id
+    fun setId(value: String) { id = value; println(id) }
+    fun setId(value: String, revision: Int): String { id = value; return id }
+    fun update(value: String) { id = id + value }
+    fun getId(default: String = "fallback"): String = id
+    fun getId(vararg types: Class<*>): String = id
+    fun read(id: String): String = id
+}
+"#,
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let contract = PropertyAccessorContract {
+            owner_type: "sample.Api".into(),
+            property: "id".into(),
+            getter: "getId".into(),
+            setter: Some("setId".into()),
+        };
+        let (updated, count) = rewrite_file(&index, &path, &source, &[contract]);
+        assert_eq!(count, 5, "{updated}");
+        assert!(updated.contains("fun getId(): String = id"), "{updated}");
+        assert!(
+            updated.contains("fun <T> getId(type: Class<T>): String = getId()"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun setId(value: String) { id = value; println(id) }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains(
+                "fun setId(value: String, revision: Int): String { setId(value); return getId() }"
+            ),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun update(value: String) { setId(getId() + value) }"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun getId(default: String = \"fallback\"): String = id"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun getId(vararg types: Class<*>): String = id"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("fun read(id: String): String = id"),
             "{updated}"
         );
     }
@@ -2226,17 +2949,18 @@ interface Api {
             "nested class bare reads remain unchanged:\n{updated}"
         );
         assert!(
-            updated.contains("fun render(): String = \"${getPayload()}\""),
-            "nested class string templates retain their prior rewrite behavior:\n{updated}"
+            updated.contains("fun render(): String = \"$payload\""),
+            "nested classes have their own receiver scope:\n{updated}"
         );
         assert!(
             updated.contains("return \"${getPayload()}:${getPayload().length}\""),
             "{updated}"
         );
         assert!(
-            updated
-                .contains("fun local(payload: String): String = payload\n        return payload"),
-            "the nested function parameter conservatively shadows the outer read:\n{updated}"
+            updated.contains(
+                "fun local(payload: String): String = payload\n        return getPayload()"
+            ),
+            "the local function parameter shadows only its own body:\n{updated}"
         );
         assert!(updated.contains("get() = getPayload()"), "{updated}");
         assert!(

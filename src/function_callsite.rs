@@ -7,6 +7,7 @@
 
 use crate::semantics::{SemanticProvider, SourceLocation, SymbolId, SyntaxSemanticProvider};
 use crate::translation_plan::{BackendOwner, PlannedRepair, PlannedSourceEdit, TranslationPlan};
+use crate::transpiler::kt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -766,27 +767,94 @@ fn node_decl_name<'a>(node: Node, source: &'a str) -> Option<&'a str> {
                 .and_then(|n| n.utf8_text(source.as_bytes()).ok())
         })
 }
-fn local_shadow(call: Node, name: &str, source: &str) -> bool {
+fn declaration_binds_name(node: Node, name: &str, source: &str) -> bool {
+    match node.kind() {
+        "variable_declaration" | "parameter" | "class_parameter" => {
+            node_decl_name(node, source) == Some(name)
+        }
+        "property_declaration" => kt::child(node, "variable_declaration")
+            .or_else(|| kt::child(node, "multi_variable_declaration"))
+            .is_some_and(|pattern| declaration_binds_name(pattern, name, source)),
+        "multi_variable_declaration" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .filter(|child| child.kind() == "variable_declaration")
+                .any(|binding| declaration_binds_name(binding, name, source))
+        }
+        _ => false,
+    }
+}
+pub(crate) fn local_shadow(call: Node, name: &str, source: &str) -> bool {
     let mut scope = call.parent();
     while let Some(n) = scope {
-        if matches!(
-            n.kind(),
-            "function_declaration" | "lambda_literal" | "function_literal"
-        ) {
-            let mut stack = vec![n];
-            while let Some(child) = stack.pop() {
-                if matches!(
-                    child.kind(),
-                    "parameter"
-                        | "class_parameter"
-                        | "variable_declaration"
-                        | "function_declaration"
-                ) && node_decl_name(child, source) == Some(name)
-                {
-                    return true;
+        if n.kind() == "function_declaration"
+            && kt::child(n, "function_value_parameters").is_some_and(|parameters| {
+                let mut cursor = parameters.walk();
+                parameters
+                    .named_children(&mut cursor)
+                    .filter(|parameter| {
+                        matches!(parameter.kind(), "parameter" | "multi_variable_declaration")
+                    })
+                    .any(|parameter| declaration_binds_name(parameter, name, source))
+            })
+        {
+            return true;
+        }
+        if n.kind() == "lambda_literal"
+            && kt::child(n, "lambda_parameters").is_some_and(|parameters| {
+                let mut cursor = parameters.walk();
+                parameters
+                    .named_children(&mut cursor)
+                    .any(|parameter| declaration_binds_name(parameter, name, source))
+            })
+        {
+            return true;
+        }
+        if n.kind() == "catch_block" {
+            let mut cursor = n.walk();
+            if n.named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "identifier" | "simple_identifier"))
+                .is_some_and(|parameter| parameter.utf8_text(source.as_bytes()).ok() == Some(name))
+            {
+                return true;
+            }
+        }
+        if n.kind() == "for_statement" {
+            let mut cursor = n.walk();
+            let children = n.named_children(&mut cursor).collect::<Vec<_>>();
+            let binding = children.first().copied();
+            let body = children.last().copied();
+            if body.is_some_and(|body| {
+                body.start_byte() <= call.start_byte() && call.end_byte() <= body.end_byte()
+            }) && binding.is_some_and(|binding| {
+                matches!(
+                    binding.kind(),
+                    "variable_declaration" | "multi_variable_declaration"
+                ) && declaration_binds_name(binding, name, source)
+            }) {
+                return true;
+            }
+        }
+        if matches!(n.kind(), "block" | "lambda_literal") {
+            let mut cursor = n.walk();
+            for statement in n.named_children(&mut cursor) {
+                match statement.kind() {
+                    "function_declaration"
+                        if statement.start_byte() <= call.start_byte()
+                            && node_decl_name(statement, source) == Some(name) =>
+                    {
+                        // A local function starts shadowing at its declaration;
+                        // Kotlin does not resolve local functions forward.
+                        return true;
+                    }
+                    "property_declaration"
+                        if statement.end_byte() <= call.start_byte()
+                            && declaration_binds_name(statement, name, source) =>
+                    {
+                        return true;
+                    }
+                    _ => {}
                 }
-                let mut c = child.walk();
-                stack.extend(child.named_children(&mut c));
             }
         }
         scope = n.parent()

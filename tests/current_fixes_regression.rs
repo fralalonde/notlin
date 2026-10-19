@@ -29,6 +29,50 @@ fn transpile_with_args(source: &str, file_name: &str, args: &[&str]) -> String {
 }
 
 #[test]
+fn interface_methods_omit_implicit_public_and_abstract_modifiers() {
+    let java = transpile(
+        r#"package neutral.regression
+interface MethodStyle {
+    public abstract fun execute(): Int
+    fun label(): String
+    fun defaultValue(): Int = 1
+    private fun hidden(): Int = 2
+    val title: String
+    var count: Int
+}
+"#,
+        "MethodStyle.kt",
+    );
+    for signature in [
+        "int execute();",
+        "String label();",
+        "default int defaultValue()",
+        "private int hidden()",
+        "String getTitle();",
+        "int getCount();",
+        "void setCount(int value);",
+    ] {
+        assert!(java.contains(signature), "missing {signature}:\n{java}");
+    }
+    assert!(!java.contains("public abstract"), "{java}");
+    assert!(!java.contains("public default"), "{java}");
+    assert!(!java.contains("private default"), "{java}");
+    assert!(!java.contains("public int "), "{java}");
+    assert!(!java.contains("public String"), "{java}");
+    assert!(!java.contains("abstract int"), "{java}");
+    assert!(!java.contains("abstract String"), "{java}");
+}
+
+#[test]
+fn abstract_class_methods_keep_explicit_visibility_and_abstract_modifier() {
+    let java = transpile(
+        "package neutral.regression\nabstract class ClassStyle {\nabstract fun execute(): Int\n}\n",
+        "ClassStyle.kt",
+    );
+    assert!(java.contains("public abstract int execute();"), "{java}");
+}
+
+#[test]
 fn repaired_jvm_field_constructor_property_keeps_explicit_getter() {
     let java = transpile(
         r#"package neutral.regression
@@ -272,7 +316,8 @@ interface Nodes {
     );
 
     assert!(
-        java.contains("(Optional<String>) (Optional<?>)"),
+        java.replace("java.util.Optional", "Optional")
+            .contains("(Optional<String>) (Optional<?>)"),
         "an exact Optional<T> return must close a stream wildcard capture:\n{java}"
     );
 }

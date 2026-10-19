@@ -284,6 +284,17 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
         let op = kt::field(stmt, "operator").map(|o| self.unit.text(o).to_string());
         match (left, right, op) {
             (Some(l), Some(r), Some(op)) => {
+                if op != "=" && l.kind() == "identifier" {
+                    let name = self.unit.text(l).trim();
+                    let e = Expr { unit: self.unit };
+                    if e.inherited_mutable_property_setter(name, l).is_some() {
+                        e.unit.diag_untranslatable(
+                            l,
+                            "compound assignment to an inherited property has no verified read-modify-write lowering",
+                        );
+                        return;
+                    }
+                }
                 let mut e = Expr { unit: self.unit };
                 let r_java = e.transpile(r);
                 // Index-assign on a map (`m[k] = v`): rewrite to `m.put(k, v)`
@@ -370,7 +381,9 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
                 return;
             }
             if !self.unit.current_function_returns_value {
-                out.line(format!("{};", java));
+                if java != "kotlin.Unit.INSTANCE" {
+                    out.line(format!("{};", java));
+                }
                 out.line("return;");
                 return;
             }

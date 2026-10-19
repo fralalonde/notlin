@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+mod default_getter_plan;
+mod eager_collection_plan;
 pub mod expr;
 pub mod fixpoint;
 pub mod java;
@@ -179,6 +181,8 @@ pub struct WorkspaceScope<'a> {
             Vec<crate::function_callsite::CallsiteRepairDiagnostic>,
         >,
     >,
+    pub top_level_property_callsite_retention:
+        Option<&'a crate::top_level_property_callsite::RetentionMap>,
     pub indexed_path: Option<&'a Path>,
 }
 
@@ -222,7 +226,48 @@ pub fn plan_with_tree_hint(
     scope: WorkspaceScope<'_>,
     silent: bool,
 ) -> PlannedTranslation {
-    lower_with_plan(source, tree, file, cli, scope, silent)
+    lower_with_plan(source, tree, file, cli, scope, silent, None)
+}
+
+/// Static semantic work for one immutable source snapshot and workspace
+/// provider. Values are round-local; callers must discard them when the
+/// source/index overlay or CLI approximation mode changes.
+pub(crate) struct StaticPlanFacts {
+    identity_path: PathBuf,
+    source_hash: [u8; 32],
+    allow_approximations: bool,
+    plan: crate::translation_plan::TranslationPlan,
+}
+
+pub(crate) fn prepare_static_plan_facts(
+    source: &str,
+    tree: &tree_sitter::Tree,
+    file: &Path,
+    cli: &Cli,
+    scope: WorkspaceScope<'_>,
+) -> StaticPlanFacts {
+    let identity_path = source_identity_path(source, file, scope);
+    let provider = scope
+        .semantic_provider
+        .expect("static workspace facts require their round-local provider");
+    StaticPlanFacts {
+        identity_path: identity_path.to_path_buf(),
+        source_hash: *blake3::hash(source.as_bytes()).as_bytes(),
+        allow_approximations: cli.allow_approximations,
+        plan: build_static_plan(source, tree, identity_path, cli, provider),
+    }
+}
+
+pub(crate) fn plan_with_static_facts_hint(
+    source: &str,
+    tree: &tree_sitter::Tree,
+    file: &Path,
+    cli: &Cli,
+    scope: WorkspaceScope<'_>,
+    silent: bool,
+    static_facts: &StaticPlanFacts,
+) -> PlannedTranslation {
+    lower_with_plan(source, tree, file, cli, scope, silent, Some(static_facts))
 }
 
 /// Transpile one file with a source-level workspace index and selected roots.
@@ -283,7 +328,7 @@ pub(crate) fn transpile_with_tree_hint_selection(
     scope: WorkspaceScope<'_>,
     silent: bool,
 ) -> (Vec<(String, String)>, usize, usize, FileCoverage) {
-    lower_with_plan(source, tree, file, cli, scope, silent).into_legacy_result()
+    lower_with_plan(source, tree, file, cli, scope, silent, None).into_legacy_result()
 }
 
 fn lower_with_plan(
@@ -293,31 +338,10 @@ fn lower_with_plan(
     cli: &Cli,
     scope: WorkspaceScope<'_>,
     silent: bool,
+    static_facts: Option<&StaticPlanFacts>,
 ) -> PlannedTranslation {
     let facts_started = profile_enabled().then(Instant::now);
-    let identity_path = scope
-        .indexed_path
-        .or_else(|| {
-            scope.index.and_then(|index| {
-                index
-                    .source_file(file)
-                    .map(|snapshot| snapshot.path.as_path())
-                    .or_else(|| {
-                        if file.is_absolute() {
-                            return None;
-                        }
-                        let mut matching = index.files.iter().filter(|snapshot| {
-                            snapshot.path.file_name() == file.file_name()
-                                && snapshot.source_text() == source
-                        });
-                        let first = matching.next()?;
-                        matching.next().is_none().then_some(first.path.as_path())
-                    })
-            })
-        })
-        .unwrap_or(file);
-    let mut plan = crate::translation_plan::analyze(source, tree.root_node(), identity_path);
-    plan.plan_type_losses(source, tree.root_node(), cli.allow_approximations);
+    let identity_path = source_identity_path(source, file, scope);
     let local_provider = scope.semantic_provider.is_none().then(|| {
         let mut snapshots = vec![(identity_path.to_path_buf(), source.to_owned())];
         if let Some(index) = scope.index {
@@ -329,7 +353,11 @@ fn lower_with_plan(
                     .map(|snapshot| (snapshot.path.clone(), snapshot.source_text().to_owned())),
             );
         }
-        crate::semantics::SyntaxSemanticProvider::new(snapshots)
+        let mut provider = crate::semantics::SyntaxSemanticProvider::new(snapshots);
+        if let Some(index) = scope.index {
+            provider.enrich_workspace_type_facts(index);
+        }
+        provider
     });
     let semantic_provider: &dyn crate::semantics::SemanticProvider = scope
         .semantic_provider
@@ -339,6 +367,18 @@ fn lower_with_plan(
                 .map(|provider| provider as &dyn crate::semantics::SemanticProvider)
         })
         .expect("a local or workspace semantic provider is available");
+    let mut plan = if let Some(static_facts) = static_facts {
+        assert_eq!(static_facts.identity_path, identity_path);
+        assert_eq!(
+            static_facts.source_hash,
+            *blake3::hash(source.as_bytes()).as_bytes(),
+            "static semantic facts must match the exact source snapshot"
+        );
+        assert_eq!(static_facts.allow_approximations, cli.allow_approximations);
+        static_facts.plan.clone()
+    } else {
+        build_static_plan(source, tree, identity_path, cli, semantic_provider)
+    };
     let retained_with_forced = scope
         .forced_retained
         .filter(|forced| !forced.is_empty())
@@ -348,21 +388,6 @@ fn lower_with_plan(
             retained
         });
     let retained_hint = retained_with_forced.as_ref().or(scope.retained_hint);
-    crate::semantics::plan_required_calls(
-        source,
-        tree,
-        identity_path,
-        semantic_provider,
-        cli.allow_approximations,
-        &mut plan,
-    );
-    crate::semantics::plan_alias_type_losses(
-        source,
-        tree,
-        semantic_provider,
-        &mut plan,
-        cli.allow_approximations,
-    );
     crate::semantics::plan_required_property_references(
         source,
         tree,
@@ -405,6 +430,52 @@ fn lower_with_plan(
         .function_callsite_retention
         .or(local_callsite_retention.as_ref())
         .expect("callsite facts are available");
+    let local_property_callsite_retention = scope
+        .top_level_property_callsite_retention
+        .is_none()
+        .then(|| {
+            let snapshots = if let Some(index) = scope.index {
+                index
+                    .files
+                    .iter()
+                    .map(|f| (f.path.clone(), f.source_text().to_owned()))
+                    .collect()
+            } else {
+                std::collections::BTreeMap::from([(identity_path.to_path_buf(), source.to_owned())])
+            };
+            crate::top_level_property_callsite::properties_requiring_kotlin_retention_in_selection(
+                &snapshots,
+                &semantic_provider
+                    .symbols()
+                    .iter()
+                    .map(|s| s.id.clone())
+                    .collect::<Vec<_>>(),
+                semantic_provider,
+                &std::collections::HashSet::from([identity_path.to_path_buf()]),
+            )
+        });
+    let property_callsite_retention = scope
+        .top_level_property_callsite_retention
+        .or(local_property_callsite_retention.as_ref())
+        .expect("top-level property callsite facts are available");
+    for decision in &mut plan.declarations {
+        let Some(diagnostics) = property_callsite_retention.get(&decision.symbol_id) else {
+            continue;
+        };
+        let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
+            kind: crate::translation_plan::PreparationBlockerKind::UnresolvedAssumption,
+            message: diagnostics
+                .first()
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| {
+                    "top-level property call sites cannot be safely rewritten".into()
+                }),
+        };
+        if !decision.retention_reasons.contains(&reason) {
+            decision.retention_reasons.push(reason);
+        }
+        decision.candidate_owner = crate::translation_plan::BackendOwner::Kotlin;
+    }
     let getter_started = profile_enabled().then(Instant::now);
     let default_provider_retention = scope.index.and_then(|index| {
         let source_file = index.source_file(identity_path)?;
@@ -412,10 +483,11 @@ fn lower_with_plan(
         let retained = retained_hint.unwrap_or(&empty_retained);
         let mut reasons = std::collections::HashMap::new();
         for indexed_declaration in &source_file.declarations {
-            let reason = index.default_property_provider_needs_physical_getter(
+            let reason = index.default_property_provider_retention_reason(
                 indexed_declaration,
                 retained,
                 scope.roots,
+                cli.migrates_in_place(),
             );
             if let Some(reason) = reason {
                 reasons.insert(
@@ -473,6 +545,83 @@ fn lower_with_plan(
             );
         }
     }
+    if let Some(index) = scope.index {
+        default_getter_plan::plan_default_getters(
+            index,
+            identity_path,
+            retained_hint.unwrap_or(&std::collections::HashSet::new()),
+            scope.roots,
+            &mut plan,
+        );
+    }
+    let effectful_file_initializer =
+        crate::top_level_property_callsite::has_effectful_top_level_initializer(
+            tree.root_node(),
+            source,
+        );
+    let annotated_file_facade = tree
+        .root_node()
+        .named_children(&mut tree.root_node().walk())
+        .any(|node| node.kind() == "file_annotation");
+    if effectful_file_initializer || annotated_file_facade {
+        let blockers = plan
+            .declarations
+            .iter()
+            .filter(|decision| {
+                decision.symbol_id.owner_path.is_empty()
+                    && matches!(decision.symbol_id.kind.as_str(), "function" | "property")
+                    && (decision.candidate_owner == crate::translation_plan::BackendOwner::Kotlin
+                        || !decision.retention_reasons.is_empty()
+                        || retained_hint.is_some_and(|retained| {
+                            retention_queries::contains(retained, &decision.symbol_id)
+                        }))
+            })
+            .map(|decision| decision.symbol_id.clone())
+            .collect::<Vec<_>>();
+        if !blockers.is_empty() {
+            for decision in &mut plan.declarations {
+                if !decision.symbol_id.owner_path.is_empty()
+                    || !matches!(decision.symbol_id.kind.as_str(), "function" | "property")
+                {
+                    continue;
+                }
+                decision.candidate_owner = crate::translation_plan::BackendOwner::Kotlin;
+                let (kind, message, dependency_label) = if effectful_file_initializer {
+                    (
+                        crate::translation_plan::PreparationBlockerKind::SemanticLoss,
+                        "top-level declarations share an effectful initializer with retained Kotlin code; a partial move would change file initialization order or timing",
+                        "file initialization",
+                    )
+                } else {
+                    (
+                        crate::translation_plan::PreparationBlockerKind::CompatibilityRule,
+                        "file facade annotations require top-level declarations to share ownership with retained Kotlin members",
+                        "annotated file facade",
+                    )
+                };
+                let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
+                    kind,
+                    message: message.into(),
+                };
+                if !decision.retention_reasons.contains(&reason) {
+                    decision.retention_reasons.push(reason);
+                }
+                for blocker in &blockers {
+                    if blocker == &decision.symbol_id {
+                        continue;
+                    }
+                    let dependency = crate::translation_plan::SymbolDependency {
+                        from: decision.symbol_id.clone(),
+                        spelling: format!("{dependency_label}: {}", blocker.name),
+                        resolution: crate::semantics::FactStatus::Established(blocker.clone()),
+                    };
+                    if !plan.dependencies.contains(&dependency) {
+                        plan.dependencies.push(dependency);
+                    }
+                }
+            }
+        }
+    }
     let workspace = scope.index;
     let translation_roots = scope.roots;
     let workspace_file = Some(identity_path);
@@ -505,7 +654,7 @@ fn lower_with_plan(
     // Preparation stage: the existing lowerer produces candidate text and
     // coverage. Candidates do not become output until strict Java parsing
     // below accepts the complete set.
-    let (candidate_java_files, approx_diags, mut coverage, type_facts) = {
+    let (candidate_java_files, approx_diags, mut coverage, type_facts, preparation_failure) = {
         let mut unit = Unit::new(
             source,
             file,
@@ -521,6 +670,7 @@ fn lower_with_plan(
         .with_workspace_selection(workspace, translation_roots, workspace_file);
         unit.retained_hint = retained_hint;
         unit.semantic_provider = Some(semantic_provider);
+        unit.add_proven_map_aliases(tree.root_node());
         let java_files = unit.run_planned(tree.root_node(), &plan);
         let java_files = java_files
             .into_iter()
@@ -534,7 +684,13 @@ fn lower_with_plan(
         let mut coverage = std::mem::take(&mut unit.coverage);
         let approx = std::mem::take(&mut coverage.diags_approx);
         let type_facts = std::mem::take(&mut unit.type_facts);
-        (java_files, approx, coverage, type_facts)
+        (
+            java_files,
+            approx,
+            coverage,
+            type_facts,
+            unit.preparation_failure,
+        )
     };
     if profile {
         record_profile(&PROFILE_UNIT_NS, started.elapsed());
@@ -575,11 +731,22 @@ fn lower_with_plan(
         .expect("lowering uses the analyzed source snapshot");
     plan.type_facts.extend(type_facts);
     let acceptance_started = profile_enabled().then(Instant::now);
-    let (accepted, emission_failed) = match crate::planning::AcceptedTranslationPlan::accept(
-        plan.clone(),
-        candidate_java_files,
-        Some(semantic_provider),
-    ) {
+    let acceptance = match preparation_failure {
+        Some(message) => Err(crate::planning::AcceptedPlanError {
+            path: file.display().to_string(),
+            error: crate::java_ir::JavaIrError {
+                message,
+                start_byte: 0,
+                end_byte: 0,
+            },
+        }),
+        None => crate::planning::AcceptedTranslationPlan::accept(
+            plan.clone(),
+            candidate_java_files,
+            Some(semantic_provider),
+        ),
+    };
+    let (accepted, emission_failed) = match acceptance {
         Ok(accepted) => (accepted, false),
         Err(error) => {
             plan.diagnostics.push(crate::semantics::SemanticDiagnostic {
@@ -646,4 +813,80 @@ fn lower_with_plan(
         warnings,
         coverage,
     }
+}
+
+fn source_identity_path<'a>(source: &str, file: &'a Path, scope: WorkspaceScope<'a>) -> &'a Path {
+    scope
+        .indexed_path
+        .or_else(|| {
+            scope.index.and_then(|index| {
+                index
+                    .source_file(file)
+                    .map(|snapshot| snapshot.path.as_path())
+                    .or_else(|| {
+                        if file.is_absolute() {
+                            return None;
+                        }
+                        let mut matching = index.files.iter().filter(|snapshot| {
+                            snapshot.path.file_name() == file.file_name()
+                                && snapshot.source_text() == source
+                        });
+                        let first = matching.next()?;
+                        matching.next().is_none().then_some(first.path.as_path())
+                    })
+            })
+        })
+        .unwrap_or(file)
+}
+
+fn build_static_plan(
+    source: &str,
+    tree: &tree_sitter::Tree,
+    identity_path: &Path,
+    cli: &Cli,
+    provider: &dyn crate::semantics::SemanticProvider,
+) -> crate::translation_plan::TranslationPlan {
+    let mut plan = crate::translation_plan::analyze(source, tree.root_node(), identity_path);
+    plan.plan_type_losses(source, tree.root_node(), cli.allow_approximations);
+    plan.plan_constructor_metadata_losses(identity_path, provider, cli.allow_approximations);
+    plan.plan_jackson_default_constructor_losses(identity_path, provider, cli.allow_approximations);
+    crate::semantics::plan_enum_when_lowerings(source, tree, identity_path, provider, &mut plan);
+    crate::semantics::plan_todo_lowerings(source, tree, identity_path, provider, &mut plan);
+    crate::semantics::plan_reference_string_calls(source, tree, identity_path, provider, &mut plan);
+    crate::semantics::plan_container_calls(source, tree, identity_path, provider, &mut plan);
+    crate::semantics::plan_eager_collection_calls(source, tree, identity_path, provider, &mut plan);
+    eager_collection_plan::plan_helpers(source, tree.root_node(), provider, &mut plan);
+    crate::semantics::plan_reified_class_calls(source, tree, identity_path, provider, &mut plan);
+    crate::semantics::plan_constructor_delegations(
+        source,
+        tree,
+        identity_path,
+        provider,
+        &mut plan,
+    );
+    crate::semantics::plan_bottom_return_losses(
+        source,
+        tree,
+        identity_path,
+        provider,
+        cli.allow_approximations,
+        &mut plan,
+    );
+    crate::semantics::plan_required_calls(
+        source,
+        tree,
+        identity_path,
+        provider,
+        cli.allow_approximations,
+        &mut plan,
+    );
+    crate::semantics::plan_alias_type_losses(
+        source,
+        tree,
+        provider,
+        &mut plan,
+        cli.allow_approximations,
+    );
+    crate::semantics::plan_builtin_unit_type_bindings(source, tree, provider, &mut plan);
+    plan
 }

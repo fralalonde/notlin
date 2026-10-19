@@ -4,11 +4,16 @@
 //! can use it in-process; the `notlin` binary is a thin CLI wrapper.
 
 pub mod cli;
+pub mod coverage;
 pub mod ctor_defaults;
+mod default_getter_repair;
 pub mod diagnostics;
+mod eager_collection_helpers;
 pub mod function_callsite;
 pub mod java_ir;
 pub mod jvm_validation;
+mod lombok_configuration;
+pub mod lombok_getter_contracts;
 pub mod manual_marks;
 pub mod migrate;
 pub mod migration_pipeline;
@@ -19,6 +24,7 @@ pub mod property_callsite;
 pub mod retention_docs;
 pub mod semantics;
 pub mod smart_cast;
+pub mod top_level_property_callsite;
 pub mod translation_advice;
 pub mod translation_plan;
 pub mod transpiler;

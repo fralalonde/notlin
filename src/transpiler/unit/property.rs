@@ -7,6 +7,51 @@ use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    /// Private default properties are field reads in
+    /// their own methods. A public getX()/setX() beside that storage is a real
+    /// method, not a replacement for a generated constructor-property accessor.
+    /// Bind fields before parameters so normal parameter/local shadowing wins.
+    pub(crate) fn bind_direct_body_fields(&mut self, function: tree_sitter::Node) {
+        let Some(body) = kt::parent_of(function)
+            .filter(|parent| matches!(parent.kind(), "class_body" | "enum_class_body"))
+        else {
+            return;
+        };
+        for property in body.children(&mut body.walk()).filter(|node| {
+            node.kind() == "property_declaration"
+                && kt::child(*node, "getter").is_none()
+                && kt::child(*node, "setter").is_none()
+                && kt::child(*node, "property_delegate").is_none()
+        }) {
+            let private = kt::child(property, "modifiers").is_some_and(|modifiers| {
+                modifiers.children(&mut modifiers.walk()).any(|modifier| {
+                    modifier.kind() == "visibility_modifier"
+                        && self.text(modifier).trim() == "private"
+                })
+            });
+            if !private || !self.property_emits_backing_field(property) {
+                continue;
+            }
+            let Some(variable) = kt::child(property, "variable_declaration") else {
+                continue;
+            };
+            let Some(identifier) = kt::child(variable, "identifier") else {
+                continue;
+            };
+            let name = self.text(identifier).to_string();
+            let ty = kt::child(variable, "user_type")
+                .or_else(|| kt::child(variable, "nullable_type"))
+                .map(|node| kt::java_type_ann(node, self.source, self.annots))
+                .or_else(|| {
+                    self.property_initializer(property)
+                        .map(|node| self.infer_type(node))
+                });
+            if let Some(ty) = ty {
+                self.var_types.insert(name, ty);
+            }
+        }
+    }
+
     fn accessor_class_body<'node>(
         &self,
         decl: tree_sitter::Node<'node>,
@@ -184,10 +229,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // Fresh scope per property: getter/setter bodies must not see locals
         // declared while a previous property was translated.
         self.var_types.clear();
-        // A stale super-access owner would leak into an unrelated property's
-        // getter body; the pending flag is only valid for the immediately
-        // following navigation inside ONE expression.
-        self.pending_super_owner = None;
 
         let is_val = kt::child(decl, "val").is_some();
         let vd = kt::child(decl, "variable_declaration");
@@ -404,6 +445,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // would collide), and then the annotation stays on the FIELD rather
         // than disappearing.
         let (mut field_annotations, mut getter_annotations) = self.annotation_split(decl);
+        let setter_bridge_annotations = self
+            .property_annotation_owner(decl)
+            .map(|(owner, property_node, property)| {
+                self.property_repair_bridge_annotations(&owner, property_node, &property, false)
+            })
+            .unwrap_or_default();
         if self.class_declares_method(decl, &format!("get{}", capitalize(&name))) {
             field_annotations.append(&mut getter_annotations);
         }
@@ -475,6 +522,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             self.class_declares_method_signature(decl, &setter_name, &[ty.as_str()]);
 
         if !has_getter_method {
+            let previous_returns_value = self.current_function_returns_value;
+            let previous_return_type = self.current_function_return_type.replace(ty.clone());
+            self.current_function_returns_value = ty != "void";
             for annotation in &getter_annotations {
                 out.line(annotation.clone());
             }
@@ -521,9 +571,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 None => out.line(format!("return {};", name)),
             }
             out.close();
+            self.current_function_returns_value = previous_returns_value;
+            self.current_function_return_type = previous_return_type;
         }
 
         if !is_val && !has_setter_method {
+            let previous_returns_value = self.current_function_returns_value;
+            let previous_return_type = self.current_function_return_type.replace("void".to_owned());
+            self.current_function_returns_value = false;
             // Kotlin `private set`: the setter exists but is private;
             // otherwise its visibility matches the property's.
             let set_vis = if setter
@@ -537,6 +592,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 visibility.clone()
             };
             out.blank();
+            for annotation in &setter_bridge_annotations {
+                out.line(annotation.clone());
+            }
             out.open(format!(
                 "{}{}void set{}({} {})",
                 set_vis,
@@ -574,6 +632,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
             out.close();
+            self.current_function_returns_value = previous_returns_value;
+            self.current_function_return_type = previous_return_type;
         }
     }
 

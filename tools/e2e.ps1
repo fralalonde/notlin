@@ -2,7 +2,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Javac,
 
-    [string]$Notlin = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target/debug/notlin.exe')
+    [string]$Notlin = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target/debug/notlin.exe'),
+
+    [switch]$KeepOutputs
 )
 
 $ErrorActionPreference = 'Stop'
@@ -76,11 +78,21 @@ foreach ($sample in $samples) {
 
 $failed = $failures.Count
 Write-Output "e2e: $passed/$($samples.Count) passed; $failed failed"
-Write-Output "logs: $outputRoot"
 if ($failed -gt 0) {
+    Write-Output "logs: $outputRoot"
     foreach ($failure in $failures) {
         Write-Output "  $failure"
     }
     exit 1
+}
+if ($KeepOutputs) {
+    Write-Output "logs: $outputRoot"
+} else {
+    $expectedParent = [IO.Path]::GetFullPath((Join-Path $repoRoot 'target/javac-e2e'))
+    $resolvedOutput = (Resolve-Path -LiteralPath $outputRoot).Path
+    if ([IO.Path]::GetDirectoryName($resolvedOutput) -ne $expectedParent) {
+        throw "Refusing to clean unexpected sample output directory: $resolvedOutput"
+    }
+    Remove-Item -LiteralPath $resolvedOutput -Recurse -Force
 }
 exit 0

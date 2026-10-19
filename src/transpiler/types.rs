@@ -43,7 +43,10 @@ pub fn map_type_name(kotlin_type: &str) -> &str {
         "MutableIterator" => "Iterator",
         "MutableListIterator" => "ListIterator",
         "Nothing" => "Void",
-        "Unit" => "void",
+        // Unit is a reference type when it is stored or passed as a value.
+        // Function declarations map an explicit Unit result to Java `void`
+        // in the return-type context instead.
+        "Unit" => "kotlin.Unit",
         "Int" => "int",
         "Long" => "long",
         "Short" => "short",
@@ -174,11 +177,19 @@ pub fn covariant_interface_return(java_type: &str) -> String {
     let base = &ty[..open];
     let arguments = &ty[open + 1..ty.len() - 1];
     let parts = split_top_level_type_arguments(arguments);
+    let covariant_argument = |argument: &str| {
+        let argument = argument.trim();
+        if argument.starts_with('?') {
+            argument.to_owned()
+        } else {
+            format!("? extends {argument}")
+        }
+    };
     let rendered = match (base, parts.as_slice()) {
         ("List" | "Set" | "Collection" | "Iterable" | "Iterator" | "Sequence", [item]) => {
-            format!("{base}<? extends {}>", item.trim())
+            format!("{base}<{}>", covariant_argument(item))
         }
-        ("Map", [key, value]) => format!("Map<{}, ? extends {}>", key.trim(), value.trim()),
+        ("Map", [key, value]) => format!("Map<{}, {}>", key.trim(), covariant_argument(value)),
         _ => return java_type.to_string(),
     };
     format!("{prefix}{rendered}")

@@ -75,6 +75,7 @@ fn plan(
             origin: kt.to_path_buf(),
             name: "Generated.java".into(),
             source: generated_java.to_owned(),
+            owners: Vec::new(),
         }],
         final_plans: Vec::new(),
         translation_plans: HashMap::new(),

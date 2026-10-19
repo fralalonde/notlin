@@ -122,7 +122,7 @@ fn record_init_block_runs_after_components_are_assigned() {
     assert!(output.contains("record Entry(int count)"), "{output}");
     assert!(output.contains("this.count = count;"), "{output}");
     assert!(
-        output.contains("throw new IllegalArgumentException(\"negative\")"),
+        output.contains("throw new java.lang.IllegalArgumentException(\"negative\")"),
         "{output}"
     );
 }
@@ -172,7 +172,8 @@ fn mutable_data_copy_uses_bean_accessors_for_unchanged_properties() {
         "Entry",
     );
     assert!(
-        output.contains("new Entry(this.getCount(), label)"),
+        output.contains("new Entry(__notlinCopyReceiver")
+            && output.contains(".getCount(), __notlinCopyArg"),
         "{output}"
     );
 }

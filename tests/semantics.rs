@@ -2,6 +2,64 @@ use notlin::semantics::*;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+#[test]
+fn module_relations_resolve_after_all_files_without_mixing_nested_companions() {
+    let consumer = r#"package consumer
+import producer.Parent
+import producer.Parent as Alias
+class Container {
+    companion object {
+        fun create(): String = "outer"
+    }
+    class Child : Parent {
+        companion object {
+            fun create(): String = "inner"
+        }
+    }
+}
+class Uncertain : Alias
+"#;
+    let parent = "package producer\ninterface Parent { fun work(): String }\n";
+    for reverse in [false, true] {
+        let mut files = vec![
+            (PathBuf::from("Consumer.kt"), consumer.to_owned()),
+            (PathBuf::from("Parent.kt"), parent.to_owned()),
+        ];
+        if reverse {
+            files.reverse();
+        }
+        let provider = SyntaxSemanticProvider::new_in_module("sample-module", files);
+        let child = &provider.symbols_named("Child")[0].id;
+        assert_eq!(child.module, "sample-module");
+        assert_eq!(child.owner_path, ["Container"]);
+        assert!(provider.has_complete_inheritance(child));
+        let inherited = provider.inherited_members(child, "work");
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(inherited[0].id.module, "sample-module");
+        assert_eq!(inherited[0].id.package, "producer");
+        assert!(!provider.has_complete_inheritance(&provider.symbols_named("Uncertain")[0].id));
+
+        for owner_name in ["Container", "Child"] {
+            let owner = &provider.symbols_named(owner_name)[0].id;
+            let members = provider.companion_members(owner, "create");
+            assert_eq!(members.len(), 1, "{owner_name}");
+            assert_eq!(members[0].id.module, "sample-module");
+            let mut expected_path = owner.owner_path.clone();
+            expected_path.push(owner.name.clone());
+            assert!(members[0].id.owner_path.starts_with(&expected_path));
+            assert_eq!(
+                members[0]
+                    .id
+                    .owner_path
+                    .iter()
+                    .filter(|part| *part == "Child")
+                    .count(),
+                usize::from(owner_name == "Child")
+            );
+        }
+    }
+}
+
 fn function_symbol(src: &str) -> SymbolId {
     let mut p = tree_sitter::Parser::new();
     p.set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
@@ -1225,7 +1283,7 @@ fn java_util_wildcard_collection_factory_collisions_remain_conservative() {
 }
 
 #[test]
-fn platform_wildcard_does_not_prove_populated_factory_behavior() {
+fn java_util_wildcard_admits_populated_factories_with_proven_lowerings() {
     for factory in ["arrayListOf(null)", "listOf(null)"] {
         let source = format!(
             "package p\nimport java.util.*\ninterface Variant {{\n val values: List<String?>\n  get() = {factory}\n}}\n"
@@ -1239,19 +1297,21 @@ fn platform_wildcard_does_not_prove_populated_factory_behavior() {
         let tree = parser.parse(&source, None).unwrap();
         let mut plan = notlin::translation_plan::analyze(&source, tree.root_node(), file);
         plan_required_calls(&source, &tree, file, &provider, false, &mut plan);
-        assert!(
-            plan.declarations
-                .iter()
-                .find(|decision| decision.symbol_id.name == "Variant")
-                .unwrap()
-                .retention_reasons
-                .iter()
-                .any(|reason| matches!(
-                    reason,
-                    notlin::translation_plan::RetentionReason::UnknownRequiredFact { .. }
-                )),
-            "factory needs a separate behavior proof: {factory}"
+        let variant = plan
+            .declarations
+            .iter()
+            .find(|decision| decision.symbol_id.name == "Variant")
+            .unwrap();
+        assert_eq!(
+            variant.candidate_owner,
+            notlin::translation_plan::BackendOwner::Java,
+            "structurally proven null-preserving factory should translate: {factory}"
         );
+        assert!(!variant.retention_reasons.iter().any(|reason| matches!(
+            reason,
+            notlin::translation_plan::RetentionReason::UnknownRequiredFact { name }
+                if name == "arrayListOf" || name == "listOf"
+        )));
     }
 }
 

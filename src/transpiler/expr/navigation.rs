@@ -7,6 +7,9 @@ use crate::transpiler::unit::capitalize;
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(java) = self.planned_container_property_access(node) {
+            return java;
+        }
         // Map/Iterable collection ops (`x.filterValues { .. }`,
         // `x.mapKeys { .. }`, `x.associateBy { .. }`) — Java has no such
         // members: lower through stream/entrySet before generic handling.
@@ -83,7 +86,10 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         // interface default method). A RETAINED-Kotlin supertype has no
         // JVM-visible Java method at all — the caller is tainted instead of
         // emitting broken Java.
-        let mut super_owner = self.unit.pending_super_owner.take();
+        let mut super_owner = base
+            .filter(|base| base.kind() == "super_expression")
+            .and_then(|base| kt::child(base, "user_type"))
+            .map(|ty| kt::java_type(ty, self.unit.source).trim().to_owned());
         if let Some(b) = base
             && b.kind() == "super_expression"
             && super_owner.is_none()
@@ -154,17 +160,17 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     .unwrap_or(self.unit.file);
                 w.source_file(declaring)
             });
-            let same_file_hit = same_file.is_some_and(|f| {
-                f.declarations.iter().any(|d| {
-                    d.name == owner && d.language == crate::workspace::SourceLanguage::Kotlin
-                })
-            });
-            let translated = same_file_hit
-                || ws.is_some_and(|w| {
-                    w.declarations_named(&owner).any(|d| {
-                        d.name == owner && d.language == crate::workspace::SourceLanguage::Java
+            let translated = ws.zip(same_file).is_some_and(|(workspace, file)| {
+                workspace
+                    .resolve_type(file, &owner)
+                    .is_some_and(|declaration| {
+                        declaration.language == crate::workspace::SourceLanguage::Java
+                            || file
+                                .declarations
+                                .iter()
+                                .any(|same| std::ptr::eq(same, declaration))
                     })
-                });
+            });
             if !translated {
                 self.unit.diag_untranslatable(
                     node,
@@ -192,12 +198,24 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             && base.kind() == "identifier"
             && result == self.unit.text(base).trim()
             && self.enclosing_record_has_component(self.unit.text(base).trim())
+            && crate::semantics::lexical_parameter_type(
+                self.unit.source,
+                base,
+                self.unit.text(base).trim(),
+            )
+            .is_none()
         {
             result = format!("this.{}()", self.unit.text(base).trim());
         }
         if let Some(base) = base
             && base.kind() == "identifier"
             && result == self.unit.text(base).trim()
+            && crate::semantics::lexical_parameter_type(
+                self.unit.source,
+                base,
+                self.unit.text(base).trim(),
+            )
+            .is_none()
             && let Some(workspace) = self.unit.workspace
             && let Some(name) = self.enclosing_type_name()
         {
@@ -216,7 +234,28 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             }
         }
         if let Some(owner) = super_owner {
-            if base.is_some_and(|base| base.kind() == "super_expression") && result == owner {
+            let class_super = self.unit.workspace.is_some_and(|workspace| {
+                let declaring = self
+                    .unit
+                    .workspace_file
+                    .as_deref()
+                    .unwrap_or(self.unit.file);
+                workspace
+                    .source_file(declaring)
+                    .and_then(|file| workspace.resolve_type(file, &owner))
+                    .is_some_and(|declaration| {
+                        declaration.kind != crate::workspace::DeclarationKind::Interface
+                    })
+            });
+            if base.is_some_and(|base| base.kind() == "super_expression")
+                && class_super
+                && (result == "super" || result == owner)
+            {
+                // Java qualifies interface defaults, but invokes an actual
+                // superclass implementation through plain super.
+                result = "super".to_string();
+            } else if base.is_some_and(|base| base.kind() == "super_expression") && result == owner
+            {
                 result = format!("{owner}.super");
             } else if !result.starts_with(&owner) {
                 result = format!("{owner}.{result}");
@@ -821,9 +860,42 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 
     pub(crate) fn navigation_call(&mut self, node: tree_sitter::Node) -> String {
+        let mut parent = node.parent();
+        while let Some(call) = parent.filter(|parent| parent.kind() == "call_expression") {
+            if let Some(fact) = self
+                .unit
+                .container_calls
+                .get(&(call.start_byte(), call.end_byte()))
+                && let Some((base, member)) = self.unit.nav_base_member(node)
+                && (base.start_byte(), base.end_byte())
+                    == (fact.receiver.start_byte, fact.receiver.end_byte)
+            {
+                assert_eq!(fact.location.snapshot_hash, self.unit.source_hash);
+                return format!("{}.{}", self.transpile(base), member);
+            }
+            parent = call.parent();
+        }
         let raw = self.unit.text(node).replace("?.", ".");
         // member call: `.name(...)`
         let mut raw_trimmed = raw.trim().to_string();
+        if let Some(base) = node.named_children(&mut node.walk()).next()
+            && matches!(base.kind(), "identifier" | "simple_identifier")
+            && self.unit.semantic_provider.is_some_and(|provider| {
+                crate::semantics::inherited_property_receiver_access(
+                    self.unit.source,
+                    base,
+                    self.unit
+                        .workspace_file
+                        .as_deref()
+                        .unwrap_or(self.unit.file),
+                    provider,
+                )
+                .is_some()
+            })
+        {
+            let receiver = self.transpile(base);
+            raw_trimmed = format!("{receiver}{}", &raw_trimmed[self.unit.text(base).len()..]);
+        }
         if let Some(base) = node.named_children(&mut node.walk()).next()
             && base.kind() == "super_expression"
             && let Some(workspace) = self.unit.workspace
@@ -895,7 +967,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             && base.kind() == "identifier"
         {
             let property = self.unit.text(base).trim();
-            if !self.unit.var_types.contains_key(property)
+            if raw_trimmed.starts_with(property)
+                && !self.unit.var_types.contains_key(property)
                 && self.unit.ext_receiver_name.is_none()
                 && !self.enclosing_record_has_component(property)
                 && let Some(getter) = self.unit.self_getters.get(property)
@@ -908,6 +981,16 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .find(|child| child.is_named())
             && base.kind() == "identifier"
             && raw_trimmed.starts_with(self.unit.text(base).trim())
+            // Constructor defaults have parameters but no instance. Their
+            // local bindings must win over an inherited property of the same
+            // name, just as method parameters and locals do in member bodies.
+            && !self.unit.var_types.contains_key(self.unit.text(base).trim())
+            && crate::semantics::lexical_parameter_type(
+                self.unit.source,
+                base,
+                self.unit.text(base).trim(),
+            )
+            .is_none()
             && let Some(name) = self.enclosing_type_name()
         {
             let property = self.unit.text(base).trim();
@@ -1103,6 +1186,12 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     } else {
                         base_java
                     };
+                    // A source-proven Java member takes precedence over
+                    // Kotlin extension and collection rewrites with the same
+                    // spelling, including rewrites handled below this point.
+                    if self.unit.established_java_callable_member(node) {
+                        return format!("{}.{}", base_java, member);
+                    }
                     // `m.filterValues { v -> pred }` — Java Map has no
                     // filterValues member: lower to entrySet stream + toMap.
                     if member == "filterValues" || member == "mapKeys" {
@@ -1245,15 +1334,10 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         (Some(_), true) => format!("{}.{}", base_java, member),
                         (Some(_), _) => format!("{}.{}", base_java, member),
                         (None, _) if member == "copy" => {
-                            // Hand the FULL callee text (receiver + `.copy`)
-                            // to call.rs — its copy arm rebuilds the ctor
-                            // with named-arg substitution using
-                            // data_components.
-                            self.unit.diags.warn_approx(
-                                node,
-                                self.unit.file,
-                                "data-class `copy` -> record ctor reassembly with named args",
-                            );
+                            // Preserve the receiver expression for call.rs,
+                            // which can lower a schema-proven generated data
+                            // class copy call. Unknown/user-defined copy calls
+                            // keep their ordinary member spelling.
                             format!("{}.{}", base_java, member)
                         }
                         (None, _) => {
@@ -1379,6 +1463,12 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 .map(|i| dot + 1 + i)
                 .unwrap_or(raw_trimmed.len());
             let member = &raw_trimmed[dot + 1..member_end];
+            // Preserve indexed Java-member precedence before the several
+            // specialized rewrites below (Pair/List access, joining, sorting,
+            // and the generic member map).
+            if self.unit.established_java_callable_member(node) {
+                return raw_trimmed.to_string();
+            }
             // Pair.first/.second on a Pair/Entry-typed receiver: the `to`
             // approximation uses AbstractMap.SimpleImmutableEntry, whose
             // accessors are getKey()/getValue().
@@ -1657,27 +1747,46 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 && let Some(owner) = ws.find_static_member(owner_name, member)
                 && owner.language == crate::workspace::SourceLanguage::Kotlin
             {
-                // A KClass-formal companion fn takes a KClass at the Java
-                // ABI: a `K::class` literal lowered to `K.class` is not a
-                // valid Java form for it — taint the caller.
-                if node
-                    .parent()
-                    .and_then(|p| kt::child(p, "value_arguments"))
-                    .is_some_and(|va: tree_sitter::Node| {
-                        let mut c = va.walk();
-                        va.children(&mut c)
-                            .filter(|arg| arg.kind() == "value_argument")
-                            .any(|arg| {
-                                arg.children(&mut arg.walk())
-                                    .filter(|x| x.is_named())
-                                    .any(|x| self.unit.text(x).contains("::class"))
-                            })
-                    })
+                // Only established reference-class projections can use the
+                // ordinary companion route. Inspect the complete call,
+                // including trailing lambdas, without treating prose as code.
+                let mut complete_call = node.parent().unwrap_or(node);
+                while let Some(parent) = complete_call.parent()
+                    && parent.kind() == "call_expression"
                 {
+                    complete_call = parent;
+                }
+                if !self.unit.semantic_provider.is_some_and(|provider| {
+                    crate::semantics::established_default_companion_call(
+                        self.unit.source,
+                        self.unit
+                            .workspace_file
+                            .as_deref()
+                            .unwrap_or(self.unit.file),
+                        complete_call,
+                        node,
+                        provider,
+                    )
+                }) {
+                    self.unit.diag_untranslatable(
+                        node,
+                        format!("retained companion call `{owner_name}.{member}` has no established JVM member name and default Companion holder"),
+                    );
+                    return raw_trimmed.to_string();
+                }
+                if crate::semantics::contains_unlowerable_class_literal(
+                    self.unit.source,
+                    self.unit
+                        .workspace_file
+                        .as_deref()
+                        .unwrap_or(self.unit.file),
+                    complete_call,
+                    self.unit.semantic_provider,
+                ) {
                     self.unit.diag_untranslatable(
                         node,
                         format!(
-                            "call `{owner_fallback}.{member}` passes a `KClass` literal into a KClass-formal companion of retained Kotlin declaration `{owner_name}`; no Java-callable literal exists",
+                            "call `{owner_fallback}.{member}` contains a Kotlin class literal without an established Java reference-class projection for retained Kotlin declaration `{owner_name}`",
                             owner_fallback = raw_trimmed.rsplit_once(&format!(".{member}")).map(|(b, _)| b.trim().to_string()).unwrap_or_default()
                         ),
                     );
@@ -1744,13 +1853,17 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         return raw_trimmed.to_string();
                     }
                 }
-                if !self.unit.known_declared_method(
-                    raw_trimmed
-                        .rsplit_once('.')
-                        .map(|(base, _)| base)
-                        .unwrap_or(""),
-                    member,
-                ) && !self.unit.established_java_callable_member(node)
+                // Generated data-class copies are checked and lowered by
+                // call.rs, including retained Kotlin receiver classes.
+                if member != "copy"
+                    && !self.unit.known_declared_method(
+                        raw_trimmed
+                            .rsplit_once('.')
+                            .map(|(base, _)| base)
+                            .unwrap_or(""),
+                        member,
+                    )
+                    && !self.unit.established_java_callable_member(node)
                     && self
                         .unit
                         .established_platform_call_return_type(node)
@@ -1904,35 +2017,161 @@ fn _unit_replace_value_placeholder(_body: String) -> String {
     String::new()
 }
 
-/// Replace whole-word occurrences of `word` in `text`.
-fn replace_whole_word(text: &str, word: &str, replacement: &str) -> String {
+/// Rename a transpiled lambda parameter without changing string/character
+/// literals or comments that happen to contain the same spelling.
+fn replace_lambda_identifier(text: &str, word: &str, replacement: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(idx) = rest.find(word) {
-        let before_ok = rest[..idx]
-            .chars()
-            .next_back()
-            .map(|c| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(true);
-        let after_idx = idx + word.len();
-        let after_ok = rest[after_idx..]
-            .chars()
-            .next()
-            .map(|c| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(true);
-        if before_ok && after_ok {
-            out.push_str(&rest[..idx]);
-            out.push_str(replacement);
-        } else {
-            out.push_str(&rest[..after_idx]);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let ch = text[i..].chars().next().expect("valid UTF-8 boundary");
+        if let Some(delimiter) = quote {
+            out.push(ch);
+            i += ch.len_utf8();
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
         }
-        rest = &rest[after_idx..];
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if text[i..].starts_with("//") {
+            let end = text[i..]
+                .find('\n')
+                .map(|offset| i + offset)
+                .unwrap_or(bytes.len());
+            out.push_str(&text[i..end]);
+            i = end;
+            continue;
+        }
+        if text[i..].starts_with("/*") {
+            let end = text[i + 2..]
+                .find("*/")
+                .map(|offset| i + 2 + offset + 2)
+                .unwrap_or(bytes.len());
+            out.push_str(&text[i..end]);
+            i = end;
+            continue;
+        }
+        if ch == '_' || ch.is_alphabetic() {
+            let start = i;
+            i += ch.len_utf8();
+            while i < bytes.len() {
+                let next = text[i..].chars().next().expect("valid UTF-8 boundary");
+                if !(next == '_' || next.is_alphanumeric()) {
+                    break;
+                }
+                i += next.len_utf8();
+            }
+            let token = &text[start..i];
+            out.push_str(if token == word { replacement } else { token });
+            continue;
+        }
+        out.push(ch);
+        i += ch.len_utf8();
     }
-    out.push_str(rest);
     out
 }
 
+fn split_generic_arguments(java_type: &str) -> Option<Vec<String>> {
+    let open = java_type.find('<')?;
+    let close = java_type.rfind('>')?;
+    if close <= open || !java_type[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let inner = &java_type[open + 1..close];
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut arguments = Vec::new();
+    for (index, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                let argument = inner[start..index].trim();
+                if argument.is_empty() {
+                    return None;
+                }
+                arguments.push(argument.to_string());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let last = inner[start..].trim();
+    if last.is_empty() {
+        return None;
+    }
+    arguments.push(last.to_string());
+    Some(arguments)
+}
+
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
+    fn collection_lambda_parameter_type(
+        &mut self,
+        node: tree_sitter::Node<'_>,
+        member: &str,
+    ) -> Option<String> {
+        let mut cursor = node.walk();
+        let receiver = node
+            .named_children(&mut cursor)
+            .find(|child| child.is_named())?;
+        let receiver_type = self.unit.infer_type(receiver);
+        let args = split_generic_arguments(&receiver_type)?;
+        match member {
+            "mapKeys" if args.len() == 2 => {
+                Some(format!("java.util.Map.Entry<{}, {}>", args[0], args[1]))
+            }
+            "filterValues" if args.len() == 2 => Some(args[1].clone()),
+            "associateBy" if !args.is_empty() => Some(args[0].clone()),
+            _ => None,
+        }
+    }
+
+    fn transpile_lambda_with_parameter_type(
+        &mut self,
+        lambda: tree_sitter::Node<'_>,
+        expected_type: Option<&str>,
+    ) -> String {
+        let Some(expected_type) = expected_type else {
+            return self.transpile(lambda);
+        };
+        let parameter = kt::child(lambda, "lambda_parameters")
+            .and_then(|parameters| {
+                let mut cursor = parameters.walk();
+                parameters
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == "variable_declaration")
+            })
+            .and_then(|declaration| kt::child(declaration, "identifier"))
+            .map(|identifier| self.unit.text(identifier).to_string())
+            .unwrap_or_else(|| "it".to_string());
+        let previous = self
+            .unit
+            .var_types
+            .insert(parameter.clone(), expected_type.to_string());
+        let translated = self.transpile(lambda);
+        if let Some(previous) = previous {
+            self.unit.var_types.insert(parameter, previous);
+        } else {
+            self.unit.var_types.remove(&parameter);
+        }
+        translated
+    }
+
     /// `map.filterValues { v -> pred }` / `map.mapKeys { k -> f }` — Java Map
     /// has no such members; lower through the entrySet stream.
     pub(crate) fn map_entry_op(
@@ -1977,7 +2216,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             );
             return format!("{base_java}.{member}");
         };
-        let raw = self.transpile(l);
+        let selector_type = self.collection_lambda_parameter_type(node, member);
+        let raw = self.transpile_lambda_with_parameter_type(l, selector_type.as_deref());
         let trimmed = raw
             .trim()
             .trim_start_matches('{')
@@ -1991,33 +2231,49 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .trim()
             .to_string();
         let body = body.trim().to_string();
+        // Lambda parameters live in a Java scope that includes surrounding
+        // source parameters and locals. Derive fresh names from the source
+        // location and reject collisions against all source text.
+        let mut suffix = node.start_byte();
+        let (acc, entry, element) = loop {
+            let names = (
+                format!("__notlin_map_acc_{suffix}"),
+                format!("__notlin_map_entry_{suffix}"),
+                format!("__notlin_map_value_{suffix}"),
+            );
+            if !self.unit.source.contains(&names.0)
+                && !self.unit.source.contains(&names.1)
+                && !self.unit.source.contains(&names.2)
+            {
+                break names;
+            }
+            suffix += 1;
+        };
         self.unit.pending_full_call = true;
         match member {
             "filterValues" => {
                 let bound = if param.is_empty() {
-                    body
+                    replace_lambda_identifier(&body, "it", &format!("{entry}.getValue()"))
                 } else {
-                    replace_whole_word(&body, &param, "e.getValue()")
+                    replace_lambda_identifier(&body, &param, &format!("{entry}.getValue()"))
                 };
-                self.unit.diags.warn_approx(
-                    node,
-                    self.unit.file,
-                    "Map.filterValues lowered to entrySet().stream().filter(...).collect(toMap(getKey, getValue))",
-                );
                 format!(
-                    "{base_java}.entrySet().stream().filter(e -> {bound}).collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue))"
+                    "{base_java}.entrySet().stream().filter({entry} -> {bound}).collect(java.util.LinkedHashMap::new, ({acc}, {entry}) -> {acc}.put({entry}.getKey(), {entry}.getValue()), java.util.LinkedHashMap::putAll)"
                 )
             }
             "associateBy" => {
-                // Iterable.associateBy { k } -> stream().collect(toMap(kfn,
-                // v -> v)). The element param (named or `it`) binds to `v`.
+                // Iterable.associateBy { k } -> a sequential ordered
+                // accumulator. LinkedHashMap accepts nulls and repeated keys;
+                // later values overwrite earlier values without moving the
+                // original insertion position.
                 let bound = if param.is_empty() {
-                    replace_whole_word(&body, "it", "v")
+                    replace_lambda_identifier(&body, "it", &element)
                 } else {
-                    replace_whole_word(&body, &param, "v")
+                    replace_lambda_identifier(&body, &param, &element)
                 };
-                let value = lambdas.get(1).map(|lambda| {
-                    let raw = self.transpile(*lambda);
+                let value_selector = lambdas.get(1).map(|lambda| {
+                    let raw = self
+                        .transpile_lambda_with_parameter_type(*lambda, selector_type.as_deref());
                     let trimmed = raw
                         .trim()
                         .trim_start_matches('{')
@@ -2030,37 +2286,26 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         .trim_end_matches(')')
                         .trim();
                     if parameter.is_empty() {
-                        replace_whole_word(body.trim(), "it", "v")
+                        replace_lambda_identifier(body.trim(), "it", &element)
                     } else {
-                        replace_whole_word(body.trim(), parameter, "v")
+                        replace_lambda_identifier(body.trim(), parameter, &element)
                     }
                 });
-                self.unit.diags.warn_approx(
-                    node,
-                    self.unit.file,
-                    "Iterable.associateBy lowered to stream().collect(toMap(keyfn, valuefn))",
-                );
                 format!(
-                    "{base_java}.stream().collect(java.util.stream.Collectors.toMap(v -> {bound}, v -> {}))",
-                    value.unwrap_or_else(|| "v".to_string())
+                    "{base_java}.stream().collect(java.util.LinkedHashMap::new, ({acc}, {element}) -> {acc}.put({bound}, {}), java.util.LinkedHashMap::putAll)",
+                    value_selector.unwrap_or_else(|| element.clone())
                 )
             }
             _ => {
-                // mapKeys: pred is a key-to-key remap — body's param slot is
-                // the KEY: bind to e.getKey(). The RESULT map keeps the
-                // original values.
+                // mapKeys' selector receives a Map.Entry, not the key itself.
+                // The RESULT map keeps each entry's original value.
                 let bound = if param.is_empty() {
-                    body
+                    replace_lambda_identifier(&body, "it", &entry)
                 } else {
-                    replace_whole_word(&body, &param, "e.getKey()")
+                    replace_lambda_identifier(&body, &param, &entry)
                 };
-                self.unit.diags.warn_approx(
-                    node,
-                    self.unit.file,
-                    "Map.mapKeys lowered to entrySet().stream().collect(toMap(keyfn, Map.Entry::getValue))",
-                );
                 format!(
-                    "{base_java}.entrySet().stream().collect(java.util.stream.Collectors.toMap(e -> {bound}, Map.Entry::getValue))"
+                    "{base_java}.entrySet().stream().collect(java.util.LinkedHashMap::new, ({acc}, {entry}) -> {acc}.put({bound}, {entry}.getValue()), java.util.LinkedHashMap::putAll)"
                 )
             }
         }

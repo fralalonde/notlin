@@ -86,6 +86,97 @@ fn annotation_fq_name(annotation: tree_sitter::Node<'_>, source: &str) -> Option
     None
 }
 
+fn annotation_imports(source: &str) -> impl Iterator<Item = (&str, Option<&str>)> {
+    source.lines().filter_map(|line| {
+        let import = line
+            .trim()
+            .strip_prefix("import ")?
+            .trim_end_matches(';')
+            .trim();
+        Some(
+            import
+                .split_once(" as ")
+                .map_or((import, None), |(path, alias)| {
+                    (path.trim(), Some(alias.trim()))
+                }),
+        )
+    })
+}
+
+fn annotation_type_is_local(
+    workspace: Option<&crate::workspace::SourceIndex>,
+    file: Option<&crate::workspace::SourceFile>,
+    name: &str,
+) -> bool {
+    workspace.zip(file).is_some_and(|(index, file)| {
+        index.declarations_named(name).any(|declaration| {
+            declaration.package == file.package
+                || index
+                    .declaration_source_file(declaration)
+                    .is_some_and(|owner| owner.path == file.path)
+        })
+    })
+}
+
+fn annotation_import_name(name: String, source: &str) -> String {
+    annotation_imports(source)
+        .find(|(_, alias)| *alias == Some(name.as_str()))
+        .map(|(path, _)| path.to_string())
+        .unwrap_or(name)
+}
+
+fn kotlin_annotation_meta_name(
+    annotation: tree_sitter::Node<'_>,
+    source: &str,
+    workspace: Option<&crate::workspace::SourceIndex>,
+    file: Option<&crate::workspace::SourceFile>,
+) -> Option<&'static str> {
+    const META: [(&str, &str); 3] = [
+        ("kotlin.annotation.Target", "Target"),
+        ("kotlin.annotation.Retention", "Retention"),
+        ("kotlin.annotation.MustBeDocumented", "MustBeDocumented"),
+    ];
+    let name = annotation_fq_name(annotation, source)?;
+    if let Some((_, simple)) = META.iter().find(|(path, _)| *path == name) {
+        return Some(simple);
+    }
+    let imports = annotation_imports(source).collect::<Vec<_>>();
+    let explicit = imports
+        .iter()
+        .filter(|(path, alias)| {
+            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == name
+        })
+        .collect::<Vec<_>>();
+    match explicit.as_slice() {
+        [(path, _)] => META
+            .iter()
+            .find(|(known, _)| known == path)
+            .map(|(_, simple)| *simple),
+        [] if !imports
+            .iter()
+            .any(|(path, _)| path.ends_with(".*") && *path != "kotlin.annotation.*")
+            && !annotation_type_is_local(workspace, file, &name) =>
+        {
+            META.iter()
+                .find(|(_, simple)| *simple == name)
+                .map(|(_, simple)| *simple)
+        }
+        _ => None,
+    }
+}
+fn annotation_argument_values(annotation: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let Some(arguments) = kt::child(annotation, "constructor_invocation")
+        .and_then(|invocation| kt::child(invocation, "value_arguments"))
+    else {
+        return Vec::new();
+    };
+    arguments
+        .children(&mut arguments.walk())
+        .filter(|child| child.kind() == "value_argument")
+        .map(|argument| source[argument.byte_range()].trim().to_string())
+        .collect()
+}
+
 fn known_mapped_superclass_annotation(
     name: &str,
     file: &crate::workspace::SourceFile,
@@ -513,6 +604,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let body = out.buf[import_anchor..].to_string();
         let mut lowered = body.clone();
         self.lower_visible_typealiases(&mut lowered);
+        if let Err(error) = self.lower_proven_map_typealiases(&mut lowered) {
+            self.preparation_failure.get_or_insert(error);
+        }
         let body = lowered;
         // Imports are chosen AFTER the body exists: a source file can be split
         // (some declarations translate, others stay Kotlin), and the retained
@@ -582,7 +676,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         block.push_str("import java.util.stream.Stream;\n");
         block.push('\n');
         if let Some(pkg) = crate::transpiler::types::nullable_import(self.annots) {
-            block.push_str(&format!("import {}.*;\n", pkg));
+            // Generated nullability uses only this short annotation name;
+            // non-null annotations are fully qualified. An unnecessary star
+            // import makes later planning snapshots' type identities unknown.
+            block.push_str(&format!("import {}.Nullable;\n", pkg));
             block.push('\n');
         }
         out.buf.insert_str(import_anchor, &block);
@@ -649,6 +746,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let name = invocation_user_type
             .or(direct_user_type)
             .map(|c| self.text(c).to_string())?;
+        // Java has no import aliases. Spell an aliased annotation's complete
+        // name so the alias cannot become an unresolved annotation or bind to
+        // a different type with the same simple name.
+        let name = annotation_import_name(name, self.source);
         // Kotlin-only argument shapes taint immediately — except a
         // `Name::class` class literal, which rewrites to `Name.class` in Java
         // when `Name` resolves to a Java-visible declaration (checked below);
@@ -764,10 +865,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             })
         });
         let property_interface_bridge = property_bridge_result.as_ref().is_some_and(Result::is_ok);
-        let getter_method_interface = self.retained_hint.is_some()
-            && crate::property_abi::is_getter_method_interface_candidate(target);
+        let method_interface = self.retained_hint.is_some()
+            && (crate::property_abi::is_noarg_method_interface_candidate(target)
+                || crate::property_abi::is_accessor_method_interface_candidate(workspace, target));
         let safe_for_retained_subtypes =
-            memberless_interface || property_interface_bridge || getter_method_interface;
+            memberless_interface || property_interface_bridge || method_interface;
         if hierarchy_closure()
             && !safe_for_retained_subtypes
             && workspace.has_unselected_kotlin_subtype(target, self.translation_roots)
@@ -903,20 +1005,40 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let retained_property_ancestor = self.retained_hint.as_ref().and_then(|retained| {
             crate::property_abi::retained_kotlin_property_ancestor(workspace, target, retained)
         });
-        if self.retained_hint.is_some()
-            && self.in_place
-            && (retained_property_ancestor.is_some()
+        // Cache the exact retained interface identities whose physical
+        // property getters this class has proven compatible. The same proof
+        // serves both the earlier property-boundary check and the final
+        // hierarchy-closure gate below.
+        let proven_property_interfaces = if self.in_place {
+            self.retained_hint.as_ref().and_then(|retained| {
+                workspace.retained_property_implementation_interfaces_java_compatible(
+                    source_file,
+                    target,
+                    self.translation_roots,
+                    retained,
+                )
+            })
+        } else {
+            None
+        };
+        if self.in_place {
+            let retained_property_boundary = retained_property_ancestor.is_some()
                 || workspace.inherits_retained_kotlin_property_interface(
                     source_file,
                     target,
                     self.translation_roots,
-                ))
-        {
-            return Some((
-                RetentionKind::RetainedPropertyInterface,
-                retained_property_ancestor.into_iter().collect(),
-                self.retained_supertypes(workspace, target),
-            ));
+                );
+            let proven_java_property_contracts = proven_property_interfaces.is_some();
+            if self.retained_hint.is_some()
+                && retained_property_boundary
+                && !proven_java_property_contracts
+            {
+                return Some((
+                    RetentionKind::RetainedPropertyInterface,
+                    retained_property_ancestor.into_iter().collect(),
+                    self.retained_supertypes(workspace, target),
+                ));
+            }
         }
         // Retained Kotlin that smart-casts one of its properties does not have
         // to keep the owner in Kotlin: the rewrite pass binds the property read
@@ -930,22 +1052,29 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if hierarchy_closure()
             && !self.declaration_is_enum(decl)
             && self.retained_hint.as_ref().is_some_and(|retained| {
-                workspace
-                    .retained_supertypes_of(target, retained)
-                    .iter()
-                    .any(|name| {
-                        let forwards_interface = memberless_interface
-                            && workspace
-                                .resolve_type(source_file, name)
-                                .is_some_and(|parent| {
-                                    parent.kind == crate::workspace::DeclarationKind::Interface
-                                });
-                        !forwards_interface
-                            && !self.retained_class_super_is_java_compatible(
-                                source_file,
-                                decl,
-                                name,
-                            )
+                target.supertypes.iter()
+                    .filter_map(|spelling| workspace.resolve_type(source_file, spelling)
+                        .map(|parent| (spelling, parent)))
+                    .filter(|(_, parent)| {
+                        parent.language == crate::workspace::SourceLanguage::Kotlin
+                            && workspace.declaration_retained(parent, retained)
+                    })
+                    .any(|(spelling, parent)| {
+                        let is_interface = parent.kind == crate::workspace::DeclarationKind::Interface;
+                        let forwards_interface = memberless_interface && is_interface;
+                        let proven_property_interface = is_interface
+                            && proven_property_interfaces.as_ref().is_some_and(|interfaces| {
+                                interfaces.contains(&crate::semantics::workspace_symbol(workspace, parent))
+                            });
+                        let proven_method_interface = self.semantic_provider
+                            .filter(|_| target.kind == crate::workspace::DeclarationKind::Interface)
+                            .is_some_and(|provider| {
+                                crate::property_abi::retained_method_interface_parent_is_java_compatible(
+                                    workspace, target, parent, retained, provider,
+                                )
+                            });
+                        !(forwards_interface || proven_property_interface || proven_method_interface)
+                            && !self.retained_class_super_is_java_compatible(source_file, decl, spelling)
                     })
             })
         {
@@ -1234,9 +1363,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let mut annotations: Vec<String> = Vec::new();
         // Java-native annotations hoisted from a preceding top-level
         // annotated_expression wrapper (grammar quirk) ride first.
-        if let Some(hoisted) = self.hoisted_annotations.remove(&decl.id()) {
-            annotations.extend(hoisted);
-        }
+        let hoisted_annotations = self
+            .hoisted_annotations
+            .remove(&decl.id())
+            .unwrap_or_default();
+        annotations.extend(hoisted_annotations.iter().cloned());
         if let Some(mods) = kt::child(decl, "modifiers") {
             let mut cursor = mods.walk();
             for m in mods.children(&mut cursor) {
@@ -1346,6 +1477,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // is rejected by javac ("enclosing instance required").
         if decl.parent().is_some_and(|p| p.kind() == "class_body")
             && (decl.kind() == "class_declaration" || decl.kind() == "object_declaration")
+            && !is_enum
             && !modifiers.contains("static")
             && !self.text(decl).contains("inner class")
         {
@@ -1467,7 +1599,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return;
         }
         if is_annotation {
-            self.transpile_annotation_decl(decl, &name, &visibility, out);
+            self.transpile_annotation_decl(decl, &name, &visibility, &hoisted_annotations, out);
             return;
         }
         if is_enum {
@@ -1976,8 +2108,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 "{}{}class {}{}{}",
                 visibility, modifiers, name, tp, extends
             ));
-            let is_non_null_reference = |ftype: &str| {
-                !ftype.starts_with('@')
+            let nullable_parameters: std::collections::HashSet<_> =
+                kt::child(decl, "primary_constructor")
+                    .and_then(|constructor| kt::child(constructor, "class_parameters"))
+                    .map(|parameters| {
+                        parameters
+                            .named_children(&mut parameters.walk())
+                            .filter(|parameter| kt::child(*parameter, "nullable_type").is_some())
+                            .filter_map(|parameter| kt::child(parameter, "identifier"))
+                            .map(|identifier| self.text(identifier).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            let is_non_null_reference = |fname: &str, ftype: &str| {
+                !nullable_parameters.contains(fname)
+                    && !ftype.starts_with('@')
                     && !matches!(
                         ftype,
                         "boolean" | "byte" | "short" | "int" | "long" | "char" | "float" | "double"
@@ -2002,7 +2147,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 {
                     out.line(annotation);
                 }
-                let nullability = if is_non_null_reference(ftype) {
+                let nullability = if is_non_null_reference(fname, ftype) {
                     "@NonNull "
                 } else {
                     ""
@@ -2028,19 +2173,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             if self.constructor_has_covariant_input(decl, &params) {
                 out.line("@SuppressWarnings(\"unchecked\")");
             }
-            out.line(format!(
-                "@java.beans.ConstructorProperties({{{}}})",
-                params
-                    .iter()
-                    .map(|(_, _, name, _)| format!("\"{}\"", name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            self.emit_constructor_property_contract(decl, &params, out);
             out.open(format!("public {}({})", name, {
                 params
                     .iter()
                     .map(|(_, _, n, t)| {
-                        let nullability = if is_non_null_reference(t) {
+                        let nullability = if is_non_null_reference(n, t) {
                             "@NonNull "
                         } else {
                             ""
@@ -2116,7 +2254,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
                 for (_, is_mutable, fname, ftype) in &params {
                     if *is_mutable && ftype != "boolean" {
-                        let nullability = if is_non_null_reference(ftype) {
+                        let nullability = if is_non_null_reference(fname, ftype) {
                             "@NonNull "
                         } else {
                             ""
@@ -2171,6 +2309,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 self.emit_jpa_no_arg_constructor(decl, &name, &params, superclass.is_some(), out);
             }
             out.blank();
+            self.emit_planned_default_getters(decl, out);
             if let Some(body) = kt::child(decl, "class_body") {
                 self.transpile_class_body(body, out);
             }
@@ -2307,6 +2446,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 for annotation in self.primary_constructor_annotations(decl) {
                     out.line(annotation);
                 }
+                self.emit_constructor_property_contract(decl, &params, out);
                 if self.constructor_has_covariant_input(decl, &params) {
                     out.line("@SuppressWarnings(\"unchecked\")");
                 }
@@ -2368,6 +2508,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             if let Some(body) = kt::child(decl, "class_body") {
                 self.transpile_class_body(body, out);
             }
+            self.emit_planned_default_getters(decl, out);
             self.emit_data_members(decl, &name, &params, as_record, out);
             if let Some(body) = kt::child(decl, "class_body") {
                 for member in body.children(&mut body.walk()) {
@@ -2493,11 +2634,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 if lombok_accessors && *is_mutable {
                     annotations.push("@Setter".into());
                 }
-                let lombok_needs_kotlin_boolean_getter = self.lombok
+                let lombok_needs_kotlin_boolean_getter = lombok_accessors
                     && ftype == "boolean"
                     && !(fname.starts_with("is")
                         && fname.chars().nth(2).is_some_and(|c| c.is_ascii_uppercase()));
-                if self.lombok && !lombok_needs_kotlin_boolean_getter {
+                if lombok_accessors && !lombok_needs_kotlin_boolean_getter {
                     annotations.extend(self.param_getter_annotations(decl, fname));
                 }
                 for annotation in annotations {
@@ -2539,7 +2680,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.blank();
             }
             if !params.is_empty()
-                && (!self.lombok || has_secondary_constructor || !lombok_supplies_all_args)
+                && (!lombok_accessors || has_secondary_constructor || !lombok_supplies_all_args)
                 && super_ctor_args.is_none()
             {
                 for annotation in &ctor_annotations {
@@ -2568,8 +2709,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             if jpa_no_arg {
                 self.emit_jpa_no_arg_constructor(decl, &name, &params, superclass.is_some(), out);
             }
-            // accessors (skipped under --lombok: @Data generates them)
-            if !self.lombok {
+            // Only omit accessors when the annotations above actually supply
+            // them. A custom method may have disabled Lombok for this class.
+            if !lombok_accessors {
                 for (is_property, is_mutable, fname, ftype) in &params {
                     // A plain constructor parameter is not a property: Kotlin
                     // declares no member for it, so an emitted accessor would
@@ -2596,6 +2738,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         && !self.class_declares_method_signature(decl, &setter, &[ftype.as_str()])
                     {
                         out.blank();
+                        for annotation in self.param_setter_annotations(decl, fname) {
+                            out.line(annotation);
+                        }
                         out.open(format!("public void {}({} {})", setter, ftype, fname));
                         out.line(format!("this.{} = {};", fname, fname));
                         out.close();
@@ -2645,9 +2790,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         continue;
                     }
                     let setter = format!("set{}", capitalize(fname));
-                    if self.class_declares_method_arity(decl, &setter, 1)
-                        && !self.class_declares_method_signature(decl, &setter, &[ftype.as_str()])
-                    {
+                    let setter_annotations = self.param_setter_annotations(decl, fname);
+                    let has_wrong_arity_peer = self.class_declares_method_arity(decl, &setter, 1)
+                        && !self.class_declares_method_signature(decl, &setter, &[ftype.as_str()]);
+                    if !setter_annotations.is_empty() || has_wrong_arity_peer {
+                        if self.class_declares_method_signature(decl, &setter, &[ftype.as_str()]) {
+                            continue;
+                        }
+                        for annotation in setter_annotations {
+                            out.line(annotation);
+                        }
                         out.open(format!("public void {}({} {})", setter, ftype, fname));
                         out.line(format!("this.{} = {};", fname, fname));
                         out.close();
@@ -2655,6 +2807,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     }
                 }
             } // body members
+            self.emit_planned_default_getters(decl, out);
             if let Some(body) = kt::child(decl, "class_body") {
                 self.transpile_class_body(body, out);
             }
@@ -2667,8 +2820,137 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         decl: tree_sitter::Node,
         name: &str,
         visibility: &str,
+        hoisted_annotations: &[String],
         out: &mut JavaOut,
     ) {
+        let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
+        let source_file = self
+            .workspace
+            .and_then(|workspace| workspace.source_file(declaring));
+        let mut metadata = hoisted_annotations.to_vec();
+        let mut java_targets = Vec::new();
+        let mut retention = "RUNTIME";
+        let mut has_target = false;
+        let mut has_java_retention = false;
+        let mut has_documented = false;
+        if let Some(modifiers) = kt::child(decl, "modifiers") {
+            for annotation in modifiers.children(&mut modifiers.walk()) {
+                if annotation.kind() != "annotation" {
+                    continue;
+                }
+                if let Some(raw_name) = annotation_fq_name(annotation, self.source) {
+                    let imported = annotation_import_name(raw_name, self.source);
+                    has_java_retention |= imported == "java.lang.annotation.Retention"
+                        || (imported == "Retention"
+                            && annotation_imports(self.source).any(|(path, alias)| {
+                                alias.is_none() && path == "java.lang.annotation.Retention"
+                            }));
+                }
+                match kotlin_annotation_meta_name(
+                    annotation,
+                    self.source,
+                    self.workspace,
+                    source_file,
+                ) {
+                    Some("Target") => {
+                        has_target = true;
+                        for value in annotation_argument_values(annotation, self.source) {
+                            let Some((owner, target)) = value.rsplit_once('.') else {
+                                self.diag_untranslatable(
+                                    decl,
+                                    "Kotlin annotation target cannot be represented in Java",
+                                );
+                                return;
+                            };
+                            if !matches!(
+                                owner,
+                                "AnnotationTarget" | "kotlin.annotation.AnnotationTarget"
+                            ) {
+                                self.diag_untranslatable(
+                                    decl,
+                                    "Kotlin annotation target cannot be resolved safely",
+                                );
+                                return;
+                            }
+                            let Some(mapped) = (match target {
+                                "CLASS" => Some("TYPE"),
+                                "ANNOTATION_CLASS" => Some("ANNOTATION_TYPE"),
+                                "FIELD" => Some("FIELD"),
+                                _ => None,
+                            }) else {
+                                self.diag_untranslatable(decl, format!("Kotlin annotation target {target} cannot be represented in Java"));
+                                return;
+                            };
+                            if !java_targets.contains(&mapped) {
+                                java_targets.push(mapped);
+                            }
+                        }
+                    }
+                    Some("Retention") => {
+                        let values = annotation_argument_values(annotation, self.source);
+                        let mapped = match values.as_slice() {
+                            [] => Some("RUNTIME"),
+                            [value] => value.rsplit_once('.').and_then(|(owner, member)| {
+                                if !matches!(
+                                    owner,
+                                    "AnnotationRetention" | "kotlin.annotation.AnnotationRetention"
+                                ) {
+                                    return None;
+                                }
+                                match member {
+                                    "SOURCE" => Some("SOURCE"),
+                                    "BINARY" => Some("CLASS"),
+                                    "RUNTIME" => Some("RUNTIME"),
+                                    _ => None,
+                                }
+                            }),
+                            _ => None,
+                        };
+                        let Some(mapped) = mapped else {
+                            self.diag_untranslatable(
+                                decl,
+                                "Kotlin annotation retention cannot be represented in Java",
+                            );
+                            return;
+                        };
+                        retention = mapped;
+                    }
+                    Some("MustBeDocumented") => has_documented = true,
+                    _ => {
+                        if let Some(lowered) = self.transpile_declaration_annotation(annotation) {
+                            metadata.push(lowered);
+                        } else {
+                            self.diag_untranslatable(
+                                decl,
+                                "annotation metadata cannot be represented in Java",
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if has_target {
+            metadata.push(format!(
+                "@java.lang.annotation.Target({{{}}})",
+                java_targets
+                    .iter()
+                    .map(|target| format!("java.lang.annotation.ElementType.{target}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !has_java_retention {
+            metadata.push(format!(
+                "@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.{retention})"
+            ));
+        }
+        if has_documented {
+            metadata.push("@java.lang.annotation.Documented".to_string());
+        }
+        for annotation in metadata {
+            out.line(annotation);
+        }
         let params = self.class_params(decl);
         let defaults = self.class_param_defaults(decl);
         out.open(format!("{visibility}@interface {name}"));
@@ -2681,17 +2963,61 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         out.close();
     }
 
-    /// Whether the class body explicitly declares `equals`, `hashCode`,
-    /// or `toString`. When it does, `@Data` must NOT be emitted: Lombok
-    /// would generate a second, conflicting implementation (duplicate
-    /// method / unwanted super-call pairing) alongside the user-defined
-    /// one the body translation already produced.
-    /// Annotations written on the Kotlin primary constructor
-    /// (`data class Layout @Default constructor(...)`). They must survive onto
-    /// the generated constructor: a Kotlin primary constructor with default
-    /// arguments becomes several Java constructors, and MapStruct picks the one
-    /// to use by an annotation named `@Default`. Dropping it leaves the mapping
-    /// ambiguous, so the generated mapper no longer compiles.
+    /// Preserve the canonical property constructor's names when Kotlin metadata
+    /// is replaced by an ordinary Java class with explicit constructors.
+    fn emit_constructor_property_contract(
+        &self,
+        decl: tree_sitter::Node,
+        params: &[(bool, bool, String, String)],
+        out: &mut JavaOut,
+    ) {
+        if params.is_empty() || params.iter().any(|(property, _, _, _)| !property) {
+            return;
+        }
+        let imported_names = self
+            .source
+            .lines()
+            .filter_map(|line| {
+                let import = line.trim().strip_prefix("import ")?.trim_end_matches(';');
+                let (path, alias) = import
+                    .split_once(" as ")
+                    .map_or((import, None), |(path, alias)| {
+                        (path.trim(), Some(alias.trim()))
+                    });
+                matches!(path, "java.beans.ConstructorProperties" | "java.beans.*")
+                    .then_some(alias.unwrap_or("ConstructorProperties"))
+            })
+            .collect::<Vec<_>>();
+        let already_present = self
+            .primary_constructor_annotations(decl)
+            .iter()
+            .any(|annotation| {
+                annotation.starts_with("@java.beans.ConstructorProperties(")
+                    || imported_names.iter().any(|name| {
+                        annotation
+                            .strip_prefix('@')
+                            .and_then(|text| text.split_once('('))
+                            .is_some_and(|(actual, _)| actual == *name)
+                    })
+            });
+        if already_present {
+            return;
+        }
+        // Primary data-class property names survive in the existing Lombok
+        // path and must also survive when custom members require plain Java.
+        // Secondary/default overloads deliberately receive no creator marker.
+        out.line(format!(
+            "@java.beans.ConstructorProperties({{{}}})",
+            params
+                .iter()
+                .map(|(_, _, name, _)| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    /// Preserve primary-constructor annotations, including MapStruct's `Default`
+    /// selection when default arguments introduce additional Java overloads.
     fn primary_constructor_annotations(&self, decl: tree_sitter::Node) -> Vec<String> {
         // A constructor with no annotations at all has no `modifiers` child;
         // the marker below must still be considered, so this is a plain
@@ -2835,11 +3161,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             for child in current.children(&mut cursor) {
                 if child.kind() == "annotation" {
                     let annotation = self.text(child);
-                    // `@JvmField` changes Kotlin's JVM ABI but is not a Java
-                    // annotation. `transpile_property` reads the modifier to
-                    // emit a public field, so never pass the marker through.
+                    // JVM control annotations describe the Kotlin ABI, not a
+                    // Java field annotation. Static companion properties already
+                    // receive an explicit Java field and static getter.
                     if annotation.contains("notlinProperty")
                         || annotation_simple_name(annotation) == "JvmField"
+                        || self.is_kotlin_jvm_static_annotation(child)
                     {
                         continue;
                     }
@@ -2855,7 +3182,189 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
         }
+        if let Some((owner, property_node, property)) = self.property_annotation_owner(node) {
+            for annotation in
+                self.property_repair_bridge_annotations(&owner, property_node, &property, true)
+            {
+                if !getter.contains(&annotation) {
+                    getter.push(annotation);
+                }
+            }
+        }
         (field, getter)
+    }
+
+    /// Annotations moved from a property onto a temporary JavaBean bridge by
+    /// retained-property repair still belong to the property's generated
+    /// accessor if the owning class becomes Java on a later fixpoint pass.
+    /// Only consume annotations from the exact generated bridge for this
+    /// property; ordinary user methods keep their own annotation semantics.
+    pub(crate) fn property_repair_bridge_annotations(
+        &self,
+        owner: &tree_sitter::Node,
+        property_node: tree_sitter::Node,
+        property: &str,
+        getter: bool,
+    ) -> Vec<String> {
+        let Some(body) =
+            kt::child(*owner, "class_body").or_else(|| kt::child(*owner, "enum_class_body"))
+        else {
+            return Vec::new();
+        };
+        let name = format!(
+            "{}{}",
+            if getter { "get" } else { "set" },
+            capitalize(property)
+        );
+        // The method-name marker must be attached to this exact property, not
+        // merely somewhere in the owning class (which could be an overload).
+        let property_marker = self
+            .text(property_node)
+            .contains(&format!("notlinProperty{name}"));
+        let Some(bridge) = body.children(&mut body.walk()).find(|member| {
+            member.kind() == "function_declaration"
+                && kt::field(*member, "name").is_some_and(|method| self.text(method) == name)
+                && (property_marker && self.is_property_repair_bridge(*member)
+                    || self.constructor_property_bridge(*member).as_deref() == Some(property))
+                && self.property_repair_bridge_for(*member, property, getter)
+        }) else {
+            return Vec::new();
+        };
+        let root = kt::child(bridge, "modifiers").unwrap_or(bridge);
+        let mut stack = vec![root];
+        let mut annotations = Vec::new();
+        while let Some(current) = stack.pop() {
+            for child in current.children(&mut current.walk()) {
+                if child.kind() == "annotation" {
+                    let text = self.text(child);
+                    if text.contains("notlinProperty")
+                        || annotation_simple_name(text) == "JvmField"
+                        || self.is_kotlin_jvm_static_annotation(child)
+                    {
+                        continue;
+                    }
+                    if let Some(annotation) = self.transpile_declaration_annotation(child) {
+                        annotations.push(annotation);
+                    }
+                } else {
+                    stack.push(child);
+                }
+            }
+        }
+        annotations
+    }
+
+    fn property_repair_bridge_for(
+        &self,
+        function: tree_sitter::Node,
+        property: &str,
+        getter: bool,
+    ) -> bool {
+        let Some(parameters) = kt::child(function, "function_value_parameters") else {
+            return false;
+        };
+        let parameter_count = parameters
+            .children(&mut parameters.walk())
+            .filter(|child| child.kind() == "parameter")
+            .count();
+        let Some(body) = kt::child(function, "function_body") else {
+            return false;
+        };
+        let normalized = self
+            .text(body)
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && !matches!(ch, '{' | '}' | ';'))
+            .collect::<String>()
+            .replace("this.", "");
+        if getter {
+            parameter_count == 0 && normalized.strip_prefix('=') == Some(property)
+        } else {
+            parameter_count == 1 && normalized == format!("{property}=value")
+        }
+    }
+
+    pub(crate) fn property_annotation_owner<'a>(
+        &self,
+        node: tree_sitter::Node<'a>,
+    ) -> Option<(tree_sitter::Node<'a>, tree_sitter::Node<'a>, String)> {
+        let (mut owner, property_node, property) = match node.kind() {
+            "property_declaration" => {
+                let variable = kt::child(node, "variable_declaration")?;
+                let property = self.text(kt::child(variable, "identifier")?).to_string();
+                (kt::parent_of(node), node, property)
+            }
+            "class_parameter" => {
+                if kt::child(node, "val").is_none() && kt::child(node, "var").is_none() {
+                    return None;
+                }
+                let property = self.text(kt::child(node, "identifier")?).to_string();
+                (kt::parent_of(node), node, property)
+            }
+            _ => return None,
+        };
+        while let Some(current) = owner {
+            if matches!(
+                current.kind(),
+                "class_declaration"
+                    | "enum_class_declaration"
+                    | "object_declaration"
+                    | "companion_object"
+            ) {
+                return Some((current, property_node, property));
+            }
+            owner = kt::parent_of(current);
+        }
+        None
+    }
+
+    fn is_kotlin_jvm_static_annotation(&self, annotation: tree_sitter::Node) -> bool {
+        let Some(name) = annotation_fq_name(annotation, self.source) else {
+            return false;
+        };
+        if name == "kotlin.jvm.JvmStatic" {
+            return true;
+        }
+        if name != "JvmStatic" && !self.source.contains("kotlin.jvm.JvmStatic") {
+            return false;
+        }
+        let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
+        if self.semantic_provider.is_some_and(|provider| {
+            let symbols = provider.symbols_in_file(declaring);
+            symbols.first().is_some_and(|symbol| {
+                !matches!(
+                    provider.resolve_type_in_file(declaring, &symbol.id.package, &name),
+                    crate::semantics::FactStatus::Unknown
+                )
+            })
+        }) {
+            return false;
+        }
+        if self.workspace.is_some_and(|workspace| {
+            workspace
+                .source_file(declaring)
+                .is_some_and(|file| workspace.resolve_type(file, &name).is_some())
+        }) {
+            // A real source annotation with the same spelling keeps its meaning.
+            return false;
+        }
+        let explicit = self
+            .source
+            .lines()
+            .filter_map(|line| {
+                let import = line.trim().strip_prefix("import ")?.trim_end_matches(';');
+                let (path, alias) = import
+                    .split_once(" as ")
+                    .map_or((import, None), |(path, alias)| {
+                        (path.trim(), Some(alias.trim()))
+                    });
+                (alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == name)
+                    .then_some(path)
+            })
+            .collect::<Vec<_>>();
+        if !explicit.is_empty() {
+            return explicit.len() == 1 && explicit[0] == "kotlin.jvm.JvmStatic";
+        }
+        name == "JvmStatic"
     }
 
     /// The `class_parameter` for a primary-constructor property, by name.
@@ -3030,6 +3539,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .unwrap_or_default()
     }
 
+    fn param_setter_annotations(&self, decl: tree_sitter::Node, property: &str) -> Vec<String> {
+        let Some(parameter) = self.param_node(decl, property) else {
+            return Vec::new();
+        };
+        let Some((owner, property_node, name)) = self.property_annotation_owner(parameter) else {
+            return Vec::new();
+        };
+        self.property_repair_bridge_annotations(&owner, property_node, &name, false)
+    }
+
     fn class_body_declares_instance_fields(&self, decl: tree_sitter::Node) -> bool {
         let Some(body) = kt::child(decl, "class_body") else {
             return false;
@@ -3198,6 +3717,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .find(|declaration| declaration.name == name)
     }
 
+    fn constructor_overload_patterns(
+        defaults: &[Option<String>],
+        has_jvm_overloads: bool,
+        in_place: bool,
+    ) -> Vec<Vec<usize>> {
+        if has_jvm_overloads {
+            crate::ctor_defaults::jvm_overload_patterns(defaults)
+        } else if in_place {
+            crate::ctor_defaults::trailing_patterns(defaults)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Whether the delegating overloads for this declaration's default
     /// arguments can be written, and which omission patterns need one.
     ///
@@ -3213,11 +3746,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // The ladder is what the emitter writes for Kotlin's own positional ABI
         // (any in-place run) or for an explicit `@JvmOverloads`; the plan must
         // not write it twice.
-        let ladder = if self.in_place || self.primary_constructor_has_jvm_overloads(decl) {
-            crate::ctor_defaults::trailing_patterns(defaults)
-        } else {
-            Vec::new()
-        };
+        let has_jvm_overloads = self.primary_constructor_has_jvm_overloads(decl);
+        let ladder =
+            Self::constructor_overload_patterns(defaults, has_jvm_overloads, self.in_place);
         let patterns = self
             .workspace
             .map(|workspace| workspace.ctor_omission_evidence(target).patterns)
@@ -3236,20 +3767,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         })
     }
 
-    /// `@JvmOverloads` exposes Java overloads for every omitted trailing
-    /// primary-constructor default. The Kotlin annotation itself has no Java
-    /// counterpart, so emit the overloads that express its ABI instead.
+    /// `@JvmOverloads` exposes Java overloads by omitting defaulted
+    /// primary-constructor parameters from right to left, keeping required ones.
+    /// Emit those overloads to preserve its Java ABI.
     ///
     /// Two sets of overloads are written, and only these:
     ///
-    /// - the trailing ladder, for `@JvmOverloads` or an in-place run: Kotlin's
+    /// - the annotation ladder, or trailing defaults for an in-place run: Kotlin's
     ///   own positional constructor ABI, which a retained caller may use;
     /// - one overload per omission pattern a call site actually writes
     ///   ([`Self::ctor_default_plan`]) — a named-argument call omitting a middle
     ///   parameter, or one whose default cannot be written into the call.
     ///
-    /// Never every subset: a declaration whose defaults no caller omits gets no
-    /// overloads at all.
+    /// Never every subset: middle defaults add no overloads unless an
+    /// annotation or an observed caller requests them.
     fn emit_jvm_overloads_primary_constructors(
         &mut self,
         decl: tree_sitter::Node<'_>,
@@ -3264,7 +3795,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // omits one needs an overload. Without either there is nothing to write —
         // and nothing to lower, which matters because lowering a default
         // expression can carry diagnostics.
-        let ladder_requested = self.in_place || self.primary_constructor_has_jvm_overloads(decl);
+        let has_jvm_overloads = self.primary_constructor_has_jvm_overloads(decl);
+        let ladder_requested = self.in_place || has_jvm_overloads;
         let has_defaults = self
             .indexed_target(name)
             .is_some_and(|target| target.has_default_constructor_parameter);
@@ -3283,12 +3815,24 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         );
         let defaults = self.class_param_defaults(decl);
         self.var_types = prior_var_types;
-        let mut patterns = if self.in_place || self.primary_constructor_has_jvm_overloads(decl) {
-            crate::ctor_defaults::trailing_patterns(&defaults)
+        let mut patterns =
+            Self::constructor_overload_patterns(&defaults, has_jvm_overloads, self.in_place);
+        let jvm_patterns = if has_jvm_overloads {
+            patterns.clone()
         } else {
             Vec::new()
         };
-        if let Some(target) = self.indexed_target(name) {
+        let target = self.indexed_target(name);
+        let secondary_arities = target
+            .map(|target| {
+                target
+                    .secondary_ctors
+                    .iter()
+                    .map(Vec::len)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(target) = target {
             let plan = self.ctor_default_plan(decl, target);
             if plan.blocked.is_none() {
                 patterns.extend(plan.overloads);
@@ -3315,7 +3859,24 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            // Each @JvmOverloads rung supplies the next default in declaration
+            // order, then delegates to the larger rung. A later default can
+            // therefore use an earlier omitted parameter without evaluating it
+            // twice or referencing a name absent from this overload.
+            let jvm_rung = jvm_patterns
+                .iter()
+                .position(|candidate| candidate == pattern);
+            let delegate_omissions = jvm_rung
+                .and_then(|index| index.checked_sub(1))
+                .map(|index| jvm_patterns[index].as_slice())
+                .unwrap_or_default();
+            let delegate_arity = params.len() - delegate_omissions.len();
+            let competing_constructor = patterns.iter().any(|candidate| {
+                candidate.len() == delegate_omissions.len()
+                    && candidate.as_slice() != delegate_omissions
+            }) || secondary_arities.contains(&delegate_arity);
             let values = (0..params.len())
+                .filter(|index| !delegate_omissions.contains(index))
                 .map(|index| {
                     if pattern.contains(&index) {
                         let value = defaults[index]
@@ -3323,13 +3884,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             .unwrap_or_else(|| "null".to_string());
                         // Kotlin delegates to the primary constructor. A bare
                         // null can select several Java reference overloads.
-                        if value.trim() == "null"
-                            && self.indexed_target(name).is_some_and(|target| {
-                                target
-                                    .secondary_ctors
-                                    .iter()
-                                    .any(|ctor| ctor.len() == params.len())
-                            })
+                        if jvm_rung.is_some() && competing_constructor {
+                            // A default's expression can have a narrower type
+                            // than the parameter. Anchor overload selection to
+                            // the intended rung, including around secondary
+                            // constructors accepting that narrower type.
+                            let cast_type = self.constructor_parameter_java_type(
+                                decl,
+                                &params[index].2,
+                                &params[index].3,
+                            );
+                            format!("({cast_type}) ({value})")
+                        } else if value.trim() == "null"
+                            && secondary_arities.contains(&params.len())
                         {
                             let cast_type = params[index]
                                 .3
@@ -3905,6 +4472,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
                 if *is_mutable && !declares_setter {
                     out.blank();
+                    for annotation in self.param_setter_annotations(decl, fname) {
+                        out.line(annotation);
+                    }
                     out.open(format!("public void set{}({} {})", cap, ftype, fname));
                     out.line(format!("this.{} = {};", fname, fname));
                     out.close();
@@ -4370,45 +4940,90 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 self.var_types = prior_var_types;
                 return false;
             };
-            let primary = self.class_params(class_decl);
-            let names: Vec<String> = primary.iter().map(|(_, _, name, _)| name.clone()).collect();
-            let Some(resolved) = crate::ctor_defaults::resolve_args(&names, &written_args) else {
-                self.var_types = prior_var_types;
-                return false;
-            };
-            let defaults = self.class_param_default_nodes(class_decl);
-            let mut args = Vec::with_capacity(names.len());
-            for (index, slot) in resolved.slots.into_iter().enumerate() {
-                if let Some(value) = slot {
-                    args.push(value);
-                    continue;
-                }
-                let Some(default) = defaults.get(index).copied().flatten() else {
+            if let Some(fact) = self
+                .constructor_delegations
+                .get(&(member.start_byte(), member.end_byte()))
+            {
+                // Planning has selected one secondary constructor, including
+                // every competing arity. Keep source argument order: Java
+                // cannot introduce temporaries before this(...).
+                let target = kt::child(class_decl, "class_body").and_then(|body| {
+                    body.named_children(&mut body.walk()).find(|node| {
+                        node.kind() == "secondary_constructor"
+                            && node.start_byte() == fact.target.start_byte
+                            && node.end_byte() == fact.target.end_byte
+                    })
+                });
+                let target_types = target
+                    .and_then(|target| kt::child(target, "function_value_parameters"))
+                    .map(|params| {
+                        params
+                            .named_children(&mut params.walk())
+                            .filter(|node| node.kind() == "parameter")
+                            .filter_map(|param| {
+                                param.named_children(&mut param.walk()).find(|node| {
+                                    matches!(node.kind(), "user_type" | "type_reference" | "type")
+                                })
+                            })
+                            .map(|ty| self.text(ty).trim().to_string())
+                            .collect::<Vec<_>>()
+                    });
+                assert!(
+                    fact.location.snapshot_hash == self.source_hash
+                        && fact.target.snapshot_hash == self.source_hash
+                        && target_types.as_ref() == Some(&fact.parameter_types)
+                        && written_args.len() == fact.parameter_types.len()
+                        && written_args.iter().all(|(name, _)| name.is_none()),
+                    "constructor emission requires the accepted delegation target"
+                );
+                written_args.into_iter().map(|(_, value)| value).collect()
+            } else {
+                let primary = self.class_params(class_decl);
+                let names: Vec<String> =
+                    primary.iter().map(|(_, _, name, _)| name.clone()).collect();
+                let Some(resolved) = crate::ctor_defaults::resolve_args(&names, &written_args)
+                else {
                     self.var_types = prior_var_types;
                     return false;
                 };
-                if !self.is_safe_secondary_constructor_argument(default)
-                    || crate::ctor_defaults::unsupplied_reference(self.text(default), &names, &[])
+                let defaults = self.class_param_default_nodes(class_decl);
+                let mut args = Vec::with_capacity(names.len());
+                for (index, slot) in resolved.slots.into_iter().enumerate() {
+                    if let Some(value) = slot {
+                        args.push(value);
+                        continue;
+                    }
+                    let Some(default) = defaults.get(index).copied().flatten() else {
+                        self.var_types = prior_var_types;
+                        return false;
+                    };
+                    if !self.is_safe_secondary_constructor_argument(default)
+                        || crate::ctor_defaults::unsupplied_reference(
+                            self.text(default),
+                            &names,
+                            &[],
+                        )
                         .is_some()
-                {
-                    self.var_types = prior_var_types;
-                    return false;
+                    {
+                        self.var_types = prior_var_types;
+                        return false;
+                    }
+                    args.push(Expr { unit: self }.transpile(default));
                 }
-                args.push(Expr { unit: self }.transpile(default));
-            }
-            // This source call resolves to the primary constructor. Preserve
-            // that choice when null also matches a Java secondary overload.
-            for (index, value) in args.iter_mut().enumerate() {
-                if value.trim() == "null" {
-                    let cast_type = primary[index]
-                        .3
-                        .replace("@Nullable ", "")
-                        .replace("@NotNull ", "")
-                        .replace("@NonNull ", "");
-                    *value = format!("({cast_type}) null");
+                // This source call resolves to the primary constructor. Preserve
+                // that choice when null also matches a Java secondary overload.
+                for (index, value) in args.iter_mut().enumerate() {
+                    if value.trim() == "null" {
+                        let cast_type = primary[index]
+                            .3
+                            .replace("@Nullable ", "")
+                            .replace("@NotNull ", "")
+                            .replace("@NonNull ", "");
+                        *value = format!("({cast_type}) null");
+                    }
                 }
+                args
             }
-            args
         } else {
             if written_args.iter().any(|(name, _)| name.is_some()) {
                 self.var_types = prior_var_types;
@@ -4473,9 +5088,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// needed by constructor defaults, while leaving Kotlin collection/extension
     /// calls (for example `joinToString`) in Kotlin.
     fn is_safe_secondary_constructor_argument(&self, node: tree_sitter::Node) -> bool {
+        if self
+            .reference_string_calls
+            .get(&(node.start_byte(), node.end_byte()))
+            .is_some_and(|fact| {
+                fact.location.snapshot_hash == self.source_hash
+                    && fact.location.end_byte == node.end_byte()
+            })
+        {
+            return true;
+        }
         match node.kind() {
             "identifier" | "this_expression" | "number_literal" | "boolean_literal"
-            | "hex_literal" | "long_literal" | "real_literal" | "null_literal" => true,
+            | "hex_literal" | "long_literal" | "real_literal" | "float_literal"
+            | "null_literal" => true,
             "string_literal" => !self.text(node).contains('$'),
             "navigation_expression" | "parenthesized_expression" | "value_arguments" => node
                 .children(&mut node.walk())
@@ -4502,7 +5128,31 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     .chars()
                     .next()
                     .is_some_and(|first| first.is_ascii_uppercase());
-                let is_supported_method = matches!(method, "getOrDefault" | "now" | "toInstant")
+                // Reuse the planner's source-scoped platform proof. A method
+                // merely named randomUUID (or a shadowed UUID qualifier) does
+                // not establish the java.util.UUID factory contract.
+                let value_receiver = callee_text
+                    .rsplit_once('.')
+                    .is_some_and(|(receiver, _)| self.var_types.contains_key(receiver.trim()));
+                let platform_uuid = !value_receiver
+                    && self.semantic_provider.is_some_and(|provider| {
+                        crate::semantics::established_platform_static_call_return_type(
+                            self.source,
+                            self.workspace_file.as_deref().unwrap_or(self.file),
+                            node,
+                            provider,
+                        ) == Some("java.util.UUID")
+                    });
+                let is_supported_method = platform_uuid
+                    || matches!(method, "getOrDefault" | "now" | "toInstant")
+                    || self.semantic_provider.is_some_and(|provider| {
+                        crate::semantics::established_own_companion_delegation_call(
+                            self.source,
+                            node,
+                            self.workspace_file.as_deref().unwrap_or(self.file),
+                            provider,
+                        )
+                    })
                     || self.is_declared_zero_arg_instance_call(node, callee_text);
                 (is_constructor || is_supported_method)
                     && named
@@ -4532,7 +5182,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return false;
         };
         if receiver.contains('.') {
-            return false;
+            return self.semantic_provider.is_some_and(|provider| {
+                crate::semantics::established_projected_receiver_instance_call(
+                    self.source,
+                    call,
+                    self.workspace_file.as_deref().unwrap_or(self.file),
+                    provider,
+                )
+            });
         }
         let Some(receiver_type) = self.var_types.get(receiver.trim()) else {
             return false;
@@ -4820,6 +5477,40 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
     }
 
+    fn emit_planned_default_getters(&self, decl: tree_sitter::Node, out: &mut JavaOut) {
+        for bridge in self
+            .default_getter_bridges
+            .iter()
+            .filter(|bridge| bridge.location.start_byte == decl.start_byte())
+        {
+            assert_eq!(bridge.location.snapshot_hash, self.source_hash);
+            assert_eq!(
+                bridge.return_type_ref,
+                crate::semantics::TypeRef::parse(&bridge.return_type),
+                "accepted getter return spelling must match the structured contract"
+            );
+            let provider = &bridge.provider;
+            let mut parts = Vec::new();
+            if !provider.package.is_empty() {
+                parts.push(provider.package.as_str());
+            }
+            parts.extend(provider.owner_path.iter().map(String::as_str));
+            parts.push(provider.name.as_str());
+            let provider_name = parts.join(".");
+            out.line("@Override");
+            out.open(format!(
+                "public {} {}()",
+                bridge.return_type, bridge.method_name
+            ));
+            out.line(format!(
+                "return {provider_name}.super.{}();",
+                bridge.method_name
+            ));
+            out.close();
+            out.blank();
+        }
+    }
+
     fn transpile_class_body(&mut self, body: tree_sitter::Node, out: &mut JavaOut) {
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
@@ -4947,8 +5638,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     })
             });
         if getter {
-            return ((constructor_property
-                || self.self_getters.get(&property).map(String::as_str) == Some(name))
+            return (constructor_property
                 && parameter_count == 0
                 && body
                     .children(&mut body.walk())

@@ -9,6 +9,213 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 #[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_explicit_super_method_dispatch() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("explicit super method dispatch");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    let sources = [
+        (
+            "Parent.java",
+            "package boundary; public interface Parent { default String label() { return \"parent\"; } }\n",
+        ),
+        (
+            "Child.kt",
+            "package boundary\ninterface Child : Parent {\n    override fun label(): String = super.label() + \"/child\"\n}\n",
+        ),
+        (
+            "Runner.kt",
+            "package boundary\nclass KeptChild : Child {\n    suspend fun retainedHook() {}\n}\nfun main() {\n    suspend fun retainedHarness() {}\n    val child: Parent = KeptChild()\n    println(child.label() + \"|\" + Derived().label() + \"|\" + Constants.DEFAULT + \"|\" + StaticReader.read())\n}\n",
+        ),
+        (
+            "Constants.kt",
+            "package boundary\ninterface Constants {\n    companion object {\n        @JvmStatic\n        val DEFAULT: String = \"constant\"\n    }\n}\n",
+        ),
+        (
+            "StaticReader.java",
+            "package boundary; public class StaticReader { public static String read() { return Constants.getDEFAULT(); } }\n",
+        ),
+        (
+            "Base.java",
+            "package boundary; public class Base { public String label() { return \"base\"; } }\n",
+        ),
+        (
+            "Derived.kt",
+            "package boundary\nclass Derived : Base() {\n    override fun label(): String = super.label() + \"/derived\"\n}\n",
+        ),
+    ];
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        for (name, source) in sources {
+            fs::write(root.join(name), source).unwrap();
+        }
+    }
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    baseline.java_sources.push(original.join("Parent.java"));
+    baseline.java_sources.push(original.join("Base.java"));
+    baseline
+        .java_sources
+        .push(original.join("StaticReader.java"));
+    baseline.kotlin_sources.extend([
+        original.join("Child.kt"),
+        original.join("Derived.kt"),
+        original.join("Constants.kt"),
+        original.join("Runner.kt"),
+    ]);
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original super call compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        "parent/child|base/derived|constant|constant"
+    );
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&migrated)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        migrated.join("Child.java").is_file(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    let child = fs::read_to_string(migrated.join("Child.java")).unwrap();
+    assert!(child.contains("Parent.super.label()"), "{child}");
+    let constants = fs::read_to_string(migrated.join("Constants.java")).unwrap();
+    assert!(!constants.contains("@JvmStatic"), "{constants}");
+    assert!(
+        constants.contains("static String getDEFAULT()"),
+        "{constants}"
+    );
+    let derived = fs::read_to_string(migrated.join("Derived.java")).unwrap();
+    assert!(
+        derived.contains("super.label()") && !derived.contains("Base.super"),
+        "{derived}"
+    );
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    for entry in fs::read_dir(&migrated).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("kt") => mixed.kotlin_sources.push(path),
+            Some("java") => mixed.java_sources.push(path),
+            _ => {}
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("migrated super call compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_member_call_before_unrelated_top_level_function() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("member before unrelated global");
+    let root = scratch.0.join("sources");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Global.kt"),
+        "package unrelated\nfun getData(): String = \"global\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Box.kt"),
+        r#"package boundary
+import unrelated.getData
+class Box(private val value: String) {
+    fun getData(): String = value
+    val label: String get() = getData()
+    fun output(): String = label
+}
+fun globalLabel(): String = getData()
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("Runner.kt"),
+        r#"package boundary
+fun main() {
+    suspend fun retainedHarness() {}
+    println(Box("member").output() + "|" + globalLabel())
+}
+"#,
+    )
+    .unwrap();
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlin_sources.extend([
+        root.join("Global.kt"),
+        root.join("Box.kt"),
+        root.join("Runner.kt"),
+    ]);
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original member dispatch compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        "member|global"
+    );
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&root)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        root.join("Box.java").is_file(),
+        "member caller must translate: {}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    for entry in fs::read_dir(&root).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("kt") => mixed.kotlin_sources.push(path),
+            Some("java") => mixed.java_sources.push(path),
+            _ => {}
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("mixed member dispatch compiles");
+    assert_eq!(
+        after.commands.last().unwrap().stdout.trim(),
+        "member|global"
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
 fn real_toolchain_preserves_bounded_generic_property_bridges() {
     let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
     let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
@@ -95,6 +302,113 @@ fun main() {
         before.commands.last().unwrap().stdout.trim(),
         after.commands.last().unwrap().stdout.trim()
     );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_nested_generic_constructor_defaults() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("nested generic constructor defaults");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    let sources = [
+        (
+            "Settings.kt",
+            r#"package boundary
+data class Settings<T> @JvmOverloads constructor(
+    val value: T? = null
+)
+"#,
+        ),
+        (
+            "Lines.kt",
+            r#"package boundary
+data class Lines<T> @JvmOverloads constructor(
+    val settings: Settings<T>? = Settings(),
+    val label: String? = null
+)
+"#,
+        ),
+        (
+            "Bundle.kt",
+            r#"package boundary
+data class Bundle<T> @JvmOverloads constructor(
+    val settings: Settings<T>? = Settings(),
+    val label: String? = null,
+    val entries: Map<String, T>? = null,
+    val lines: Lines<T>? = Lines()
+)
+"#,
+        ),
+        (
+            "Runner.kt",
+            r#"package boundary
+fun main() {
+    suspend fun retainedHarness() {}
+    val bundle = Bundle<String>()
+    println("${bundle.settings != null}|${bundle.lines != null}|${bundle.lines?.settings != null}|${bundle.lines?.label == null}")
+}
+"#,
+        ),
+    ];
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        for (name, source) in sources {
+            fs::write(root.join(name), source).unwrap();
+        }
+    }
+
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlin_sources = ["Settings.kt", "Lines.kt", "Bundle.kt", "Runner.kt"]
+        .into_iter()
+        .map(|name| original.join(name))
+        .collect();
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original nested generic defaults compile");
+    let expected = "true|true|true|true";
+    assert_eq!(before.commands.last().unwrap().stdout.trim(), expected);
+
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&migrated)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    for name in ["Settings", "Lines", "Bundle"] {
+        assert!(
+            migrated.join(format!("{name}.java")).is_file(),
+            "{name} should translate: {}",
+            String::from_utf8_lossy(&translation.stderr)
+        );
+    }
+
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    for entry in fs::read_dir(&migrated).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("kt") => mixed.kotlin_sources.push(path),
+            Some("java") => mixed.java_sources.push(path),
+            _ => {}
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("mixed nested generic defaults compile");
+    assert_eq!(after.commands.last().unwrap().stdout.trim(), expected);
 }
 
 #[test]
@@ -484,13 +798,14 @@ fn real_toolchain_preserves_uuid_factory_defaults_and_inferred_receivers() {
     let migrated = scratch.0.join("migrated");
     for root in [&original, &migrated] {
         fs::create_dir_all(root).unwrap();
-        fs::write(root.join("Identifier.kt"), "package boundary\nimport java.util.*\nclass Identifier(val id: UUID = UUID.randomUUID()) {\n fun freshText(): String = UUID.randomUUID().toString()\n fun inferredText(): String { val value = UUID.randomUUID(); return value.toString() }\n}\n").unwrap();
-        fs::write(root.join("Runner.kt"), "package boundary\nfun main() {\n val value = Identifier()\n println(\"${value.id.version()}|${value.freshText().length}|${value.inferredText().length}\")\n}\n").unwrap();
+        fs::write(root.join("Identifier.kt"), "package boundary\nimport java.util.*\nclass Identifier(val id: UUID = UUID.randomUUID()) {\n constructor(marker: String) : this(UUID.randomUUID())\n fun freshText(): String = UUID.randomUUID().toString()\n fun inferredText(): String { val value = UUID.randomUUID(); return value.toString() }\n}\n").unwrap();
+        fs::write(root.join("InstanceFactory.kt"), "package boundary\nimport java.util.UUID\nfun UUID.randomUUID(): UUID = UUID(0, 0)\nclass KeptInstance(val id: UUID) {\n constructor(source: UUID, marker: Int) : this(source.randomUUID())\n}\n").unwrap();
+        fs::write(root.join("Runner.kt"), "package boundary\nfun main() {\n suspend fun retainedHarness() {}\n val value = Identifier()\n val delegated = Identifier(\"fresh\")\n val fromExtension = KeptInstance(value.id, 1)\n println(\"${value.id.version()}|${value.freshText().length}|${value.inferredText().length}|${delegated.id.version()}|${delegated.id.variant()}|${fromExtension.id.version()}\")\n}\n").unwrap();
     }
     let mut baseline =
         JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
     target_java_17(&mut baseline);
-    baseline.kotlin_sources = ["Identifier.kt", "Runner.kt"]
+    baseline.kotlin_sources = ["Identifier.kt", "InstanceFactory.kt", "Runner.kt"]
         .iter()
         .map(|name| original.join(name))
         .collect();
@@ -501,7 +816,7 @@ fn real_toolchain_preserves_uuid_factory_defaults_and_inferred_receivers() {
         .arg("--root")
         .arg(&migrated)
         .args(["--annotations", "none", "--in-place"])
-        .arg(migrated.join("Identifier.kt"))
+        .arg(&migrated)
         .output()
         .unwrap();
     assert!(
@@ -514,16 +829,23 @@ fn real_toolchain_preserves_uuid_factory_defaults_and_inferred_receivers() {
         "{}",
         String::from_utf8_lossy(&translation.stderr)
     );
+    assert!(!migrated.join("KeptInstance.java").exists());
     let mut mixed =
         JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("mixed classes"));
     target_java_17(&mut mixed);
     mixed.kotlin_sources.push(migrated.join("Runner.kt"));
+    mixed
+        .kotlin_sources
+        .push(migrated.join("InstanceFactory.kt"));
     mixed.java_sources.push(migrated.join("Identifier.java"));
     mixed.classpath.push(stdlib);
     mixed.run_main_class = Some("boundary.RunnerKt".into());
     let after = validate_jvm_sources(&mixed)
         .expect("translated UUID factories compile with Kotlin callers");
-    assert_eq!(before.commands.last().unwrap().stdout.trim(), "4|36|36");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        "4|36|36|4|2|0"
+    );
     assert_eq!(
         before.commands.last().unwrap().stdout,
         after.commands.last().unwrap().stdout
@@ -900,6 +1222,98 @@ fn real_toolchain_compiles_transpiled_java_with_retained_kotlin() {
         report.commands[2].stdout.trim(),
         baseline_stdout,
         "transpiled Java plus retained Kotlin must match the original Kotlin runtime output"
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_ordered_nullable_map_transformations() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new_under(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/jvm-validation"),
+        "ordered nullable map transformations",
+    );
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    let source = r#"package mapcase
+data class Entry(val key: String?, val value: String?)
+fun remap(source: Map<String?, String?>): Map<String?, String?> =
+    source.mapKeys { entry -> if (entry.key == "A") "a" else entry.key }
+fun keep(source: Map<String?, String?>): Map<String?, String?> =
+    source.filterValues { value -> value == null || value != "drop" }
+fun index(values: List<Entry>): Map<String?, String?> =
+    values.associateBy({ entry -> entry.key }, { entry -> entry.value })
+fun main() {
+    val source: MutableMap<String?, String?> = mutableMapOf()
+    source["A"] = null
+    source["a"] = "later"
+    source[null] = "null-key"
+    source["B"] = "drop"
+    source["C"] = "stay"
+    val filtered = keep(remap(source)) as MutableMap<String?, String?>
+    filtered["z"] = null
+    val values: MutableList<Entry> = mutableListOf()
+    values.add(Entry(null, null))
+    values.add(Entry("same", "first"))
+    values.add(Entry("other", "middle"))
+    values.add(Entry("same", "last"))
+    println(filtered)
+    println(index(values))
+}
+"#;
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("Main.kt"), source).unwrap();
+    }
+
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("baseline classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlin_sources.push(original.join("Main.kt"));
+    baseline.classpath.push(PathBuf::from(&stdlib));
+    baseline.run_main_class = Some("mapcase.MainKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original collection fixture compiles");
+
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root"])
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(migrated.join("Main.kt"))
+        .output()
+        .expect("run notlin transpiler");
+    assert!(
+        translation.status.success(),
+        "default-mode translation failed: {}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    let generated = migrated.join("Main.java");
+    assert!(
+        generated.is_file(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+
+    let mut mixed =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    mixed.java_sources.push(generated);
+    let entry = migrated.join("Entry.java");
+    assert!(
+        entry.is_file(),
+        "collection fixture's entry class must translate"
+    );
+    mixed.java_sources.push(entry);
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("mapcase.Main".into());
+    let after = validate_jvm_sources(&mixed).expect("transpiled collection fixture compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim(),
+        "Java collection lowering must preserve duplicate-key overwrite, null keys/values, order, and mutability"
     );
 }
 
@@ -3028,13 +3442,14 @@ fn real_toolchain_preserves_default_collection_factory_with_platform_wildcard() 
             "package boundary\nclass Provider : Variant\n",
         )
         .unwrap();
-        fs::write(root.join("Runner.kt"), "package boundary\nfun main() {\n val provider: Variant = Provider()\n val first = provider.entries as MutableList<Entry>\n first.add(Entry())\n val second = provider.entries\n println(\"${first.size}|${second.size}|${first === second}\")\n}\n").unwrap();
+        fs::write(root.join("Message.kt"), "package boundary\nimport java.util.*\nimport java.io.Serializable\ndata class Message @JvmOverloads constructor(val values: Map<String, String> = hashMapOf()) : Serializable\n").unwrap();
+        fs::write(root.join("Runner.kt"), "package boundary\nfun main() {\n val provider: Variant = Provider()\n val first = provider.entries as MutableList<Entry>\n first.add(Entry())\n val second = provider.entries\n val message = Message()\n val other = Message()\n (message.values as MutableMap<String, String>)[\"key\"] = \"value\"\n println(\"${first.size}|${second.size}|${first === second}|${message.values.size}|${other.values.size}|${message.values === other.values}\")\n}\n").unwrap();
     }
     let mut baseline =
         JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
     target_java_17(&mut baseline);
     baseline.kotlinc_args.push("-Xjvm-default=all".into());
-    baseline.kotlin_sources = ["Variant.kt", "Provider.kt", "Runner.kt"]
+    baseline.kotlin_sources = ["Variant.kt", "Provider.kt", "Message.kt", "Runner.kt"]
         .iter()
         .map(|name| original.join(name))
         .collect();
@@ -3049,6 +3464,7 @@ fn real_toolchain_preserves_default_collection_factory_with_platform_wildcard() 
         .args(["--annotations", "none", "--in-place"])
         .arg(migrated.join("Variant.kt"))
         .arg(migrated.join("Provider.kt"))
+        .arg(migrated.join("Message.kt"))
         .output()
         .unwrap();
     assert!(
@@ -3059,6 +3475,11 @@ fn real_toolchain_preserves_default_collection_factory_with_platform_wildcard() 
     assert!(
         migrated.join("Variant.java").is_file(),
         "default factory interface must translate: {}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        migrated.join("Message.java").is_file(),
+        "constructor factory default must translate: {}",
         String::from_utf8_lossy(&translation.stderr)
     );
     fs::write(migrated.join("PolicyRunner.java"), r#"package boundary; public class PolicyRunner { public static void main(String[] args) { Provider provider = new Provider(); java.util.List<?> names = provider.getNames(); names.add(null); java.util.Set<?> tags = provider.getTags(); tags.add(null); java.util.Map<?, ?> values = provider.getValues(); values.put(null, null); System.out.println(names.size() + "|" + tags.size() + "|" + values.size()); } }"#).unwrap();
@@ -3079,7 +3500,7 @@ fn real_toolchain_preserves_default_collection_factory_with_platform_wildcard() 
     let migrated_result = validate_jvm_sources(&mixed).expect("migrated default factory compiles");
     assert_eq!(
         original_result.commands.last().unwrap().stdout.trim(),
-        "1|0|false"
+        "1|0|false|1|0|false"
     );
     assert_eq!(
         original_result.commands.last().unwrap().stdout,
@@ -4176,5 +4597,1254 @@ fun main() {
         mixed_report.commands.last().unwrap().stdout.trim(),
         baseline_output,
         "reflection values, abstract payload getter identity, and default getter behavior must match"
+    );
+}
+
+/// Compare Kotlin data-class copy calls with the translated Java lowering,
+/// including source-order and single-evaluation guarantees for qualified
+/// receivers and named arguments.
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_data_class_copy_behavior() {
+    let (Some(kotlinc), Some(javac), Some(java), Some(stdlib)) = (
+        std::env::var_os("NOTLIN_KOTLINC"),
+        std::env::var_os("NOTLIN_JAVAC"),
+        std::env::var_os("NOTLIN_JAVA"),
+        std::env::var_os("NOTLIN_KOTLIN_STDLIB"),
+    ) else {
+        panic!("set NOTLIN_KOTLINC, NOTLIN_JAVAC, NOTLIN_JAVA, and NOTLIN_KOTLIN_STDLIB");
+    };
+    let scratch = Scratch::new_under(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/jvm-validation"),
+        "data class copy behavior",
+    );
+    let root = scratch.0.join("source root");
+    fs::create_dir_all(&root).unwrap();
+    let model = root.join("Record.kt");
+    let runner = root.join("Runner.kt");
+    fs::write(
+        &model,
+        r#"package boundary
+data class Record<T>(val count: Int, val item: T?, val label: String, val enabled: Boolean = false) {
+    var receiverCalls: Int = 0
+    var trace: String = ""
+
+    private fun markInt(tag: String, value: Int): Int {
+        trace += tag
+        return value
+    }
+
+    private fun markString(tag: String, value: String): String {
+        trace += tag
+        return value
+    }
+
+    private fun combine(left: String, right: String): String = left + right
+    private fun add(left: Int, right: Int): Int = left + right
+
+    fun selfCopy(nextCount: Int, nextLabel: String): Record<T> =
+        copy(
+            label = combine(markString("self-left", nextLabel), markString("self-right", "!")),
+            count = nextCount
+        )
+
+    private fun nextRecord(): Record<T> {
+        receiverCalls += 1
+        return Record(10, item, "source", true)
+    }
+
+    fun qualifiedCopy(): Record<T> {
+        var mutableCount = 4
+        var nullableItem: T? = null
+        return nextRecord().copy(
+            label = combine(markString("qual-left", "new"), markString("qual-right", "!")),
+            count = add(markInt("count-left", mutableCount), markInt("count-right", 2)),
+            item = nullableItem
+        )
+    }
+}
+
+data class GuardedCopy(@JvmField val item: String) {
+    fun getItem(): String = "wrong"
+    fun item(): String = "wrong"
+    fun duplicate(): GuardedCopy = copy()
+}
+class SuppliedCopy {
+    fun replaced(original: GuardedCopy, next: String): GuardedCopy = original.copy(item = next)
+}
+
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &runner,
+        r#"package boundary
+fun main() {
+    val original = Record<String>(1, null, "base", true)
+    suspend fun retainedCopyHarness() {}
+    val self = original.selfCopy(5, "self")
+    val qualified = original.qualifiedCopy()
+    val guarded = GuardedCopy("right").duplicate()
+    val supplied = SuppliedCopy().replaced(guarded, "fresh")
+    println("${self.count}|${self.item}|${self.label}|${self.enabled}|${qualified.count}|${qualified.item}|${qualified.label}|${qualified.enabled}|${original.trace}|${original.receiverCalls}|${guarded.item}|${supplied.item}")
+}
+suspend fun retainedBoundary() {}
+"#,
+    )
+    .unwrap();
+
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("baseline classes"));
+    target_java_17(&mut baseline);
+    baseline
+        .kotlin_sources
+        .extend([model.clone(), runner.clone()]);
+    baseline.classpath.push(PathBuf::from(&stdlib));
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original Kotlin copy behavior compiles");
+    let before_stdout = before.commands.last().unwrap().stdout.trim().to_owned();
+    assert_eq!(
+        before_stdout,
+        "5|null|self!|true|6|null|new!|true|self-leftself-rightqual-leftqual-rightcount-leftcount-right|1|right|fresh"
+    );
+
+    let transpile = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root"])
+        .arg(&root)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&root)
+        .output()
+        .expect("run notlin data-class copy migration");
+    assert!(
+        transpile.status.success(),
+        "data-class copy migration failed: {}",
+        String::from_utf8_lossy(&transpile.stderr)
+    );
+    let generated = root.join("Record.java");
+    assert!(
+        generated.is_file(),
+        "data-class copy owner was retained instead of translated; stderr: {}",
+        String::from_utf8_lossy(&transpile.stderr)
+    );
+    assert!(
+        runner.is_file(),
+        "suspend boundary should retain the Kotlin runner"
+    );
+    assert!(
+        model.is_file() && !root.join("GuardedCopy.java").exists(),
+        "a copy with conflicting custom component accessors must retain its owner"
+    );
+
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    mixed.kotlin_sources.push(runner);
+    mixed.kotlin_sources.push(model);
+    mixed.java_sources.push(generated);
+    let supplied_java = root.join("SuppliedCopy.java");
+    assert!(
+        supplied_java.is_file(),
+        "an explicitly supplied copy should still translate across the retained owner boundary"
+    );
+    mixed.java_sources.push(supplied_java);
+    mixed.classpath.push(PathBuf::from(stdlib));
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("translated copy behavior compiles");
+    assert_eq!(
+        after.commands.last().unwrap().stdout.trim(),
+        before_stdout,
+        "translated data-class copies must preserve values, evaluation order, and receiver count"
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_readonly_list_contract_identity_and_getter_annotations() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = PathBuf::from(std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC"));
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("readonly list contract identity");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("GetterTag.java"), "package boundary; @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @java.lang.annotation.Target(java.lang.annotation.ElementType.METHOD) public @interface GetterTag {}\n").unwrap();
+        fs::write(
+            root.join("Definitions.kt"),
+            "package boundary\ninterface Base {}\nclass Derived : Base {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("Parent.kt"), "package boundary\ninterface Parent {\n @get:GetterTag\n val items: List<Base>\n companion object {\n  suspend fun remainKotlin() {}\n }\n}\n").unwrap();
+        fs::write(root.join("Child.kt"), "package boundary\nclass Child(@get:GetterTag override val items: List<Derived>) : Parent {}\n").unwrap();
+        fs::write(root.join("Sibling.kt"), "package boundary\nclass Sibling(override val items: List<Derived>) : Parent {\n suspend fun remainKotlin() {}\n}\n").unwrap();
+        fs::write(root.join("Runner.kt"), r#"package boundary
+fun main() {
+ suspend fun retainedHarness() {}
+ val items = listOf(Derived())
+ val child = Child(items)
+ val parent: Parent = child
+ val sibling: Parent = Sibling(items)
+ val getter = Parent::class.java.getDeclaredMethod("getItems")
+ val childGetter = Child::class.java.getDeclaredMethod("getItems")
+ val physical = Parent::class.java.declaredMethods.count { it.name == "getItems" }
+ println("${child.items === items}|${parent.items === items}|${sibling.items === items}|${getter.isAnnotationPresent(GetterTag::class.java)}|${childGetter.isAnnotationPresent(GetterTag::class.java)}|$physical")
+}
+
+
+"#).unwrap();
+    }
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    for entry in fs::read_dir(&original).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("kt") => baseline.kotlin_sources.push(path),
+            Some("java") => baseline.java_sources.push(path),
+            _ => {}
+        }
+    }
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original list contracts compile");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        "true|true|true|true|true|1"
+    );
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&migrated)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        migrated.join("Child.java").is_file(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    let parent = fs::read_to_string(migrated.join("Parent.kt")).unwrap();
+    assert!(
+        parent.contains("List<@kotlin.jvm.JvmWildcard Base>"),
+        "{parent}"
+    );
+    let mut mixed =
+        JvmValidationConfig::new(&kotlinc, &javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    for entry in fs::read_dir(&migrated).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("kt") => mixed.kotlin_sources.push(path),
+            Some("java") => mixed.java_sources.push(path),
+            _ => {}
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("mixed list contracts compile");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+    let javap = javac
+        .parent()
+        .unwrap()
+        .join(if cfg!(windows) { "javap.exe" } else { "javap" });
+    let inspection = std::process::Command::new(javap)
+        .args(["-p", "-classpath"])
+        .arg(&mixed.output_dir)
+        .arg("boundary.Parent")
+        .output()
+        .unwrap();
+    assert!(inspection.status.success());
+    let signature = String::from_utf8_lossy(&inspection.stdout);
+    assert!(
+        signature.contains("java.util.List<? extends boundary.Base> getItems()"),
+        "{signature}"
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_generic_default_getters_over_retained_descendants() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("generic default getter paths");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("GetterTag.java"), "package boundary; @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @java.lang.annotation.Target(java.lang.annotation.ElementType.METHOD) public @interface GetterTag {}\n").unwrap();
+        fs::write(
+            root.join("RootAware.java"),
+            "package boundary; public interface RootAware extends java.io.Serializable { BaseKey getKey(); }\n",
+        )
+        .unwrap();
+        fs::write(root.join("GenericBase.java"), "package boundary; public interface GenericBase<E extends Entity<K>, K extends BaseKey> extends RootAware { K getKey(); }\n").unwrap();
+        fs::write(
+            root.join("Model.kt"),
+            r#"package boundary
+interface BaseKey {}
+class KeyBox<V>(val value: V) : BaseKey {}
+interface Entity<K : BaseKey> : RootAware {
+    override fun getKey(): K
+    suspend fun keepEntity()
+}
+class Payload<K : BaseKey>(private val provided: K) : Entity<K> {
+    override fun getKey(): K = provided
+    override suspend fun keepEntity() {}
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("DefaultEvent.kt"),
+            r#"package boundary
+interface DefaultEvent<E : Entity<K>, K : BaseKey> : GenericBase<E, K> {
+    fun getPayload(): E
+    @GetterTag
+    override fun getKey(): K = getPayload().key
+    @get:GetterTag
+    val envelope: Any get() = getKey()
+}
+interface ForwardEvent<X> : DefaultEvent<Payload<KeyBox<List<X>>>, KeyBox<List<X>>> {}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("KeptEvent.kt"),
+            r#"package boundary
+class KeptEvent<X>(private val provided: Payload<KeyBox<List<X>>>) : ForwardEvent<X> {
+    override fun getPayload(): Payload<KeyBox<List<X>>> = provided
+    suspend fun remainKotlin() {}
+}
+class ConcreteEvent(private val provided: Payload<KeyBox<List<String>>>) : ForwardEvent<String>, Comparable<ConcreteEvent> {
+    override fun getPayload(): Payload<KeyBox<List<String>>> = provided
+    override fun compareTo(other: ConcreteEvent): Int = 0
+    suspend fun remainKotlin() {}
+}
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("Runner.kt"), r#"package boundary
+fun main() {
+    suspend fun retainedHarness() {}
+    val items = listOf("value")
+    val key = KeyBox(items)
+    val payload = Payload(key)
+    val event: ForwardEvent<String> = KeptEvent(payload)
+    val concrete = ConcreteEvent(payload)
+    val generic: GenericBase<Payload<KeyBox<List<String>>>, KeyBox<List<String>>> = event
+    val broad: RootAware = event
+    val keyGetter = DefaultEvent::class.java.getDeclaredMethod("getKey")
+    val envelopeGetter = DefaultEvent::class.java.getDeclaredMethod("getEnvelope")
+    val physical = DefaultEvent::class.java.declaredMethods.count { it.name == "getKey" && !it.isBridge }
+    println("${event.getKey() === key}|${generic.getKey() === key}|${broad.getKey() === key}|${concrete.getKey() === key}|${event.envelope === key}|${key.value === items}|${keyGetter.isAnnotationPresent(GetterTag::class.java)}|${envelopeGetter.isAnnotationPresent(GetterTag::class.java)}|$physical")
+}
+"#).unwrap();
+    }
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    for entry in fs::read_dir(&original).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("kt") => baseline.kotlin_sources.push(path),
+            Some("java") => baseline.java_sources.push(path),
+            _ => {}
+        }
+    }
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original generic default getters compile");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        "true|true|true|true|true|true|true|true|1"
+    );
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&migrated)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        migrated.join("DefaultEvent.java").is_file(),
+        "default getter provider must translate: {}\n{}",
+        String::from_utf8_lossy(&translation.stderr),
+        fs::read_to_string(migrated.join("DefaultEvent.kt")).unwrap_or_default()
+    );
+    assert!(
+        migrated.join("KeptEvent.kt").is_file(),
+        "suspend descendants must remain Kotlin"
+    );
+    let mut mixed =
+        JvmValidationConfig::new(&kotlinc, &javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    for entry in fs::read_dir(&migrated).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("kt") => mixed.kotlin_sources.push(path),
+            Some("java") => mixed.java_sources.push(path),
+            _ => {}
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("mixed generic default getters compile");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_chained_calls_with_producer_scoped_return_types() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("producer scoped chained returns");
+    let root = scratch.0.join("sources");
+    fs::create_dir_all(&root).unwrap();
+    let mut original_sources = Vec::new();
+    for (name, source) in [
+        (
+            "model/Payload.kt",
+            "package model\nclass Payload(private val value: String) {\n val item: Item get() = Item(value)\n fun getId(): String = value\n}\n",
+        ),
+        (
+            "model/Item.kt",
+            "package model\nclass Item(private val value: String) {\n fun getId(): String = value\n}\n",
+        ),
+        (
+            "other/Payload.kt",
+            "package other\nclass Payload {\n fun getId(index: Int): Int = index\n}\n",
+        ),
+        (
+            "api/Provider.kt",
+            "package api\nimport model.Payload\nclass Provider(private val payload: Payload) {\n fun getPayload(): Payload = payload\n}\n",
+        ),
+        (
+            "consumer/Reader.kt",
+            "package consumer\nimport api.Provider\nimport other.Payload\nclass Reader {\n fun read(provider: Provider): String = provider.getPayload().item.getId()\n}\n",
+        ),
+        (
+            "consumer/Runner.kt",
+            "package consumer\nimport api.Provider\nimport model.Payload\nfun main() {\n suspend fun retainedHarness() {}\n println(Reader().read(Provider(Payload(\"value\"))))\n}\n",
+        ),
+    ] {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, source).unwrap();
+        original_sources.push(path);
+    }
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlin_sources = original_sources;
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("consumer.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original producer-scoped chain compiles");
+    assert_eq!(before.commands.last().unwrap().stdout.trim(), "value");
+
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&root)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        root.join("consumer/Reader.java").is_file(),
+        "producer-scoped caller should translate: {}\n{}",
+        String::from_utf8_lossy(&translation.stderr),
+        fs::read_to_string(root.join("consumer/Reader.kt")).unwrap_or_default()
+    );
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    let mut directories = vec![root];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+            } else {
+                match path.extension().and_then(|extension| extension.to_str()) {
+                    Some("kt") => mixed.kotlin_sources.push(path),
+                    Some("java") => mixed.java_sources.push(path),
+                    _ => {}
+                }
+            }
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("consumer.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("mixed producer-scoped chain compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_comparison_through_declared_interface_properties() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("declared property comparison");
+    let root = scratch.0.join("sources");
+    fs::create_dir_all(&root).unwrap();
+    for (name, source) in [
+        (
+            "Keyed.kt",
+            "package sample\ninterface Keyed : Comparable<Keyed> {\n val key: String\n override fun compareTo(other: Keyed): Int = this.key.compareTo(other.key)\n}\n",
+        ),
+        (
+            "Entry.kt",
+            "package sample\ndata class Entry(override val key: String) : Keyed\n",
+        ),
+        (
+            "Runner.kt",
+            "package sample\nfun main() {\n suspend fun retainedHarness() {}\n val a: Keyed = Entry(\"a\")\n val b: Keyed = Entry(\"b\")\n println(a.compareTo(b).toString() + \"|\" + b.compareTo(a) + \"|\" + a.compareTo(a))\n}\n",
+        ),
+    ] {
+        fs::write(root.join(name), source).unwrap();
+    }
+    let mut original =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut original);
+    original.kotlin_sources = ["Keyed.kt", "Entry.kt", "Runner.kt"]
+        .into_iter()
+        .map(|name| root.join(name))
+        .collect();
+    original.classpath.push(stdlib.clone());
+    original.run_main_class = Some("sample.RunnerKt".into());
+    let before = validate_jvm_sources(&original).expect("original property comparison compiles");
+    assert_eq!(before.commands.last().unwrap().stdout.trim(), "-1|1|0");
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&root)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        root.join("Keyed.java").is_file(),
+        "comparison interface should translate"
+    );
+    assert!(
+        root.join("Entry.java").is_file(),
+        "implementation should translate"
+    );
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    for entry in fs::read_dir(&root).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("kt") => mixed.kotlin_sources.push(path),
+            Some("java") => mixed.java_sources.push(path),
+            _ => {}
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("sample.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("mixed property comparison compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_proven_decimal_arithmetic_chains() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("proven decimal chains");
+    let root = scratch.0.join("sources");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("DecimalAmount.kt"), "package sample\nimport java.math.BigDecimal\nclass DecimalAmount(private val value: BigDecimal) {\n fun compute(other: BigDecimal): String = value.add(other).divide(BigDecimal.TEN).negate().stripTrailingZeros().toPlainString()\n fun compare(other: BigDecimal): Int = this.value.compareTo(other)\n}\n").unwrap();
+    fs::write(root.join("Runner.kt"), "package sample\nimport java.math.BigDecimal\nfun main() {\n suspend fun retainedHarness() {}\n val amount = DecimalAmount(BigDecimal(\"5.0\"))\n println(amount.compute(BigDecimal(\"7.5\")) + \"|\" + amount.compare(BigDecimal(\"20\")))\n}\n").unwrap();
+    let mut original =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut original);
+    original.kotlin_sources = vec![root.join("DecimalAmount.kt"), root.join("Runner.kt")];
+    original.classpath.push(stdlib.clone());
+    original.run_main_class = Some("sample.RunnerKt".into());
+    let before = validate_jvm_sources(&original).expect("original decimal chain compiles");
+    assert_eq!(before.commands.last().unwrap().stdout.trim(), "-1.25|-1");
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&root)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        root.join("DecimalAmount.java").is_file(),
+        "decimal arithmetic class should translate: {}",
+        fs::read_to_string(root.join("DecimalAmount.kt")).unwrap_or_default()
+    );
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    mixed.java_sources.push(root.join("DecimalAmount.java"));
+    mixed.kotlin_sources.push(root.join("Runner.kt"));
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("sample.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("mixed decimal chain compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_bounded_generic_getter_chains() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("bounded generic getter chain");
+    let root = scratch.0.join("sources");
+    fs::create_dir_all(&root).unwrap();
+    for (name, source) in [
+        (
+            "ObjectId.kt",
+            r#"package sample
+interface ObjectId {
+    fun getObjectId(): String
+}
+"#,
+        ),
+        (
+            "HasId.kt",
+            r#"package sample
+interface HasId<T : ObjectId> {
+    fun getId(): T
+    fun describeId(): String = getId().getObjectId()
+}
+"#,
+        ),
+        (
+            "SpecificId.kt",
+            r#"package sample
+data class SpecificId(private val value: String) : ObjectId {
+    override fun getObjectId(): String = value
+}
+"#,
+        ),
+        (
+            "RetainedHolder.kt",
+            r#"package sample
+class RetainedHolder(private val id: SpecificId) : HasId<SpecificId> {
+    override fun getId(): SpecificId = id
+    suspend fun retainedHook() {}
+}
+"#,
+        ),
+        (
+            "Runner.kt",
+            r#"package sample
+fun main() {
+    suspend fun retainedHarness() {}
+    val value: HasId<SpecificId> = RetainedHolder(SpecificId("generic-id"))
+    val genericReturn = HasId::class.java.getDeclaredMethod("getId").genericReturnType.typeName
+    println(value.describeId() + "|" + genericReturn)
+}
+"#,
+        ),
+    ] {
+        fs::write(root.join(name), source).unwrap();
+    }
+
+    let mut original =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut original);
+    original.kotlin_sources = [
+        "ObjectId.kt",
+        "HasId.kt",
+        "SpecificId.kt",
+        "RetainedHolder.kt",
+        "Runner.kt",
+    ]
+    .into_iter()
+    .map(|name| root.join(name))
+    .collect();
+    original.classpath.push(stdlib.clone());
+    original.run_main_class = Some("sample.RunnerKt".into());
+    let before = validate_jvm_sources(&original).expect("original generic chain compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        "generic-id|T"
+    );
+
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&root)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    let has_id_java = root.join("HasId.java");
+    assert!(
+        has_id_java.is_file(),
+        "generic interface should translate; retained source: {}",
+        fs::read_to_string(root.join("HasId.kt")).unwrap_or_default()
+    );
+    let java_contract = fs::read_to_string(has_id_java).unwrap();
+    assert!(
+        java_contract.contains("interface HasId<T extends ObjectId>"),
+        "{java_contract}"
+    );
+    assert!(
+        java_contract.contains("T getId();"),
+        "generic return type was widened:\n{java_contract}"
+    );
+
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    for entry in fs::read_dir(&root).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("kt") => mixed.kotlin_sources.push(path),
+            Some("java") => mixed.java_sources.push(path),
+            _ => {}
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("sample.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("mixed bounded generic chain compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_retains_child_over_defaultimpls_dependent_kotlin_parent() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("forwarded child over retained generic method parent");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    let sources = [
+        (
+            "Contract.kt",
+            r#"package boundary
+interface Contract<T> {
+    fun payload(): T
+    fun key(): String
+    fun defaultLabel(): String = key() + ":" + payload().toString()
+
+    companion object {
+        suspend fun retainedHelper(): String = "kept"
+    }
+}
+"#,
+        ),
+        (
+            "Forwarded.kt",
+            r#"package boundary
+interface Forwarded<T> : Contract<T> {
+    fun label(): String = defaultLabel() + ":child"
+}
+"#,
+        ),
+        (
+            "Kept.kt",
+            r#"package boundary
+class Kept<T>(private val content: T, private val keyText: String) : Forwarded<T> {
+    override fun payload(): T = content
+    override fun key(): String = keyText
+    suspend fun retainedHook() {}
+}
+"#,
+        ),
+        (
+            "Runner.kt",
+            r#"package boundary
+fun main() {
+    suspend fun retainedHarness() {}
+    val child: Forwarded<String> = Kept("payload", "key")
+    val parent: Contract<String> = child
+    val genericParent = Forwarded::class.java.genericInterfaces.single().typeName
+    println(child.label() + "|" + parent.defaultLabel() + "|" + child.payload() + "|" + genericParent)
+}
+"#,
+        ),
+    ];
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        for (name, source) in sources {
+            fs::write(root.join(name), source).unwrap();
+        }
+    }
+
+    let modes = ["disable", "all"];
+    let mut before_outputs = Vec::new();
+    for mode in modes {
+        let mut baseline = JvmValidationConfig::new(
+            &kotlinc,
+            &javac,
+            &java,
+            scratch.0.join(format!("original classes {mode}")),
+        );
+        target_java_17(&mut baseline);
+        baseline
+            .kotlinc_args
+            .push(format!("-Xjvm-default={mode}").into());
+        baseline.kotlin_sources = ["Contract.kt", "Forwarded.kt", "Kept.kt", "Runner.kt"]
+            .into_iter()
+            .map(|name| original.join(name))
+            .collect();
+        baseline.classpath.push(stdlib.clone());
+        baseline.run_main_class = Some("boundary.RunnerKt".into());
+        let before = validate_jvm_sources(&baseline)
+            .unwrap_or_else(|error| panic!("original {mode} hierarchy failed: {error}"));
+        let output = before.commands.last().unwrap().stdout.trim().to_owned();
+        assert_eq!(
+            output, "key:payload:child|key:payload|payload|boundary.Contract<T>",
+            "original output in -Xjvm-default={mode}"
+        );
+        before_outputs.push(output);
+    }
+
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&migrated)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        migrated.join("Contract.kt").is_file() && !migrated.join("Contract.java").exists(),
+        "the unsupported companion must keep the generic contract in Kotlin"
+    );
+    assert!(
+        migrated.join("Forwarded.kt").is_file() && !migrated.join("Forwarded.java").exists(),
+        "a child default depending on a retained Kotlin parent must stay Kotlin"
+    );
+    assert!(
+        migrated.join("Kept.kt").is_file() && !migrated.join("Kept.java").exists(),
+        "the suspend implementation must remain Kotlin"
+    );
+    for (index, mode) in modes.into_iter().enumerate() {
+        let mut mixed = JvmValidationConfig::new(
+            &kotlinc,
+            &javac,
+            &java,
+            scratch.0.join(format!("mixed classes {mode}")),
+        );
+        target_java_17(&mut mixed);
+        mixed
+            .kotlinc_args
+            .push(format!("-Xjvm-default={mode}").into());
+        for entry in fs::read_dir(&migrated).unwrap() {
+            let path = entry.unwrap().path();
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("kt") => mixed.kotlin_sources.push(path),
+                Some("java") => mixed.java_sources.push(path),
+                _ => {}
+            }
+        }
+        mixed.classpath.push(stdlib.clone());
+        mixed.run_main_class = Some("boundary.RunnerKt".into());
+        let after = validate_jvm_sources(&mixed)
+            .unwrap_or_else(|error| panic!("mixed {mode} hierarchy failed: {error}"));
+        assert_eq!(
+            before_outputs[index],
+            after.commands.last().unwrap().stdout.trim(),
+            "mixed output in -Xjvm-default={mode}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_translates_child_default_over_abstract_retained_generic_parent() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("child default over abstract generic parent");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    let sources = [
+        (
+            "PlatformContract.java",
+            r#"package boundary;
+public interface PlatformContract<T> {
+    T payload();
+    default String platformLabel() { return "platform"; }
+    default boolean matches(T value) { return java.util.Objects.equals(payload(), value); }
+    default java.util.List<T> payloads() { return java.util.Collections.singletonList(payload()); }
+}
+"#,
+        ),
+        (
+            "Contract.kt",
+            r#"package boundary
+interface Contract<T> : PlatformContract<T> {
+    override fun payload(): T
+    fun key(): String
+    fun defaultLabel(): String
+
+    companion object {
+        suspend fun retainedHelper(): String = "kept"
+    }
+}
+"#,
+        ),
+        (
+            "Forwarded.kt",
+            r#"package boundary
+interface Forwarded<T> : Contract<T> {
+    fun label(): String = defaultLabel() + ":child:" + platformLabel()
+}
+"#,
+        ),
+        (
+            "Kept.kt",
+            r#"package boundary
+class Kept<T>(private val content: T, private val keyText: String) : Forwarded<T> {
+    override fun payload(): T = content
+    override fun key(): String = keyText
+    override fun defaultLabel(): String = key() + ":" + payload().toString()
+    suspend fun retainedHook() {}
+}
+"#,
+        ),
+        (
+            "Runner.kt",
+            r#"package boundary
+fun main() {
+    suspend fun retainedHarness() {}
+    val child: Forwarded<String> = Kept("payload", "key")
+    val parent: Contract<String> = child
+    val genericParent = Forwarded::class.java.genericInterfaces.single().typeName
+    val contractParent = Contract::class.java.genericInterfaces.single().typeName
+    val platformReturn = PlatformContract::class.java.getDeclaredMethod("payload").genericReturnType.typeName
+    println(child.label() + "|" + parent.defaultLabel() + "|" + child.payload() + "|" + genericParent + "|" + contractParent + "|" + platformReturn + "|" + parent.matches("payload") + "|" + parent.payloads().single())
+}
+"#,
+        ),
+    ];
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        for (name, source) in sources {
+            fs::write(root.join(name), source).unwrap();
+        }
+    }
+
+    let modes = ["disable", "all"];
+    let mut before_outputs = Vec::new();
+    for mode in modes {
+        let mut baseline = JvmValidationConfig::new(
+            &kotlinc,
+            &javac,
+            &java,
+            scratch.0.join(format!("abstract original classes {mode}")),
+        );
+        target_java_17(&mut baseline);
+        baseline
+            .kotlinc_args
+            .push(format!("-Xjvm-default={mode}").into());
+        baseline.kotlin_sources = ["Contract.kt", "Forwarded.kt", "Kept.kt", "Runner.kt"]
+            .into_iter()
+            .map(|name| original.join(name))
+            .collect();
+        baseline
+            .java_sources
+            .push(original.join("PlatformContract.java"));
+        baseline.classpath.push(stdlib.clone());
+        baseline.run_main_class = Some("boundary.RunnerKt".into());
+        let before = validate_jvm_sources(&baseline)
+            .unwrap_or_else(|error| panic!("original abstract-parent {mode} failed: {error}"));
+        let output = before.commands.last().unwrap().stdout.trim().to_owned();
+        assert_eq!(
+            output,
+            "key:payload:child:platform|key:payload|payload|boundary.Contract<T>|boundary.PlatformContract<T>|T|true|payload",
+            "original output in -Xjvm-default={mode}"
+        );
+        before_outputs.push(output);
+    }
+
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&migrated)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(
+        migrated.join("Contract.kt").is_file() && !migrated.join("Contract.java").exists(),
+        "the unsupported companion must retain the abstract generic parent"
+    );
+    assert!(
+        migrated.join("Forwarded.java").is_file(),
+        "the self-contained child default should translate: {}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    assert!(migrated.join("Kept.kt").is_file());
+    let child_contract = fs::read_to_string(migrated.join("Forwarded.java")).unwrap();
+    let normalized = child_contract
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        normalized.contains("interface Forwarded<T> extends Contract<T>"),
+        "generic parent signature was erased:\n{child_contract}"
+    );
+    assert!(
+        child_contract.contains("default String label()")
+            && child_contract.contains("defaultLabel()")
+            && child_contract.contains("platformLabel()"),
+        "child default should invoke the abstract parent method:\n{child_contract}"
+    );
+
+    for (index, mode) in modes.into_iter().enumerate() {
+        let mut mixed = JvmValidationConfig::new(
+            &kotlinc,
+            &javac,
+            &java,
+            scratch.0.join(format!("abstract mixed classes {mode}")),
+        );
+        target_java_17(&mut mixed);
+        mixed
+            .kotlinc_args
+            .push(format!("-Xjvm-default={mode}").into());
+        for entry in fs::read_dir(&migrated).unwrap() {
+            let path = entry.unwrap().path();
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("kt") => mixed.kotlin_sources.push(path),
+                Some("java") => mixed.java_sources.push(path),
+                _ => {}
+            }
+        }
+        mixed.classpath.push(stdlib.clone());
+        mixed.run_main_class = Some("boundary.RunnerKt".into());
+        let after = validate_jvm_sources(&mixed)
+            .unwrap_or_else(|error| panic!("mixed abstract-parent {mode} failed: {error}"));
+        assert_eq!(
+            before_outputs[index],
+            after.commands.last().unwrap().stdout.trim(),
+            "mixed output in -Xjvm-default={mode}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_preserves_named_generic_bound_member_chain() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("named generic bound member chain");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    let sources = [
+        (
+            "Identifier.kt",
+            r#"package boundary
+interface Identifier {
+    fun label(): String
+}
+
+"#,
+        ),
+        (
+            "Entity.kt",
+            r#"package boundary
+interface Entity<I : Identifier> {
+    fun getId(): I
+    fun describe(): String = getId().label()
+}
+"#,
+        ),
+        (
+            "Holder.kt",
+            r#"package boundary
+interface Holder<I : Identifier, T : Entity<I>> {
+    fun getValue(): T
+    fun summary(): String = getValue().describe()
+}
+"#,
+        ),
+        (
+            "Concrete.kt",
+            r#"package boundary
+class SpecificIdentifier(private val text: String) : Identifier {
+    override fun label(): String = text
+}
+class SpecificEntity<I : Identifier>(private val id: I) : Entity<I> {
+    override fun getId(): I = id
+}
+"#,
+        ),
+        (
+            "KeptHolder.kt",
+            r#"package boundary
+class KeptHolder<I : Identifier, T : Entity<I>>(private val value: T) : Holder<I, T> {
+    override fun getValue(): T = value
+    suspend fun retainedHook() {}
+}
+"#,
+        ),
+        (
+            "Runner.kt",
+            r#"package boundary
+fun main() {
+    suspend fun retainedHarness() {}
+    val identifier = SpecificIdentifier("specific-id")
+    val entity = SpecificEntity(identifier)
+    val holder: Holder<SpecificIdentifier, SpecificEntity<SpecificIdentifier>> = KeptHolder(entity)
+    val value = holder.getValue()
+    val holderReturn = Holder::class.java.getDeclaredMethod("getValue").genericReturnType.typeName
+    val entityReturn = Entity::class.java.getDeclaredMethod("getId").genericReturnType.typeName
+    println(holder.summary() + "|" + value.describe() + "|" + holderReturn + "|" + entityReturn)
+}
+"#,
+        ),
+    ];
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        for (name, source) in sources {
+            fs::write(root.join(name), source).unwrap();
+        }
+    }
+
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlin_sources = [
+        "Identifier.kt",
+        "Entity.kt",
+        "Holder.kt",
+        "Concrete.kt",
+        "KeptHolder.kt",
+        "Runner.kt",
+    ]
+    .into_iter()
+    .map(|name| original.join(name))
+    .collect();
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original named generic bound compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        "specific-id|specific-id|T|I"
+    );
+
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place"])
+        .arg(&migrated)
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    for name in ["Entity", "Holder", "SpecificIdentifier", "SpecificEntity"] {
+        assert!(
+            migrated.join(format!("{name}.java")).is_file(),
+            "{name} should translate; stderr:\n{}",
+            String::from_utf8_lossy(&translation.stderr)
+        );
+    }
+    assert!(
+        migrated.join("KeptHolder.kt").is_file() && !migrated.join("KeptHolder.java").exists(),
+        "the suspend concrete implementation should remain Kotlin"
+    );
+    let holder_java = fs::read_to_string(migrated.join("Holder.java")).unwrap();
+    assert!(
+        holder_java.contains("T extends Entity<I>") && holder_java.contains("T getValue();"),
+        "the declared generic bound/return must remain structured:\n{holder_java}"
+    );
+    assert!(
+        holder_java.contains("getValue().describe()"),
+        "the emitted default method must use the bounded member chain:\n{holder_java}"
+    );
+
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    for entry in fs::read_dir(&migrated).unwrap() {
+        let path = entry.unwrap().path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("kt") => mixed.kotlin_sources.push(path),
+            Some("java") => mixed.java_sources.push(path),
+            _ => {}
+        }
+    }
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("mixed named generic bound compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
     );
 }

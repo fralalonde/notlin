@@ -36,7 +36,33 @@ pub struct Unit<'src, 'tree> {
         crate::semantics::FactStatus<crate::semantics::TypeRef>,
     )>,
     pub output_owners: std::collections::HashMap<String, Vec<crate::semantics::SymbolId>>,
+    pub(crate) preparation_failure: Option<String>,
     pub semantic_provider: Option<&'src dyn crate::semantics::SemanticProvider>,
+    pub(crate) enum_when_lowerings:
+        std::collections::HashMap<usize, crate::semantics::EnumWhenLowering>,
+    pub(crate) todo_lowerings: std::collections::HashMap<usize, crate::semantics::TodoLowering>,
+    pub(crate) reference_string_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::ReferenceStringCall>,
+    pub(crate) container_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::ContainerMemberCall>,
+    pub(crate) container_lambdas:
+        std::collections::HashMap<(usize, usize), crate::semantics::ContainerLambdaBinding>,
+    pub(crate) container_property_accesses:
+        std::collections::HashMap<(usize, usize), crate::semantics::ContainerPropertyAccess>,
+    pub(crate) eager_collection_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::EagerCollectionCall>,
+    pub(crate) eager_collection_helpers: Vec<crate::translation_plan::PlannedEagerCollectionHelper>,
+    pub(crate) local_expression_aliases: std::collections::HashMap<String, String>,
+    pub(crate) local_expression_types: std::collections::HashMap<String, crate::semantics::TypeRef>,
+    pub(crate) exact_overload_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::ExactOverloadCall>,
+    pub(crate) reified_class_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::ReifiedClassCall>,
+    pub(crate) constructor_delegations: std::collections::HashMap<
+        (usize, usize),
+        crate::translation_plan::PlannedConstructorDelegation,
+    >,
+    pub(crate) default_getter_bridges: Vec<crate::translation_plan::PlannedDefaultGetterBridge>,
     declaration_diagnostic_start: usize,
     /// Per-file coverage: which declarations translated, which didn't.
     pub coverage: FileCoverage,
@@ -124,12 +150,6 @@ pub struct Unit<'src, 'tree> {
     /// stream arm should collect with joining(sep) (not toList()) and the
     /// member's joinToString tail is stripped.
     pub(crate) pending_join_to_string: Option<String>,
-    /// Set by the super_expression arm when a qualified supertype member
-    /// access (`super.<member>`) follows and the qualifying supertype
-    /// (`SupName`) translated to Java: the navigation layer must emit the
-    /// qualified accessor form `SupName.super.getMember()`. Consumed (and
-    /// cleared) by the next navigation member step.
-    pub(crate) pending_super_owner: Option<String>,
     /// Callee nav text of the shape `.member<ty>` — a generic type argument
     /// written INSIDE the callee navigation (`context.get<T>()`). The call
     /// node itself carries no type_arguments child, so navigation_call stashes
@@ -157,6 +177,11 @@ pub struct Unit<'src, 'tree> {
     /// Visible Kotlin typealiases, resolved once per source file instead of
     /// once for every Java type emitted from that source.
     pub(crate) visible_typealiases: Vec<(String, String)>,
+    /// Provider-proven collection aliases are rewritten only at Java type-use
+    /// nodes, so matching source text cannot alter literals or identifiers.
+    pub(crate) proven_map_typealiases: Vec<(String, String)>,
+    /// Imported alias -> original spelling, collected once from import nodes.
+    pub(crate) import_alias_targets: std::collections::HashMap<String, String>,
     pub(crate) translation_roots: &'src [PathBuf],
     /// Retention-fixpoint retained set from the caller (probe passes): names
     /// known to be retained in Kotlin for intrinsic reasons. When Some, the
@@ -181,6 +206,50 @@ pub struct Unit<'src, 'tree> {
     /// retained Kotlin source), decided in the pre-pass — the loose-decl pass
     /// runs after the type loop, so callee checks need this decision early.
     pub(crate) retained_file_functions: std::collections::HashSet<String>,
+}
+
+fn is_java_type_use(node: tree_sitter::Node<'_>, name: &str, source: &str) -> bool {
+    // A file-visible alias does not override a method/class type parameter.
+    // Java's type nodes preserve that lexical scope, unlike text replacement.
+    let mut ancestor = node.parent();
+    while let Some(scope) = ancestor {
+        for parameters in scope
+            .named_children(&mut scope.walk())
+            .filter(|child| child.kind() == "type_parameters")
+        {
+            if parameters
+                .named_children(&mut parameters.walk())
+                .filter(|parameter| parameter.kind() == "type_parameter")
+                .any(|parameter| {
+                    parameter
+                        .named_children(&mut parameter.walk())
+                        .find(|child| child.kind() == "type_identifier")
+                        .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+                        == Some(name)
+                })
+            {
+                return false;
+            }
+        }
+        ancestor = scope.parent();
+    }
+    let mut child = node;
+    while let Some(parent) = child.parent() {
+        if parent.kind() == "scoped_type_identifier" {
+            return false;
+        }
+        if matches!(
+            parent.kind(),
+            "generic_type" | "array_type" | "annotated_type" | "type_arguments" | "wildcard"
+        ) {
+            child = parent;
+            continue;
+        }
+        return parent
+            .child_by_field_name("type")
+            .is_some_and(|ty| ty.id() == child.id());
+    }
+    false
 }
 
 /// Constructor-mode flags bundled for `Unit::new` (a plain value object
@@ -332,7 +401,22 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             untranslated_names: std::collections::HashSet::new(),
             type_facts: Vec::new(),
             output_owners: std::collections::HashMap::new(),
+            preparation_failure: None,
             semantic_provider: None,
+            enum_when_lowerings: std::collections::HashMap::new(),
+            todo_lowerings: std::collections::HashMap::new(),
+            reference_string_calls: std::collections::HashMap::new(),
+            container_calls: std::collections::HashMap::new(),
+            container_lambdas: std::collections::HashMap::new(),
+            container_property_accesses: std::collections::HashMap::new(),
+            eager_collection_calls: std::collections::HashMap::new(),
+            eager_collection_helpers: Vec::new(),
+            local_expression_aliases: std::collections::HashMap::new(),
+            local_expression_types: std::collections::HashMap::new(),
+            exact_overload_calls: std::collections::HashMap::new(),
+            reified_class_calls: std::collections::HashMap::new(),
+            constructor_delegations: std::collections::HashMap::new(),
+            default_getter_bridges: Vec::new(),
             tainted_declarations: std::collections::HashSet::new(),
             current_decl: None,
             decl_labels: std::collections::HashMap::new(),
@@ -357,7 +441,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             fn_rets: std::collections::HashMap::new(),
             pending_nav_text: None,
             pending_join_to_string: None,
-            pending_super_owner: None,
             pending_field_types: Vec::new(),
             data_components: std::collections::HashMap::new(),
             record_types: std::collections::HashSet::new(),
@@ -367,6 +450,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             workspace: None,
             workspace_file: None,
             visible_typealiases: Vec::new(),
+            proven_map_typealiases: Vec::new(),
+            import_alias_targets: std::collections::HashMap::new(),
             translation_roots: &[],
             retained_hint: None,
             hoisted_annotations: std::collections::HashMap::new(),
@@ -425,6 +510,132 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
     }
 
+    pub(crate) fn add_proven_map_aliases(&mut self, root: tree_sitter::Node<'_>) {
+        let Some(provider) = self.semantic_provider else {
+            return;
+        };
+        let package = root
+            .named_children(&mut root.walk())
+            .find(|node| node.kind() == "package_header")
+            .and_then(|header| {
+                header
+                    .named_children(&mut header.walk())
+                    .find(|node| node.kind() == "qualified_identifier")
+            })
+            .and_then(|node| node.utf8_text(self.source.as_bytes()).ok())
+            .unwrap_or_default()
+            .replace(' ', "");
+        let mut visible = std::collections::BTreeSet::new();
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "user_type"
+                && let Ok(raw) = node.utf8_text(self.source.as_bytes())
+            {
+                let raw = raw.trim();
+                if !raw.contains('.') && !raw.contains('<') {
+                    visible.insert(raw.trim_end_matches('?').to_owned());
+                }
+            }
+            pending.extend(node.named_children(&mut node.walk()));
+        }
+        let mut candidate_aliases = visible
+            .iter()
+            .filter(|name| provider.type_alias_definition(&package, name).is_some())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        candidate_aliases.extend(
+            self.visible_typealiases
+                .iter()
+                .map(|(name, _)| name)
+                .filter(|name| provider.type_alias_definition(&package, name).is_some())
+                .cloned(),
+        );
+        for child in root.named_children(&mut root.walk()) {
+            if child.kind() != "import" {
+                continue;
+            }
+            let Some(declaration) = self.text(child).trim().strip_prefix("import ") else {
+                continue;
+            };
+            let (path, alias) = declaration
+                .split_once(" as ")
+                .map_or((declaration, None), |(path, alias)| {
+                    (path.trim(), Some(alias.trim()))
+                });
+            let Some((target_package, target_name)) = path.rsplit_once('.') else {
+                continue;
+            };
+            if target_package.ends_with('*')
+                || provider
+                    .type_alias_definition(target_package, target_name)
+                    .is_none()
+            {
+                continue;
+            }
+            let visible_name = alias.unwrap_or(target_name);
+            if visible.contains(visible_name) {
+                candidate_aliases.insert(visible_name.to_owned());
+            }
+        }
+        for alias in candidate_aliases {
+            let crate::semantics::FactStatus::Established(arguments) =
+                provider.map_alias_type_arguments(self.file, &package, &alias)
+            else {
+                continue;
+            };
+            self.visible_typealiases
+                .retain(|(existing, _)| existing != &alias);
+            self.proven_map_typealiases.push((
+                alias,
+                format!("java.util.Map<{}, {}>", arguments.key, arguments.value),
+            ));
+        }
+    }
+
+    pub(crate) fn lower_proven_map_typealiases(&self, java: &mut String) -> Result<(), String> {
+        if self.proven_map_typealiases.is_empty() {
+            return Ok(());
+        }
+        let prefix = "class __NotlinAliasScope {\n";
+        let wrapped = format!("{prefix}{java}\n}}");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .map_err(|error| format!("cannot initialize Java alias lowering: {error}"))?;
+        let tree = parser
+            .parse(&wrapped, None)
+            .ok_or("Java alias lowering did not produce a syntax tree")?;
+        if tree.root_node().has_error() {
+            return Err("cannot lower proven map aliases in invalid Java candidate syntax".into());
+        }
+        let aliases = self
+            .proven_map_typealiases
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut replacements = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "type_identifier"
+                && let Ok(name) = node.utf8_text(wrapped.as_bytes())
+                && let Some(target) = aliases.get(name)
+                && is_java_type_use(node, name, &wrapped)
+            {
+                replacements.push((
+                    node.start_byte() - prefix.len(),
+                    node.end_byte() - prefix.len(),
+                    target.clone(),
+                ));
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        for (start, end, target) in replacements {
+            java.replace_range(start..end, &target);
+        }
+        Ok(())
+    }
+
     fn annotated_interface_parsed_as_expression(&self, node: tree_sitter::Node) -> Option<String> {
         let mut pending = vec![node];
         while let Some(wrapper) = pending.pop() {
@@ -448,6 +659,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             }
         }
         None
+    }
+
+    fn annotated_annotation_class_parsed_as_expression(
+        &self,
+        node: tree_sitter::Node,
+    ) -> Option<String> {
+        crate::semantics::recovered_annotation_class_name(node, self.source)
     }
 
     /// Kotlin's parser can represent a stacked class annotation block as a
@@ -511,11 +729,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         self.referenced_by_surviving_kotlin(name)
     }
 
-    /// A Kotlin reference that survives the run: with a fixpoint hint only
-    /// references from declarations that THEMSELVES stay Kotlin keep the
-    /// referenced declaration in Kotlin — a file that translates away lowers
-    /// its own references in the same run. Without a hint (single-file mode)
-    /// nothing says what will translate later, so any Kotlin reference counts.
+    /// Only surviving Kotlin callers constrain the unchanged function and
+    /// companion-call ABI. Property field references are planned separately.
     fn referenced_by_surviving_kotlin(&self, name: &str) -> bool {
         let Some(workspace) = self.workspace else {
             return false;
@@ -853,6 +1068,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .unwrap_or(raw)
             .trim_end_matches(';')
             .trim();
+        let imported_path = path
+            .split_once(" as ")
+            .map_or(path, |(path, _)| path.trim());
+        // Kotlin imports can name top-level properties and functions. Their
+        // callers use a qualified facade after translation, while a use that
+        // still needs its Kotlin owner keeps this unit out of Java emission.
+        // Omit the import instead of rendering `import pkg.value` as an invalid
+        // Java type import (or an accidental static member import).
+        if self.is_indexed_top_level_property_or_function_import(imported_path) {
+            return String::new();
+        }
         // kotlin.reflect / kotlin.jvm.* machinery has no Java counterpart:
         // importing it produces "cannot find symbol" noise. Drop them; the
         // using sites are warned separately as approximations.
@@ -900,6 +1126,40 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
     }
 
+    fn is_indexed_top_level_property_or_function_import(&self, path: &str) -> bool {
+        let Some((package, name)) = path.rsplit_once('.') else {
+            return false;
+        };
+        let Some(provider) = self.semantic_provider else {
+            return false;
+        };
+        let symbols = provider.symbols_named(name);
+        // A Kotlin factory and a classifier may share the imported spelling.
+        // Keep the Java type import when it also names an actual classifier.
+        if symbols.iter().any(|symbol| {
+            symbol.id.owner_path.is_empty()
+                && symbol.id.package == package
+                && matches!(
+                    symbol.id.kind.as_str(),
+                    "class" | "interface" | "object" | "enum" | "annotation"
+                )
+        }) {
+            return false;
+        }
+        symbols.into_iter().any(|symbol| {
+            matches!(symbol.id.kind.as_str(), "property" | "function")
+                && symbol.id.owner_path.is_empty()
+                && symbol.id.package == package
+                && symbol.id.file != self.file
+                && (symbol.id.kind != "function"
+                    || symbol
+                        .id
+                        .file
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("kt")))
+        })
+    }
+
     /// An import path's last segment refers to an enum constant when the
     /// parent type is a known enum in the workspace index and the last
     /// segment starts uppercase but isn't itself a known type.
@@ -936,6 +1196,105 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         plan: &crate::translation_plan::TranslationPlan,
     ) -> Vec<(String, String)> {
         // Collect top-level structure
+        assert_eq!(
+            plan.source_hash, self.source_hash,
+            "Java preparation requires the planned snapshot"
+        );
+        self.enum_when_lowerings = plan
+            .enum_when_lowerings
+            .iter()
+            .map(|lowering| (lowering.location.start_byte, lowering.clone()))
+            .collect();
+        self.default_getter_bridges = plan.default_getter_bridges.clone();
+        self.todo_lowerings = plan
+            .todo_lowerings
+            .iter()
+            .map(|lowering| (lowering.location.start_byte, lowering.clone()))
+            .collect();
+        self.reference_string_calls = plan
+            .reference_string_calls
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.container_calls = plan
+            .container_calls
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.exact_overload_calls = plan
+            .exact_overload_calls
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.container_lambdas = plan
+            .container_calls
+            .iter()
+            .filter_map(|call| call.lambda_binding.as_ref())
+            .map(|binding| {
+                (
+                    (binding.location.start_byte, binding.location.end_byte),
+                    binding.clone(),
+                )
+            })
+            .collect();
+        self.container_property_accesses = self
+            .container_lambdas
+            .values()
+            .flat_map(|binding| binding.property_accesses.iter())
+            .map(|access| {
+                (
+                    (access.location.start_byte, access.location.end_byte),
+                    access.clone(),
+                )
+            })
+            .collect();
+        self.eager_collection_calls = plan
+            .eager_collection_calls
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.eager_collection_helpers = plan.eager_collection_helpers.clone();
+        self.reified_class_calls = plan
+            .reified_class_calls
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.constructor_delegations = plan
+            .constructor_delegations
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.import_alias_targets.clear();
         let mut package = String::new();
         let mut imports: Vec<String> = Vec::new();
         let mut decls: Vec<tree_sitter::Node> = Vec::new();
@@ -959,6 +1318,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     }
                 }
                 "import" => {
+                    let alias = self
+                        .text(child)
+                        .trim()
+                        .strip_prefix("import ")
+                        .and_then(|import| import.split_once(" as "))
+                        .and_then(|(path, alias)| {
+                            Some((
+                                alias.trim().to_owned(),
+                                path.trim().rsplit('.').next()?.to_owned(),
+                            ))
+                        });
+                    if let Some((alias, target)) = alias {
+                        self.import_alias_targets.insert(alias, target);
+                    }
                     let imp = self.kotlin_import_to_java(child);
                     if !imp.is_empty() {
                         imports.push(imp);
@@ -970,9 +1343,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     // declaration-dispatch pass below. That pass runs after
                     // class-body facts and plans have been prepared.
                     if child.kind() == "annotated_expression"
-                        && self
+                        && (self
                             .annotated_interface_parsed_as_expression(child)
                             .is_some()
+                            || self
+                                .annotated_annotation_class_parsed_as_expression(child)
+                                .is_some())
                     {
                         decls.push(child);
                         wrapper_spans_for_next.clear();
@@ -1078,6 +1454,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     let original_decl = *decl;
                     let recovery_name = if original_decl.kind() == "annotated_expression" {
                         self.annotated_interface_parsed_as_expression(original_decl)
+                            .or_else(|| {
+                                self.annotated_annotation_class_parsed_as_expression(original_decl)
+                            })
                     } else {
                         None
                     };
@@ -1101,7 +1480,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         self.diag_untranslatable_coded(
                             original_decl,
                             format!(
-                                "annotated top-level expression contains an unparsed declaration; retained in Kotlin; affected declaration: interface {name}"
+                                "annotated top-level expression contains an unparsed declaration; retained in Kotlin; affected declaration: {name}"
                             ),
                             Some("N47BC".to_string()),
                         );
@@ -1285,13 +1664,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     member.indent = out.indent;
                     if unit.apply_preflight_retention(**decl, plan) {
                         // The plan already owns this declaration in Kotlin.
-                    } else if decl.kind() == "property_declaration"
-                        && unit.workspace_requires_top_level_retention(&label)
-                    {
-                        unit.diag_untranslatable(
-                            **decl,
-                            "top-level declaration is referenced by retained Kotlin source",
-                        );
                     } else {
                         match decl.kind() {
                             "function_declaration" => {
@@ -1423,6 +1795,60 @@ pub fn capitalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proven_map_alias_lowering_preserves_names_literals_and_generic_scopes() {
+        let mut diags = Diagnostics::new();
+        let mut unit = Unit::new(
+            "",
+            Path::new("Aliases.kt"),
+            &mut diags,
+            AnnotationSet::None,
+            UnitOptions::default(),
+        );
+        unit.proven_map_typealiases.push((
+            "ResultMap".into(),
+            "java.util.Map<java.lang.String, java.lang.Integer>".into(),
+        ));
+        let mut candidate = r#"class Values {
+    ResultMap field;
+    String ResultMap = "ResultMap";
+    <ResultMap> ResultMap echo(ResultMap value) { return value; }
+    class Inner<ResultMap> { ResultMap item; }
+    java.util.List<ResultMap> all() { return null; }
+}"#
+        .to_owned();
+        unit.lower_proven_map_typealiases(&mut candidate).unwrap();
+        assert!(candidate.contains("java.util.Map<java.lang.String, java.lang.Integer> field;"));
+        assert!(candidate.contains("String ResultMap = \"ResultMap\";"));
+        assert!(candidate.contains("<ResultMap> ResultMap echo(ResultMap value)"));
+        assert!(candidate.contains("class Inner<ResultMap> { ResultMap item; }"));
+        assert!(
+            candidate.contains(
+                "java.util.List<java.util.Map<java.lang.String, java.lang.Integer>> all()"
+            )
+        );
+    }
+
+    #[test]
+    fn proven_map_alias_lowering_rejects_invalid_candidate_syntax() {
+        let mut diags = Diagnostics::new();
+        let mut unit = Unit::new(
+            "",
+            Path::new("Aliases.kt"),
+            &mut diags,
+            AnnotationSet::None,
+            UnitOptions::default(),
+        );
+        unit.proven_map_typealiases.push((
+            "ResultMap".into(),
+            "java.util.Map<java.lang.String, java.lang.Integer>".into(),
+        ));
+        let mut candidate = "public class Broken { ResultMap value( }".to_owned();
+        let original = candidate.clone();
+        assert!(unit.lower_proven_map_typealiases(&mut candidate).is_err());
+        assert_eq!(candidate, original, "failed lowering must be transactional");
+    }
 
     #[test]
     fn untranslated_membership_deduplicates_while_preserving_coverage_order() {

@@ -43,6 +43,11 @@ pub struct Cli {
     #[arg(long)]
     pub validation_config: Option<PathBuf>,
 
+    /// Write JSON coverage for this invocation's original Kotlin declarations.
+    /// Previously migrated Java is excluded; this is not historical project coverage.
+    #[arg(long, value_name = "PATH")]
+    pub coverage_report: Option<PathBuf>,
+
     /// Nullability annotation set to emit
     #[arg(long, value_enum, default_value = "jetbrains")]
     pub annotations: Annotations,
