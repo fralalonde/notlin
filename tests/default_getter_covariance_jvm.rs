@@ -484,3 +484,303 @@ fn real_toolchain_preserves_covariant_property_default_dispatch() {
         );
     }
 }
+
+const GENERIC_SOURCES: [(&str, &str); 11] = [
+    (
+        "Identifier.java",
+        r#"package sample;
+public interface Identifier { String value(); }
+"#,
+    ),
+    (
+        "Key.java",
+        r#"package sample;
+public interface Key extends Identifier {}
+"#,
+    ),
+    (
+        "JavaKey.java",
+        r#"package sample;
+public final class JavaKey implements Key {
+    private final String text;
+    public JavaKey(String text) { this.text = text; }
+    @Override public String value() { return text; }
+}
+"#,
+    ),
+    (
+        "WideView.java",
+        r#"package sample;
+public interface WideView { Identifier getKey(); }
+"#,
+    ),
+    (
+        "Counter.java",
+        r#"package sample;
+public final class Counter {
+    private static int reads;
+    private static int created;
+    public static JavaKey next(String label) { return new JavaKey(label + (++created)); }
+    public static JavaKey read(JavaKey key) { reads++; return key; }
+    public static int reads() { return reads; }
+    public static int created() { return created; }
+    public static void reset() { reads = 0; created = 0; }
+}
+"#,
+    ),
+    (
+        "GenericProvider.kt",
+        r#"package sample
+interface GenericProvider<T : Key> : WideView {
+    val current: T
+    override fun getKey(): T = current
+}
+"#,
+    ),
+    (
+        "Child.kt",
+        r#"package sample
+class Child(private val stored: JavaKey) : GenericProvider<JavaKey> {
+    override val current: JavaKey get() = Counter.read(stored)
+}
+"#,
+    ),
+    (
+        "RetainedChild.kt",
+        r#"package sample
+class RetainedChild(private val stored: JavaKey) : GenericProvider<JavaKey>, Comparable<RetainedChild> {
+    override val current: JavaKey get() = Counter.read(stored)
+    override fun compareTo(other: RetainedChild): Int = 0
+    suspend fun retainedMarker() {}
+}
+"#,
+    ),
+    (
+        "Intermediate.kt",
+        r#"package sample
+interface Intermediate : GenericProvider<JavaKey> {
+    suspend fun retainedIntermediateMarker() {}
+}
+"#,
+    ),
+    (
+        "IndirectRetainedChild.kt",
+        r#"package sample
+class IndirectRetainedChild(private val stored: JavaKey) : Intermediate {
+    override val current: JavaKey get() = Counter.read(stored)
+    suspend fun retainedChildMarker() {}
+}
+"#,
+    ),
+    (
+        "IndirectChild.kt",
+        r#"package sample
+class IndirectChild(private val stored: JavaKey) : Intermediate {
+    override val current: JavaKey get() = Counter.read(stored)
+}
+"#,
+    ),
+];
+
+const GENERIC_EXTRA_SOURCES: [(&str, &str); 2] = [
+    (
+        "JavaChild.java",
+        r#"package sample;
+public final class JavaChild implements GenericProvider<JavaKey> {
+    private final JavaKey current;
+    public JavaChild(JavaKey current) { this.current = current; }
+    @Override public JavaKey getCurrent() { return Counter.read(current); }
+}
+"#,
+    ),
+    (
+        "Runner.kt",
+        r#"package sample
+private fun inspect(label: String, value: GenericProvider<JavaKey>, expected: JavaKey?) {
+    val wide: WideView = value
+    val generic: GenericProvider<JavaKey> = value
+    val fromWide = wide.getKey()
+    val fromGeneric = generic.getKey()
+    println("$label=${fromWide === expected},${fromGeneric === expected},${fromWide?.value()},${fromGeneric?.value()}")
+}
+fun main() {
+    suspend fun retainedHarness() {}
+    Counter.reset()
+    val first = Counter.next("child-")
+    inspect("child", Child(first), first)
+    val second = Counter.next("retained-")
+    inspect("retained", RetainedChild(second), second)
+    val third = Counter.next("indirect-retained-")
+    inspect("indirect-retained", IndirectRetainedChild(third), third)
+    val fourth = Counter.next("indirect-")
+    inspect("indirect", IndirectChild(fourth), fourth)
+    val fifth = Counter.next("java-")
+    inspect("java", JavaChild(fifth), fifth)
+    inspect("java-null", JavaChild(null), null)
+    val descriptors = GenericProvider::class.java.declaredMethods
+        .filter { it.name == "getKey" }
+        .map { "${it.returnType.simpleName}:${it.isBridge}" }
+        .sorted()
+        .joinToString(",")
+    println("reads=${Counter.reads()}|created=${Counter.created()}|bridge=$descriptors")
+}
+"#,
+    ),
+];
+
+fn populate_generic(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    for (name, source) in GENERIC_SOURCES.into_iter().chain(GENERIC_EXTRA_SOURCES) {
+        fs::write(root.join(name), source).unwrap();
+    }
+}
+
+#[test]
+fn generic_return_with_concrete_first_bound_translates_and_keeps_the_bridge() {
+    let scratch = Scratch::new();
+    let root = scratch.0.join("generic-cli");
+    populate_generic(&root);
+    let translated = translate(&root, false);
+    assert!(
+        translated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translated.stderr)
+    );
+    assert!(root.join("GenericProvider.java").is_file());
+    assert!(root.join("Child.java").is_file());
+    assert!(root.join("RetainedChild.kt").is_file());
+    assert!(root.join("Intermediate.kt").is_file());
+    assert!(!root.join("Intermediate.java").exists());
+    assert!(root.join("IndirectRetainedChild.kt").is_file());
+    assert!(!root.join("IndirectRetainedChild.java").exists());
+    // This class has no intrinsic blocker, but the independent retained-supertype
+    // rule still keeps it Kotlin. It needs the same accessor repair.
+    assert!(!root.join("IndirectChild.java").exists());
+    let indirect_child = fs::read_to_string(root.join("IndirectChild.kt")).unwrap();
+    assert!(
+        indirect_child.contains("override fun getKey(): sample.JavaKey")
+            && indirect_child.contains("super<sample.Intermediate>.getKey()"),
+        "the inherited retention boundary still needs its concrete getter:\n{indirect_child}"
+    );
+    let provider = fs::read_to_string(root.join("GenericProvider.java")).unwrap();
+    assert!(
+        provider.contains("T getKey()"),
+        "the generic source return must remain in the interface:\n{provider}"
+    );
+    let child = fs::read_to_string(root.join("Child.java")).unwrap();
+    assert!(
+        child.contains("sample.JavaKey getKey()")
+            && child.contains("sample.GenericProvider.super.getKey()")
+            && !child.contains("notlinProperty"),
+        "the translated child needs the concrete return bridge without a property alias:\n{child}"
+    );
+    let retained = fs::read_to_string(root.join("RetainedChild.kt")).unwrap();
+    assert!(
+        retained.contains("override fun getKey(): sample.JavaKey")
+            && retained.contains("super<sample.GenericProvider>.getKey()"),
+        "the retained class needs a narrow bridge to the Java interface:\n{retained}"
+    );
+    let intermediate = fs::read_to_string(root.join("Intermediate.kt")).unwrap();
+    assert!(intermediate.contains("suspend fun retainedIntermediateMarker()"));
+    let indirect = fs::read_to_string(root.join("IndirectRetainedChild.kt")).unwrap();
+    assert!(
+        indirect.contains("override fun getKey(): sample.JavaKey")
+            && indirect.contains("super<sample.Intermediate>.getKey()")
+            && !indirect.contains("notlinProperty"),
+        "the retained child needs a concrete bridge through its direct interface:\n{indirect}"
+    );
+    let java_child = fs::read_to_string(root.join("JavaChild.java")).unwrap();
+    assert!(
+        !java_child.contains("getKey()"),
+        "the Java implementation should use the inherited default, without an alias accessor:\n{java_child}"
+    );
+}
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin stdlib, Lombok, and its Kotlin compiler plugin"]
+fn real_toolchain_preserves_generic_bound_getter_dispatch() {
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new();
+    let original = scratch.0.join("generic-original");
+    populate_generic(&original);
+    let before = validate_jvm_sources(&jvm_config(
+        &original,
+        scratch.0.join("generic-original-classes"),
+        &stdlib,
+        false,
+    ))
+    .expect("original generic Java/Kotlin fixture compiles and runs");
+    let expected = before
+        .commands
+        .last()
+        .unwrap()
+        .stdout
+        .trim()
+        .replace("\r\n", "\n");
+    assert_eq!(
+        expected,
+        "child=true,true,child-1,child-1\nretained=true,true,retained-2,retained-2\nindirect-retained=true,true,indirect-retained-3,indirect-retained-3\nindirect=true,true,indirect-4,indirect-4\njava=true,true,java-5,java-5\njava-null=true,true,null,null\nreads=12|created=5|bridge=Identifier:true,Key:false"
+    );
+
+    for lombok_enabled in [false, true] {
+        let migrated = scratch.0.join(format!("generic-migrated-{lombok_enabled}"));
+        populate_generic(&migrated);
+        let translated = translate(&migrated, lombok_enabled);
+        assert!(
+            translated.status.success(),
+            "Lombok mode {lombok_enabled}: {}",
+            String::from_utf8_lossy(&translated.stderr)
+        );
+        assert!(migrated.join("GenericProvider.java").is_file());
+        assert!(migrated.join("Child.java").is_file());
+        assert!(migrated.join("RetainedChild.kt").is_file());
+        assert!(migrated.join("Intermediate.kt").is_file());
+        assert!(!migrated.join("Intermediate.java").exists());
+        assert!(migrated.join("IndirectRetainedChild.kt").is_file());
+        assert!(!migrated.join("IndirectRetainedChild.java").exists());
+        assert!(!migrated.join("IndirectChild.java").exists());
+        let indirect_child = fs::read_to_string(migrated.join("IndirectChild.kt")).unwrap();
+        assert!(
+            indirect_child.contains("super<sample.Intermediate>.getKey()"),
+            "{indirect_child}"
+        );
+        let provider = fs::read_to_string(migrated.join("GenericProvider.java")).unwrap();
+        assert!(provider.contains("T getKey()"), "{provider}");
+        let retained = fs::read_to_string(migrated.join("RetainedChild.kt")).unwrap();
+        assert!(
+            retained.contains("override fun getKey(): sample.JavaKey")
+                && retained.contains("super<sample.GenericProvider>.getKey()"),
+            "{retained}"
+        );
+        let intermediate = fs::read_to_string(migrated.join("Intermediate.kt")).unwrap();
+        assert!(intermediate.contains("suspend fun retainedIntermediateMarker()"));
+        let indirect = fs::read_to_string(migrated.join("IndirectRetainedChild.kt")).unwrap();
+        assert!(
+            indirect.contains("override fun getKey(): sample.JavaKey")
+                && indirect.contains("super<sample.Intermediate>.getKey()")
+                && !indirect.contains("notlinProperty"),
+            "the child through a retained generic intermediate needs a concrete bridge:\n{indirect}"
+        );
+        let after = validate_jvm_sources(&jvm_config(
+            &migrated,
+            scratch
+                .0
+                .join(format!("generic-mixed-classes-{lombok_enabled}")),
+            &stdlib,
+            lombok_enabled,
+        ))
+        .expect("mixed generic Java/Kotlin fixture compiles and runs");
+        assert_eq!(
+            after
+                .commands
+                .last()
+                .unwrap()
+                .stdout
+                .trim()
+                .replace("\r\n", "\n"),
+            expected,
+            "mixed runtime output in Lombok mode {lombok_enabled}"
+        );
+    }
+}

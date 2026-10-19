@@ -107,6 +107,50 @@ impl AcceptedTranslationPlan {
             if let Some(provider) = semantic_provider {
                 attach_resolved_targets(&mut unit.root, &[], provider, &facade_targets);
             }
+            crate::eager_collection_helpers::attach_projection_targets(
+                &mut unit,
+                &owners,
+                &translation.eager_collection_calls,
+                &translation.container_calls,
+            )
+            .map_err(|error| AcceptedPlanError {
+                path: path.clone(),
+                error,
+            })?;
+            let helpers = crate::eager_collection_helpers::inject(
+                &mut unit,
+                &path,
+                &owners,
+                &translation.eager_collection_helpers,
+            )
+            .map_err(|error| AcceptedPlanError {
+                path: path.clone(),
+                error,
+            })?;
+            for helper in helpers {
+                let kind = match helper.operation {
+                    crate::semantics::EagerCollectionOperation::Map => "eager-collection-map",
+                    crate::semantics::EagerCollectionOperation::FilterNot => {
+                        "eager-collection-filter-not"
+                    }
+                };
+                let bridge = crate::translation_plan::PlannedBridge {
+                    id: helper.id.clone(),
+                    origin: helper.origin.clone(),
+                    kind: kind.into(),
+                };
+                if !translation.bridges.contains(&bridge) {
+                    translation.bridges.push(bridge);
+                }
+                let origin = crate::semantics::OriginMap {
+                    generated: helper.id,
+                    origin: helper.origin,
+                    reason: kind.into(),
+                };
+                if !translation.provenance.contains(&origin) {
+                    translation.provenance.push(origin);
+                }
+            }
             assignments.push((path.clone(), owners.clone(), snapshot_hash));
             files.push(AcceptedJavaFile { path, unit, owners });
         }
@@ -204,7 +248,28 @@ impl AcceptedTranslationPlan {
                 owner: crate::translation_plan::BackendOwner::Java,
             })
             .collect();
+        translation
+            .eager_collection_helpers
+            .retain(|helper| emitted_owners.contains(&helper.origin));
         record_generated_declarations(&mut translation, &files, semantic_provider);
+        if let Some(provider) = semantic_provider {
+            for file in &files {
+                for getter in crate::lombok_getter_contracts::collect(file, provider) {
+                    if !translation
+                        .bridges
+                        .iter()
+                        .any(|bridge| bridge.id == getter.target)
+                    {
+                        translation.record_generated_bridge(
+                            &getter.origin,
+                            format!("lombok:getter:{}()", getter.method_name),
+                            "Lombok-generated property getter",
+                        );
+                    }
+                    translation.generated_getters.push(getter);
+                }
+            }
+        }
         Ok(Self {
             translation,
             files,

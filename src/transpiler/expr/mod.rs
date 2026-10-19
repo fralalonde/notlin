@@ -2,6 +2,8 @@
 
 mod binary;
 mod call;
+mod container_lambdas;
+mod eager_collections;
 mod navigation;
 mod string;
 
@@ -148,6 +150,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             }
             "identifier" => {
                 let name = self.unit.text(node).trim().to_string();
+                if let Some(alias) = self.unit.local_expression_aliases.get(&name) {
+                    return alias.clone();
+                }
                 let implicit_this = self.narrowed_receiver("this", "this");
                 // Bare self-reference inside an object body: Kotlin resolves
                 // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
@@ -832,11 +837,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     /// workspace-policy decision happens in `navigation()`.
     fn transpile_super_qualifier(&mut self, node: tree_sitter::Node) -> String {
         match kt::child(node, "user_type") {
-            Some(ty) => {
-                let name = kt::java_type(ty, self.unit.source).trim().to_string();
-                self.unit.pending_super_owner = Some(name.clone());
-                name
-            }
+            Some(ty) => kt::java_type(ty, self.unit.source).trim().to_string(),
             None => "super".to_string(),
         }
     }

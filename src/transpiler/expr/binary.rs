@@ -48,6 +48,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 
     fn known_primitive_operand(&self, node: tree_sitter::Node) -> bool {
+        if let Some(ty) = self.structured_operand_type(node) {
+            return !ty.nullable && matches!(ty.ty, crate::semantics::KotlinType::Primitive(_));
+        }
         if node.kind() == "identifier" {
             self.unit
                 .var_types
@@ -56,6 +59,35 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         } else {
             false
         }
+    }
+
+    fn structured_operand_type(
+        &self,
+        node: tree_sitter::Node<'_>,
+    ) -> Option<&crate::semantics::TypeRef> {
+        match node.kind() {
+            "identifier" => self
+                .unit
+                .local_expression_types
+                .get(self.unit.text(node).trim()),
+            "navigation_expression" => self
+                .unit
+                .container_property_accesses
+                .get(&(node.start_byte(), node.end_byte()))
+                .map(|access| &access.projection.result_type),
+            _ => None,
+        }
+    }
+
+    fn structured_primitive_type(&self, node: tree_sitter::Node<'_>) -> Option<String> {
+        let ty = self.structured_operand_type(node)?;
+        if ty.nullable {
+            return None;
+        }
+        let crate::semantics::KotlinType::Primitive(name) = &ty.ty else {
+            return None;
+        };
+        Some(crate::transpiler::types::map_type_name(name).to_owned())
     }
 
     /// Kotlin infix function calls (`a to b`, `x shr 1`) — the grammar uses
@@ -288,12 +320,12 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 let op_java = if java_op == "==" || java_op == "!=" {
                     let lhs_text = self.unit.text(l);
                     // Primitive when a literal, or a known primitive param/local.
-                    let is_primitive = is_likely_primitive(lhs_text)
-                        || self
-                            .unit
-                            .var_types
-                            .get(lhs_text.trim())
-                            .is_some_and(|t| is_primitive_type(t));
+                    let nullable_operand = [l, r].iter().any(|operand| {
+                        self.structured_operand_type(*operand)
+                            .is_some_and(|ty| ty.nullable)
+                    });
+                    let is_primitive = !nullable_operand
+                        && (is_likely_primitive(lhs_text) || self.known_primitive_operand(l));
                     if referential {
                         // Referential equality keeps Java identity regardless
                         // of operand type.
@@ -308,6 +340,22 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                             return format!("Objects.equals({}, {})", lhs, rhs);
                         } else {
                             return format!("!Objects.equals({}, {})", lhs, rhs);
+                        }
+                    }
+                    if is_likely_primitive(self.unit.text(r)) || self.known_primitive_operand(r) {
+                        let lhs_type = self.structured_primitive_type(l);
+                        let rhs_type = self.structured_primitive_type(r);
+                        if lhs_type.is_some() || rhs_type.is_some() {
+                            // JDK SAM parameters remain boxed in Java. Force
+                            // Kotlin's proven primitive equality at the use,
+                            // without unboxing an unused lambda parameter.
+                            let lhs = self.transpile(l);
+                            let rhs = self.transpile(r);
+                            let lhs = lhs_type
+                                .map_or_else(|| lhs.clone(), |ty| format!("(({ty}) {lhs})"));
+                            let rhs = rhs_type
+                                .map_or_else(|| rhs.clone(), |ty| format!("(({ty}) {rhs})"));
+                            return format!("({lhs} {java_op} {rhs})");
                         }
                     }
                     java_op

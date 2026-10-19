@@ -6,10 +6,14 @@
 pub mod cli;
 pub mod coverage;
 pub mod ctor_defaults;
+mod default_getter_repair;
 pub mod diagnostics;
+mod eager_collection_helpers;
 pub mod function_callsite;
 pub mod java_ir;
 pub mod jvm_validation;
+mod lombok_configuration;
+pub mod lombok_getter_contracts;
 pub mod manual_marks;
 pub mod migrate;
 pub mod migration_pipeline;

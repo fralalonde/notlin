@@ -31,8 +31,8 @@ pub struct FilePlan {
 pub struct WorkspacePlan {
     pub plans: Vec<FilePlan>,
     pub retained: HashSet<crate::semantics::SymbolId>,
-    /// Intrinsic retained declarations. Unlike the full retained closure, these
-    /// cannot form self-supporting cascade cycles when reused after overlays.
+    /// Root-cause candidates used to prioritize work after overlays. They are
+    /// scheduling hints, never ownership constraints on a different snapshot.
     pub roots: HashSet<crate::semantics::SymbolId>,
 }
 
@@ -298,22 +298,34 @@ fn plan_workspace_cold_mode(
 ) -> Result<(WorkspacePlan, usize), String> {
     let setup_started = std::time::Instant::now();
     let trees: Vec<_> = files.iter().map(|(_, source)| parse_tree(source)).collect();
+    if crate::workspace::profile::enabled() {
+        eprintln!(
+            "NOTLIN_PROFILE planner input parse: files={} elapsed={:.3}s",
+            files.len(),
+            setup_started.elapsed().as_secs_f64()
+        );
+    }
     let workspace_files: Vec<_> = files
         .iter()
         .map(|(file, _)| std::fs::canonicalize(file).ok())
         .collect();
+    let semantic_started = std::time::Instant::now();
     let mut semantic_provider = crate::semantics::SyntaxSemanticProvider::new(
         index
             .files
             .iter()
             .map(|file| (file.path.clone(), file.source_text().to_owned())),
     );
+    let semantic_collect_elapsed = semantic_started.elapsed();
+    let enrich_started = std::time::Instant::now();
     semantic_provider.enrich_workspace_type_facts(index);
     use crate::semantics::SemanticProvider;
-    if std::env::var_os("NOTLIN_PROFILE").is_some() {
+    if crate::workspace::profile::enabled() {
         eprintln!(
-            "NOTLIN_PROFILE semantic provider setup: {:.3}s, {} symbols",
-            setup_started.elapsed().as_secs_f64(),
+            "NOTLIN_PROFILE semantic provider: collect+resolve={:.3}s enrich={:.3}s indexed_files={} symbols={}",
+            semantic_collect_elapsed.as_secs_f64(),
+            enrich_started.elapsed().as_secs_f64(),
+            index.files.len(),
             semantic_provider.symbols().len()
         );
     }
@@ -323,24 +335,24 @@ fn plan_workspace_cold_mode(
         .iter()
         .map(|file| (file.path.clone(), file.source_text().to_owned()))
         .collect();
+    let semantic_symbol_ids = semantic_provider
+        .symbols()
+        .iter()
+        .map(|symbol| symbol.id.clone())
+        .collect::<Vec<_>>();
+    let function_callsite_started = std::time::Instant::now();
     let function_callsite_retention =
         crate::function_callsite::functions_requiring_kotlin_retention_with_provider(
             &snapshots,
-            &semantic_provider
-                .symbols()
-                .iter()
-                .map(|symbol| symbol.id.clone())
-                .collect::<Vec<_>>(),
+            &semantic_symbol_ids,
             &semantic_provider,
         );
+    let function_callsite_elapsed = function_callsite_started.elapsed();
+    let property_callsite_started = std::time::Instant::now();
     let top_level_property_callsite_retention =
         crate::top_level_property_callsite::properties_requiring_kotlin_retention_in_selection(
             &snapshots,
-            &semantic_provider
-                .symbols()
-                .iter()
-                .map(|s| s.id.clone())
-                .collect::<Vec<_>>(),
+            &semantic_symbol_ids,
             &semantic_provider,
             &files
                 .iter()
@@ -352,10 +364,14 @@ fn plan_workspace_cold_mode(
                 })
                 .collect(),
         );
-    if std::env::var_os("NOTLIN_PROFILE").is_some() {
+    if crate::workspace::profile::enabled() {
         eprintln!(
-            "NOTLIN_PROFILE call-site eligibility: {:.3}s",
-            callsite_started.elapsed().as_secs_f64()
+            "NOTLIN_PROFILE call-site eligibility: functions={:.3}s function_candidates={} properties={:.3}s property_candidates={} total={:.3}s",
+            function_callsite_elapsed.as_secs_f64(),
+            function_callsite_retention.len(),
+            property_callsite_started.elapsed().as_secs_f64(),
+            top_level_property_callsite_retention.len(),
+            callsite_started.elapsed().as_secs_f64(),
         );
     }
     let static_facts_started = std::time::Instant::now();
@@ -382,9 +398,10 @@ fn plan_workspace_cold_mode(
                 .collect::<Vec<_>>()
         })
     });
-    if cache_static_facts && std::env::var_os("NOTLIN_PROFILE").is_some() {
+    if cache_static_facts && crate::workspace::profile::enabled() {
         eprintln!(
-            "NOTLIN_PROFILE round static plan facts: {:.3}s",
+            "NOTLIN_PROFILE round static plan facts: files={} elapsed={:.3}s",
+            files.len(),
             static_facts_started.elapsed().as_secs_f64()
         );
     }
@@ -401,14 +418,31 @@ fn plan_workspace_cold_mode(
         static_facts: static_facts.as_deref(),
     };
     let mut indices = (0..files.len()).collect::<Vec<_>>();
+    // Previous snapshots can suggest useful work order, but their retained
+    // owners are not facts about this snapshot. Starting from those owners can
+    // create a self-supporting property/default-getter cycle after its original
+    // blocker disappears. Recompute the least fixpoint from current facts.
+    let priority_files = seed
+        .iter()
+        .map(|symbol| &symbol.file)
+        .collect::<HashSet<_>>();
+    indices.sort_by_key(|position| {
+        !priority_files.contains(
+            workspace_files[*position]
+                .as_ref()
+                .unwrap_or(&files[*position].0),
+        )
+    });
     let mut cache: Vec<Option<CachedFilePlan>> = (0..files.len()).map(|_| None).collect();
     let mut preparations = 0;
-    let mut retained = seed.clone();
+    let mut retained = HashSet::new();
     retained.extend(forced_retained.keys().cloned());
     let mut seen = BTreeMap::new();
     let mut history = vec![retained.clone()];
     seen.insert(sorted_key(&retained), 0usize);
     for _pass in 0..max_passes {
+        let ownership_pass_started =
+            crate::workspace::profile::enabled().then(std::time::Instant::now);
         preparations += indices.len();
         for (position, plan) in planner.translate_indices(&indices, &retained, &forced_retained)? {
             cache[position] = Some(plan);
@@ -422,14 +456,23 @@ fn plan_workspace_cold_mode(
             })
             .map(|decision| decision.symbol_id.clone())
             .collect();
-        if std::env::var_os("NOTLIN_PROFILE").is_some() {
+        if crate::workspace::profile::enabled() {
             eprintln!(
-                "profile: ownership pass {} prepared {} files, reused {}, retained {} symbols",
+                "NOTLIN_PROFILE ownership pass {}: prepared {} files, reused {}, retained {} symbols, elapsed={:.3}s",
                 _pass + 1,
                 indices.len(),
                 files.len() - indices.len(),
-                exact.len()
+                exact.len(),
+                ownership_pass_started
+                    .as_ref()
+                    .map(std::time::Instant::elapsed)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
             );
+            crate::workspace::profile::report_getter_traversals(&format!(
+                "ownership pass {}",
+                _pass + 1
+            ));
         }
         if exact == retained {
             let mut plans: Vec<_> = cache

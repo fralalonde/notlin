@@ -244,9 +244,17 @@ where
         (PathBuf, String, String, Vec<crate::semantics::SymbolId>),
     > = HashMap::new();
     let mut output_identities = HashMap::<PathBuf, PathBuf>::new();
+    let mut generated_getters =
+        HashMap::<PathBuf, Vec<crate::lombok_getter_contracts::GeneratedGetterContract>>::new();
+    let mut lombok_configuration =
+        crate::lombok_configuration::DefaultLombokConfiguration::default();
+    let mut default_lombok_paths = HashMap::<PathBuf, bool>::new();
     let mut converged_plans = None;
     let mut converged_round = 0usize;
     let mut retained_seed: Option<HashSet<crate::semantics::SymbolId>> = None;
+    // Cache facts may carry between analyses, while every source snapshot is
+    // still rebuilt from `index` plus the current speculative overlays.
+    let mut latest_cache_index: Option<crate::workspace::SourceIndex> = None;
     let mut translation_plans = HashMap::<PathBuf, crate::translation_plan::TranslationPlan>::new();
     if !variance_contracts.is_empty() {
         let edited_files = variance_contracts
@@ -319,7 +327,40 @@ where
         let mut phase_started = std::time::Instant::now();
         crate::diagnostics::clear_retention();
         let overlays = speculative_overlays(&sources, &virtual_sources, &cumulative);
-        let current_index = index.with_overlays(&overlays)?;
+        let cache_source = latest_cache_index.as_ref().unwrap_or(&index);
+        let mut current_index = index.with_overlays_using_cache_from(&overlays, cache_source)?;
+        // Newly accepted outputs keep their Kotlin-origin contracts. Only
+        // existing Java inputs need source-derived field identities; scanning
+        // cumulative outputs would also repeat their parsing every round.
+        let default_lombok_sources = original_java_by_identity
+            .iter()
+            .filter(|(identity, file)| {
+                cli.lombok
+                    && !output_identities.contains_key(*identity)
+                    && file.source_text().contains("lombok")
+            })
+            .filter(|(_, file)| {
+                *default_lombok_paths
+                    .entry(file.path.clone())
+                    .or_insert_with(|| lombok_configuration.supports_default_accessors(&file.path))
+            })
+            .map(|(_, file)| file.path.clone())
+            .collect::<Vec<_>>();
+        current_index.set_default_lombok_accessors(default_lombok_sources);
+        current_index.set_generated_getters(
+            generated_getters
+                .iter()
+                .filter(|(path, contracts)| {
+                    !contracts.is_empty()
+                        && cli.lombok
+                        && *default_lombok_paths
+                            .entry((*path).clone())
+                            .or_insert_with(|| {
+                                lombok_configuration.supports_default_accessors(path)
+                            })
+                })
+                .flat_map(|(_, contracts)| contracts.iter().cloned()),
+        );
         profile_phase(
             profile_speculation,
             round,
@@ -405,6 +446,7 @@ where
                     .collect::<Vec<_>>();
                 for path in stale {
                     cumulative.remove(&path);
+                    generated_getters.remove(&path);
                     output_identities.remove(&normalized(&path));
                     cumulative_changed = true;
                 }
@@ -534,6 +576,21 @@ where
                     (plan.file.clone(), content.clone(), name.clone(), owners)
                 };
                 cumulative_changed |= cumulative.get(&key) != Some(&value);
+                let output_hash = *blake3::hash(value.1.as_bytes()).as_bytes();
+                let contracts = plan
+                    .translation
+                    .generated_getters
+                    .iter()
+                    .filter(|getter| {
+                        getter.output_path == Path::new(name) && getter.output_hash == output_hash
+                    })
+                    .cloned()
+                    .map(|mut getter| {
+                        getter.output_path = key.clone();
+                        getter
+                    })
+                    .collect();
+                generated_getters.insert(key.clone(), contracts);
                 cumulative.insert(key, value);
                 output_identities.insert(identity, target);
             }
@@ -646,7 +703,8 @@ where
         }
         next = residual_by_path.into_iter().collect();
         let repair_overlays = speculative_overlays(&sources, &next, &cumulative);
-        let repair_index = index.with_overlays(&repair_overlays)?;
+        let repair_index =
+            index.with_overlays_using_cache_from(&repair_overlays, &current_index)?;
         profile_phase(
             profile_speculation,
             round,
@@ -654,6 +712,12 @@ where
             "property repair index",
         );
         let generated_java = cumulative.keys().cloned().collect::<HashSet<_>>();
+        let getter_repairs = crate::default_getter_repair::repair_virtual_sources(
+            &repair_index,
+            &mut next,
+            &vetoed_this_round,
+        )?;
+        merge_accessor_repairs(&mut translation_plans, getter_repairs, &vetoed_this_round);
         let repair_report = crate::property_abi::repair_virtual_sources_planned_with_contracts(
             &repair_index,
             &mut next,
@@ -670,7 +734,8 @@ where
                 persisted_abi_contracts.push(contract.clone());
             }
         }
-        merge_property_repairs(&mut translation_plans, repair_report, &vetoed_this_round);
+        merge_accessor_repairs(&mut translation_plans, repair_report, &vetoed_this_round);
+        crate::workspace::profile::report_getter_traversals("property repairs");
         profile_phase(
             profile_speculation,
             round,
@@ -691,15 +756,19 @@ where
         let full_callsite_sweep = next == virtual_sources && !cumulative_changed;
         let callsite_needs_index =
             callsite_repair.requires_index(&next, &callsite_contracts, full_callsite_sweep);
+        let mut callsite_cache_index = None;
         let callsite_stats = if callsite_needs_index {
             let callsite_overlays = speculative_overlays(&sources, &next, &cumulative);
-            let callsite_index = index.with_overlays(&callsite_overlays)?;
-            callsite_repair.rewrite_files(
+            let callsite_index =
+                index.with_overlays_using_cache_from(&callsite_overlays, &repair_index)?;
+            let stats = callsite_repair.rewrite_files(
                 &callsite_index,
                 &mut next,
                 &callsite_contracts,
                 full_callsite_sweep,
-            )
+            );
+            callsite_cache_index = Some(callsite_index);
+            stats
         } else {
             callsite_repair.rewrite_files(
                 &repair_index,
@@ -708,6 +777,7 @@ where
                 full_callsite_sweep,
             )
         };
+        latest_cache_index = Some(callsite_cache_index.unwrap_or(repair_index));
         profile_phase(
             profile_speculation,
             round,
@@ -907,6 +977,7 @@ where
         original_snapshots.push((file.path.clone(), Some(bytes)));
     }
     original_snapshots.extend(observed_output_snapshots.values().cloned());
+    original_snapshots.extend(lombok_configuration.snapshots());
     if cli.out_dir.is_none() {
         for (source, _) in &sources {
             let Some(directory) = source.parent() else {
@@ -1132,6 +1203,17 @@ fn merge_translation_plan(
             plan.bridges.push(bridge.clone());
         }
     }
+    for getter in &incoming.generated_getters {
+        if let Some(old) = plan
+            .generated_getters
+            .iter_mut()
+            .find(|old| old.target == getter.target && old.output_path == getter.output_path)
+        {
+            *old = getter.clone();
+        } else {
+            plan.generated_getters.push(getter.clone());
+        }
+    }
     for repair in &incoming.repairs {
         if !plan.repairs.contains(repair) {
             plan.repairs.push(repair.clone());
@@ -1291,14 +1373,15 @@ fn veto_translation(plan: &mut crate::translation_plan::TranslationPlan) {
     }
     plan.outputs.clear();
     plan.bridges.clear();
+    plan.generated_getters.clear();
     plan.repairs.clear();
     plan.source_edits.clear();
     plan.variance_contracts.clear();
 }
 
-fn merge_property_repairs(
+fn merge_accessor_repairs(
     plans: &mut HashMap<PathBuf, crate::translation_plan::TranslationPlan>,
-    report: crate::property_abi::PlannedPropertyRepairs,
+    report: crate::property_abi::PlannedAccessorRepairs,
     excluded_files: &HashSet<PathBuf>,
 ) {
     for repair in report.repairs {

@@ -627,36 +627,43 @@ fn is_subtype_of<P: SemanticProvider + ?Sized>(
     bound: &SymbolId,
     provider: &P,
 ) -> bool {
-    if actual == bound {
-        return true;
-    }
-    fn visit<P: SemanticProvider + ?Sized>(
-        current: &SymbolId,
-        target: &SymbolId,
-        provider: &P,
-        active: &mut BTreeSet<SymbolId>,
-    ) -> Option<bool> {
-        if !active.insert(current.clone()) {
-            return None;
+    subtype_path(actual, bound, provider).is_some()
+}
+
+/// An established inheritance path, including both endpoints. Only complete
+/// source-backed edges can authorize an upcast; unrelated unknown branches
+/// do not erase a path already proved through another parent.
+pub(super) fn subtype_path<P: SemanticProvider + ?Sized>(
+    actual: &SymbolId,
+    bound: &SymbolId,
+    provider: &P,
+) -> Option<Vec<SymbolId>> {
+    let mut pending = vec![actual.clone()];
+    let mut visited = BTreeSet::from([actual.clone()]);
+    let mut predecessors = std::collections::BTreeMap::<SymbolId, SymbolId>::new();
+    while let Some(current) = pending.pop() {
+        if &current == bound {
+            let mut path = vec![current];
+            while path.last()? != actual {
+                path.push(predecessors.get(path.last()?)?.clone());
+            }
+            path.reverse();
+            return Some(path);
         }
-        if !provider.has_complete_inheritance(current) {
-            active.remove(current);
-            return None;
+        if !provider.has_complete_inheritance(&current) {
+            continue;
         }
-        let FactStatus::Established(parents) = provider.instance_contract_parents(current) else {
-            active.remove(current);
-            return None;
+        let FactStatus::Established(parents) = provider.instance_contract_parents(&current) else {
+            continue;
         };
         for parent in parents {
-            if &parent == target || visit(&parent, target, provider, active)? {
-                active.remove(current);
-                return Some(true);
+            if visited.insert(parent.clone()) {
+                predecessors.insert(parent.clone(), current.clone());
+                pending.push(parent);
             }
         }
-        active.remove(current);
-        Some(false)
     }
-    visit(actual, bound, provider, &mut BTreeSet::new()) == Some(true)
+    None
 }
 
 fn value_parameters(declaration: Node<'_>) -> Option<Vec<Node<'_>>> {

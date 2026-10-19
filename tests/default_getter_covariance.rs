@@ -344,3 +344,66 @@ fn unproven_any_contracts_and_unboxed_value_getters_still_conflict() {
         assert!(conflicts(source), "{source}");
     }
 }
+
+fn bounded_provider_fixture(parameter: &str, extra: &str, arguments: &str) -> Fixture {
+    Fixture::new(&[
+        ("Wide.java", "package sample; public interface Wide {}"),
+        (
+            "Key.java",
+            "package sample; public interface Key extends Wide {}",
+        ),
+        (
+            "Concrete.java",
+            "package sample; public final class Concrete implements Key {}",
+        ),
+        (
+            "Root.java",
+            "package sample; public interface Root { Wide getValue(); }",
+        ),
+        (
+            "Contracts.kt",
+            &format!(
+                "package sample\n{extra}\ninterface Provider<{parameter}> : Root {{\n    val current: T\n    override fun getValue(): T = current\n}}\nclass Child : Provider<{arguments}> {{\n    override val current: Concrete = Concrete()\n    suspend fun retained() {{}}\n}}\n"
+            ),
+        ),
+    ])
+}
+
+#[test]
+fn bounded_generic_method_return_can_narrow_an_inherited_java_getter() {
+    assert!(!bounded_provider_fixture("T : Key", "", "Concrete").conflicts());
+}
+
+#[test]
+fn comparable_does_not_block_a_proven_generic_getter_bridge() {
+    let fixture = bounded_provider_fixture("T : Key", "", "Concrete");
+    let path = fixture.0.join("Contracts.kt");
+    let source = fs::read_to_string(&path)
+        .unwrap()
+        .replace(
+            "Provider<Concrete> {",
+            "Provider<Concrete>, Comparable<Child> {",
+        )
+        .replace(
+            "    suspend fun retained()",
+            "    override fun compareTo(other: Child): Int = 0\n    suspend fun retained()",
+        );
+    fs::write(path, source).unwrap();
+    assert!(!fixture.conflicts());
+}
+
+#[test]
+fn unproven_generic_upper_bounds_still_retain_the_provider() {
+    for (parameter, extra, arguments) in [
+        ("T", "", "Concrete"),
+        ("T : Key?", "", "Concrete"),
+        ("T : Missing", "", "Concrete"),
+        ("T : Bound", "typealias Bound = Key", "Concrete"),
+        ("T : U, U : Key", "", "Concrete, Key"),
+    ] {
+        assert!(
+            bounded_provider_fixture(parameter, extra, arguments).conflicts(),
+            "{parameter}"
+        );
+    }
+}

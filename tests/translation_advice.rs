@@ -264,8 +264,8 @@ fn recommends_only_a_known_covariant_default_getter_conflict_on_retained_descend
             .is_none()
     );
 
-    // Exact same-package covariance is now proven safe and should not produce
-    // advice after the getter conflict check was tightened.
+    // Known covariance still needs an explicit override when the competing
+    // Kotlin property contract is retained: a method repair cannot implement it.
     let exact = Fixture::new();
     exact.write(
         "types.kt",
@@ -281,7 +281,7 @@ fn recommends_only_a_known_covariant_default_getter_conflict_on_retained_descend
          class RetainedChild : Provider {}\n",
     );
     let exact_index = exact.index();
-    let (exact_files, exact_plans) = plans_for(&exact_index);
+    let (exact_files, mut exact_plans) = plans_for(&exact_index);
     let exact_advice = analyze(
         &exact_files,
         &exact_plans,
@@ -289,7 +289,36 @@ fn recommends_only_a_known_covariant_default_getter_conflict_on_retained_descend
         std::slice::from_ref(&exact.root),
         &[],
     );
-    assert!(exact_advice.iter().all(|item| item.code != "U001"));
+    assert_eq!(
+        exact_advice
+            .iter()
+            .filter(|item| item.code == "U001")
+            .count(),
+        1,
+        "{exact_advice:#?}"
+    );
+
+    // Once that contract moves to Java, the planned method repair can preserve
+    // the concrete getter without asking the user to edit the descendant.
+    for decision in exact_plans
+        .values_mut()
+        .flat_map(|plan| &mut plan.declarations)
+    {
+        if decision.symbol_id.name == "BroadContract" {
+            decision.final_owner = Some(BackendOwner::Java);
+        }
+    }
+    assert!(
+        analyze(
+            &exact_files,
+            &exact_plans,
+            &exact_index,
+            std::slice::from_ref(&exact.root),
+            &[],
+        )
+        .iter()
+        .all(|item| item.code != "U001")
+    );
 }
 
 #[test]

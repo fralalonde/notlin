@@ -70,7 +70,48 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             _ => return None,
         };
 
-        let (name, args) = self.map_type_name_and_arguments(type_node)?;
+        let (name, args) = if let Some(provider) = self.unit.semantic_provider {
+            let candidate = if type_node.kind() == "nullable_type" {
+                kt::child(type_node, "user_type")?
+            } else {
+                type_node
+            };
+            let raw = self.unit.text(candidate).trim();
+            let classifier = raw.split('<').next().unwrap_or(raw).trim();
+            if matches!(
+                classifier,
+                "Map" | "MutableMap" | "kotlin.collections.Map" | "kotlin.collections.MutableMap"
+            ) {
+                self.map_type_name_and_arguments(type_node)?
+            } else {
+                if candidate.kind() != "user_type" || raw.contains('<') || raw.contains('.') {
+                    return None;
+                }
+                let mut root = candidate;
+                while let Some(parent) = root.parent() {
+                    root = parent;
+                }
+                let package = root
+                    .named_children(&mut root.walk())
+                    .find(|node| node.kind() == "package_header")
+                    .and_then(|header| {
+                        header
+                            .named_children(&mut header.walk())
+                            .find(|node| node.kind() == "qualified_identifier")
+                    })
+                    .and_then(|node| node.utf8_text(self.unit.source.as_bytes()).ok())
+                    .unwrap_or_default()
+                    .replace(' ', "");
+                let crate::semantics::FactStatus::Established(arguments) =
+                    provider.map_alias_type_arguments(self.unit.file, &package, raw)
+                else {
+                    return None;
+                };
+                ("Map".to_string(), vec![arguments.key, arguments.value])
+            }
+        } else {
+            self.map_type_name_and_arguments(type_node)?
+        };
         if !matches!(
             name.as_str(),
             "Map" | "MutableMap" | "kotlin.collections.Map" | "kotlin.collections.MutableMap"
@@ -274,6 +315,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 
     fn call_body(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(expression) = self.planned_eager_collection_call(node) {
+            return expression;
+        }
         if let Some(fact) = self
             .unit
             .reified_class_calls
@@ -2223,6 +2267,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 
     pub(crate) fn lambda(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(java) = self.planned_container_lambda(node) {
+            return java;
+        }
         // lambda_literal: { params -> body }. The body is real AST (named
         // children after `->`) — transpiling it keeps println and other
         // top-level rewrites intact; raw text pass-through loses them.

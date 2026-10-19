@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 mod default_getters;
+pub(crate) mod header_facts;
+pub(crate) mod profile;
 
 // 5: `Declaration::constructor_param_count` (primary-constructor arity, not a
 // property count — companion members and body properties both inflate that).
@@ -22,7 +24,8 @@ mod default_getters;
 // same-named overloads that cannot collide with a property bridge.
 // 26: constructor-property visibility is indexed for inherited setter proofs.
 // 28: value-class identity excludes unboxed getters from reference covariance.
-const CACHE_VERSION: u32 = 28;
+// 29: method-generic and inline-bound header facts reuse the indexing parse.
+const CACHE_VERSION: u32 = 30;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -336,8 +339,8 @@ impl DefaultGetterConflict {
             _ => "an unresolved return type".to_string(),
         };
         format!(
-            "default property `{}` has competing inherited getter types {shape} on a retained Kotlin descendant",
-            self.property
+            "default property `{}` has competing inherited getter types {shape} on a retained Kotlin descendant `{}` (contract `{}`)",
+            self.property, self.implementation.name, self.competing_owner.name,
         )
     }
 }
@@ -351,6 +354,8 @@ pub struct SourceFile {
     /// filesystem contents after an in-memory rewrite.
     #[serde(default)]
     source_text: String,
+    #[serde(default)]
+    header_facts: header_facts::HeaderFacts,
     /// Top-level Kotlin ownership boundaries counted from the parser tree.
     /// Java files always report zero. Stored in the workspace cache so display
     /// statistics do not need to parse Kotlin source again.
@@ -391,6 +396,16 @@ impl SourceFile {
         &self.source_text
     }
 
+    pub(crate) fn inline_type_parameter_upper_bound(
+        &self,
+        owner: &Declaration,
+        parameter: &str,
+    ) -> Option<String> {
+        self.header_facts
+            .inline_bound(&owner.name, owner.kind, parameter)
+            .map(str::to_owned)
+    }
+
     /// Number of top-level Kotlin declarations that translation plans own.
     /// Class members and nested declarations belong to their containing owner.
     pub fn kotlin_declaration_count(&self) -> usize {
@@ -425,6 +440,12 @@ impl SourceFile {
 #[derive(Debug, Default)]
 pub struct SourceIndex {
     pub files: Vec<SourceFile>,
+    /// Accepted generated-member facts, never inferred from arbitrary Java text.
+    generated_getters: Vec<crate::lombok_getter_contracts::GeneratedGetterContract>,
+    /// Java paths with an explicitly enabled, snapshot-checked default Lombok profile.
+    default_lombok_accessors: HashSet<PathBuf>,
+    /// Ownership-independent getter bridge facts, scoped to this immutable index snapshot.
+    getter_bridge_cache: default_getters::BridgeCache,
     /// Symbols are populated together for a file on its first retention query.
     /// Per-file cells avoid serializing independent Rayon planning workers.
     declaration_symbols: Vec<std::sync::OnceLock<HashMap<usize, crate::semantics::SymbolId>>>,
@@ -489,6 +510,97 @@ pub enum SourceOverlay {
     Delete {
         path: PathBuf,
     },
+}
+
+fn changed_bridge_dependencies(
+    old_files: &[SourceFile],
+    new_files: &[SourceFile],
+) -> (HashSet<String>, HashSet<String>) {
+    let old_by_path = old_files
+        .iter()
+        .map(|file| (normalized_path(&file.path), file))
+        .collect::<HashMap<_, _>>();
+    let new_by_path = new_files
+        .iter()
+        .map(|file| (normalized_path(&file.path), file))
+        .collect::<HashMap<_, _>>();
+    let paths = old_by_path
+        .keys()
+        .chain(new_by_path.keys())
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut changed_files = HashSet::new();
+    let mut changed_names = HashSet::new();
+    for path in paths {
+        let old = old_by_path.get(&path).copied();
+        let new = new_by_path.get(&path).copied();
+        let changed = old.is_some_and(|left| {
+            new.is_none_or(|right| {
+                left.language != right.language || left.source_text != right.source_text
+            })
+        }) || (old.is_none() && new.is_some());
+        if changed {
+            changed_files.insert(path);
+            let old_names = old.map_or_else(HashMap::new, namespace_name_counts);
+            let new_names = new.map_or_else(HashMap::new, namespace_name_counts);
+            for name in old_names.keys().chain(new_names.keys()) {
+                if old_names.get(name) != new_names.get(name) {
+                    changed_names.insert(name.1.clone());
+                }
+            }
+        }
+    }
+    (changed_files, changed_names)
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum BridgeNamespaceKind {
+    DeclarationSimple,
+    DeclarationQualified,
+    AliasSimple,
+    AliasQualified,
+    MemberSimple,
+}
+
+fn namespace_name_counts(file: &SourceFile) -> HashMap<(BridgeNamespaceKind, String), usize> {
+    fn add(
+        counts: &mut HashMap<(BridgeNamespaceKind, String), usize>,
+        kind: BridgeNamespaceKind,
+        name: &str,
+    ) {
+        *counts.entry((kind, name.to_owned())).or_default() += 1;
+    }
+
+    let mut counts = HashMap::new();
+    for declaration in &file.declarations {
+        add(
+            &mut counts,
+            BridgeNamespaceKind::DeclarationSimple,
+            &declaration.name,
+        );
+        let qualified = declaration_key(declaration);
+        if qualified != declaration.name {
+            add(
+                &mut counts,
+                BridgeNamespaceKind::DeclarationQualified,
+                &qualified,
+            );
+        }
+        for member in &declaration.members {
+            add(&mut counts, BridgeNamespaceKind::MemberSimple, &member.name);
+        }
+    }
+    for alias in file.type_aliases.keys() {
+        add(&mut counts, BridgeNamespaceKind::AliasSimple, alias);
+        if let Some(package) = &file.package {
+            add(
+                &mut counts,
+                BridgeNamespaceKind::AliasQualified,
+                &format!("{package}.{alias}"),
+            );
+        }
+    }
+    counts
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -563,6 +675,72 @@ fn flatten_sources(root: &CachedDirectory) -> Vec<CachedPathSource> {
 }
 
 impl SourceIndex {
+    pub(crate) fn set_default_lombok_accessors(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) {
+        let enabled = paths
+            .into_iter()
+            .map(|path| normalized_path(&path))
+            .collect::<HashSet<_>>();
+        self.default_lombok_accessors = self
+            .java_files()
+            .filter(|file| enabled.contains(&normalized_path(&file.path)))
+            .map(|file| file.path.clone())
+            .collect();
+    }
+
+    pub(crate) fn has_default_lombok_accessors(&self, path: &Path) -> bool {
+        self.default_lombok_accessors.contains(path)
+    }
+
+    pub(crate) fn generated_getters(
+        &self,
+    ) -> &[crate::lombok_getter_contracts::GeneratedGetterContract] {
+        &self.generated_getters
+    }
+
+    pub(crate) fn set_generated_getters(
+        &mut self,
+        getters: impl IntoIterator<Item = crate::lombok_getter_contracts::GeneratedGetterContract>,
+    ) {
+        self.generated_getters.clear();
+        let getters = getters.into_iter().collect::<Vec<_>>();
+        if getters.is_empty() {
+            return;
+        }
+        let files = self
+            .files
+            .iter()
+            .filter(|file| file.language == SourceLanguage::Java)
+            .map(|file| (normalized_path(&file.path), file))
+            .collect::<HashMap<_, _>>();
+        let mut hashes = HashMap::new();
+        let mut contracts_by_target = HashMap::<_, Vec<usize>>::new();
+        for mut getter in getters {
+            let Some(file) = files.get(&normalized_path(&getter.output_path)) else {
+                continue;
+            };
+            let hash = hashes
+                .entry(&file.path)
+                .or_insert_with(|| *blake3::hash(file.source_text().as_bytes()).as_bytes());
+            if *hash != getter.output_hash {
+                continue;
+            }
+            getter.output_path = file.path.clone();
+            let matching = contracts_by_target
+                .entry((getter.output_path.clone(), getter.target.clone()))
+                .or_default();
+            if !matching
+                .iter()
+                .any(|&index| self.generated_getters[index] == getter)
+            {
+                matching.push(self.generated_getters.len());
+                self.generated_getters.push(getter);
+            }
+        }
+    }
+
     pub(crate) fn cached_declaration_symbol(
         &self,
         declaration: &Declaration,
@@ -598,7 +776,37 @@ impl SourceIndex {
         retained: &HashSet<crate::semantics::SymbolId>,
     ) -> bool {
         let symbol = crate::semantics::workspace_symbol(self, declaration);
-        crate::transpiler::retention_queries::contains(retained, &symbol)
+        self.symbol_retained(&symbol, retained)
+    }
+
+    /// Nested types share their enclosing top-level declaration's ownership.
+    /// Record that boundary read as well as the exact symbol read so cached
+    /// preparation is revisited when either ownership decision changes.
+    pub(crate) fn symbol_retained(
+        &self,
+        symbol: &crate::semantics::SymbolId,
+        retained: &HashSet<crate::semantics::SymbolId>,
+    ) -> bool {
+        if crate::transpiler::retention_queries::contains(retained, symbol)
+            || symbol.kind.starts_with("ambiguous:")
+        {
+            return true;
+        }
+        let Some(outer_name) = symbol.owner_path.first() else {
+            return false;
+        };
+        let Some(file) = self.source_file(&symbol.file) else {
+            return true;
+        };
+        let mut boundaries = file.declarations.iter().filter_map(|declaration| {
+            let boundary = crate::semantics::workspace_symbol(self, declaration);
+            (boundary.owner_path.is_empty() && &boundary.name == outer_name).then_some(boundary)
+        });
+        let Some(boundary) = boundaries.next() else {
+            return true;
+        };
+        boundaries.next().is_some()
+            || crate::transpiler::retention_queries::contains(retained, &boundary)
     }
     pub fn discover(root: &Path) -> Result<Self, String> {
         Self::discover_with_stats(root).map(|(index, _)| index)
@@ -646,11 +854,31 @@ impl SourceIndex {
     }
 
     fn from_files(files: Vec<SourceFile>) -> Self {
+        let profile_started = profile::enabled().then(std::time::Instant::now);
+        let profiled_files = profile_started
+            .as_ref()
+            .map(|_| files.len())
+            .unwrap_or_default();
+        let profiled_declarations = profile_started
+            .as_ref()
+            .map(|_| {
+                files
+                    .iter()
+                    .map(|file| file.declarations.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or_default();
+        let mut profiled_supertype_edges = 0usize;
+        let mut profiled_resolved_edges = 0usize;
+        let mut profiled_unresolved_edges = 0usize;
         let declaration_symbols = std::iter::repeat_with(std::sync::OnceLock::new)
             .take(files.len())
             .collect();
         let mut index = Self {
             files,
+            generated_getters: Vec::new(),
+            default_lombok_accessors: HashSet::new(),
+            getter_bridge_cache: default_getters::BridgeCache::default(),
             declaration_symbols,
             kotlin_subtypes: HashMap::new(),
             subtype_names: HashMap::new(),
@@ -707,6 +935,8 @@ impl SourceIndex {
                 }
             }
         }
+        let lookup_index_elapsed = profile_started.as_ref().map(std::time::Instant::elapsed);
+        let hierarchy_started = profile::enabled().then(std::time::Instant::now);
         let mut subtype_edges = Vec::new();
         let mut subtype_name_edges = Vec::new();
         let mut all_subtype_name_edges = Vec::new();
@@ -716,7 +946,13 @@ impl SourceIndex {
             for (declaration_index, declaration) in file.declarations.iter().enumerate() {
                 let mut resolved_supers = HashSet::new();
                 for supertype in &declaration.supertypes {
+                    if profile_started.is_some() {
+                        profiled_supertype_edges += 1;
+                    }
                     if let Some(target) = index.resolve_type(file, supertype) {
+                        if profile_started.is_some() {
+                            profiled_resolved_edges += 1;
+                        }
                         let target_address = target as *const Declaration as usize;
                         if resolved_supers.insert(target_address) {
                             direct_subtype_edges.push((
@@ -733,6 +969,9 @@ impl SourceIndex {
                         all_subtype_name_edges
                             .push((declaration_key(target), declaration.name.clone()));
                     } else {
+                        if profile_started.is_some() {
+                            profiled_unresolved_edges += 1;
+                        }
                         let raw = supertype
                             .split(['<', '('])
                             .next()
@@ -786,10 +1025,33 @@ impl SourceIndex {
         index
             .unresolved_supertype_names
             .extend(unresolved_supertype_names);
+        if let (Some(total_started), Some(hierarchy_started), Some(lookup_index_elapsed)) =
+            (profile_started, hierarchy_started, lookup_index_elapsed)
+        {
+            eprintln!(
+                "NOTLIN_PROFILE source index: files={profiled_files} declarations={profiled_declarations} members={} lookup={:.3}s hierarchy={:.3}s edges={profiled_supertype_edges} resolved={profiled_resolved_edges} unresolved={profiled_unresolved_edges} total={:.3}s",
+                index.member_names.values().map(Vec::len).sum::<usize>(),
+                lookup_index_elapsed.as_secs_f64(),
+                hierarchy_started.elapsed().as_secs_f64(),
+                total_started.elapsed().as_secs_f64(),
+            );
+        }
         index
     }
 
     pub fn with_overlays(&self, overlays: &[SourceOverlay]) -> Result<Self, String> {
+        self.with_overlays_using_cache_from(overlays, self)
+    }
+
+    /// Build this snapshot from `self` while carrying only getter facts that
+    /// remain valid relative to `cache_source`. The source index is always
+    /// assembled from `self`; `cache_source` contributes cache entries only.
+    pub(crate) fn with_overlays_using_cache_from(
+        &self,
+        overlays: &[SourceOverlay],
+        cache_source: &SourceIndex,
+    ) -> Result<Self, String> {
+        let overlay_started = profile::enabled().then(std::time::Instant::now);
         let mut by_path = HashMap::with_capacity(overlays.len());
         for overlay in overlays {
             let path = match overlay {
@@ -798,6 +1060,24 @@ impl SourceIndex {
             by_path.insert(normalized_path(&absolute_source_path(path)), overlay);
         }
         let mut files = Vec::with_capacity(self.files.len() + overlays.len());
+        let (reused_files, replacement_count, deletion_count) = if overlay_started.is_some() {
+            let reused = self
+                .files
+                .iter()
+                .filter(|file| !by_path.contains_key(&normalized_path(&file.path)))
+                .count();
+            let replacements = by_path
+                .values()
+                .filter(|overlay| matches!(overlay, SourceOverlay::Replace { .. }))
+                .count();
+            (
+                reused,
+                replacements,
+                by_path.len().saturating_sub(replacements),
+            )
+        } else {
+            (0, 0, 0)
+        };
         files.extend(
             self.files
                 .iter()
@@ -825,11 +1105,13 @@ impl SourceIndex {
                         inferred_binding_calls,
                         ctor_calls,
                         kotlin_declaration_count,
+                        header_facts,
                     ) = parse_declarations(source, *language, package.as_deref())?;
                     files.push(SourceFile {
                         path: absolute_source_path(path),
                         language: *language,
                         source_text: source.clone(),
+                        header_facts,
                         kotlin_declaration_count,
                         package,
                         imports,
@@ -847,7 +1129,25 @@ impl SourceIndex {
             }
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(Self::from_files(files))
+        if let Some(started) = overlay_started {
+            eprintln!(
+                "NOTLIN_PROFILE source overlay: replacements={replacement_count} deletions={deletion_count} reused={reused_files} assembly={:.3}s",
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        let mut index = Self::from_files(files);
+        index.set_generated_getters(cache_source.generated_getters.iter().cloned());
+        index.set_default_lombok_accessors(cache_source.default_lombok_accessors.iter().cloned());
+        let (changed_files, changed_names) =
+            changed_bridge_dependencies(&cache_source.files, &index.files);
+        let (reused, invalidated) = index.getter_bridge_cache.carry_compatible_entries(
+            &cache_source.getter_bridge_cache,
+            &index,
+            &changed_files,
+            &changed_names,
+        );
+        profile::getter_cache_overlay(reused, invalidated);
+        Ok(index)
     }
 
     /// Which primary-constructor parameters callers leave out of `target`'s
@@ -957,22 +1257,36 @@ impl SourceIndex {
     }
 
     pub fn source_file(&self, path: &Path) -> Option<&SourceFile> {
+        default_getters::record_source_path(path);
         if let Some(&file_index) = self.file_paths.get(path) {
-            return self.files.get(file_index);
+            let file = self.files.get(file_index);
+            if let Some(file) = file {
+                default_getters::record_source_path(&file.path);
+            }
+            return file;
         }
         if let Ok(canonical) = fs::canonicalize(path) {
             if let Some(&file_index) = self.file_paths.get(&canonical) {
-                return self.files.get(file_index);
+                let file = self.files.get(file_index);
+                if let Some(file) = file {
+                    default_getters::record_source_path(&file.path);
+                }
+                return file;
             }
             if let Some(file) = self
                 .files
                 .iter()
                 .find(|file| paths_match(&file.path, &canonical))
             {
+                default_getters::record_source_path(&file.path);
                 return Some(file);
             }
         }
-        self.files.iter().find(|file| paths_match(&file.path, path))
+        let file = self.files.iter().find(|file| paths_match(&file.path, path));
+        if let Some(file) = file {
+            default_getters::record_source_path(&file.path);
+        }
+        file
     }
 
     /// Whether a resolved Java annotation may be written on `ElementType.FIELD`
@@ -2542,6 +2856,7 @@ impl SourceIndex {
     /// packages. This preserves the conservative semantics of name-based
     /// workspace compatibility checks without re-scanning every declaration.
     pub fn declarations_named(&self, name: &str) -> impl Iterator<Item = &Declaration> {
+        default_getters::record_alias_lookup(self, name);
         self.declaration_names.get(name).into_iter().flatten().map(
             |&(file_index, declaration_index)| {
                 &self.files[file_index].declarations[declaration_index]
@@ -2552,6 +2867,7 @@ impl SourceIndex {
         &self,
         name: &str,
     ) -> impl Iterator<Item = (&Declaration, &Member)> {
+        default_getters::record_alias_lookup(self, name);
         self.member_names.get(name).into_iter().flatten().map(
             |&(file_index, declaration_index, member_index)| {
                 let declaration = &self.files[file_index].declarations[declaration_index];
@@ -2564,6 +2880,9 @@ impl SourceIndex {
     /// both a method name and its property-getter form; sorting their indexed
     /// hits together preserves the old declaration/member traversal order.
     fn members_named_any(&self, names: &[&str]) -> Vec<(&Declaration, &Member)> {
+        for name in names {
+            default_getters::record_alias_lookup(self, name);
+        }
         let mut locations = names
             .iter()
             .filter_map(|name| self.member_names.get(*name))
@@ -2672,6 +2991,22 @@ impl SourceIndex {
             .map(|conflict| conflict.message())
     }
 
+    pub(crate) fn default_property_provider_retention_reason(
+        &self,
+        provider: &Declaration,
+        retained: &HashSet<crate::semantics::SymbolId>,
+        translation_roots: &[PathBuf],
+        allow_repairs: bool,
+    ) -> Option<String> {
+        self.default_property_getter_conflict_with_repairs(
+            provider,
+            retained,
+            translation_roots,
+            allow_repairs,
+        )
+        .map(|conflict| conflict.message())
+    }
+
     /// Exact declarations and return shapes behind the annotation-processor
     /// getter safeguard. Missing types still block translation, but must not
     /// become source-change recommendations.
@@ -2680,6 +3015,21 @@ impl SourceIndex {
         provider: &Declaration,
         retained: &HashSet<crate::semantics::SymbolId>,
         translation_roots: &[PathBuf],
+    ) -> Option<DefaultGetterConflict> {
+        self.default_property_getter_conflict_with_repairs(
+            provider,
+            retained,
+            translation_roots,
+            true,
+        )
+    }
+
+    fn default_property_getter_conflict_with_repairs(
+        &self,
+        provider: &Declaration,
+        retained: &HashSet<crate::semantics::SymbolId>,
+        translation_roots: &[PathBuf],
+        allow_repairs: bool,
     ) -> Option<DefaultGetterConflict> {
         if provider.language != SourceLanguage::Kotlin
             || provider.kind != DeclarationKind::Interface
@@ -2694,7 +3044,15 @@ impl SourceIndex {
                 && member.visibility.as_deref() != Some("private"))
             .then_some((member, name))
         }) {
-            let property_type = property.type_name.as_deref();
+            let inferred_property_type = property
+                .type_name
+                .is_none()
+                .then(|| self.inferred_simple_property_type(provider, property))
+                .flatten();
+            let property_type = property
+                .type_name
+                .as_deref()
+                .or_else(|| inferred_property_type.as_ref().map(|(ty, _)| ty.as_str()));
             let mut pending = vec![provider];
             let mut visited = HashSet::new();
             while let Some(current) = pending.pop() {
@@ -2796,26 +3154,11 @@ impl SourceIndex {
                             let Some(parent) =
                                 resolve_unique_getter_type(self, owner_file, supertype)
                             else {
-                                // Exact JDK markers declare no methods. A
-                                // source-defined or uncertain namesake still
-                                // participates in getter compatibility.
-                                let (base, arguments) = split_generic(supertype);
-                                let identity =
-                                    canonical_getter_named_identity(self, owner_file, base);
-                                if (arguments.is_none()
-                                    && matches!(identity.as_deref(),
-                                        Some(
-                                            "external:java.io.Serializable"
-                                                | "external:java.lang.Cloneable"
-                                                | "external:java.util.RandomAccess"
-                                        )
-                                    ))
-                                    // Comparable only declares compareTo(T),
-                                    // never an accessor. Its type argument cannot
-                                    // introduce a competing getter contract.
-                                    || (arguments.as_ref().is_some_and(|args| args.len() == 1)
-                                        && identity.as_deref() == Some("external:java.lang.Comparable"))
-                                {
+                                // Eligibility and bridge planning must agree
+                                // about external types that declare no getters.
+                                if default_getters::known_external_without_getters(
+                                    self, owner_file, supertype,
+                                ) {
                                     continue;
                                 }
                                 return Some(DefaultGetterConflict {
@@ -2862,8 +3205,11 @@ impl SourceIndex {
                                 member_is_property_getter(member, &property_name)
                                     && !member.is_static
                             }) {
-                                let inherited_type = inherited.type_name.as_deref();
-                                let effective_type = inherited_type.and_then(|ty| {
+                                let inherited_type = inherited.type_name.clone().or_else(|| {
+                                    self.inferred_simple_property_type(parent, inherited)
+                                        .map(|(ty, _)| ty)
+                                });
+                                let effective_type = inherited_type.as_deref().and_then(|ty| {
                                     canonical_getter_type(self, parent, ty, &parent_bindings)
                                 });
                                 inherited_getters.push((
@@ -2928,7 +3274,7 @@ impl SourceIndex {
                     let provider_types = provider_candidates
                         .iter()
                         .filter_map(|(_, raw_type, effective_type, _)| {
-                            Some(((*raw_type)?, effective_type.as_ref()?))
+                            Some((raw_type.as_deref()?, effective_type.as_ref()?))
                         })
                         .collect::<Vec<_>>();
                     if provider_types.len() != provider_candidates.len()
@@ -2966,7 +3312,7 @@ impl SourceIndex {
                                 competing_owner: crate::semantics::workspace_symbol(self, parent),
                                 property: property_name.clone(),
                                 provider_type: property_type.map(str::to_owned),
-                                competing_type: inherited_type.map(str::to_owned),
+                                competing_type: None,
                             });
                         };
                         let Some(effective_type) = effective_type.as_ref() else {
@@ -2990,14 +3336,22 @@ impl SourceIndex {
                                     parent,
                                     inherited_type,
                                 )
-                                || self.default_getter_has_proven_covariant_reference_return(
+                                || (self.default_getter_has_proven_covariant_reference_return(
                                     effective_provider,
                                     effective_property,
                                     provider_raw_type,
                                     parent,
                                     inherited_member,
                                     inherited_type,
-                                )
+                                ) && allow_repairs
+                                    && crate::default_getter_repair::can_repair_contract(
+                                        self,
+                                        descendant,
+                                        provider,
+                                        &property_accessor_name(&property_name),
+                                        retained,
+                                        translation_roots,
+                                    ))
                             {
                                 continue;
                             }
@@ -3021,11 +3375,11 @@ impl SourceIndex {
 
     /// Prove that a public, non-null Kotlin default getter returns a source
     /// reference subtype of one inherited getter contract. This is deliberately
-    /// narrower than general override compatibility: generic returns, aliases,
-    /// method type parameters, and incomplete type-name bindings remain
-    /// conservative conflicts. A known nominal path is enough to prove the
-    /// subtype relation; unrelated JDK interfaces on that path do not weaken
-    /// that proof.
+    /// narrower than general override compatibility: a method's owner type
+    /// parameter may use one explicit nonnullable reference bound, but generic
+    /// bounds, aliases and method type parameters remain unknown. This proves
+    /// logical covariance only; the caller still requires a concrete bridge
+    /// plan when JVM erasures differ.
     fn default_getter_has_proven_covariant_reference_return(
         &self,
         provider: &Declaration,
@@ -3058,9 +3412,7 @@ impl SourceIndex {
         let Some(parent_file) = self.declaration_source_file(parent) else {
             return false;
         };
-        if declaration_type_parameter_shadows(provider, provider_type)
-            || declaration_type_parameter_shadows(parent, inherited_type)
-        {
+        if declaration_type_parameter_shadows(parent, inherited_type) {
             return false;
         }
         if (provider_member.kind == MemberKind::Method
@@ -3078,6 +3430,36 @@ impl SourceIndex {
         {
             return false;
         }
+
+        let provider_bound = if declaration_type_parameter_shadows(provider, provider_type) {
+            // A Kotlin method returning T is a subtype of its declared bound.
+            // Do not replace T with that bound in the emitted signature or
+            // assume equal JVM descriptors: bridge planning checks those
+            // separately for each concrete descendant.
+            if provider.language != SourceLanguage::Kotlin
+                || provider_member.kind != MemberKind::Method
+                || !provider
+                    .type_params
+                    .iter()
+                    .any(|parameter| parameter == provider_type)
+            {
+                return false;
+            }
+            let Some(bound) = crate::property_abi::inline_type_parameter_upper_bound(
+                self,
+                provider,
+                provider_type,
+            ) else {
+                return false;
+            };
+            if bound.contains('?') || declaration_type_parameter_shadows(provider, &bound) {
+                return false;
+            }
+            Some(bound)
+        } else {
+            None
+        };
+        let provider_type = provider_bound.as_deref().unwrap_or(provider_type);
 
         let Some(provider_decl) = exact_source_reference_type(self, provider_file, provider_type)
         else {
@@ -4006,9 +4388,15 @@ impl SourceIndex {
     }
 
     pub(crate) fn declaration_source_file(&self, declaration: &Declaration) -> Option<&SourceFile> {
-        self.declaration_files
+        let file = self
+            .declaration_files
             .get(&(declaration as *const Declaration as usize))
-            .and_then(|index| self.files.get(*index))
+            .and_then(|index| self.files.get(*index));
+        default_getters::record_declaration_lookup(declaration);
+        if let Some(file) = file {
+            default_getters::record_source_path(&file.path);
+        }
+        file
     }
 
     fn resolve_kotlin_type<'a>(
@@ -4079,6 +4467,7 @@ impl SourceIndex {
         source_file: &SourceFile,
         type_name: &str,
     ) -> Option<&'a Declaration> {
+        default_getters::record_type_resolution(self, source_file, type_name);
         let base = type_name
             .trim()
             .trim_end_matches('?')
@@ -4269,21 +4658,25 @@ fn source_types_have_same_identity(
     // index. Their identical unshadowed spellings are exact JVM types across
     // source files, so retain that exact identity proof without extending the
     // same-name fallback to user declarations.
+    let builtin_name = own_type.trim_end_matches('?').trim();
     if own_type == contract_type
         && matches!(
-            own_type,
+            builtin_name,
             "String" | "Boolean" | "Byte" | "Short" | "Int" | "Long" | "Float" | "Double" | "Char"
         )
         && own_resolved.is_none()
         && contract_resolved.is_none()
-        && !index
-            .declarations()
-            .any(|declaration| declaration.name == own_type)
+        && index.declarations_named(builtin_name).next().is_none()
         && !own_file
             .imports
             .iter()
             .chain(contract_file.imports.iter())
-            .any(|import| import.rsplit('.').next() == Some(own_type))
+            .any(|import| {
+                import.split_once(" as ").map_or_else(
+                    || import.rsplit('.').next() == Some(builtin_name),
+                    |(_, alias)| alias.trim() == builtin_name,
+                )
+            })
     {
         return true;
     }
@@ -4715,6 +5108,7 @@ fn scan_source(
         inferred_binding_calls,
         ctor_calls,
         kotlin_declaration_count,
+        header_facts,
     ) = parse_declarations(&source, language, package.as_deref())?;
     stats.parsed_files += 1;
     Ok(CachedSource {
@@ -4725,6 +5119,7 @@ fn scan_source(
             path: canonical_path,
             language,
             source_text: source,
+            header_facts,
             kotlin_declaration_count,
             package,
             imports,
@@ -4777,6 +5172,7 @@ type ParseDeclarations = (
     Vec<crate::smart_cast::InferredBindingCall>,
     Vec<CtorCall>,
     usize,
+    header_facts::HeaderFacts,
 );
 
 fn java_annotation_target(source: &str, name: &str, element_type: &str) -> Option<bool> {
@@ -4830,6 +5226,7 @@ fn parse_declarations(
         .ok_or_else(|| "source parse failed".to_string())?;
     let mut declarations = Vec::new();
     let mut type_aliases = HashMap::new();
+    let mut header_facts = header_facts::HeaderFacts::default();
     // Walk the whole tree so NESTED declarations (a class declared inside
     // another class body) are indexed too: the retention fixpoint must see
     // a nested Kotlin class's implements edge, or its supertype interface
@@ -4841,6 +5238,7 @@ fn parse_declarations(
         .collect();
     stack.reverse();
     while let Some(node) = stack.pop() {
+        header_facts.record(node, language, source);
         if language == SourceLanguage::Kotlin && node.kind() == "type_alias" {
             let alias = node.child_by_field_name("type");
             let target = node
@@ -4946,6 +5344,7 @@ fn parse_declarations(
         inferred_binding_calls,
         ctor_calls,
         kotlin_declaration_count,
+        header_facts,
     ))
 }
 
@@ -7072,56 +7471,9 @@ fn java_getter_has_no_method_type_parameters(
     owner: &Declaration,
     getter: &str,
 ) -> bool {
-    let source = file.source_text();
-    let mut parser = tree_sitter::Parser::new();
-    if parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .is_err()
-    {
-        return false;
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return false;
-    };
-    let mut pending = vec![tree.root_node()];
-    let mut owners = Vec::new();
-    while let Some(node) = pending.pop() {
-        if matches!(
-            node.kind(),
-            "interface_declaration" | "class_declaration" | "record_declaration"
-        ) && node
-            .child_by_field_name("name")
-            .and_then(|name| node_text(name, source).ok())
-            .as_deref()
-            == Some(owner.name.as_str())
-        {
-            owners.push(node);
-        }
-        pending.extend(node.named_children(&mut node.walk()));
-    }
-    let [owner_node] = owners.as_slice() else {
-        return false;
-    };
-    let Some(body) = owner_node.child_by_field_name("body") else {
-        return false;
-    };
-    let methods = body
-        .named_children(&mut body.walk())
-        .filter(|node| node.kind() == "method_declaration")
-        .filter(|node| {
-            node.child_by_field_name("name")
-                .and_then(|name| node_text(name, source).ok())
-                .as_deref()
-                == Some(getter)
-        })
-        .filter(|node| {
-            node.child_by_field_name("parameters")
-                .is_some_and(|parameters| parameters.named_child_count() == 0)
-        })
-        .collect::<Vec<_>>();
-    matches!(methods.as_slice(), [method] if method.child_by_field_name("type_parameters").is_none())
+    file.language == SourceLanguage::Java
+        && getter_has_no_method_type_parameters(file, owner, getter)
 }
-
 /// The ancestry graph was resolved while gathering this descendant's getter
 /// contracts. Reuse those exact symbol edges instead of resolving names again.
 fn getter_owner_ancestors(
@@ -7149,65 +7501,9 @@ fn getter_has_no_method_type_parameters(
     owner: &Declaration,
     getter: &str,
 ) -> bool {
-    match file.language {
-        SourceLanguage::Java => java_getter_has_no_method_type_parameters(file, owner, getter),
-        SourceLanguage::Kotlin => {
-            let source = file.source_text();
-            let mut parser = tree_sitter::Parser::new();
-            if parser
-                .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
-                .is_err()
-            {
-                return false;
-            }
-            let Some(tree) = parser.parse(source, None) else {
-                return false;
-            };
-            let mut pending = vec![tree.root_node()];
-            let mut owners = Vec::new();
-            while let Some(node) = pending.pop() {
-                if matches!(node.kind(), "class_declaration" | "object_declaration")
-                    && node
-                        .child_by_field_name("name")
-                        .and_then(|name| node_text(name, source).ok())
-                        .as_deref()
-                        == Some(owner.name.as_str())
-                {
-                    owners.push(node);
-                }
-                pending.extend(node.named_children(&mut node.walk()));
-            }
-            let [owner_node] = owners.as_slice() else {
-                return false;
-            };
-            let Some(body) = owner_node.child_by_field_name("body").or_else(|| {
-                owner_node
-                    .named_children(&mut owner_node.walk())
-                    .find(|node| node.kind() == "class_body")
-            }) else {
-                return false;
-            };
-            let methods = body
-                .named_children(&mut body.walk())
-                .filter(|node| node.kind() == "function_declaration")
-                .filter(|node| {
-                    node.child_by_field_name("name")
-                        .and_then(|name| node_text(name, source).ok())
-                        .as_deref()
-                        == Some(getter)
-                })
-                .filter(|node| {
-                    node.children(&mut node.walk())
-                        .find(|child| child.kind() == "function_value_parameters")
-                        .is_some_and(|parameters| parameters.named_child_count() == 0)
-                })
-                .collect::<Vec<_>>();
-            matches!(methods.as_slice(), [method]
-                if !method.children(&mut method.walk()).any(|child| matches!(child.kind(), "type_parameters" | ".")))
-        }
-    }
+    file.header_facts
+        .getter_has_no_method_type_parameters(&owner.name, getter)
 }
-
 fn getter_is_public(member: &Member, owner: &Declaration) -> bool {
     match member.visibility.as_deref() {
         Some("public") => true,
@@ -7373,6 +7669,7 @@ fn canonical_getter_named_identity(
     file: &SourceFile,
     type_name: &str,
 ) -> Option<String> {
+    default_getters::record_alias_lookup(index, type_name);
     let simple = type_name.rsplit('.').next().unwrap_or(type_name);
     if type_name.is_empty()
         || !type_name
@@ -8064,6 +8361,59 @@ interface SiblingContext {
             Some("String")
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nullable_builtin_getter_identity_preserves_nullability_and_import_scope() {
+        let left_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("facts/Left.kt");
+        let right_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("facts/Right.kt");
+        let index = SourceIndex::from_files(Vec::new())
+            .with_overlays(&[
+                SourceOverlay::Replace {
+                    path: left_path.clone(),
+                    language: SourceLanguage::Kotlin,
+                    source: "package left\ninterface Left\n".into(),
+                },
+                SourceOverlay::Replace {
+                    path: right_path.clone(),
+                    language: SourceLanguage::Kotlin,
+                    source: "package right\ninterface Right\n".into(),
+                },
+            ])
+            .unwrap();
+        for builtin in ["String", "Boolean", "Int", "Char"] {
+            let nullable = format!("{builtin}?");
+            assert!(index.property_getter_return_compatible_in_files(
+                &left_path,
+                &nullable,
+                &right_path,
+                &nullable,
+            ));
+            assert!(!index.property_getter_return_compatible_in_files(
+                &left_path,
+                &nullable,
+                &right_path,
+                builtin,
+            ));
+        }
+        for import in ["import external.String", "import external.Text as String"] {
+            let shadowed = index
+                .with_overlays(&[SourceOverlay::Replace {
+                    path: left_path.clone(),
+                    language: SourceLanguage::Kotlin,
+                    source: format!("package left\n{import}\ninterface Left\n"),
+                }])
+                .unwrap();
+            assert!(
+                !shadowed.property_getter_return_compatible_in_files(
+                    &left_path,
+                    "String?",
+                    &right_path,
+                    "String?",
+                ),
+                "conflicting import: {import}"
+            );
+        }
     }
 
     #[test]

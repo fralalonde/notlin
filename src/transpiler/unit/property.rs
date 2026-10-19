@@ -229,10 +229,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // Fresh scope per property: getter/setter bodies must not see locals
         // declared while a previous property was translated.
         self.var_types.clear();
-        // A stale super-access owner would leak into an unrelated property's
-        // getter body; the pending flag is only valid for the immediately
-        // following navigation inside ONE expression.
-        self.pending_super_owner = None;
 
         let is_val = kt::child(decl, "val").is_some();
         let vd = kt::child(decl, "variable_declaration");

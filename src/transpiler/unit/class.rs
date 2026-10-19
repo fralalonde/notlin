@@ -604,6 +604,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let body = out.buf[import_anchor..].to_string();
         let mut lowered = body.clone();
         self.lower_visible_typealiases(&mut lowered);
+        if let Err(error) = self.lower_proven_map_typealiases(&mut lowered) {
+            self.preparation_failure.get_or_insert(error);
+        }
         let body = lowered;
         // Imports are chosen AFTER the body exists: a source file can be split
         // (some declarations translate, others stay Kotlin), and the retained
@@ -5481,6 +5484,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .filter(|bridge| bridge.location.start_byte == decl.start_byte())
         {
             assert_eq!(bridge.location.snapshot_hash, self.source_hash);
+            assert_eq!(
+                bridge.return_type_ref,
+                crate::semantics::TypeRef::parse(&bridge.return_type),
+                "accepted getter return spelling must match the structured contract"
+            );
             let provider = &bridge.provider;
             let mut parts = Vec::new();
             if !provider.package.is_empty() {

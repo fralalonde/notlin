@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 mod default_getter_plan;
+mod eager_collection_plan;
 pub mod expr;
 pub mod fixpoint;
 pub mod java;
@@ -482,10 +483,11 @@ fn lower_with_plan(
         let retained = retained_hint.unwrap_or(&empty_retained);
         let mut reasons = std::collections::HashMap::new();
         for indexed_declaration in &source_file.declarations {
-            let reason = index.default_property_provider_needs_physical_getter(
+            let reason = index.default_property_provider_retention_reason(
                 indexed_declaration,
                 retained,
                 scope.roots,
+                cli.migrates_in_place(),
             );
             if let Some(reason) = reason {
                 reasons.insert(
@@ -652,7 +654,7 @@ fn lower_with_plan(
     // Preparation stage: the existing lowerer produces candidate text and
     // coverage. Candidates do not become output until strict Java parsing
     // below accepts the complete set.
-    let (candidate_java_files, approx_diags, mut coverage, type_facts) = {
+    let (candidate_java_files, approx_diags, mut coverage, type_facts, preparation_failure) = {
         let mut unit = Unit::new(
             source,
             file,
@@ -668,6 +670,7 @@ fn lower_with_plan(
         .with_workspace_selection(workspace, translation_roots, workspace_file);
         unit.retained_hint = retained_hint;
         unit.semantic_provider = Some(semantic_provider);
+        unit.add_proven_map_aliases(tree.root_node());
         let java_files = unit.run_planned(tree.root_node(), &plan);
         let java_files = java_files
             .into_iter()
@@ -681,7 +684,13 @@ fn lower_with_plan(
         let mut coverage = std::mem::take(&mut unit.coverage);
         let approx = std::mem::take(&mut coverage.diags_approx);
         let type_facts = std::mem::take(&mut unit.type_facts);
-        (java_files, approx, coverage, type_facts)
+        (
+            java_files,
+            approx,
+            coverage,
+            type_facts,
+            unit.preparation_failure,
+        )
     };
     if profile {
         record_profile(&PROFILE_UNIT_NS, started.elapsed());
@@ -722,11 +731,22 @@ fn lower_with_plan(
         .expect("lowering uses the analyzed source snapshot");
     plan.type_facts.extend(type_facts);
     let acceptance_started = profile_enabled().then(Instant::now);
-    let (accepted, emission_failed) = match crate::planning::AcceptedTranslationPlan::accept(
-        plan.clone(),
-        candidate_java_files,
-        Some(semantic_provider),
-    ) {
+    let acceptance = match preparation_failure {
+        Some(message) => Err(crate::planning::AcceptedPlanError {
+            path: file.display().to_string(),
+            error: crate::java_ir::JavaIrError {
+                message,
+                start_byte: 0,
+                end_byte: 0,
+            },
+        }),
+        None => crate::planning::AcceptedTranslationPlan::accept(
+            plan.clone(),
+            candidate_java_files,
+            Some(semantic_provider),
+        ),
+    };
+    let (accepted, emission_failed) = match acceptance {
         Ok(accepted) => (accepted, false),
         Err(error) => {
             plan.diagnostics.push(crate::semantics::SemanticDiagnostic {
@@ -834,6 +854,8 @@ fn build_static_plan(
     crate::semantics::plan_todo_lowerings(source, tree, identity_path, provider, &mut plan);
     crate::semantics::plan_reference_string_calls(source, tree, identity_path, provider, &mut plan);
     crate::semantics::plan_container_calls(source, tree, identity_path, provider, &mut plan);
+    crate::semantics::plan_eager_collection_calls(source, tree, identity_path, provider, &mut plan);
+    eager_collection_plan::plan_helpers(source, tree.root_node(), provider, &mut plan);
     crate::semantics::plan_reified_class_calls(source, tree, identity_path, provider, &mut plan);
     crate::semantics::plan_constructor_delegations(
         source,

@@ -5,6 +5,9 @@
 //! continues to provide synthetic property syntax to Kotlin callers.
 
 use crate::property_callsite::PropertyAccessorContract;
+use crate::workspace::header_facts::{
+    declaration_kind_matches, declaration_name, declaration_node,
+};
 use crate::workspace::{
     Declaration, DeclarationKind, MemberKind, SourceFile, SourceIndex, SourceLanguage,
 };
@@ -142,11 +145,11 @@ impl<'a> PersistedContractIndex<'a> {
     }
 }
 
-/// Operation-derived facts for speculative Kotlin property ABI repairs.
+/// Operation-derived facts for speculative Kotlin accessor ABI repairs.
 /// These are accumulated while the exact property node is rewritten; they are
 /// not reconstructed by comparing source snapshots after the fact.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PlannedPropertyRepairs {
+pub(crate) struct PlannedAccessorRepairs {
     pub count: usize,
     pub repairs: Vec<crate::translation_plan::PlannedRepair>,
     pub bridges: Vec<crate::translation_plan::PlannedBridge>,
@@ -155,7 +158,7 @@ pub(crate) struct PlannedPropertyRepairs {
     pub(crate) abi_contracts: Vec<PersistedPropertyContract>,
 }
 
-impl PlannedPropertyRepairs {
+impl PlannedAccessorRepairs {
     fn record_abi_repair(
         &mut self,
         path: &Path,
@@ -2399,65 +2402,9 @@ pub(crate) fn inline_type_parameter_upper_bound(
     {
         return None;
     }
-    let owner_file = index.declaration_source_file(owner)?;
-    let source = owner_file.source_text();
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(source, None)?;
-    let mut stack = vec![tree.root_node()];
-    let mut owners = Vec::new();
-    while let Some(node) = stack.pop() {
-        if declaration_node(node)
-            && declaration_name(node, source) == owner.name
-            && declaration_kind_matches(owner.kind, node)
-        {
-            owners.push(node);
-        }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
-    let [owner_node] = owners.as_slice() else {
-        return None;
-    };
-    let type_parameters = owner_node
-        .child_by_field_name("type_parameters")
-        .or_else(|| {
-            let mut cursor = owner_node.walk();
-            owner_node
-                .named_children(&mut cursor)
-                .find(|node| node.kind() == "type_parameters")
-        })?;
-    let mut owner_cursor = owner_node.walk();
-    if owner_node
-        .named_children(&mut owner_cursor)
-        .any(|node| node.kind() == "type_constraints")
-    {
-        return None;
-    }
-    let mut cursor = type_parameters.walk();
-    let parameters = type_parameters
-        .named_children(&mut cursor)
-        .filter(|node| node.kind() == "type_parameter")
-        .map(|node| node_text(node, source).to_string())
-        .filter(|text| type_parameter_name(text) == Some(parameter))
-        .collect::<Vec<_>>();
-    let [parameter_text] = parameters.as_slice() else {
-        return None;
-    };
-    let (name, bound) = parameter_text.split_once(':')?;
-    if name.trim() != parameter {
-        return None;
-    }
-    let bound = bound.trim();
-    (!bound.is_empty()).then(|| bound.to_string())
-}
-
-fn type_parameter_name(parameter: &str) -> Option<&str> {
-    let declaration = parameter.split(':').next()?.trim();
-    declaration
-        .split(|character: char| !character.is_alphanumeric() && character != '_')
-        .rfind(|token| !token.is_empty())
+    index
+        .declaration_source_file(owner)?
+        .inline_type_parameter_upper_bound(owner, parameter)
 }
 
 fn is_scalar_reference_type(type_name: &str) -> bool {
@@ -2553,6 +2500,24 @@ fn qualify_simple_type_argument(
         format!("{qualified}?")
     } else {
         qualified
+    }
+}
+
+/// Qualify a simple source type in its lexical scope, preserving type
+/// parameters declared by the implementation. A same-named top-level class
+/// must not capture an in-scope type parameter such as `T` in `Parent<T>`.
+fn qualify_simple_type_argument_in_scope(
+    index: &SourceIndex,
+    context: &SourceFile,
+    argument: &str,
+    type_parameters: &[String],
+) -> String {
+    let argument = argument.trim();
+    let name = argument.trim_end_matches('?').trim();
+    if type_parameters.iter().any(|parameter| parameter == name) {
+        argument.to_string()
+    } else {
+        qualify_simple_type_argument(index, context, argument)
     }
 }
 
@@ -2916,6 +2881,7 @@ fn class_supertype_properties_compatible(
                         )?;
                         inferred_property_matches_receiver_bound(
                             index,
+                            implementation,
                             parent,
                             &parent_bindings,
                             &receiver,
@@ -3356,12 +3322,19 @@ fn simple_inferred_property_getter_rhs(
 /// return a narrower subtype.
 fn inferred_property_matches_receiver_bound(
     index: &SourceIndex,
+    implementation: &Declaration,
     owner: &Declaration,
     owner_bindings: &HashMap<String, String>,
     receiver: &str,
     selected_property: &str,
     inferred: &(String, std::path::PathBuf),
 ) -> bool {
+    let mut lexical_type_parameters = owner.type_params.clone();
+    for parameter in &implementation.type_params {
+        if !lexical_type_parameters.contains(parameter) {
+            lexical_type_parameters.push(parameter.clone());
+        }
+    }
     // The value used by a default getter can be declared on a generic
     // superinterface rather than on `owner` itself (for example, `id: T` on
     // `IBaseObject<T>`). Resolve that inherited property with the owner's own
@@ -3430,11 +3403,14 @@ fn inferred_property_matches_receiver_bound(
         .type_params
         .iter()
         .cloned()
-        .zip(
-            bound_args
-                .into_iter()
-                .map(|argument| qualify_simple_type_argument(index, owner_file, argument)),
-        )
+        .zip(bound_args.into_iter().map(|argument| {
+            qualify_simple_type_argument_in_scope(
+                index,
+                owner_file,
+                argument,
+                &lexical_type_parameters,
+            )
+        }))
         .collect::<HashMap<_, _>>();
     let bound_member_type = bound_declaration
         .members
@@ -3446,7 +3422,7 @@ fn inferred_property_matches_receiver_bound(
         .or_else(|| {
             inherited_property_type_from_supertypes(
                 index,
-                bound_declaration,
+                implementation,
                 bound_declaration,
                 &bound_bindings,
                 selected_property,
@@ -3461,15 +3437,27 @@ fn inferred_property_matches_receiver_bound(
         .any(|parameter| bound_type.trim().trim_end_matches('?').trim() == parameter)
     {
         owner_file
+    } else if implementation
+        .type_params
+        .iter()
+        .any(|parameter| bound_type.trim().trim_end_matches('?').trim() == parameter)
+    {
+        index
+            .declaration_source_file(implementation)
+            .unwrap_or(owner_file)
     } else {
         index
             .source_file(&bound_type_source_path)
             .unwrap_or(bound_file)
     };
-    let bound_type = qualify_simple_type_argument(index, bound_type_source, &bound_type);
+    let bound_type = qualify_simple_type_argument_in_scope(
+        index,
+        bound_type_source,
+        &bound_type,
+        &lexical_type_parameters,
+    );
     if bound_type == inferred.0
-        && owner
-            .type_params
+        && lexical_type_parameters
             .iter()
             .any(|parameter| bound_type.trim().trim_end_matches('?').trim() == parameter)
     {
@@ -3549,11 +3537,14 @@ fn inherited_property_type_from_supertypes(
                 .type_params
                 .iter()
                 .cloned()
-                .zip(
-                    supplied_args
-                        .into_iter()
-                        .map(|argument| qualify_simple_type_argument(index, context, argument)),
-                )
+                .zip(supplied_args.into_iter().map(|argument| {
+                    qualify_simple_type_argument_in_scope(
+                        index,
+                        context,
+                        argument,
+                        &implementation.type_params,
+                    )
+                }))
                 .collect::<HashMap<_, _>>();
             if let Some(member) = parent
                 .members
@@ -3562,10 +3553,17 @@ fn inherited_property_type_from_supertypes(
                 && let Some(member_type) = member.type_name.as_deref()
             {
                 let specialized = substitute_type_parameters(member_type, &bindings)?;
-                let Some(simple) = scalar_type_identity(&specialized) else {
+                if scalar_type_identity(&specialized).is_none() {
                     continue;
-                };
-                let qualified = qualify_simple_type_argument(index, parent_file, simple);
+                }
+                // Keep the original spelling so nullable markers survive
+                // scalar-classifier normalization in `scalar_type_identity`.
+                let qualified = qualify_simple_type_argument_in_scope(
+                    index,
+                    parent_file,
+                    &specialized,
+                    &implementation.type_params,
+                );
                 let remains_unbound = parent.type_params.iter().any(|parameter| {
                     qualified.trim().trim_end_matches('?').trim() == parameter
                         && !bindings
@@ -3998,7 +3996,7 @@ pub(crate) fn repair_virtual_sources_planned(
     index: &SourceIndex,
     sources: &mut [(std::path::PathBuf, String)],
     generated_java: &HashSet<std::path::PathBuf>,
-) -> PlannedPropertyRepairs {
+) -> PlannedAccessorRepairs {
     repair_virtual_sources_planned_with_contracts(index, sources, generated_java, &[])
 }
 
@@ -4007,7 +4005,7 @@ pub(crate) fn repair_virtual_sources_planned_with_contracts(
     sources: &mut [(std::path::PathBuf, String)],
     generated_java: &HashSet<std::path::PathBuf>,
     persisted_contracts: &[PersistedPropertyContract],
-) -> PlannedPropertyRepairs {
+) -> PlannedAccessorRepairs {
     let persisted_index = PersistedContractIndex::new(index, persisted_contracts);
     let mut contracts = HashMap::new();
     // Discover inheritance contracts once, serially, because declarations in
@@ -4040,7 +4038,7 @@ pub(crate) fn repair_virtual_sources_planned_with_contracts(
             .collect::<Vec<_>>()
     })
     .into_iter()
-    .fold(PlannedPropertyRepairs::default(), |mut all, report| {
+    .fold(PlannedAccessorRepairs::default(), |mut all, report| {
         all.append(report);
         all
     })
@@ -4074,16 +4072,16 @@ fn repair_source_cached(
     path: &Path,
     source: &str,
     contract_cache: &HashMap<String, Vec<PropertyContract>>,
-) -> (String, PlannedPropertyRepairs) {
+) -> (String, PlannedAccessorRepairs) {
     let Some(source_file) = index.source_file(path) else {
-        return (source.to_string(), PlannedPropertyRepairs::default());
+        return (source.to_string(), PlannedAccessorRepairs::default());
     };
     if source_file.language != SourceLanguage::Kotlin {
-        return (source.to_string(), PlannedPropertyRepairs::default());
+        return (source.to_string(), PlannedAccessorRepairs::default());
     }
     let tree = crate::transpiler::parse_tree(source);
     let mut edits = Vec::new();
-    let mut report = PlannedPropertyRepairs::default();
+    let mut report = PlannedAccessorRepairs::default();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if declaration_node(node) {
@@ -4116,7 +4114,7 @@ fn repair_source_cached(
         stack.extend(node.named_children(&mut node.walk()));
     }
     if edits.is_empty() {
-        return (source.to_string(), PlannedPropertyRepairs::default());
+        return (source.to_string(), PlannedAccessorRepairs::default());
     }
     report.count = edits.len();
     (crate::smart_cast::apply_edits(source, edits), report)
@@ -4684,7 +4682,7 @@ fn repair_property_origin(
 }
 
 fn record_repair_accessors(
-    report: &mut PlannedPropertyRepairs,
+    report: &mut PlannedAccessorRepairs,
     origin: &crate::semantics::SymbolId,
     contract: &PropertyContract,
     getter: bool,
@@ -4751,7 +4749,7 @@ fn repair_declaration(
     contracts: &[PropertyContract],
     contract_cache: &HashMap<String, Vec<PropertyContract>>,
     edits: &mut Vec<crate::smart_cast::Edit>,
-    report: &mut PlannedPropertyRepairs,
+    report: &mut PlannedAccessorRepairs,
 ) {
     let is_interface = declaration.kind == DeclarationKind::Interface;
     let mut stack = vec![node];
@@ -5041,6 +5039,24 @@ fn inferred_interface_property_contract(
     member: &crate::workspace::Member,
     contract: &PropertyContract,
 ) -> Option<PropertyContract> {
+    let inferred = index.inferred_simple_property_type(declaration, member)?;
+    let mut local = contract.clone();
+    local.type_name = inferred.0;
+    local.type_source = inferred.1;
+    Some(local)
+}
+
+/// Exact return fact for an untyped getter delegating to a property through a
+/// declared generic receiver bound. An inherited override type alone is not
+/// sufficient: Kotlin may infer a narrower return from the getter expression.
+pub(crate) fn inferred_simple_property_type(
+    index: &SourceIndex,
+    declaration: &Declaration,
+    member: &crate::workspace::Member,
+) -> Option<(String, std::path::PathBuf)> {
+    if member.kind != MemberKind::Property || member.type_name.is_some() {
+        return None;
+    }
     let (receiver, selected_property) =
         simple_inferred_property_getter_rhs(index, declaration, &member.name)?;
     if selected_property != member.name {
@@ -5057,6 +5073,7 @@ fn inferred_interface_property_contract(
     if !inferred_property_matches_receiver_bound(
         index,
         declaration,
+        declaration,
         &empty_bindings,
         &receiver,
         &selected_property,
@@ -5064,10 +5081,7 @@ fn inferred_interface_property_contract(
     ) {
         return None;
     }
-    let mut local = contract.clone();
-    local.type_name = inferred.0;
-    local.type_source = inferred.1;
-    Some(local)
+    Some(inferred)
 }
 
 fn contains_token(node: Node<'_>, token: &str) -> bool {
@@ -5777,62 +5791,6 @@ fn custom_accessor_annotations(text: &str, accessor: &str) -> Vec<String> {
         .collect()
 }
 
-fn declaration_node(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "class_declaration"
-            | "interface_declaration"
-            | "object_declaration"
-            | "enum_class_declaration"
-    )
-}
-
-fn declaration_kind_matches(kind: DeclarationKind, node: Node<'_>) -> bool {
-    match node.kind() {
-        "object_declaration" => kind == DeclarationKind::Object,
-        "interface_declaration" => kind == DeclarationKind::Interface,
-        "enum_class_declaration" | "enum_declaration" => kind == DeclarationKind::Enum,
-        "class_declaration" => {
-            let direct_children = node.children(&mut node.walk()).collect::<Vec<_>>();
-            let is_interface = direct_children
-                .iter()
-                .any(|child| child.kind() == "interface");
-            let modifiers = direct_children
-                .iter()
-                .find(|child| child.kind() == "modifiers");
-            let has_class_modifier = |modifier: &str| {
-                modifiers.is_some_and(|modifiers| {
-                    modifiers
-                        .children(&mut modifiers.walk())
-                        .filter(|child| child.kind() == "class_modifier")
-                        .any(|class_modifier| {
-                            class_modifier
-                                .children(&mut class_modifier.walk())
-                                .any(|child| child.kind() == modifier)
-                        })
-                })
-            };
-            if has_class_modifier("annotation") {
-                kind == DeclarationKind::Annotation
-            } else if is_interface {
-                kind == DeclarationKind::Interface
-            } else if has_class_modifier("enum") {
-                kind == DeclarationKind::Enum
-            } else {
-                kind == DeclarationKind::Class
-            }
-        }
-        _ => false,
-    }
-}
-
-fn declaration_name(node: Node<'_>, source: &str) -> String {
-    node.named_children(&mut node.walk())
-        .find(|child| child.kind() == "type_identifier" || child.kind() == "identifier")
-        .map(|name| node_text(name, source).to_string())
-        .unwrap_or_default()
-}
-
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     node.utf8_text(source.as_bytes()).unwrap_or("")
 }
@@ -6111,6 +6069,7 @@ mod tests {
             inferred_property_matches_receiver_bound(
                 &index,
                 declaration,
+                declaration,
                 &empty_bindings,
                 "id",
                 "lookupId",
@@ -6237,6 +6196,77 @@ mod tests {
             "same-named nested declarations must not borrow one another's getter evidence"
         );
         let _ = kotlin;
+    }
+
+    #[test]
+    fn inferred_generic_bound_getter_preserves_nullable_return_type() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "kotlin/NullableGetter.kt",
+            "package sample\n\
+             interface NullableBound {\n\
+                 val value: String?\n\
+             }\n\
+             interface NullableParent<T> {\n\
+                 val value: String?\n\
+             }\n\
+             interface NullableGetter<T : NullableBound> : NullableParent<T> {\n\
+                 val payload: T\n\
+                 override val value\n\
+                     get() = payload.value\n\
+             }\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let owner = index
+            .declarations()
+            .find(|declaration| declaration.name == "NullableGetter")
+            .unwrap();
+        let member = owner
+            .members
+            .iter()
+            .find(|member| member.kind == MemberKind::Property && member.name == "value")
+            .unwrap();
+        let inferred = inferred_simple_property_type(&index, owner, member)
+            .expect("the bounded receiver and inherited property establish the getter type");
+
+        assert_eq!(inferred.0, "String?");
+    }
+
+    #[test]
+    fn inferred_generic_bound_getter_keeps_type_parameter_identity_over_same_named_class() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "kotlin/TypeParameterIdentity.kt",
+            "package sample\n\
+             class T {\n\
+             }\n\
+             interface Bound<X> {\n\
+                 val value: X\n\
+             }\n\
+             interface Parent<X> {\n\
+                 val value: X\n\
+             }\n\
+             interface Child<T : Bound<T>> : Parent<T> {\n\
+                 val payload: T\n\
+                 override val value\n\
+                     get() = payload.value\n\
+             }\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let owner = index
+            .declarations()
+            .find(|declaration| declaration.name == "Child")
+            .unwrap();
+        let member = owner
+            .members
+            .iter()
+            .find(|member| member.kind == MemberKind::Property && member.name == "value")
+            .unwrap();
+
+        let inferred = inferred_simple_property_type(&index, owner, member)
+            .expect("the owner type parameter is proven by the receiver bound");
+
+        assert_eq!(inferred.0, "T");
     }
 
     #[test]

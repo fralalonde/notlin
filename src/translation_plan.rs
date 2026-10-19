@@ -161,6 +161,10 @@ pub struct TranslationPlan {
     pub source_hash: [u8; 32],
     pub declarations: Vec<DeclarationDecision>,
     pub bridges: Vec<PlannedBridge>,
+    /// Conditional contracts for accepted Java using default Lombok accessors.
+    /// The migration pipeline proves and snapshots configuration before use.
+    #[serde(default)]
+    pub generated_getters: Vec<crate::lombok_getter_contracts::GeneratedGetterContract>,
     /// Concrete overrides preserving inherited covariant default getter APIs.
     #[serde(default)]
     pub default_getter_bridges: Vec<PlannedDefaultGetterBridge>,
@@ -188,6 +192,12 @@ pub struct TranslationPlan {
     /// Canonical external container calls with wrapper-only return facts.
     #[serde(default)]
     pub container_calls: Vec<crate::semantics::ContainerMemberCall>,
+    /// Proven eager stdlib collection operations tied to this snapshot.
+    #[serde(default)]
+    pub eager_collection_calls: Vec<crate::semantics::EagerCollectionCall>,
+    /// Private loop helpers required by the planned ownership boundaries.
+    #[serde(default)]
+    pub eager_collection_helpers: Vec<PlannedEagerCollectionHelper>,
     #[serde(default)]
     pub exact_overload_calls: Vec<crate::semantics::ExactOverloadCall>,
     #[serde(default)]
@@ -224,13 +234,27 @@ pub struct PlannedBridge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedEagerCollectionHelper {
+    pub id: SymbolId,
+    pub origin: SymbolId,
+    pub name: String,
+    pub parameter_name: String,
+    pub operation: crate::semantics::EagerCollectionOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedDefaultGetterBridge {
     pub owner: SymbolId,
     pub location: crate::semantics::SourceLocation,
+    /// Declaring interface of the effective default; this owner must use Java
+    /// method semantics before the bridge can be emitted or repaired.
     pub target: SymbolId,
+    /// Direct interface qualifier for the super call. It may remain Kotlin
+    /// when it inherits the selected Java default without overriding it.
     pub provider: SymbolId,
     pub method_name: String,
     pub return_type: String,
+    pub return_type_ref: crate::semantics::TypeRef,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedRepair {
@@ -613,6 +637,7 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         source_hash,
         declarations: Vec::new(),
         bridges: Vec::new(),
+        generated_getters: Vec::new(),
         default_getter_bridges: Vec::new(),
         repairs: Vec::new(),
         outputs: Vec::new(),
@@ -625,6 +650,8 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         todo_lowerings: Vec::new(),
         reference_string_calls: Vec::new(),
         container_calls: Vec::new(),
+        eager_collection_calls: Vec::new(),
+        eager_collection_helpers: Vec::new(),
         exact_overload_calls: Vec::new(),
         reified_class_calls: Vec::new(),
         constructor_delegations: Vec::new(),

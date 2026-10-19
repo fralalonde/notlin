@@ -94,7 +94,7 @@ fn associate_by_with_value_selector_uses_second_lambda() {
 }
 
 #[test]
-fn filter_not_and_plus_element_lower_to_streams() {
+fn filter_not_is_eager_before_plus_element_concat() {
     let source = "package neutral.mapd\nfun add(xs: List<String>, item: String): List<String> = xs.filterNot { it == item } + item\nfun remove(xs: List<String>, item: String): List<String> = xs.filterNot { it == item }\n";
     let cli = notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", "M.kt"]);
     let (files, errors, _warnings, _cov) =
@@ -106,7 +106,8 @@ fn filter_not_and_plus_element_lower_to_streams() {
         .map(|(_, code)| code.as_str())
         .expect("M.java");
     assert!(
-        java.contains("filter(it -> !(Objects.equals(it, item)))"),
+        java.contains("notlinFilterNot(xs, notlinItem -> Objects.equals(notlinItem, item))")
+            && java.contains("if (!predicate.test(value))"),
         "{java}"
     );
     assert!(java.contains("Stream.concat("), "{java}");

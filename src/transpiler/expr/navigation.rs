@@ -7,6 +7,9 @@ use crate::transpiler::unit::capitalize;
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(java) = self.planned_container_property_access(node) {
+            return java;
+        }
         // Map/Iterable collection ops (`x.filterValues { .. }`,
         // `x.mapKeys { .. }`, `x.associateBy { .. }`) — Java has no such
         // members: lower through stream/entrySet before generic handling.
@@ -83,7 +86,10 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         // interface default method). A RETAINED-Kotlin supertype has no
         // JVM-visible Java method at all — the caller is tainted instead of
         // emitting broken Java.
-        let mut super_owner = self.unit.pending_super_owner.take();
+        let mut super_owner = base
+            .filter(|base| base.kind() == "super_expression")
+            .and_then(|base| kt::child(base, "user_type"))
+            .map(|ty| kt::java_type(ty, self.unit.source).trim().to_owned());
         if let Some(b) = base
             && b.kind() == "super_expression"
             && super_owner.is_none()
@@ -154,17 +160,17 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     .unwrap_or(self.unit.file);
                 w.source_file(declaring)
             });
-            let same_file_hit = same_file.is_some_and(|f| {
-                f.declarations.iter().any(|d| {
-                    d.name == owner && d.language == crate::workspace::SourceLanguage::Kotlin
-                })
-            });
-            let translated = same_file_hit
-                || ws.is_some_and(|w| {
-                    w.declarations_named(&owner).any(|d| {
-                        d.name == owner && d.language == crate::workspace::SourceLanguage::Java
+            let translated = ws.zip(same_file).is_some_and(|(workspace, file)| {
+                workspace
+                    .resolve_type(file, &owner)
+                    .is_some_and(|declaration| {
+                        declaration.language == crate::workspace::SourceLanguage::Java
+                            || file
+                                .declarations
+                                .iter()
+                                .any(|same| std::ptr::eq(same, declaration))
                     })
-                });
+            });
             if !translated {
                 self.unit.diag_untranslatable(
                     node,

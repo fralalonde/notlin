@@ -96,6 +96,25 @@ class Child : Left, Right {
 }
 
 #[test]
+fn qualified_super_selects_the_exact_direct_branch() {
+    let source = r#"package p
+interface Left {
+    fun value(): String = "left"
+}
+interface Right {
+    fun value(): String = "right"
+}
+class Child : Left, Right {
+    override fun value(): String = super<p.Right>.value()
+}
+"#;
+    assert_eq!(
+        resolve_super(source, "value"),
+        FactStatus::Established(expected_member(source, "Right"))
+    );
+}
+
+#[test]
 fn rejects_mixed_depth_candidates_across_parent_branches() {
     let source = r#"package p
 interface Root {

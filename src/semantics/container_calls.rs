@@ -7,8 +7,8 @@ use tree_sitter::Node;
 
 /// A snapshot-bound call to a canonical JDK container member.
 ///
-/// `return_type` is only the classifier needed to continue a fluent chain.
-/// Generic element/result types are deliberately not inferred here.
+/// Classifier facts can continue fluent chains independently of the bounded
+/// source-proven payload and scoped lambda facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerMemberCall {
     pub location: SourceLocation,
@@ -20,6 +20,20 @@ pub struct ContainerMemberCall {
     pub result_check: Option<String>,
     #[serde(default)]
     pub expected_type: Option<ContainerResultType>,
+    /// A non-null String fallback independently proves Optional.orElse's
+    /// result even when the surrounding argument contract is unavailable.
+    #[serde(default)]
+    pub nonnull_fallback: Option<SourceLocation>,
+    #[serde(default)]
+    pub receiver_payload: Option<super::TypeRef>,
+    #[serde(default)]
+    pub result_payload: Option<super::TypeRef>,
+    #[serde(default)]
+    pub lambda_binding: Option<super::ContainerLambdaBinding>,
+    #[serde(default)]
+    pub dependencies: Vec<super::SymbolId>,
+    #[serde(default)]
+    pub owner: Option<super::SymbolId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,14 +48,15 @@ pub(super) fn establish<P: SemanticProvider + ?Sized>(
     call: Node<'_>,
     provider: &P,
 ) -> Option<ContainerMemberCall> {
-    if !matches!(call.kind(), "call_expression" | "method_invocation")
-        || provider.source_for_file(file)? != source
-    {
+    if !matches!(call.kind(), "call_expression" | "method_invocation") {
         return None;
     }
     let callee = super::call_callee_node(call)?;
     let name = callee.utf8_text(source.as_bytes()).ok()?.trim();
-    if !plain_call_arguments(call, callee) {
+    if !supported_member_name(name)
+        || provider.source_for_file(file)? != source
+        || !plain_call_arguments(call, callee)
+    {
         return None;
     }
     let receiver = super::explicit_receiver_node(call, callee)?;
@@ -54,7 +69,11 @@ pub(super) fn establish<P: SemanticProvider + ?Sized>(
     if navigation_gap.contains("?.") || navigation_gap.contains("::") {
         return None;
     }
-    let receiver_type = super::explicit_receiver_type(source, call, callee, file, provider)?;
+    let typed = super::container_types::establish(source, file, call, provider);
+    let receiver_type = typed
+        .as_ref()
+        .map(|types| types.receiver.classifier.clone())
+        .or_else(|| super::explicit_receiver_type(source, call, callee, file, provider))?;
     let receiver_type = super::standard_external_type(
         source,
         provider,
@@ -90,13 +109,51 @@ pub(super) fn establish<P: SemanticProvider + ?Sized>(
         // Keep it outside this first bounded fact set.
         _ => return None,
     };
-    let expected_type = explicit_result_type(source, file, call, provider).ok()?;
-    let result_check = (!matches!(name, "isPresent" | "isEmpty")
+    if typed.as_ref().is_none_or(|types| types.lambda.is_none())
+        && matches!(name, "map" | "filter" | "flatMap")
+        && super::container_types::lambda_requires_binding(source, call)
+    {
+        return None;
+    }
+    let nonnull_fallback = typed.as_ref().and_then(|types| {
+        if receiver_type != "java.util.Optional"
+            || name != "orElse"
+            || !matches!(&types.receiver.element.ty,
+                super::KotlinType::Named { name, arguments }
+                if name == "java.lang.String" && arguments.is_empty())
+        {
+            return None;
+        }
+        let arguments = call
+            .named_children(&mut call.walk())
+            .find(|node| node.kind() == "value_arguments")?;
+        let argument = arguments
+            .named_children(&mut arguments.walk())
+            .find(|node| node.kind() == "value_argument")?;
+        let literal = argument.named_child(0)?;
+        if literal.kind() != "string_literal" {
+            return None;
+        }
+        Some(SourceLocation {
+            file: file.to_path_buf(),
+            snapshot_hash: *blake3::hash(source.as_bytes()).as_bytes(),
+            start_byte: literal.start_byte(),
+            end_byte: literal.end_byte(),
+        })
+    });
+    let expected_type = match explicit_result_type(source, file, call, provider) {
+        Ok(expected) => expected,
+        Err(()) if nonnull_fallback.is_some() => None,
+        Err(()) => return None,
+    };
+    let result_check = (nonnull_fallback.is_none()
+        && !matches!(name, "isPresent" | "isEmpty")
         && expected_type.as_ref().is_some_and(|expected| {
             !expected.ty.nullable
                 && matches!(
                     expected.ty.ty,
-                    super::KotlinType::Named { .. }
+                    super::KotlinType::Primitive(_)
+                        | super::KotlinType::Named { .. }
                         | super::KotlinType::Array { .. }
                         | super::KotlinType::Function { .. }
                 )
@@ -124,7 +181,36 @@ pub(super) fn establish<P: SemanticProvider + ?Sized>(
         return_type: return_type.map(str::to_owned),
         result_check,
         expected_type,
+        nonnull_fallback,
+        receiver_payload: typed.as_ref().map(|types| types.receiver.element.clone()),
+        result_payload: typed
+            .as_ref()
+            .and_then(|types| types.result_element.clone()),
+        lambda_binding: typed.as_ref().and_then(|types| types.lambda.clone()),
+        dependencies: typed.map(|types| types.dependencies).unwrap_or_default(),
+        owner: None,
     })
+}
+
+/// Rejection-only prescreen. Receiver, arity, and payload evidence below still
+/// decide eligibility; unrelated calls need no container resolution or hashing.
+pub(super) fn supported_member_name(name: &str) -> bool {
+    matches!(
+        name,
+        "stream"
+            | "filter"
+            | "map"
+            | "flatMap"
+            | "findAny"
+            | "findFirst"
+            | "or"
+            | "orElseThrow"
+            | "get"
+            | "isPresent"
+            | "isEmpty"
+            | "orElse"
+            | "orElseGet"
+    )
 }
 
 pub(super) fn explicit_result_type<P: SemanticProvider + ?Sized>(
@@ -311,6 +397,9 @@ fn argument_result_type<P: SemanticProvider + ?Sized>(
         .filter(|node| node.kind() == "call_expression")
         .ok_or(())?;
     let callee = super::call_callee_node(call).ok_or(())?;
+    if !plain_call_arguments(call, callee) {
+        return Err(());
+    }
     let name = callee.utf8_text(source.as_bytes()).map_err(|_| ())?;
     let super::FactStatus::Established(target) =
         super::resolve_required_call(source, file, call, callee, name, provider)
@@ -344,28 +433,133 @@ fn argument_result_type<P: SemanticProvider + ?Sized>(
         .root_node()
         .named_descendant_for_byte_range(symbol.location.start_byte, symbol.location.end_byte)
         .ok_or(())?;
-    if declaration.kind() != "function_declaration" {
+    let parameter = if declaration.kind() == "function_declaration" {
+        let parameters = declaration
+            .named_children(&mut declaration.walk())
+            .find(|node| node.kind() == "function_value_parameters")
+            .ok_or(())?;
+        let parameter = parameters
+            .named_children(&mut parameters.walk())
+            .filter(|node| node.kind() == "parameter")
+            .nth(position)
+            .ok_or(())?;
+        if super::parameter_signature(target_source, parameter).starts_with("vararg:") {
+            return Err(());
+        }
+        parameter
+    } else if declaration.kind() == "class_declaration" && symbol.id.kind == "class" {
+        if super::own_type_parameters(declaration).is_some()
+            || super::declaration_has_modifier(
+                target_source,
+                declaration,
+                &["inner", "value", "inline"],
+            )
+        {
+            return Err(());
+        }
+        selected_constructor_parameter(
+            target_source,
+            declaration,
+            call_argument_count(call),
+            position,
+        )?
+    } else {
         return Err(());
-    }
-    let parameters = declaration
-        .named_children(&mut declaration.walk())
-        .find(|node| node.kind() == "function_value_parameters")
-        .ok_or(())?;
-    let parameter = parameters
-        .named_children(&mut parameters.walk())
-        .filter(|node| node.kind() == "parameter")
-        .nth(position)
-        .ok_or(())?;
-    if super::parameter_signature(target_source, parameter).starts_with("vararg:") {
-        return Err(());
-    }
+    };
     let ty = super::named_type_child(parameter).ok_or(())?;
     let expected = expected_type_node(target_source, &target.file, ty, declaration, provider)?;
     if expected.as_ref().is_some_and(|expected| matches!(&expected.ty.ty, super::KotlinType::Named { name, .. } if matches!(name.rsplit('.').next(), Some("Optional" | "Stream")))) { return Err(()); }
     Ok(expected)
 }
 
-fn plain_call_arguments(call: Node<'_>, callee: Node<'_>) -> bool {
+/// Resolve only an explicit, nongeneric Kotlin constructor parameter whose
+/// positional arity uniquely identifies one constructor declaration. This
+/// intentionally declines defaulted and vararg overload sets: the workspace
+/// resolver identifies the class, not the selected constructor.
+fn selected_constructor_parameter<'tree>(
+    source: &str,
+    class: Node<'tree>,
+    argument_count: usize,
+    position: usize,
+) -> Result<Node<'tree>, ()> {
+    let mut candidates = Vec::<Vec<Node<'tree>>>::new();
+
+    let primary = class
+        .child_by_field_name("primary_constructor")
+        .or_else(|| {
+            class
+                .named_children(&mut class.walk())
+                .find(|child| child.kind() == "primary_constructor")
+        })
+        .unwrap_or(class);
+    if let Some(parameters) = primary
+        .named_children(&mut primary.walk())
+        .find(|child| child.kind() == "class_parameters")
+    {
+        candidates.push(
+            parameters
+                .named_children(&mut parameters.walk())
+                .filter(|child| child.kind() == "class_parameter")
+                .collect(),
+        );
+    }
+
+    let body = class.child_by_field_name("body").or_else(|| {
+        class
+            .named_children(&mut class.walk())
+            .find(|child| child.kind() == "class_body")
+    });
+    if let Some(body) = body {
+        // `Value(...)` can select a companion's invoke member or extension.
+        // A class identity and constructor arity do not prove that binding.
+        if body
+            .named_children(&mut body.walk())
+            .any(|child| child.kind() == "companion_object")
+        {
+            return Err(());
+        }
+        for constructor in body
+            .named_children(&mut body.walk())
+            .filter(|child| child.kind() == "secondary_constructor")
+        {
+            let parameters = constructor
+                .child_by_field_name("parameters")
+                .or_else(|| {
+                    constructor
+                        .named_children(&mut constructor.walk())
+                        .find(|child| child.kind() == "function_value_parameters")
+                })
+                .ok_or(())?;
+            candidates.push(
+                parameters
+                    .named_children(&mut parameters.walk())
+                    .filter(|child| child.kind() == "parameter")
+                    .collect(),
+            );
+        }
+    }
+
+    let mut selected = None;
+    for parameters in candidates {
+        if parameters.iter().any(|parameter| {
+            super::parameter_signature(source, *parameter).starts_with("vararg:")
+                || parameter
+                    .children(&mut parameter.walk())
+                    .any(|child| child.kind() == "=")
+        }) {
+            return Err(());
+        }
+        if parameters.len() == argument_count {
+            if selected.is_some() {
+                return Err(());
+            }
+            selected = parameters.get(position).copied();
+        }
+    }
+    selected.ok_or(())
+}
+
+pub(super) fn plain_call_arguments(call: Node<'_>, callee: Node<'_>) -> bool {
     // Explicit generic method type arguments have overload/exception semantics
     // that this classifier-only fact does not model.
     if callee.parent().is_some_and(|parent| {
