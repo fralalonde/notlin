@@ -1299,12 +1299,18 @@ fn walk_kotlin(dir: &Path) -> Result<Vec<PathBuf>, String> {
             let is_kotlin = path.extension().is_some_and(|extension| extension == "kt");
             let metadata = match std::fs::metadata(&path) {
                 Ok(metadata) => metadata,
+                // A listed entry can vanish before it is opened (overlapping
+                // migrator, concurrent cleanup); it has no content this run.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) if !is_kotlin => continue,
                 Err(e) => return Err(format!("{}: {e}", notlin::paths::display(&path))),
             };
             if metadata.is_dir() {
-                let canonical = std::fs::canonicalize(&path)
-                    .map_err(|e| format!("{}: {e}", notlin::paths::display(&path)))?;
+                let canonical = match std::fs::canonicalize(&path) {
+                    Ok(canonical) => canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(format!("{}: {e}", notlin::paths::display(&path))),
+                };
                 if visited_directories.insert(canonical.clone()) {
                     stack.push(canonical);
                 }

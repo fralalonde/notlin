@@ -5036,7 +5036,13 @@ fn scan_directory(
             continue;
         };
         let previous = old_sources.get(&child_relative).copied();
-        let source = scan_source(&path, language, previous, stats)?;
+        // A listed entry can vanish between `read_dir` and the open (an
+        // overlapping migrator, a concurrent cleanup). Skip it with a warning
+        // like the tolerant input read: the file simply drops out of this
+        // snapshot and the next run sees it again if it reappears.
+        let Some(source) = scan_source(&path, &child_relative, language, previous, stats)? else {
+            continue;
+        };
         files.push(source.source_file.clone());
         entries.insert(name, CachedEntry::Source(Box::new(source)));
     }
@@ -5060,14 +5066,40 @@ fn scan_directory(
 
 fn scan_source(
     path: &Path,
+    relative: &Path,
     language: SourceLanguage,
     previous: Option<&CachedSource>,
     stats: &mut IndexStats,
-) -> Result<CachedSource, String> {
-    let canonical_path = fs::canonicalize(path)
-        .map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
-    let metadata = fs::metadata(&canonical_path)
-        .map_err(|error| format!("{}: {error}", crate::paths::display(&canonical_path)))?;
+) -> Result<Option<CachedSource>, String> {
+    // A listed entry that is already gone (NotFound on open) vanishes from
+    // this snapshot with a warning; any other I/O failure stays fatal.
+    let vanished = || {
+        eprintln!(
+            "warning: source vanished during indexing, skipped: {}",
+            crate::paths::display(relative)
+        );
+    };
+    let canonical_path = match fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            vanished();
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("{}: {error}", crate::paths::display(path))),
+    };
+    let metadata = match fs::metadata(&canonical_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            vanished();
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(format!(
+                "{}: {error}",
+                crate::paths::display(&canonical_path)
+            ));
+        }
+    };
     let size = metadata.len();
     let modified_nanos = metadata
         .modified()
@@ -5076,8 +5108,19 @@ fn scan_source(
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
 
-    let bytes = fs::read(&canonical_path)
-        .map_err(|error| format!("{}: {error}", crate::paths::display(&canonical_path)))?;
+    let bytes = match fs::read(&canonical_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            vanished();
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(format!(
+                "{}: {error}",
+                crate::paths::display(&canonical_path)
+            ));
+        }
+    };
     let digest = *blake3::hash(&bytes).as_bytes();
     if let Some(previous) = previous
         && previous.digest == digest
@@ -5085,12 +5128,12 @@ fn scan_source(
         let mut cached = previous.source_file.clone();
         cached.path = canonical_path.clone();
         stats.reused_files += 1;
-        return Ok(CachedSource {
+        return Ok(Some(CachedSource {
             size,
             modified_nanos,
             digest,
             source_file: cached,
-        });
+        }));
     }
 
     let source = String::from_utf8(bytes)
@@ -5111,7 +5154,7 @@ fn scan_source(
         header_facts,
     ) = parse_declarations(&source, language, package.as_deref())?;
     stats.parsed_files += 1;
-    Ok(CachedSource {
+    Ok(Some(CachedSource {
         size,
         modified_nanos,
         digest,
@@ -5133,7 +5176,7 @@ fn scan_source(
             inferred_binding_calls,
             ctor_calls,
         },
-    })
+    }))
 }
 
 fn should_skip_directory(name: &Path) -> bool {
