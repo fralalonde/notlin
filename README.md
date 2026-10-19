@@ -1,191 +1,15 @@
 # notlin
 
-Brutal Kotlin to Java converter.
+Kotlin to Java, ground down file by file.
 
-## Usage
+notlin translates the Kotlin it can prove translates correctly and leaves the
+rest Kotlin. The output is a mixed source tree that compiles and runs — a
+partial migration, not an all-or-nothing sweep. Re-run it as the engine
+improves or as you edit blockers away; coverage climbs, the Kotlin shrinks.
 
-```sh
-# Transpile a single file (Java written next to the input):
-notlin src/main.kt
-
-# Write output to a directory:
-notlin -o build/java src/main.kt
-
-# Untranslatable constructs: fail instead of warn
-notlin --untranslatable=error src/main.kt
-
-# Migrate in place: removes translated code from the .kt file,
-# deletes the .kt entirely when everything translates
-notlin --in-place src/main.kt
-
-# Whole tree at once:
-notlin -o build/java src/kotlin/
-
-# Keep uncertain or lossy declarations in Kotlin (the default):
-notlin --lombok --in-place .
-
-# Explicitly permit diagnosed approximate transformations:
-notlin --allow-approximations --in-place .
-
-# Compile the staged mixed sources before applying migration:
-notlin --validation-config validation.json --in-place .
-
-# Save declaration coverage and structured retention reasons for this run:
-notlin --lombok --in-place --coverage-report coverage.json .
-```
-
-The summary measures accepted Kotlin declarations, separately from Java output
-files. A whole class (including its members) counts once; top-level functions and
-properties count independently. Coverage partitions the original Kotlin input
-of this invocation into translated and retained declarations, including outputs
-accepted in earlier speculative passes. Existing Java from previous migrations
-is excluded; this percentage does not claim cumulative project coverage.
-`--coverage-report <path.json>` saves the same counts, accepted output paths,
-stable declaration identities, structured retention reasons and recorded semantic
-dependencies. Dependency information is currently partial. Reason category counts
-can overlap because one retained declaration can have several blockers.
-The default retention summary uses those exact original-owner counts and lists
-per-reason owner counts. The older name-joined diagnostic-site graph is available
-only at `-vv`; it is partial and does not predict translation unlock counts.
-
-The semantic provider extracts declaration, inheritance, and companion facts in
-one syntax parse per file. It resolves cross-file relations after assigning module
-identities and indexing all files, without retaining the parsed trees.
-
-Inherited getter checks compose type arguments along each inheritance path and
-compare resolved declaration identities. Matching type-parameter names alone
-are insufficient. Unknown, ambiguous, raw, cyclic, or incompatible paths keep
-the declaration in Kotlin. A default method with a proven matching Java return
-erasure can translate while its concrete descendants remain Kotlin.
-
-Public no-argument method interfaces with supported scalar/reference return
-signatures can also move to Java while descendants remain Kotlin. This uses the
-same checked JVM boundary as getter-shaped methods; it does not apply to methods
-with arguments, collection returns, or names requiring a Java spelling change.
-
-A Java child interface can also extend a retained Kotlin interface with a proven
-abstract method contract, even if an unsupported companion keeps that parent in
-Kotlin. Parent default bodies require a separate JVM-default bridge plan: legacy
-Kotlin compilation can otherwise call a missing Java-child `DefaultImpls` class.
-Plain `super.method()` calls with no arguments resolve against indexed parent
-identities, checking every inheritance branch. Unknown or competing targets
-retain the caller. Java superclass calls use `super.method()`; interface defaults
-use `Parent.super.method()` and still require a Java-visible implementation.
-Parallel property contracts remain Kotlin when repairing them would break a
-property implementation inherited from a retained Kotlin base class.
-Parallel read-only properties with the same nonnullable Kotlin `String` or
-primitive return type can share one getter on a retained implementation. The
-planner requires matching resolved types and JVM descriptors across both
-interfaces and the implementation; nullable, boxed, aliased, or conflicting
-contracts do not use this rule.
-
-Simple `if` expressions preserve smart casts of checked locals and `this`
-within the proven branch, including the else branch of `!is`. Distinct nested
-refinements remain Kotlin until their intersection type can be established.
-
-Constructor defaults use the exact planned overload when any omitted default
-needs the declaration's scope. Classes exposed through an indexed bounded
-factory to Kotlin constructor reflection (`primaryConstructor` or `constructors`
-with `callBy`) remain Kotlin: Java overloads do not preserve Kotlin constructor
-metadata. This proof currently covers a direct `Class<T>` holder and an explicitly
-typed factory returning that holder under a resolved bound. The loss can be
-selected explicitly with `--allow-approximations`.
-
-Enum `when` expressions can translate without approximation when the planner
-proves a nonnullable enum subject, exact case identities, and an explicitly typed
-function return context. The Java switch evaluates the subject once and preserves
-Kotlin's unmatched-branch exception for exhaustive cases. Nullable subjects,
-ambiguous names, and unknown wildcard imports retain the declaration.
-
-Proven stdlib `TODO()` calls in throwing function bodies and typed expression
-bodies preserve `kotlin.NotImplementedError` and its message. A custom `TODO`
-declaration or unknown wildcard import keeps the caller in Kotlin. Known JDK
-package wildcard imports can be accepted when scope checks exclude a shadow.
-
-An explicitly typed nonnullable source reference can use the inherited
-`Object.toString()` contract, including in secondary constructor arguments.
-Its String result can support further String calls. Nullable or unresolved
-receivers, arrays, value classes, and unconstrained type parameters need a
-separate proof. Kotlin `Nothing` and `Nothing?` return contracts and callers
-that depend on them remain Kotlin by default; Java `Void` cannot express that
-contract.
-
-Secondary constructors can delegate through the proven zero-argument
-`java.util.UUID.randomUUID()` factory. The same source-scoped platform fact
-checks imports and shadowing before admitting the call as a Java constructor
-argument; a custom method with that name does not receive this allowance.
-
-Secondary constructors can also delegate to another secondary constructor when
-the planner proves a unique target by its complete positional argument shape.
-The plan records the owning symbol, target declaration and source snapshot.
-Constructor defaults, competing overloads, generic signatures, and reordered
-named arguments need further resolution before they can use this path.
-The planner reuses workspace builtin type proofs only when every contributing
-source snapshot matches. Constructor parameters keep their lexical binding
-when their names overlap record components or inherited properties.
-
-Generic getter chains can use an explicit nonnullable upper bound to resolve the
-next no-argument member call. The bound supplies member availability only: a
-declared return type `T` remains `T`. Named generic bounds such as `Entity<I>`
-preserve their arguments as evidence without substituting the bound's own
-generic return types. The proof survives a Kotlin owner becoming
-Java and rejects method type-parameter shadowing, aliases, unresolved ancestry,
-and unsupported bound shapes. Exact qualified or explicitly imported
-`Serializable` and `Cloneable` markers add no unknown callable members.
-
-In-place migration can add an explicit `@kotlin.jvm.JvmWildcard` to a retained
-Kotlin interface's read-only `List` element type when a proven narrower Java
-implementation requires it. The parent keeps its Kotlin property and physical
-getter. These snapshot-checked contract edits are accepted only together with
-the translated implementation; unsuccessful attempts leave no annotation behind.
-
-Receiver chains can follow explicitly typed Kotlin properties and physical public
-Java `getX()` getters. Each type resolves in its declaring file, including across
-method-return and nested-property chains. Nullable or ambiguous hops, hidden
-Lombok members, and properties requiring unproven generic substitution remain
-unresolved. Java getter lookup also excludes static/private methods, known
-nullable getters, and visible fields that could change property resolution.
-
-Resolved public Kotlin source methods with no arguments can retain their Java
-call spelling even when their owner stays Kotlin. This requires an explicit,
-supported return type and a stable JVM name. Method type parameters, visibility
-or JVM-name changes, value-class signatures, aliases, and uncertain symbols do
-not establish this fact. Methods with `@Throws`, including aliased forms, need
-a separate Java exception-handling plan and do not receive this allowance.
-
-Canonical `java.math.BigDecimal` receivers support proven single-argument
-arithmetic/comparison calls and zero-argument normalization calls. Arithmetic
-arguments must themselves have established decimal types; a matching method
-name alone does not establish a JDK call.
-
-Use `--advice` during workspace migration to report targeted source changes that may unlock more
-translation. `U001` identifies competing inherited getter contracts on a retained
-Kotlin implementation; `U002` identifies the actual constructor overloads that
-collide after erasure, with resolved caller locations when available. Each
-recommendation explains the constraint and a possible manual change. Parser
-errors, unknown types and conservative secondary-constructor checks do not
-produce source-change advice.
-
-Use `--max-pass <count>` to cap workspace planning passes. The default remains the
-automatic limit of twice the indexed Kotlin declaration count, with a minimum of
-16. If planning does not converge within the limit, migration fails without
-writing translated sources. The separate `--max-retention-passes` limit controls
-internal ownership resolution within each workspace pass.
-
-Recommendations are ranked by related retained declarations using resolved
-symbol references, with at most ten shown per run. These counts are not promises
-of successful translation: review the suggested edit, rerun Notlin, and validate
-the mixed result. Locations refer to the input snapshots before migration edits.
-The library exposes the complete structured report through
-`translation_advice::analyze`.
-
-Advice is disabled by default and does not change the translation plan. Add `-v`
-to show elapsed time since launch on log and progress lines
-(`-vv` adds file planning, diagnostic and skipping details; `-vvv` adds trace details). For example:
-
-```sh
-notlin --lombok --in-place --advice -v .
-```
+One engine makes every decision. A single file, a directory, or a whole repo
+reach the same verdict: there is no "fast mode" that splits a Java child from
+its Kotlin parent.
 
 ## Install
 
@@ -197,25 +21,105 @@ curl -fsSL https://github.com/fralalonde/notlin/releases/latest/download/install
 
 Windows PowerShell:
 ```powershell
-# installs to %LOCALAPPDATA%\Programs\notlin\notlin.exe and (unless -NoPath)
-# adds that dir to your user PATH via the registry — Windows has no default
+# installs to %LOCALAPPDATA%\Programs\notlin\notlin.exe and adds it to your user PATH
 irm https://github.com/fralalonde/notlin/releases/latest/download/install.ps1 | iex
 ```
 
-From Source (Rust)
+From source: `cargo install --path .`
+
+## Use
+
+```sh
+notlin src/main.kt                     # Java written next to the input
+notlin -o build/java src/main.kt       # Java to a directory
+notlin -o build/java src/kotlin/       # whole tree at once
+notlin --in-place src/                 # migrate: remove translated code from .kt,
+                                       # delete the file when fully translated
+notlin --untranslatable=error file.kt  # fail instead of warn on untranslatables
+notlin --lombok --in-place .           # keep uncertain declarations in Kotlin,
+                                       # use Lombok on the Java side
+notlin --allow-approximations --in-place .   # accept diagnosed lossy transforms
+notlin --validation-config validation.json --in-place .  # compile the staged
+                                       # mixed result before touching anything
+notlin --coverage-report cov.json --lombok --in-place .  # structured report
+notlin --advice --in-place .           # source edits that would unlock more
 ```
-git clone git@github.com:fralalonde/notlin.git
-cargo install --path .
-```
+
+Diagnostics are compiler-style: N-codes for untranslatable constructs and
+approximations, parse errors are N003. Errors exit non-zero; warnings do not
+(`--deny-warnings` makes them fatal). Nothing is written unless the whole plan
+is accepted — a failed run leaves every input untouched.
+
+Coverage counts original Kotlin declarations for this invocation, not Java
+files: a class (with its members) is one unit, top-level functions and
+properties count individually. Earlier migrations' Java is excluded — the
+percentage is not cumulative project coverage. `--coverage-report` saves the
+same counts with accepted output paths, stable declaration identities, and
+structured retention reasons; reason categories can overlap because one
+declaration can have several blockers. Add `-v` for elapsed time on log lines,
+`-vv` for planning detail, `-vvv` for traces. `--advice` prints ranked source
+changes that would unlock more translation (`U001` competing inherited getter
+contracts, `U002` constructor overloads colliding after erasure); counts are
+hints, not promises — review, rerun, validate. `--max-pass` caps planning
+iterations; non-convergence fails the run without writing.
+
+## What holds declarations back, and why the design looks like this
+
+The honest answer: **notlin has no Kotlin type checker.** The semantic provider
+extracts declaration, inheritance, and companion facts from the syntax — one
+parse per file, cross-file resolution by indexed identity — and grades every
+fact established, inferred, ambiguous, or unknown. Required unknowns retain
+their declaration. That single constraint explains everything else:
+
+- **Ownership is a fixpoint, not a per-file choice.** Translating a class
+  changes what its parents, children, and callers can do. The planner iterates
+  ownership over the indexed workspace until it converges, emits Java only for
+  the accepted set, and renders from strictly parsed Java syntax trees — an
+  invalid generated file aborts migration before a write.
+- **Hierarchy closure.** A retained Kotlin descendant cannot implement a
+  translated-away parent's ABI (enum entries, `DefaultImpls`, KClass bridges);
+  a declaration cannot move to Java ahead of a Kotlin parent that stays,
+  except through proven getter/method-ABI bridges. Parents and children move
+  together or stay together.
+- **Uncertain declarations stay Kotlin.** `suspend`/coroutines have no Java
+  lowering and are retained outright. `value class`, `Nothing`, Kotlin
+  constructor reflection (`callBy`), Jackson missing-vs-null, boxed numeric
+  identity all retain by default. Each retention records a structured reason.
+- **Approximations are opt-in.** What Java can express with a semantic
+  difference — elvis as a ternary, `by lazy` as eager init, `when` as switch —
+  is diagnosed (N002) and retained unless you pass `--allow-approximations`.
+- **Repairs are proven before they are trusted.** Default-getter bridges,
+  caller rewrites, and `@JvmWildcard` contract edits apply to virtual
+  snapshots; only the converged plan commits. Edits carry source hashes; a
+  stale snapshot cannot authorize a write at application time.
+- **The compiler is the gate.** `--validation-config` stages the planned mixed
+  tree, runs kotlinc then javac against it; failure aborts before any original
+  file is rewritten.
+
+So expect: high coverage on data/model/service shapes, interfaces and classes
+that translate as families, and an exact list of every declaration that didn't
+move with the reason it stayed. Don't expect: coroutine code, `inline value
+class` wrappers, or inferred types — those need the JVM-compiler analysis
+stage the architecture reserves a serializable contract for.
+
+## Verification
+
+Three gates, cheapest first: `cargo test` (200+ suites), `tools/e2e.sh`
+(transpile every sample, javac the result — the contract is *emitted Java
+compiles*), and the JVM comparison harness (`cargo test --test jvm_validation
+-- --ignored`), which runs original Kotlin against mixed Kotlin/Java execution
+with real compilers. `DEV.md` has the environment variables and corpus layout.
+
+## Docs
+
+- `docs/partial-transpiler-architecture.md` — the analysis contract, identity
+  model, ownership fixpoint, and each rule's exact proof conditions.
+- `DEV.md` — how the engine works, grammar pitfalls, test pipeline.
 
 ## Status
 
-In development
-
-The Rust planner keeps ownership, bridges, caller repairs and checked edits
-explicit before accepting structured Java output. See
-[the partial translation architecture](docs/partial-transpiler-architecture.md)
-for the analysis contract, validation configuration and JVM comparison tests.
+In development. JDK 25 is the CI baseline (27 locally). Lombok, commons-lang3
+and StreamEx may live on the receiving classpath; notlin uses them.
 
 ## LICENSE
 
