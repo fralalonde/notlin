@@ -58,15 +58,81 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         false
     }
 
+    /// Whether `name` is a `val`/`var` primary-constructor property of the
+    /// nearest enclosing class. This check is deliberately bounded by the
+    /// nearest class/object/companion receiver: a companion getter must not
+    /// accidentally bind to an outer instance property instead of an imported
+    /// top-level declaration with the same name.
+    fn enclosing_constructor_property(&self, name: &str) -> bool {
+        let mut current = self.unit.current_decl;
+        while let Some(node) = current {
+            if matches!(
+                node.kind(),
+                "class_declaration" | "object_declaration" | "companion_object"
+            ) {
+                if node.kind() != "class_declaration" {
+                    return false;
+                }
+                let Some(parameters) = kt::child(node, "primary_constructor")
+                    .and_then(|constructor| kt::child(constructor, "class_parameters"))
+                else {
+                    return false;
+                };
+                return parameters
+                    .named_children(&mut parameters.walk())
+                    .any(|parameter| {
+                        parameter.kind() == "class_parameter"
+                            && (kt::child(parameter, "val").is_some()
+                                || kt::child(parameter, "var").is_some())
+                            && parameter
+                                .child_by_field_name("name")
+                                .or_else(|| kt::child(parameter, "identifier"))
+                                .is_some_and(|identifier| self.unit.text(identifier).trim() == name)
+                    });
+            }
+            current = node.parent();
+        }
+        false
+    }
+
     pub fn transpile(&mut self, node: tree_sitter::Node) -> String {
+        if self.is_unit_singleton(node) {
+            return "kotlin.Unit.INSTANCE".to_string();
+        }
         match node.kind() {
             "string_literal" => self.string_literal(node),
             // Kotlin and Java use the same lexical form for character
             // literals, including standard escapes such as `\\n` and `\\uXXXX`.
             "character_literal" => self.unit.text(node).trim().to_string(),
             "number_literal" | "boolean_literal" | "hex_literal" | "long_literal"
-            | "real_literal" => {
+            | "real_literal" | "float_literal" => {
                 let raw = self.unit.text(node).trim().to_string();
+                if matches!(node.kind(), "float_literal" | "real_literal") {
+                    let clean = raw.replace('_', "");
+                    let single = clean.ends_with(['f', 'F']);
+                    let numeric = clean.trim_end_matches(['f', 'F']);
+                    let parsed = if single {
+                        numeric.parse::<f32>().map(f64::from)
+                    } else {
+                        numeric.parse::<f64>()
+                    };
+                    if let Ok(value) = parsed {
+                        if value.is_infinite() {
+                            // Constant arithmetic also works when a local
+                            // value shadows the `java` package in expressions.
+                            let sign = if value.is_sign_negative() { "-" } else { "" };
+                            let suffix = if single { "f" } else { "" };
+                            return format!("({sign}1.0{suffix} / 0.0{suffix})");
+                        }
+                        // Kotlin permits rounded-to-zero constants which javac
+                        // rejects as nonzero literals too small for their type.
+                        let mantissa = numeric.split(['e', 'E']).next().unwrap_or(numeric);
+                        if value == 0.0 && mantissa.chars().any(|c| c.is_ascii_digit() && c != '0')
+                        {
+                            return if single { "0.0f" } else { "0.0" }.to_string();
+                        }
+                    }
+                }
                 // Kotlin unsigned suffixes (u/U/L/UL/uL) have no Java
                 // equivalent for the plain literal; strip to the base type.
                 if raw.ends_with("uL")
@@ -76,32 +142,62 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 {
                     // unsigned markers vanish in Java
                     raw.trim_end_matches(['u', 'U', 'L']).to_string()
-                } else if raw.ends_with('L') {
-                    raw.trim_end_matches('L').to_string()
                 } else {
                     raw
                 }
             }
             "identifier" => {
                 let name = self.unit.text(node).trim().to_string();
+                let implicit_this = self.narrowed_receiver("this", "this");
                 // Bare self-reference inside an object body: Kotlin resolves
                 // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
-                if self.unit.current_object.as_deref() == Some(name.as_str()) {
+                let value = if self.unit.current_object.as_deref() == Some(name.as_str()) {
                     format!("{}.INSTANCE", name)
+                } else if let Some(access) = self.unit.semantic_provider.and_then(|provider| {
+                    crate::semantics::inherited_property_receiver_access(
+                        self.unit.source,
+                        node,
+                        self.unit
+                            .workspace_file
+                            .as_deref()
+                            .unwrap_or(self.unit.file),
+                        provider,
+                    )
+                }) {
+                    let mut path = access.contract_owner.owner_path.clone();
+                    path.push(access.contract_owner.name.clone());
+                    let owner = if access.contract_owner.package.is_empty() {
+                        path.join(".")
+                    } else {
+                        format!("{}.{}", access.contract_owner.package, path.join("."))
+                    };
+                    format!(
+                        "(({owner}) {implicit_this}).{}()",
+                        crate::workspace::property_accessor_name(&access.getter_contract.name)
+                    )
                 } else if !self.unit.var_types.contains_key(&name)
                     && self.enclosing_record_has_component(&name)
                 {
                     // A data class is emitted as a Java record. Its implicit
                     // component reads use `component()`, not JavaBean
                     // `getComponent()` accessors.
-                    format!("this.{}()", name)
+                    format!("{implicit_this}.{}()", name)
                 } else if !self.unit.var_types.contains_key(&name)
                     && let Some(getter) = self.unit.self_getters.get(&name)
                 {
                     // Not a local/param in this scope: a bare identifier
                     // naming a property member of the enclosing type reads
                     // through its accessor (implicit `this`).
-                    format!("this.{}()", getter)
+                    format!("{implicit_this}.{}()", getter)
+                } else if !self.unit.var_types.contains_key(&name)
+                    && self.enclosing_constructor_property(&name)
+                {
+                    // Constructor properties are class members even while a
+                    // computed property getter is being emitted (its local
+                    // variable type scope is intentionally empty). Bind this
+                    // before workspace-level top-level-property lookup so an
+                    // unrelated imported `data` cannot capture the name.
+                    format!("{implicit_this}.{name}")
                 } else if !self.unit.var_types.contains_key(&name)
                     && let Some(literal) = self.inline_same_file_string_const(&name, node)
                 {
@@ -120,7 +216,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     if let Some(first) = cap.chars().next() {
                         cap = first.to_uppercase().collect::<String>() + &cap[1..];
                     }
-                    format!("this.get{}()", cap)
+                    format!("{implicit_this}.get{}()", cap)
                 } else if self
                     .unit
                     .workspace
@@ -136,17 +232,21 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 {
                     format!("{}.INSTANCE", name)
                 } else {
-                    name
-                }
+                    name.clone()
+                };
+                self.narrowed_receiver(&name, &value)
             }
             // `this` inside an extension function body refers to the receiver
             // parameter (emitted as a regular first param, so `this` must map
             // to it in the static method's body).
-            "this_expression" => self
-                .unit
-                .ext_receiver_name
-                .clone()
-                .unwrap_or_else(|| "this".to_string()),
+            "this_expression" => {
+                let receiver = self
+                    .unit
+                    .ext_receiver_name
+                    .clone()
+                    .unwrap_or_else(|| "this".to_string());
+                self.narrowed_receiver(self.unit.text(node).trim(), &receiver)
+            }
             // `super<T>` qualifier: Java drops the explicit supertype — an
             // interface super-access is just `T.super.member` (a Kotlin class
             // super-access is the plain-`super` form, which falls through).
@@ -182,8 +282,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             "lambda_literal" => self.lambda(node),
             "when_expression" => self.when_expr(node),
             "is_expression" => {
-                // `x is T` -> `x instanceof T` (primitives use their boxed type;
-                // smart-cast narrowing is not emitted — caller may need a cast)
+                // `x is T` -> `x instanceof T`; branch-local narrowing is
+                // supplied by the enclosing condition lowering.
                 let mut cursor = node.walk();
                 let kids: Vec<_> = node.children(&mut cursor).collect();
                 let target = kids.iter().find(|c| c.is_named()).copied();
@@ -261,6 +361,74 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         }
     }
 
+    /// Unit is a singleton value, independently of the void descriptor used by
+    /// Unit-returning methods. Source imports establish the type binding; value
+    /// parameters, locals and properties can still shadow that spelling.
+    fn is_unit_singleton(&self, node: tree_sitter::Node) -> bool {
+        if !kt::is_canonical_unit_reference(node, self.unit.source) {
+            return false;
+        }
+        let spelling = self.unit.text(node).trim().replace('`', "");
+        let root_name = spelling.split('.').next().unwrap_or(&spelling);
+        if self.unit.var_types.contains_key(root_name)
+            || self.unit.self_getters.contains_key(root_name)
+        {
+            return false;
+        }
+        if spelling == "Unit"
+            && let Some(provider) = self.unit.semantic_provider
+        {
+            let file = self
+                .unit
+                .workspace_file
+                .as_deref()
+                .unwrap_or(self.unit.file);
+            let package = self
+                .unit
+                .workspace
+                .and_then(|index| index.source_file(file))
+                .and_then(|file| file.package.as_deref())
+                .unwrap_or("");
+            if provider.has_type_alias_in_package(package, "Unit")
+                || !matches!(
+                    provider.resolve_type_in_file(file, package, "Unit"),
+                    crate::semantics::FactStatus::Unknown
+                )
+            {
+                return false;
+            }
+        }
+        let mut enclosing = node.parent();
+        while let Some(scope) = enclosing {
+            // Search declarations in lexical scopes, without descending into
+            // sibling functions/classes whose locals cannot bind this use.
+            let mut pending: Vec<_> = scope.named_children(&mut scope.walk()).collect();
+            while let Some(candidate) = pending.pop() {
+                if matches!(
+                    candidate.kind(),
+                    "parameter" | "class_parameter" | "variable_declaration"
+                ) && kt::field(candidate, "name")
+                    .or_else(|| kt::child(candidate, "identifier"))
+                    .is_some_and(|name| self.unit.text(name).trim().trim_matches('`') == root_name)
+                {
+                    return false;
+                }
+                if !matches!(
+                    candidate.kind(),
+                    "function_declaration"
+                        | "class_declaration"
+                        | "object_declaration"
+                        | "lambda_literal"
+                        | "function_body"
+                ) {
+                    pending.extend(candidate.named_children(&mut candidate.walk()));
+                }
+            }
+            enclosing = scope.parent();
+        }
+        true
+    }
+
     pub fn transpile_target(&mut self, node: tree_sitter::Node) -> String {
         match node.kind() {
             "identifier" => {
@@ -269,6 +437,17 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
                 if self.unit.current_object.as_deref() == Some(name.as_str()) {
                     format!("{}.INSTANCE", name)
+                } else if let Some(setter) = self.inherited_mutable_property_setter(&name, node) {
+                    self.unit.pending_setter = true;
+                    format!("this.{setter}(")
+                } else if self.inherited_property_target_is_unproven(&name, node) {
+                    self.unit.diag_untranslatable(
+                        node,
+                        format!(
+                            "inherited property `{name}` has no verified writable Java accessor"
+                        ),
+                    );
+                    "null /* notlin: unresolved inherited property write */".to_string()
                 } else {
                     name
                 }
@@ -326,7 +505,79 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         }
     }
 
+    /// A bare assignment in a translated subclass cannot write an inherited
+    /// Kotlin property's private Java field. Rewrite only when the indexed
+    /// supertype chain proves the inherited property is mutable and exposes
+    /// the ordinary JavaBean setter ABI. Locals/parameters and properties
+    /// declared on the current class keep their existing target handling.
+    pub(crate) fn inherited_mutable_property_setter(
+        &self,
+        name: &str,
+        node: tree_sitter::Node,
+    ) -> Option<String> {
+        if self.unit.var_types.contains_key(name)
+            || crate::semantics::lexical_parameter_type(self.unit.source, node, name).is_some()
+            || self.unit.class_props.contains_key(name)
+        {
+            return None;
+        }
+        let workspace = self.unit.workspace?;
+        let path = self
+            .unit
+            .workspace_file
+            .as_deref()
+            .unwrap_or(self.unit.file);
+        let owner_name = self.enclosing_type_name()?;
+        let mut ancestor = node.parent();
+        while let Some(scope) = ancestor {
+            if matches!(
+                scope.kind(),
+                "lambda_literal" | "function_literal" | "anonymous_function"
+            ) {
+                // The receiver stack is not established for this scope.
+                return None;
+            }
+            if scope.kind() == "function_declaration" {
+                break;
+            }
+            ancestor = scope.parent();
+        }
+        workspace.inherited_mutable_property_setter_in_file(path, &owner_name, name)
+    }
+
+    fn inherited_property_target_is_unproven(&self, name: &str, node: tree_sitter::Node) -> bool {
+        if self.unit.var_types.contains_key(name)
+            || crate::semantics::lexical_parameter_type(self.unit.source, node, name).is_some()
+            || self.unit.class_props.contains_key(name)
+        {
+            return false;
+        }
+        let Some(workspace) = self.unit.workspace else {
+            return false;
+        };
+        let Some(owner_name) = self.enclosing_type_name() else {
+            return false;
+        };
+        let path = self
+            .unit
+            .workspace_file
+            .as_deref()
+            .unwrap_or(self.unit.file);
+        workspace
+            .inherited_property_names_in_file(path, &owner_name)
+            .iter()
+            .any(|property| property == name)
+    }
+
     fn when_expr(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(lowering) = self
+            .unit
+            .enum_when_lowerings
+            .get(&node.start_byte())
+            .cloned()
+        {
+            return self.planned_enum_when(node, &lowering);
+        }
         self.unit.diags.warn_approx(
             node,
             self.unit.file,
@@ -368,6 +619,58 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             return lowered;
         }
         self.when_if_else(node, subject, &subject_java, &arms)
+    }
+
+    fn planned_enum_when(
+        &mut self,
+        node: tree_sitter::Node,
+        lowering: &crate::semantics::EnumWhenLowering,
+    ) -> String {
+        assert_eq!(lowering.location.snapshot_hash, self.unit.source_hash);
+        assert_eq!(
+            (lowering.location.start_byte, lowering.location.end_byte),
+            (node.start_byte(), node.end_byte())
+        );
+        let locate = |location: &crate::semantics::SourceLocation| {
+            assert_eq!(location.snapshot_hash, self.unit.source_hash);
+            let expression = node
+                .named_descendant_for_byte_range(location.start_byte, location.end_byte)
+                .expect("planned when expression exists in its snapshot");
+            assert_eq!(
+                (expression.start_byte(), expression.end_byte()),
+                (location.start_byte, location.end_byte)
+            );
+            expression
+        };
+        let subject = locate(&lowering.subject);
+        let arms = lowering
+            .arms
+            .iter()
+            .map(|arm| {
+                (
+                    arm.labels
+                        .iter()
+                        .map(|label| label.name.clone())
+                        .collect::<Vec<_>>(),
+                    locate(&arm.result),
+                )
+            })
+            .collect::<Vec<_>>();
+        let default = lowering.default_result.as_ref().map(locate);
+        let subject_java = self.transpile(subject);
+        let mut out = format!("switch ({subject_java}) {{\n");
+        for (labels, result) in arms {
+            out.push_str(&format!(
+                "case {} -> {};\n",
+                labels.join(", "),
+                self.when_arm_body(Some(result))
+            ));
+        }
+        let default = default
+            .map(|result| self.when_arm_body(Some(result)))
+            .unwrap_or_else(|| "throw new kotlin.NoWhenBranchMatchedException()".into());
+        out.push_str(&format!("default -> {default};\n}}"));
+        out
     }
 
     fn when_switch(
@@ -693,6 +996,13 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         }
     }
 
+    fn narrowed_receiver(&self, source: &str, java: &str) -> String {
+        match self.unit.flow_smart_casts.get(source) {
+            Some(ty) => format!("(({ty}) {java})"),
+            None => java.to_string(),
+        }
+    }
+
     fn if_expr(&mut self, node: tree_sitter::Node) -> String {
         // Supported simple `if` expressions lower directly to a Java ternary.
         // Only malformed/complex shapes below emit an approximation warning.
@@ -726,17 +1036,42 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             let inner = unwrap_paren_node(c);
             self.transpile(inner)
         });
-        // If the condition is `x is T`, smart-cast means the then-branch
-        // must cast x back to T in Java.
-        let cast_ty = cond_node
+        // Narrow only the checked stable receiver, and only in the branch
+        // where the test proves its type. Restoring the prior environment
+        // also keeps nested conditions from leaking into sibling branches.
+        let narrowing = cond_node
             .map(|c| unwrap_paren_node(c))
             .filter(|c| c.kind() == "is_expression")
             .and_then(|c| {
-                c.children(&mut c.walk())
+                let children = c
+                    .children(&mut c.walk())
                     .filter(|k| k.is_named())
-                    .nth(1)
-                    .map(|t| box_primitive(&kt::java_type(t, self.unit.source)))
+                    .collect::<Vec<_>>();
+                let target = unwrap_paren_node(*children.first()?);
+                if !matches!(target.kind(), "identifier" | "this_expression") {
+                    return None;
+                }
+                let name = self.unit.text(target).trim();
+                if target.kind() == "this_expression"
+                    && (name != "this" || self.unit.ext_receiver_name.is_some())
+                {
+                    return None;
+                }
+                let ty = box_primitive(&kt::java_type(*children.get(1)?, self.unit.source));
+                Some((name.to_string(), ty, self.unit.text(c).contains("!is")))
             });
+        if let Some((name, ty, _)) = &narrowing
+            && self
+                .unit
+                .flow_smart_casts
+                .get(name)
+                .is_some_and(|prior| prior != ty)
+        {
+            self.unit.diag_untranslatable(
+                node,
+                "overlapping smart casts require a proven intersection type",
+            );
+        }
         // Branches: named children after the condition. When the condition is
         // a field-named node we skip only that node; else skip all up to `else`.
         let cond_id = cond_node.map(|c| c.id());
@@ -747,14 +1082,17 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .collect();
         match (cond.clone(), branches.len()) {
             (Some(c), 2) => {
+                let prior = self.unit.flow_smart_casts.clone();
+                if let Some((name, ty, false)) = &narrowing {
+                    self.unit.flow_smart_casts.insert(name.clone(), ty.clone());
+                }
                 let a = self.transpile(branches[0]);
+                self.unit.flow_smart_casts.clone_from(&prior);
+                if let Some((name, ty, true)) = &narrowing {
+                    self.unit.flow_smart_casts.insert(name.clone(), ty.clone());
+                }
                 let b = self.transpile(branches[1]);
-                // Smart-cast repair: cast the then-branch to the is-type if the
-                // then-branch is the same expression the is-check tested.
-                let a = match (&cast_ty, branches[0].kind()) {
-                    (Some(ty), "identifier") => format!("(({}) {})", ty, a),
-                    _ => a,
-                };
+                self.unit.flow_smart_casts = prior;
                 // Both arms are void calls (println etc.)? A statement-level
                 // ternary over void calls is illegal Java — emit real if/else.
                 let arms_void =
@@ -787,11 +1125,12 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 }
 
-fn unwrap_paren_node(node: tree_sitter::Node) -> tree_sitter::Node {
-    if node.kind() == "parenthesized"
-        && let Some(inner) = node.children(&mut node.walk()).find(|c| c.is_named())
-    {
-        return inner;
+fn unwrap_paren_node(mut node: tree_sitter::Node) -> tree_sitter::Node {
+    while matches!(node.kind(), "parenthesized" | "parenthesized_expression") {
+        let Some(inner) = node.children(&mut node.walk()).find(|c| c.is_named()) else {
+            break;
+        };
+        node = inner;
     }
     node
 }

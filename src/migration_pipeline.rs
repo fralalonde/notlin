@@ -18,6 +18,8 @@ pub struct GeneratedJava {
     pub origin: PathBuf,
     pub name: String,
     pub source: String,
+    /// Original Kotlin ownership boundaries represented by this accepted output.
+    pub owners: Vec<crate::semantics::SymbolId>,
 }
 
 pub struct WorkspaceMigrationPlan {
@@ -46,6 +48,162 @@ pub fn plan_workspace_migration<F>(
     cli: &Cli,
     index: &SourceIndex,
     translation_roots: &[PathBuf],
+    mut progress: F,
+) -> Result<WorkspaceMigrationPlan, String>
+where
+    F: FnMut(String),
+{
+    // These are speculative requirements, not accepted ownership decisions.
+    // Discover them before the first pass so a one-pass screen includes their
+    // opportunities rather than paying for a complete preliminary fixpoint.
+    let retained = index
+        .kotlin_files()
+        .flat_map(|file| &file.declarations)
+        .map(|declaration| crate::semantics::workspace_symbol(index, declaration))
+        .collect::<HashSet<_>>();
+    let limit = cli.max_pass.unwrap_or_else(|| {
+        index
+            .kotlin_files()
+            .map(|file| file.declarations.len())
+            .sum::<usize>()
+            .saturating_mul(2)
+            .max(16)
+    });
+    let selected = sources
+        .iter()
+        .map(|(path, _)| normalized(path))
+        .collect::<HashSet<_>>();
+    let mut requirements = BTreeMap::<_, Vec<_>>::new();
+    for file in index
+        .kotlin_files()
+        .filter(|file| cli.migrates_in_place() && selected.contains(&normalized(&file.path)))
+    {
+        for declaration in &file.declarations {
+            let symbol = crate::semantics::workspace_symbol(index, declaration);
+            if !symbol.owner_path.is_empty()
+                || !retained.contains(&symbol)
+                || declaration.supertypes.is_empty()
+                || !declaration.members.iter().any(|member| {
+                    member.kind == crate::workspace::MemberKind::Property
+                        && !member.is_mutable
+                        && member
+                            .type_name
+                            .as_deref()
+                            .is_some_and(|ty| ty.trim().starts_with("List<"))
+                })
+            {
+                continue;
+            }
+            let conflicts = index.retained_supertype_member_conflicts_in_file(
+                &file.path,
+                &declaration.supertypes,
+                &declaration.name,
+            );
+            let members = conflicts
+                .iter()
+                .filter(|conflict| conflict.blocks_java_override())
+                .map(|conflict| conflict.member_name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            for member in members {
+                if let Some(group) = index.readonly_list_jvm_wildcard_requirements(
+                    declaration,
+                    member,
+                    &conflicts,
+                    translation_roots,
+                    &retained,
+                ) {
+                    let edits = group
+                        .into_iter()
+                        .filter(|requirement| !requirement.already_present)
+                        .map(
+                            |requirement| crate::translation_plan::PlannedVarianceContract {
+                                implementer: requirement.implementation,
+                                contract_owner: requirement.contract,
+                                accessor: requirement.member_name,
+                                edit: crate::translation_plan::PlannedSourceEdit {
+                                    location: requirement.location,
+                                    replacement: requirement.replacement,
+                                    speculative: false,
+                                },
+                            },
+                        )
+                        .collect::<Vec<_>>();
+                    if !edits.is_empty()
+                        && edits
+                            .iter()
+                            .all(|edit| selected.contains(&normalized(&edit.edit.location.file)))
+                    {
+                        requirements
+                            .entry(symbol.clone())
+                            .or_default()
+                            .extend(edits);
+                    }
+                }
+            }
+        }
+    }
+    // Each retry starts from immutable originals. A failed implementer removes
+    // its entire requirement group, so speculative annotations cannot leak and
+    // the retry set strictly shrinks rather than oscillating.
+    let mut completed_rounds = 0;
+    loop {
+        if !requirements.is_empty() {
+            progress(format!(
+                "checking JVM collection contracts for {} declarations",
+                requirements.len()
+            ));
+        }
+        let contracts = requirements.values().flatten().cloned().collect::<Vec<_>>();
+        let candidate = plan_workspace_migration_inner(
+            sources.clone(),
+            cli,
+            index,
+            translation_roots,
+            &contracts,
+            completed_rounds + 1..=limit,
+            &mut progress,
+        )?;
+        completed_rounds = candidate.rounds;
+        let accepted = accepted_owners(&candidate);
+        let previous_count = requirements.len();
+        requirements.retain(|implementer, _| {
+            if accepted.contains(implementer) {
+                true
+            } else {
+                let reasons = candidate
+                    .translation_plans
+                    .values()
+                    .flat_map(|plan| &plan.declarations)
+                    .find(|decision| decision.symbol_id == *implementer)
+                    .map(|decision| &decision.retention_reasons);
+                log::debug!(
+                    "discarding speculative JVM collection contracts for {}: {:?}",
+                    implementer.stable_key(),
+                    reasons
+                );
+                false
+            }
+        });
+        if requirements.len() == previous_count {
+            return Ok(candidate);
+        }
+    }
+}
+
+fn accepted_owners(plan: &WorkspaceMigrationPlan) -> HashSet<crate::semantics::SymbolId> {
+    plan.generated_java
+        .iter()
+        .flat_map(|output| output.owners.iter().cloned())
+        .collect()
+}
+
+fn plan_workspace_migration_inner<F>(
+    sources: Vec<(PathBuf, String)>,
+    cli: &Cli,
+    index: &SourceIndex,
+    translation_roots: &[PathBuf],
+    variance_contracts: &[crate::translation_plan::PlannedVarianceContract],
+    passes: std::ops::RangeInclusive<usize>,
     mut progress: F,
 ) -> Result<WorkspaceMigrationPlan, String>
 where
@@ -80,23 +238,38 @@ where
             ));
         }
     }
-    let mut virtual_sources = sources.clone();
+    let mut virtual_sources = apply_variance_contract_edits(&sources, variance_contracts)?;
     let mut cumulative: HashMap<
         PathBuf,
         (PathBuf, String, String, Vec<crate::semantics::SymbolId>),
     > = HashMap::new();
     let mut output_identities = HashMap::<PathBuf, PathBuf>::new();
-    let declaration_count = index
-        .kotlin_files()
-        .map(|f| f.declarations.len())
-        .sum::<usize>();
-    let limit = cli
-        .max_pass
-        .unwrap_or_else(|| declaration_count.saturating_mul(2).max(16));
     let mut converged_plans = None;
     let mut converged_round = 0usize;
     let mut retained_seed: Option<HashSet<crate::semantics::SymbolId>> = None;
     let mut translation_plans = HashMap::<PathBuf, crate::translation_plan::TranslationPlan>::new();
+    if !variance_contracts.is_empty() {
+        let edited_files = variance_contracts
+            .iter()
+            .map(|contract| normalized(&contract.edit.location.file))
+            .collect::<HashSet<_>>();
+        for (path, source) in sources
+            .iter()
+            .filter(|(path, _)| edited_files.contains(&normalized(path)))
+        {
+            let tree = transpiler::parse_tree(source);
+            // The ordinary planner uses the indexed path as semantic identity,
+            // even when an explicit input preserved relative/non-verbatim path
+            // spelling. Original-location templates must use that same identity.
+            let identity_path = index
+                .source_file(path)
+                .map_or_else(|| normalized(path), |file| file.path.clone());
+            translation_plans.insert(
+                path.clone(),
+                crate::translation_plan::analyze(source, tree.root_node(), &identity_path),
+            );
+        }
+    }
     let mut strict_vetoed_paths = HashSet::<PathBuf>::new();
     let mut callsite_repair = crate::property_callsite::IncrementalRepairState::default();
     // Keep contracts from accepted operations, even once the former property
@@ -115,6 +288,11 @@ where
             .entry(normalized(&file.path))
             .or_insert(file);
     }
+    // Output collisions can involve an existing Java path that is outside
+    // the initial source index. Capture it the first time planning consults
+    // that path and reuse these exact bytes for both merging and write-time
+    // snapshot verification.
+    let mut observed_output_snapshots = HashMap::<PathBuf, (PathBuf, Option<Vec<u8>>)>::new();
     let mut original_sources_by_identity = HashMap::new();
     for (path, source) in &sources {
         original_sources_by_identity
@@ -122,7 +300,22 @@ where
             .or_insert(source.as_str());
     }
 
-    for round in 1..=limit {
+    let original_by_path = sources
+        .iter()
+        // Accepted owners use indexed paths (including Windows' extended
+        // prefix). Explicit file arguments may spell the same path
+        // differently; call repairs must find the matching snapshot.
+        .map(|(path, source)| {
+            let indexed_path = index
+                .source_file(path)
+                .map(|file| file.path.clone())
+                .unwrap_or_else(|| path.clone());
+            (indexed_path, source.clone())
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let pass_limit = *passes.end();
+    for round in passes {
         let mut phase_started = std::time::Instant::now();
         crate::diagnostics::clear_retention();
         let overlays = speculative_overlays(&sources, &virtual_sources, &cumulative);
@@ -234,43 +427,46 @@ where
                     .unwrap_or_else(|| plan.file.parent().unwrap_or(Path::new(".")).join(name));
                 let identity = normalized(&target);
                 let key = target.clone();
+                if !observed_output_snapshots.contains_key(&identity) {
+                    let snapshot = if let Some(existing) = original_java_by_identity.get(&identity)
+                    {
+                        Some(existing.source_text().as_bytes().to_vec())
+                    } else {
+                        match std::fs::read(&target) {
+                            Ok(bytes) => Some(bytes),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(error) => {
+                                return Err(format!("{}: {error}", crate::paths::display(&target)));
+                            }
+                        }
+                    };
+                    observed_output_snapshots.insert(identity.clone(), (target.clone(), snapshot));
+                }
+                let mut previous_generated = None;
                 if let Some(existing) = original_java_by_identity.get(&identity) {
-                    let origins = [
-                        normalized(&plan.file).to_string_lossy().replace('\\', "/"),
-                        plan.file.to_string_lossy().replace('\\', "/"),
-                    ];
-                    let owned = existing.source_text().lines().next().is_some_and(|line| {
-                        line.contains("NOTLIN: generated from")
-                            && origins
-                                .iter()
-                                .any(|origin| line.replace('\\', "/").contains(origin))
-                    });
-                    if !owned {
+                    if !generated_header_matches_source(existing.source_text(), &plan.file) {
                         return Err(format!(
                             "generated Java path overlaps an existing source: {}",
                             crate::paths::display(&target)
                         ));
                     }
+                    previous_generated = Some(existing.source_text().to_owned());
                 }
-                if target.exists() && !original_java_by_identity.contains_key(&identity) {
-                    let existing = std::fs::read_to_string(&target)
-                        .map_err(|e| format!("{}: {e}", crate::paths::display(&target)))?;
-                    let origins = [
-                        normalized(&plan.file).to_string_lossy().replace('\\', "/"),
-                        plan.file.to_string_lossy().replace('\\', "/"),
-                    ];
-                    let owned = existing.lines().next().is_some_and(|line| {
-                        line.contains("NOTLIN: generated from")
-                            && origins
-                                .iter()
-                                .any(|origin| line.replace('\\', "/").contains(origin))
-                    });
-                    if !owned {
+                if previous_generated.is_none()
+                    && let Some(bytes) = observed_output_snapshots
+                        .get(&identity)
+                        .and_then(|(_, bytes)| bytes.as_ref())
+                {
+                    let existing = String::from_utf8(bytes.clone()).map_err(|error| {
+                        format!("{} is not UTF-8: {error}", crate::paths::display(&target))
+                    })?;
+                    if !generated_header_matches_source(&existing, &plan.file) {
                         return Err(format!(
                             "generated Java path overlaps an existing file: {}",
                             crate::paths::display(&target)
                         ));
                     }
+                    previous_generated = Some(existing);
                 }
                 if let Some(previous_path) = output_identities.get(&identity)
                     && let Some((origin, _old, _, _)) = cumulative.get(previous_path)
@@ -318,6 +514,22 @@ where
                         }
                         (origin.clone(), merged, name.clone(), merged_owners)
                     }
+                } else if let Some(previous) = previous_generated {
+                    if is_top_level_facade_owner_set(&owners) {
+                        let merged = merge_existing_facade(&plan.file, &previous, content, name)
+                            .ok_or_else(|| {
+                                format!(
+                                    "cannot safely merge existing generated facade: {}",
+                                    crate::paths::display(&target)
+                                )
+                            })?;
+                        // Historical members intentionally have no source-owner
+                        // identities. Only owners accepted in this invocation
+                        // contribute to coverage.
+                        (plan.file.clone(), merged, name.clone(), owners)
+                    } else {
+                        (plan.file.clone(), content.clone(), name.clone(), owners)
+                    }
                 } else {
                     (plan.file.clone(), content.clone(), name.clone(), owners)
                 };
@@ -334,10 +546,6 @@ where
             "output acceptance",
         );
         next.sort_by(|left, right| left.0.cmp(&right.0));
-        let original_by_path = sources
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeMap<_, _>>();
         let mut residual_by_path = next
             .iter()
             .filter(|(path, _)| !vetoed_this_round.contains(&normalized(path)))
@@ -347,12 +555,13 @@ where
             .iter()
             .flat_map(|plan| plan.emitted_owners.iter().cloned())
             .collect::<Vec<_>>();
+        let callsite_plans = plans
+            .iter()
+            .map(|plan| plan.translation.clone())
+            .collect::<Vec<_>>();
         let callsite_report = crate::function_callsite::repair_virtual_calls_with_emitted_owners(
             &original_by_path,
-            &plans
-                .iter()
-                .map(|plan| plan.translation.clone())
-                .collect::<Vec<_>>(),
+            &callsite_plans,
             &mut residual_by_path,
             &emitted_owners,
         );
@@ -380,6 +589,46 @@ where
             ));
         }
         for repair in callsite_report.repairs {
+            if vetoed_this_round.contains(&normalized(&repair.target.file)) {
+                continue;
+            }
+            if let Some(path) = plan_owner_path(&translation_plans, &repair.target)
+                && let Some(aggregate) = translation_plans.get_mut(&path)
+                && !aggregate.repairs.contains(&repair)
+            {
+                aggregate.repairs.push(repair);
+            }
+        }
+        let property_callsite_report =
+            crate::top_level_property_callsite::repair_emitted_property_references(
+                // Accepted owner locations use indexed identities, while
+                // explicit CLI inputs can retain a different path spelling.
+                // The hashes belong to this round's pre-emission snapshots;
+                // earlier rounds may already have repaired or trimmed them.
+                &plans
+                    .iter()
+                    .flat_map(|plan| {
+                        plan.translation.declarations.iter().map(|declaration| {
+                            (declaration.symbol_id.file.clone(), plan.source.clone())
+                        })
+                    })
+                    .collect(),
+                &callsite_plans,
+                &mut residual_by_path,
+                &emitted_owners,
+            );
+        if !property_callsite_report.diagnostics.is_empty() {
+            let details = property_callsite_report
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}: {}", crate::paths::display(&d.file), d.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "top-level property call-site repair needs a safer migration plan: {details}"
+            ));
+        }
+        for repair in property_callsite_report.repairs {
             if vetoed_this_round.contains(&normalized(&repair.target.file)) {
                 continue;
             }
@@ -528,7 +777,7 @@ where
     }
     let Some(mut final_plans) = converged_plans else {
         return Err(format!(
-            "workspace migration did not converge within {limit} planning passes; increase --max-pass to allow more passes (no migration applied)"
+            "workspace migration did not converge within {pass_limit} planning passes; increase --max-pass to allow more passes (no migration applied)"
         ));
     };
     transpiler::fixpoint::qualify_retention_markers(&mut final_plans);
@@ -587,11 +836,12 @@ where
     }
     let generated_java: Vec<GeneratedJava> = cumulative
         .into_iter()
-        .map(|(path, (origin, source, name, _owners))| GeneratedJava {
+        .map(|(path, (origin, source, name, owners))| GeneratedJava {
             path,
             origin,
             name,
             source,
+            owners,
         })
         .collect();
     let migration_proposals = sources
@@ -630,6 +880,20 @@ where
             aggregate.source_edits = vec![edit.clone()];
         }
     }
+    for contract in variance_contracts {
+        let accepted = generated_java
+            .iter()
+            .any(|output| output.owners.contains(&contract.implementer));
+        let contract_file = normalized(&contract.edit.location.file);
+        if accepted
+            && let Some(aggregate) = translation_plans
+                .iter_mut()
+                .find_map(|(path, plan)| (normalized(path) == contract_file).then_some(plan))
+            && !aggregate.variance_contracts.contains(contract)
+        {
+            aggregate.variance_contracts.push(contract.clone());
+        }
+    }
     let mut original_snapshots = sources
         .iter()
         .map(|(p, s)| (p.clone(), Some(s.as_bytes().to_vec())))
@@ -642,13 +906,12 @@ where
         let bytes = file.source_text().as_bytes().to_vec();
         original_snapshots.push((file.path.clone(), Some(bytes)));
     }
+    original_snapshots.extend(observed_output_snapshots.values().cloned());
     if cli.out_dir.is_none() {
         for (source, _) in &sources {
             let Some(directory) = source.parent() else {
                 continue;
             };
-            let source_canon = std::fs::canonicalize(source).unwrap_or_else(|_| source.clone());
-            let source_marker = source_canon.to_string_lossy().replace('\\', "/");
             let emitted = generated_java
                 .iter()
                 .filter(|g| g.origin == *source)
@@ -669,10 +932,7 @@ where
                 }
                 let owned = std::fs::read_to_string(&path)
                     .ok()
-                    .and_then(|text| text.lines().next().map(str::to_owned))
-                    .is_some_and(|line| {
-                        line.contains("NOTLIN: generated from") && line.contains(&source_marker)
-                    });
+                    .is_some_and(|text| generated_header_matches_source(&text, source));
                 if owned {
                     let bytes = std::fs::read(&path)
                         .map_err(|e| format!("{}: {e}", crate::paths::display(&path)))?;
@@ -684,18 +944,11 @@ where
     let mut snapshot_seen: HashSet<PathBuf> = HashSet::new();
     original_snapshots.retain(|(p, _)| snapshot_seen.insert(normalized(p)));
     for generated in &generated_java {
-        if snapshot_seen.insert(normalized(&generated.path)) {
-            let snapshot = match std::fs::read(&generated.path) {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(format!(
-                        "{}: {error}",
-                        crate::paths::display(&generated.path)
-                    ));
-                }
-            };
-            original_snapshots.push((generated.path.clone(), snapshot));
+        if snapshot_seen.insert(normalized(&generated.path))
+            && let Some((path, snapshot)) =
+                observed_output_snapshots.get(&normalized(&generated.path))
+        {
+            original_snapshots.push((path.clone(), snapshot.clone()));
         }
     }
     Ok(WorkspaceMigrationPlan {
@@ -709,6 +962,66 @@ where
         source_edits,
         rounds: converged_round,
     })
+}
+
+fn apply_variance_contract_edits(
+    sources: &[(PathBuf, String)],
+    contracts: &[crate::translation_plan::PlannedVarianceContract],
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let mut edits_by_file =
+        BTreeMap::<PathBuf, Vec<&crate::translation_plan::PlannedSourceEdit>>::new();
+    for contract in contracts {
+        let edits = edits_by_file
+            .entry(normalized(&contract.edit.location.file))
+            .or_default();
+        if !edits.contains(&&contract.edit) {
+            edits.push(&contract.edit);
+        }
+    }
+    let mut result = sources.to_vec();
+    for (file, edits) in &mut edits_by_file {
+        let Some((_, source)) = result
+            .iter_mut()
+            .find(|(path, _)| normalized(path) == *file)
+        else {
+            return Err(format!(
+                "JVM collection contract edit is outside selected sources: {}",
+                crate::paths::display(file)
+            ));
+        };
+        let snapshot_hash = *blake3::hash(source.as_bytes()).as_bytes();
+        edits.sort_by_key(|edit| (edit.location.start_byte, edit.location.end_byte));
+        let mut previous_span = None;
+        for edit in edits.iter() {
+            let location = &edit.location;
+            if location.snapshot_hash != snapshot_hash
+                || location.start_byte > location.end_byte
+                || !source.is_char_boundary(location.start_byte)
+                || !source.is_char_boundary(location.end_byte)
+            {
+                return Err(format!(
+                    "stale or invalid JVM collection contract edit: {}",
+                    crate::paths::display(file)
+                ));
+            }
+            if previous_span.is_some_and(|(start, end)| {
+                start == location.start_byte || end > location.start_byte
+            }) {
+                return Err(format!(
+                    "overlapping JVM collection contract edits: {}",
+                    crate::paths::display(file)
+                ));
+            }
+            previous_span = Some((location.start_byte, location.end_byte));
+        }
+        for edit in edits.iter().rev() {
+            source.replace_range(
+                edit.location.start_byte..edit.location.end_byte,
+                &edit.replacement,
+            );
+        }
+    }
+    Ok(result)
 }
 
 fn same_owner_set(
@@ -822,6 +1135,11 @@ fn merge_translation_plan(
     for repair in &incoming.repairs {
         if !plan.repairs.contains(repair) {
             plan.repairs.push(repair.clone());
+        }
+    }
+    for contract in &incoming.variance_contracts {
+        if !plan.variance_contracts.contains(contract) {
+            plan.variance_contracts.push(contract.clone());
         }
     }
     for output in &incoming.outputs {
@@ -975,6 +1293,7 @@ fn veto_translation(plan: &mut crate::translation_plan::TranslationPlan) {
     plan.bridges.clear();
     plan.repairs.clear();
     plan.source_edits.clear();
+    plan.variance_contracts.clear();
 }
 
 fn merge_property_repairs(
@@ -1309,6 +1628,46 @@ fn normalized(path: &Path) -> PathBuf {
     }
 }
 
+fn generated_header_matches_source(source_text: &str, source: &Path) -> bool {
+    let canonical = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let expected = [
+        canonical.to_string_lossy().replace('\\', "/"),
+        crate::paths::display(source),
+    ];
+    let Some((_, actual)) = source_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_once("NOTLIN: generated from"))
+    else {
+        return false;
+    };
+    let normalize = |path: &str| {
+        let path = path.trim().replace('\\', "/");
+        if cfg!(windows) {
+            path.to_ascii_lowercase()
+        } else {
+            path
+        }
+    };
+    let actual = normalize(actual);
+    expected.iter().any(|candidate| {
+        let candidate = normalize(candidate);
+        actual == candidate
+            || actual
+                .strip_prefix(&candidate)
+                .is_some_and(|suffix| suffix.starts_with(" —"))
+    })
+}
+
+fn is_top_level_facade_owner_set(owners: &[crate::semantics::SymbolId]) -> bool {
+    !owners.is_empty()
+        && owners.iter().all(|owner| {
+            matches!(owner.kind.as_str(), "function" | "property")
+                && owner.owner_path.is_empty()
+                && owner.receiver.is_none()
+        })
+}
+
 fn speculative_overlays(
     original: &[(PathBuf, String)],
     current: &[(PathBuf, String)],
@@ -1381,6 +1740,15 @@ fn merge_cumulative_facade(
         || package_text(&base) != package_text(&extra)
     {
         return None;
+    }
+    let has_unowned_previous_member = find_node(base_class, "class_body")?
+        .children
+        .iter()
+        .filter_map(element_node)
+        .filter(|node| node.kind == "method_declaration")
+        .any(|node| owner_for_method(node, previous_owners).is_none());
+    if has_unowned_previous_member {
+        return merge_existing_facade(origin, previous, incoming, generated_name);
     }
     let existing = {
         let class = sole_top_class(&base)?;
@@ -1499,6 +1867,218 @@ fn merge_cumulative_facade(
         base.root.children.insert(class_index + offset, import);
     }
     Some(render(&base))
+}
+
+/// Preserve a previously accepted file facade when a later run translates
+/// additional top-level functions from the same Kotlin file. Old method
+/// ownership is intentionally unknown: keep every old method, merge only
+/// disjoint JVM signatures, and reject collisions before any files are written.
+fn merge_existing_facade(
+    origin: &Path,
+    previous: &str,
+    incoming: &str,
+    generated_name: &str,
+) -> Option<String> {
+    use crate::java_ir::{JavaElement, parse_java, render};
+    let generated_stem = Path::new(generated_name).file_stem()?.to_str()?;
+    if origin.file_stem()?.to_str()? != generated_stem {
+        return None;
+    }
+    let mut base = parse_java(previous).ok()?;
+    let extra = parse_java(incoming).ok()?;
+    let base_class = sole_top_class(&base)?;
+    let extra_class = sole_top_class(&extra)?;
+    if node_name(base_class)? != generated_stem
+        || node_name(extra_class)? != generated_stem
+        || package_text(&base) != package_text(&extra)
+    {
+        return None;
+    }
+    let members = |class: &crate::java_ir::JavaSyntaxNode| {
+        let body = find_node(class, "class_body")?;
+        let mut members = Vec::<(String, crate::java_ir::JavaSyntaxNode)>::new();
+        let mut seen = HashSet::new();
+        for node in body.children.iter().filter_map(element_node) {
+            if node.kind == "constructor_declaration"
+                || matches!(node.kind.as_str(), "line_comment" | "block_comment")
+            {
+                continue;
+            }
+            match node.kind.as_str() {
+                "method_declaration" if java_method_is_static(node) => {
+                    let key = format!("method:{}", java_method_signature(node)?);
+                    if !seen.insert(key.clone()) {
+                        return None;
+                    }
+                    members.push((key, node.clone()));
+                }
+                "field_declaration" if java_field_is_static(node) => {
+                    let names = java_field_names(node)?;
+                    if names.len() != 1 {
+                        return None;
+                    }
+                    for name in names {
+                        let key = format!("field:{name}");
+                        if !seen.insert(key.clone()) {
+                            return None;
+                        }
+                        members.push((key, node.clone()));
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(members)
+    };
+    if !facade_imports_compatible(&base, &extra) {
+        return None;
+    }
+    let old_members = members(base_class)?;
+    let old_lookup = old_members.iter().cloned().collect::<BTreeMap<_, _>>();
+    let new_members = members(extra_class)?;
+    let mut additions = Vec::new();
+    for (signature, member) in new_members {
+        if let Some(old) = old_lookup.get(&signature) {
+            if render_node(old) != render_node(&member) {
+                return None;
+            }
+        } else {
+            additions.push(member);
+        }
+    }
+    let base_class = sole_top_class_mut(&mut base)?;
+    let body = find_node_mut(base_class, "class_body")?;
+    let close_brace = body
+        .children
+        .iter()
+        .rposition(|element| matches!(element, JavaElement::Token(token) if token.text == "}"))?;
+    for (offset, member) in additions.into_iter().enumerate() {
+        body.children
+            .insert(close_brace + offset, JavaElement::Declaration(member));
+    }
+    let mut imports = base
+        .root
+        .children
+        .iter()
+        .filter_map(element_node)
+        .filter(|node| node.kind == "import_declaration")
+        .map(render_node)
+        .collect::<HashSet<_>>();
+    let imports_to_add = extra
+        .root
+        .children
+        .iter()
+        .filter_map(element_node)
+        .filter(|node| node.kind == "import_declaration")
+        .filter(|node| imports.insert(render_node(node)))
+        .cloned()
+        .map(JavaElement::Import)
+        .collect::<Vec<_>>();
+    let class_index = base.root.children.iter().position(|element| {
+        element_node(element).is_some_and(|node| node.kind == "class_declaration")
+    })?;
+    for (offset, import) in imports_to_add.into_iter().enumerate() {
+        base.root.children.insert(class_index + offset, import);
+    }
+    Some(render(&base))
+}
+
+fn facade_imports_compatible(
+    previous: &crate::java_ir::JavaCompilationUnit,
+    incoming: &crate::java_ir::JavaCompilationUnit,
+) -> bool {
+    fn collect(
+        unit: &crate::java_ir::JavaCompilationUnit,
+    ) -> Option<(BTreeMap<String, String>, HashSet<String>)> {
+        let mut explicit = BTreeMap::new();
+        let mut wildcards = HashSet::new();
+        for node in unit
+            .root
+            .children
+            .iter()
+            .filter_map(element_node)
+            .filter(|node| node.kind == "import_declaration")
+        {
+            let text = render_node(node)
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_owned();
+            let import = text.strip_prefix("import ")?;
+            let import = import.strip_prefix("static ").unwrap_or(import);
+            if import.contains(".*") {
+                wildcards.insert(text);
+                continue;
+            }
+            let simple = import.rsplit('.').next()?.to_owned();
+            if explicit.insert(simple, text).is_some() {
+                return None;
+            }
+        }
+        Some((explicit, wildcards))
+    }
+    let Some((old_explicit, old_wildcards)) = collect(previous) else {
+        return false;
+    };
+    let Some((new_explicit, new_wildcards)) = collect(incoming) else {
+        return false;
+    };
+    if old_wildcards != new_wildcards {
+        return false;
+    }
+    for (name, path) in new_explicit {
+        if old_explicit.get(&name).is_some_and(|old| old != &path) {
+            return false;
+        }
+    }
+    // Separate static imports have package/member collision semantics which
+    // cannot be inferred from import text alone, so require them to match.
+    let static_imports = |unit: &crate::java_ir::JavaCompilationUnit| -> HashSet<String> {
+        unit.root
+            .children
+            .iter()
+            .filter_map(element_node)
+            .filter(|node| node.kind == "import_declaration")
+            .map(render_node)
+            .filter(|text| text.contains("import static"))
+            .collect()
+    };
+    static_imports(previous) == static_imports(incoming)
+}
+
+fn java_method_is_static(node: &crate::java_ir::JavaSyntaxNode) -> bool {
+    java_has_static_modifier(node)
+}
+
+fn java_field_is_static(node: &crate::java_ir::JavaSyntaxNode) -> bool {
+    java_has_static_modifier(node)
+}
+
+fn java_has_static_modifier(node: &crate::java_ir::JavaSyntaxNode) -> bool {
+    fn contains_static(node: &crate::java_ir::JavaSyntaxNode) -> bool {
+        node.children.iter().any(|element| match element {
+            crate::java_ir::JavaElement::Token(token) => token.text == "static",
+            _ => element_node(element).is_some_and(contains_static),
+        })
+    }
+    find_node(node, "modifiers").is_some_and(contains_static)
+}
+
+fn java_field_names(node: &crate::java_ir::JavaSyntaxNode) -> Option<Vec<String>> {
+    fn visit(node: &crate::java_ir::JavaSyntaxNode, names: &mut Vec<String>) {
+        if node.kind == "variable_declarator" {
+            if let Some(name) = node_name(node) {
+                names.push(name);
+            }
+            return;
+        }
+        for child in node.children.iter().filter_map(element_node) {
+            visit(child, names);
+        }
+    }
+    let mut names = Vec::new();
+    visit(node, &mut names);
+    (!names.is_empty()).then_some(names)
 }
 
 fn element_node(element: &crate::java_ir::JavaElement) -> Option<&crate::java_ir::JavaSyntaxNode> {
@@ -1917,6 +2497,50 @@ mod lineage_tests {
         );
     }
 
+    #[test]
+    fn existing_generated_facade_keeps_prior_methods_and_adds_new_members() {
+        let previous = "package sample; public final class Example { private Example() {} public static int first() { return 1; } }";
+        let incoming = "package sample; public final class Example { private Example() {} public static int third() { return 3; } }";
+        let merged =
+            merge_existing_facade(Path::new("Example.kt"), previous, incoming, "Example.java")
+                .expect("same-origin generated top-level facades should merge disjoint members");
+        assert!(merged.contains("first()"), "{merged}");
+        assert!(merged.contains("third()"), "{merged}");
+    }
+
+    #[test]
+    fn existing_generated_facade_rejects_conflicting_method_signatures() {
+        let previous = "package sample; public final class Example { private Example() {} public static int read(String value) { return 1; } }";
+        let incoming = "package sample; public final class Example { private Example() {} public static int read(String value) { return 2; } }";
+        assert!(
+            merge_existing_facade(Path::new("Example.kt"), previous, incoming, "Example.java",)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn existing_generated_facade_preserves_static_initializer_order() {
+        let previous = "package sample; public final class Example { private Example() {} public static int old = 0; }";
+        let incoming = "package sample; public final class Example { private Example() {} public static int later = init(1); public static int earlier = init(2); }";
+        let merged =
+            merge_existing_facade(Path::new("Example.kt"), previous, incoming, "Example.java")
+                .expect("disjoint static property fields should merge");
+        assert!(
+            merged.find("later = init(1)").unwrap() < merged.find("earlier = init(2)").unwrap(),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn existing_generated_facade_rejects_conflicting_simple_imports() {
+        let previous = "package sample; import a.Identifier; public final class Example { private Example() {} public static int first() { return 1; } }";
+        let incoming = "package sample; import b.Identifier; public final class Example { private Example() {} public static int second() { return new Identifier().value(); } }";
+        assert!(
+            merge_existing_facade(Path::new("Example.kt"), previous, incoming, "Example.java")
+                .is_none()
+        );
+    }
+
     fn analyze(source: &str) -> crate::translation_plan::TranslationPlan {
         let tree = crate::transpiler::parse_tree(source);
         crate::translation_plan::analyze(source, tree.root_node(), Path::new("Definitions.kt"))
@@ -1995,5 +2619,46 @@ mod lineage_tests {
         )
         .unwrap_err();
         assert!(error.contains("explicit unique origin mapping"), "{error}");
+    }
+
+    #[test]
+    fn variance_contract_edits_verify_snapshots_and_reject_overlap() {
+        use crate::translation_plan::{PlannedSourceEdit, PlannedVarianceContract};
+        let original = "interface Parent { val items: List<Base> }";
+        let file = PathBuf::from("Definitions.kt");
+        let symbol = analyze(original).declarations[0].symbol_id.clone();
+        let start = original.find("Base").unwrap();
+        let contract = PlannedVarianceContract {
+            implementer: symbol.clone(),
+            contract_owner: symbol,
+            accessor: "items".into(),
+            edit: PlannedSourceEdit {
+                location: crate::semantics::SourceLocation {
+                    file: file.clone(),
+                    snapshot_hash: *blake3::hash(original.as_bytes()).as_bytes(),
+                    start_byte: start,
+                    end_byte: start + 4,
+                },
+                replacement: "@kotlin.jvm.JvmWildcard Base".into(),
+                speculative: false,
+            },
+        };
+        let sources = vec![(file.clone(), original.to_owned())];
+        let applied =
+            apply_variance_contract_edits(&sources, &[contract.clone(), contract.clone()]).unwrap();
+        assert_eq!(applied[0].1.matches("@kotlin.jvm.JvmWildcard").count(), 1);
+        let stale = vec![(file, format!("{original}\n"))];
+        assert!(
+            apply_variance_contract_edits(&stale, std::slice::from_ref(&contract))
+                .unwrap_err()
+                .contains("stale")
+        );
+        let mut overlapping = contract.clone();
+        overlapping.edit.location.start_byte += 1;
+        assert!(
+            apply_variance_contract_edits(&sources, &[contract, overlapping])
+                .unwrap_err()
+                .contains("overlapping")
+        );
     }
 }

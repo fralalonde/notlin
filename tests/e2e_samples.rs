@@ -349,7 +349,7 @@ fn when_throw_else_is_valid_java() {
     assert_eq!(errors, 0);
     let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
     assert!(
-        all.contains("throw new IllegalArgumentException()"),
+        all.contains("throw new java.lang.IllegalArgumentException()"),
         "{all}"
     );
     assert!(!all.contains("? "), "{all}");
@@ -393,7 +393,7 @@ fn annotations_option_controls_import() {
         (notlin::transpiler::transpile(source, &path, &cli_jet).0, 0)
     };
     let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
-    assert!(all.contains("import org.jetbrains.annotations.*;"));
+    assert!(all.contains("import org.jetbrains.annotations.Nullable;"));
 
     let cli_none = notlin::cli::Cli::parse_from(vec![
         "notlin",
@@ -794,15 +794,22 @@ fn retained_workspace_interface_does_not_leave_a_stale_java_output() {
         root.join("definitions.kt"),
         r#"package neutral.retainedoutput
 
-interface Parent { fun getKey(): String }
-interface Base { val parent: Parent }
+interface Parent {
+    fun getKey(): String
+}
+interface Base {
+    val parent: Parent
+}
 interface Child : Base {
+    suspend fun pending(): String = alias
     val alias: String get() = parent.getKey()
 }
 enum class Residual : Child {
     ONLY;
     override val parent: Parent get() = throw UnsupportedOperationException()
-}"#,
+}
+fun unrelated(): Int = 1
+"#,
     )
     .unwrap();
     // This is deliberately pre-existing Java. Its Kotlin enum-entries ABI
@@ -818,6 +825,17 @@ enum class Residual : Child {
         root.join("Child.java"),
         format!(
             "// NOTLIN: generated from {} — do not edit by hand while the source .kt exists\nclass Child {{}}\n",
+            source_canon.display().to_string().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    // Historical output with no corresponding top-level Kotlin owner is
+    // ambiguous: cleanup must preserve it rather than treating absence from
+    // the current plan as proof that it is stale.
+    fs::write(
+        root.join("Orphan.java"),
+        format!(
+            "// NOTLIN: generated from {} — do not edit by hand while the source .kt exists\nclass Orphan {{}}\n",
             source_canon.display().to_string().replace('\\', "/")
         ),
     )
@@ -841,8 +859,16 @@ enum class Residual : Child {
         !root.join("Child.java").exists(),
         "a retained interface must not leave Java emitted before retention converges"
     );
+    assert!(
+        root.join("Orphan.java").exists(),
+        "a generated-looking output without a uniquely matched retained owner is ambiguous and must be preserved"
+    );
     let retained = fs::read_to_string(root.join("definitions.kt")).unwrap();
     assert!(retained.contains("interface Child : Base"), "{retained}");
+    assert!(
+        !retained.contains("fun unrelated()"),
+        "the fixture must trim successfully so stale cleanup runs after partial migration:\n{retained}"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

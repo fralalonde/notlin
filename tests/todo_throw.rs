@@ -4,10 +4,10 @@ use std::process::Command;
 
 /// Kotlin stdlib `TODO("msg")` is `Nothing`-typed (throws
 /// NotImplementedError). The Java emission must be a THROW statement —
-/// `throw new RuntimeException("msg")` — never `new TODO(...)`,
+/// `throw new kotlin.NotImplementedError(...)` — never `new TODO(...)`,
 /// which references a class that does not exist.
 #[test]
-fn todo_call_throws_runtime_exception_in_getter_body() {
+fn todo_call_preserves_not_implemented_error_in_getter_body() {
     let root = Path::new("tests/tmp_scratch_todo");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -28,8 +28,8 @@ fn todo_call_throws_runtime_exception_in_getter_body() {
     );
     if !java.is_empty() {
         assert!(
-            java.contains("throw new RuntimeException(\"Not yet implemented\")"),
-            "TODO() must lower to a RuntimeException throw:\n{java}"
+            java.contains("throw new kotlin.NotImplementedError(\"An operation is not implemented: \" + \"Not yet implemented\")"),
+            "TODO() must preserve Kotlin's error and message:\n{java}"
         );
     }
     let _ = fs::remove_dir_all(root);
@@ -59,7 +59,9 @@ fn todo_expression_body_is_emitted_as_a_bare_throw() {
     assert!(output.status.success(), "notlin failed: {output:?}");
     let java = fs::read_to_string(root.join("Kind.java")).unwrap();
     assert!(
-        java.contains("throw new RuntimeException();"),
+        java.contains(
+            "throw new kotlin.NotImplementedError(\"An operation is not implemented.\");"
+        ),
         "TODO() expression body must emit a bare throw:\n{java}"
     );
     assert!(!java.contains("return throw"), "invalid Java:\n{java}");

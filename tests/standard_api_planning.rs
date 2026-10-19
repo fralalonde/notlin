@@ -107,12 +107,16 @@ fn explicitly_imported_domain_uuid_is_not_mistaken_for_java_util_uuid() {
         "Identifier.kt",
     );
     assert_eq!(errors, 0);
+    let java = outputs
+        .iter()
+        .find(|(name, _)| name == "Identifier.java")
+        .map(|(_, java)| java)
+        .expect("the source reference inherits Object.toString");
+    assert!(java.contains("import domain.UUID;"), "{java}");
+    assert!(!java.contains("java.util.UUID"), "{java}");
+    assert!(java.contains(".getObjectId().toString()"), "{java}");
     assert!(
-        !outputs.iter().any(|(name, _)| name == "Identifier.java"),
-        "unexpected outputs: {outputs:?}"
-    );
-    assert!(
-        coverage
+        !coverage
             .untranslated
             .iter()
             .any(|name| name == "Identifier")

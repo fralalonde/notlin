@@ -5,6 +5,48 @@ use super::Expr;
 use crate::transpiler::kt;
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
+    fn is_proven_map_factory_pair(&self, node: tree_sitter::Node<'_>) -> bool {
+        let mut current = node;
+        let value_argument = loop {
+            let Some(parent) = current.parent() else {
+                return false;
+            };
+            if parent.kind() == "value_argument" {
+                break parent;
+            }
+            if parent.kind() != "parenthesized_expression" {
+                return false;
+            }
+            current = parent;
+        };
+        let Some(arguments) = value_argument.parent() else {
+            return false;
+        };
+        let Some(call) = arguments
+            .parent()
+            .filter(|parent| parent.kind() == "call_expression")
+        else {
+            return false;
+        };
+        let Some(callee) = call
+            .named_children(&mut call.walk())
+            .find(|child| child.kind() != "value_arguments")
+        else {
+            return false;
+        };
+        let name = self.unit.text(callee).trim();
+        matches!(name, "mapOf" | "mutableMapOf" | "linkedMapOf" | "hashMapOf")
+            && self.unit.semantic_provider.is_some_and(|provider| {
+                crate::semantics::known_collection_factory_shape(
+                    self.unit.source,
+                    call,
+                    callee,
+                    name,
+                    provider,
+                )
+            })
+    }
+
     fn known_primitive_operand(&self, node: tree_sitter::Node) -> bool {
         if node.kind() == "identifier" {
             self.unit
@@ -39,6 +81,12 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             let l_java = self.transpile(named[0]);
             let r_java = self.transpile(named[2]);
             if op == "to" {
+                if self.is_proven_map_factory_pair(node) {
+                    return format!(
+                        "new java.util.AbstractMap.SimpleImmutableEntry<>({}, {})",
+                        l_java, r_java
+                    );
+                }
                 // Infix `to` builds a Pair. Closest pure-JDK value:
                 // AbstractMap.SimpleImmutableEntry (getKey/getValue mapped
                 // at call sites that read .first/.second on Pair-typed vars).

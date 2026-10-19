@@ -13,8 +13,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     pub fn infer_type(&mut self, expr: tree_sitter::Node) -> String {
         let t = self.infer_type_inner(expr);
         let known = match expr.kind() {
-            "number_literal" | "boolean_literal" | "string_literal" => true,
-            "identifier" => self.var_types.contains_key(self.text(expr).trim()),
+            "number_literal" | "float_literal" | "real_literal" | "long_literal"
+            | "hex_literal" | "boolean_literal" | "string_literal" => true,
+            "identifier" => {
+                self.var_types.contains_key(self.text(expr).trim())
+                    || kt::is_canonical_unit_reference(expr, self.source)
+            }
             _ => false,
         };
         let kotlin_type = match t.as_str() {
@@ -74,6 +78,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
                 if let Some(ty) = self.var_types.get(self.text(expr).trim()).cloned() {
                     ty
+                } else if kt::is_canonical_unit_reference(expr, self.source) {
+                    "kotlin.Unit".to_string()
                 } else {
                     self.diag_approx(expr, "required identifier type is unknown".to_string());
                     "Object".to_string()
@@ -118,9 +124,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
             "string_literal" => "String".to_string(),
-            "number_literal" => {
+            "number_literal" | "float_literal" | "real_literal" | "long_literal"
+            | "hex_literal" => {
                 let t = self.text(expr);
-                if t.contains('.') || t.contains('e') || t.contains('E') {
+                if t.ends_with('L') {
+                    "long".to_string()
+                } else if t.ends_with(['f', 'F']) && !(t.starts_with("0x") || t.starts_with("0X")) {
+                    "float".to_string()
+                } else if !(t.starts_with("0x") || t.starts_with("0X"))
+                    && (t.contains('.') || t.contains('e') || t.contains('E'))
+                {
                     "double".to_string()
                 } else {
                     "int".to_string()
@@ -205,6 +218,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
             "call_expression" => {
+                if let Some(fact) = self
+                    .reified_class_calls
+                    .get(&(expr.start_byte(), expr.end_byte()))
+                    && let crate::semantics::KotlinType::Named { name, arguments } =
+                        &fact.return_type.ty
+                    && arguments.is_empty()
+                {
+                    assert_eq!(fact.location.snapshot_hash, self.source_hash);
+                    return crate::transpiler::types::map_type_name(name).to_string();
+                }
                 // constructor call: Person(...) -> Person
                 let callee = kt::child(expr, "identifier")
                     .map(|n| self.text(n).to_string())

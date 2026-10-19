@@ -199,6 +199,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         for (fname, fty) in std::mem::take(&mut self.pending_field_types) {
             self.var_types.insert(fname, fty);
         }
+        self.bind_direct_body_fields(decl);
         let name = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_else(|| "anon".to_string());
@@ -384,7 +385,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     match k.kind() {
                         "user_type" | "nullable_type" | "function_type" | "type"
                         | "parenthesized_type" => {
-                            ret = kt::java_type_ann(k, self.source, self.annots);
+                            ret = kt::java_return_type(k, self.source, self.annots);
                             explicit_ret = true;
                         }
                         _ => {}
@@ -448,6 +449,51 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         // javac rejects with "unexpected return value" and turns
                         // every call site into "'void' type not allowed here".
                         "call_expression" => {
+                            if let Some(fact) = self
+                                .reified_class_calls
+                                .get(&(be.start_byte(), be.end_byte()))
+                                && let crate::semantics::KotlinType::Named { name, arguments } =
+                                    &fact.return_type.ty
+                                && arguments.is_empty()
+                            {
+                                assert_eq!(fact.location.snapshot_hash, self.source_hash);
+                                let prefix = if fact.return_type.nullable {
+                                    self.annots
+                                        .nullable()
+                                        .map(|annotation| format!("{annotation} "))
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                return Some(format!(
+                                    "{prefix}{}",
+                                    crate::transpiler::types::map_type_name(name)
+                                ));
+                            }
+                            if let Some(fact) = self
+                                .exact_overload_calls
+                                .get(&(be.start_byte(), be.end_byte()))
+                                && let Some(ty) = &fact.return_type
+                            {
+                                assert_eq!(fact.location.snapshot_hash, self.source_hash);
+                                match &ty.ty {
+                                    crate::semantics::KotlinType::Primitive(name) => {
+                                        return Some(
+                                            crate::transpiler::types::map_type_name(name)
+                                                .to_string(),
+                                        );
+                                    }
+                                    crate::semantics::KotlinType::Named { name, arguments }
+                                        if arguments.is_empty() =>
+                                    {
+                                        return Some(
+                                            crate::transpiler::types::map_type_name(name)
+                                                .to_string(),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
                             let text = self.text(be);
                             let head = text.split('(').next().unwrap_or("").trim();
                             let segment = head.rsplit('.').next().unwrap_or(head);
@@ -660,11 +706,22 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .and_then(|p| kt::parent_of(p))
             .map(|gp| gp.children(&mut gp.walk()).any(|c| c.kind() == "interface"))
             .unwrap_or(false);
+        let visibility = if in_interface && visibility == "public " {
+            ""
+        } else {
+            visibility.as_str()
+        };
         // `external` fun has no JVM body; emit `native` and skip the body.
         let abstract_kw = if is_external {
             "native "
         } else if has_body {
-            if in_interface { "default " } else { "" }
+            if in_interface && visibility != "private " && !make_static {
+                "default "
+            } else {
+                ""
+            }
+        } else if in_interface {
+            ""
         } else {
             "abstract "
         };
@@ -850,7 +907,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     out.line(java);
                 } else if returns_value {
                     out.line(format!("return {};", java));
-                } else {
+                } else if java != "kotlin.Unit.INSTANCE" {
+                    // A pure singleton read can be discarded for void methods;
+                    // field access alone is not a Java statement expression.
                     out.line(format!("{};", java));
                 }
             }

@@ -1,7 +1,8 @@
 //! Bridge retained Kotlin implementations of translated abstract-property
 //! interfaces. Kotlin does not treat a Java `getX()` as an overridable Kotlin
-//! `val x`; implementations need a field for Kotlin property syntax and an
-//! explicit Java-style getter (and setter for `var`).
+//! `val x`; stored properties need a storage/accessor bridge. Storage-free
+//! getters can become ordinary methods while the inherited Java contract
+//! continues to provide synthetic property syntax to Kotlin callers.
 
 use crate::property_callsite::PropertyAccessorContract;
 use crate::workspace::{
@@ -155,6 +156,28 @@ pub(crate) struct PlannedPropertyRepairs {
 }
 
 impl PlannedPropertyRepairs {
+    fn record_abi_repair(
+        &mut self,
+        path: &Path,
+        declaration: &Declaration,
+        contract: &PropertyContract,
+        target: crate::semantics::SymbolId,
+        detail: String,
+    ) {
+        self.abi_contracts.push(PersistedPropertyContract {
+            owner_file: path.to_path_buf(),
+            owner_name: declaration.name.clone(),
+            owner_package: declaration.package.clone(),
+            owner_kind: declaration.kind,
+            contract: contract.clone(),
+        });
+        self.repairs.push(crate::translation_plan::PlannedRepair {
+            target,
+            kind: "property-abi-repair".into(),
+            detail,
+        });
+    }
+
     fn append(&mut self, mut other: Self) {
         self.count += other.count;
         self.repairs.append(&mut other.repairs);
@@ -192,13 +215,540 @@ pub(crate) fn is_property_interface_candidate(target: &Declaration) -> bool {
 /// Retained Kotlin descendants can implement those methods directly without
 /// converting their properties or changing a JVM descriptor.
 pub(crate) fn is_getter_method_interface_candidate(target: &Declaration) -> bool {
+    noarg_method_signatures_supported(target)
+        && target
+            .members
+            .iter()
+            .all(|member| getter_property(&member.name).is_some())
+}
+
+/// Ordinary public no-argument methods have the same stable JVM descriptors as
+/// getter-shaped methods. Their spelling does not require a closed hierarchy.
+/// Keep collection/function/unknown shapes behind their separate ABI proofs.
+pub(crate) fn is_noarg_method_interface_candidate(target: &Declaration) -> bool {
+    is_getter_method_interface_candidate(target)
+        || (noarg_method_signatures_supported(target)
+            && target.members.iter().all(|member| {
+                matches!(member.visibility.as_deref(), None | Some("public"))
+                    && plain_java_method_name(&member.name)
+            }))
+}
+
+/// Prove a method-only Kotlin interface whose methods form ordinary JavaBean
+/// accessors. This admits the getter/setter ABI produced when a mutable Kotlin
+/// property interface is lowered to Java, without treating arbitrary one-arg
+/// methods as setters.
+pub(crate) fn is_accessor_method_interface_candidate(
+    index: &SourceIndex,
+    target: &Declaration,
+) -> bool {
+    if target.kind != DeclarationKind::Interface
+        || target.language != SourceLanguage::Kotlin
+        || !target.type_params.is_empty()
+        || target.members.is_empty()
+        || !accessor_methods_have_plain_source_shapes(index, target)
+    {
+        return false;
+    }
+    let Some(source_file) = index.declaration_source_file(target) else {
+        return false;
+    };
+    let methods = target
+        .members
+        .iter()
+        .filter(|member| member.kind == MemberKind::Method)
+        .collect::<Vec<_>>();
+    if methods.len() != target.members.len()
+        || methods.iter().any(|member| {
+            member.is_static
+                || member.has_body
+                || member.has_unsupported_property_shape
+                || !matches!(member.visibility.as_deref(), None | Some("public"))
+        })
+    {
+        return false;
+    }
+    let getters = methods
+        .iter()
+        .filter_map(|member| {
+            let (property, _) = getter_property(&member.name)?;
+            let return_type = member.type_name.as_deref()?;
+            if member
+                .callable_arity
+                .is_none_or(|arity| arity.required != 0 || arity.fixed != 0 || arity.vararg)
+                || !member.parameter_types.is_empty()
+            {
+                return None;
+            }
+            is_jvm_getter_return_type(return_type).then_some((property, member, return_type))
+        })
+        .collect::<Vec<_>>();
+    if getters.is_empty()
+        || getters
+            .iter()
+            .map(|(property, _, _)| property.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+            != getters.len()
+        || getters.len()
+            != methods
+                .iter()
+                .filter(|member| getter_property(&member.name).is_some())
+                .count()
+    {
+        return false;
+    }
+    let mut valid_getters = HashSet::new();
+    let mut paired_setters = HashSet::new();
+    for (property, getter, getter_type) in getters {
+        if getter.name.starts_with("is")
+            && !matches!(
+                getter_type.trim().trim_end_matches('?'),
+                "Boolean" | "boolean"
+            )
+        {
+            return false;
+        }
+        valid_getters.insert(getter.name.as_str());
+        let setter = setter_name(&property);
+        let matches = methods
+            .iter()
+            .filter(|member| member.name == setter)
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return false;
+        }
+        if let Some(member) = matches.first() {
+            if member
+                .callable_arity
+                .is_none_or(|arity| arity.required != 1 || arity.fixed != 1 || arity.vararg)
+                || member.parameter_types.len() != 1
+                || !member.type_name.as_deref().is_none_or(|return_type| {
+                    canonical_unit_return(index, source_file, return_type)
+                })
+                || !exact_type_tree_matches(
+                    index,
+                    source_file,
+                    getter_type,
+                    source_file,
+                    &member.parameter_types[0],
+                )
+            {
+                return false;
+            }
+            paired_setters.insert(member.name.as_str());
+        }
+    }
+    let setter_count = methods
+        .iter()
+        .filter(|member| member.name.starts_with("set"))
+        .count();
+    setter_count > 0
+        && methods.iter().all(|member| {
+            valid_getters.contains(member.name.as_str())
+                || paired_setters.contains(member.name.as_str())
+        })
+}
+
+fn canonical_unit_return(index: &SourceIndex, source_file: &SourceFile, type_name: &str) -> bool {
+    if type_name == "kotlin.Unit" {
+        return true;
+    }
+    if type_name != "Unit" || index.resolve_type(source_file, "Unit").is_some() {
+        return false;
+    }
+    !source_file.imports.iter().any(|import| {
+        import.contains(" as Unit")
+            || (import.ends_with(".*") && !import.starts_with("kotlin."))
+            || (import.ends_with(".Unit") && import != "kotlin.Unit")
+    })
+}
+
+fn accessor_methods_have_plain_source_shapes(index: &SourceIndex, target: &Declaration) -> bool {
+    let Some(source_file) = index.declaration_source_file(target) else {
+        return false;
+    };
+    let source = source_file.source_text();
+    let tree = crate::transpiler::parse_tree(source);
+    let mut pending = vec![tree.root_node()];
+    let mut declarations = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.kind() == "class_declaration" && declaration_name(node, source) == target.name {
+            declarations.push(node);
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    let [declaration] = declarations.as_slice() else {
+        return false;
+    };
+    if crate::translation_plan::has_unclassified_parse_error(*declaration, source)
+        || !declaration
+            .children(&mut declaration.walk())
+            .any(|child| !child.is_named() && node_text(child, source).trim() == "interface")
+    {
+        return false;
+    }
+    let mut stack = vec![*declaration];
+    let mut source_methods = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_declaration" {
+            let Some(name) = node.child_by_field_name("name") else {
+                return false;
+            };
+            let mut direct_cursor = node.walk();
+            let modifiers = node
+                .children(&mut direct_cursor)
+                .find(|child| child.kind() == "modifiers");
+            if let Some(modifiers) = modifiers {
+                let mut modifier_nodes = vec![modifiers];
+                while let Some(modifier) = modifier_nodes.pop() {
+                    if modifier.kind() == "annotation" {
+                        // Annotation aliases and JVM-specific annotations need
+                        // symbol resolution beyond this bounded ABI proof.
+                        return false;
+                    }
+                    modifier_nodes.extend(modifier.named_children(&mut modifier.walk()));
+                }
+            }
+            let mut direct_cursor = node.walk();
+            if node
+                .children(&mut direct_cursor)
+                .any(|child| child.kind() == "type_parameters")
+            {
+                return false;
+            }
+            let mut named_cursor = node.walk();
+            let receiver_before_name = node.named_children(&mut named_cursor).any(|child| {
+                child.end_byte() <= name.start_byte()
+                    && matches!(
+                        child.kind(),
+                        "user_type" | "nullable_type" | "function_type" | "parenthesized_type"
+                    )
+            });
+            if receiver_before_name || node.has_error() {
+                return false;
+            }
+            source_methods.push(node_text(name, source).to_string());
+            continue;
+        }
+        if node != *declaration && matches!(node.kind(), "class_declaration" | "object_declaration")
+        {
+            continue;
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    let mut indexed_methods = target
+        .members
+        .iter()
+        .filter(|member| member.kind == MemberKind::Method)
+        .map(|member| member.name.as_str())
+        .collect::<Vec<_>>();
+    source_methods.sort_unstable();
+    indexed_methods.sort_unstable();
+    source_methods == indexed_methods
+}
+
+/// Prove that a translated Kotlin interface can extend this retained Kotlin
+/// interface without changing the JVM contract inherited by Java.
+///
+/// This intentionally accepts only complete, source-indexed method-only
+/// interface hierarchies. Properties and same-named child methods are left to
+/// the existing property and override proofs.
+pub(crate) fn retained_method_interface_parent_is_java_compatible(
+    index: &SourceIndex,
+    child: &Declaration,
+    parent: &Declaration,
+    retained: &HashSet<crate::semantics::SymbolId>,
+    provider: &dyn crate::semantics::SemanticProvider,
+) -> bool {
+    if child.kind != DeclarationKind::Interface
+        || parent.kind != DeclarationKind::Interface
+        || parent.language != SourceLanguage::Kotlin
+        || !index.declaration_retained(parent, retained)
+    {
+        return false;
+    }
+
+    let mut methods = HashSet::new();
+    let mut pending = vec![parent];
+    let mut visited = HashSet::new();
+    while let Some(declaration) = pending.pop() {
+        let id = crate::semantics::workspace_symbol(index, declaration);
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let symbols = provider.symbols_named(&id.name);
+        if symbols.iter().filter(|symbol| symbol.id == id).count() != 1
+            || !provider.has_complete_inheritance(&id)
+            || !provider.is_nonsealed_interface(&id)
+        {
+            return false;
+        }
+        let instance_members = declaration
+            .members
+            .iter()
+            .filter(|member| !member.is_static && member.kind != MemberKind::Field)
+            .collect::<Vec<_>>();
+        if declaration.kind != DeclarationKind::Interface
+            || declaration.language == SourceLanguage::Kotlin
+                && instance_members.iter().any(|member| {
+                    member.kind != MemberKind::Method
+                    // In legacy JVM-default mode Kotlin descendants forward
+                    // through the immediate interface's DefaultImpls class.
+                    // A Java child cannot supply that compiler-generated
+                    // class without a mode-specific bridge plan.
+                    || member.has_body
+                    || !matches!(member.visibility.as_deref(), None | Some("public"))
+                    || !member.parameter_types.is_empty()
+                    || member.is_nullable
+                    || !member
+                        .type_name
+                        .as_deref()
+                        .is_some_and(is_jvm_getter_return_type)
+                })
+        {
+            return false;
+        }
+        if declaration.language == SourceLanguage::Kotlin
+            && !kotlin_method_contract_is_stable(declaration, &id, provider)
+        {
+            return false;
+        }
+        // Already-Java ancestors keep their JVM signatures, including methods
+        // with arguments, generic returns and Java default bodies. No Kotlin
+        // signature is lowered for those members. Interface fields are static.
+        for member in &instance_members {
+            methods.insert(member.name.clone());
+        }
+        let crate::semantics::FactStatus::Established(parents) =
+            provider.instance_contract_parents(&id)
+        else {
+            return false;
+        };
+        for parent_id in parents {
+            let Some(ancestor_file) = index.source_file(&parent_id.file) else {
+                return false;
+            };
+            let ancestors = ancestor_file
+                .declarations
+                .iter()
+                .filter(|candidate| {
+                    crate::semantics::workspace_symbol(index, candidate) == parent_id
+                })
+                .collect::<Vec<_>>();
+            let [ancestor] = ancestors.as_slice() else {
+                return false;
+            };
+            if ancestor.kind != DeclarationKind::Interface {
+                return false;
+            }
+            pending.push(*ancestor);
+        }
+    }
+
+    !child
+        .members
+        .iter()
+        .any(|member| methods.contains(&member.name))
+}
+
+fn kotlin_method_contract_is_stable(
+    declaration: &Declaration,
+    id: &crate::semantics::SymbolId,
+    provider: &dyn crate::semantics::SemanticProvider,
+) -> bool {
+    let mut owner_path = id.owner_path.clone();
+    owner_path.push(id.name.clone());
+    declaration
+        .members
+        .iter()
+        .filter(|member| !member.is_static)
+        .all(|member| {
+            if !plain_java_method_name(&member.name) {
+                return false;
+            }
+            let matches = provider
+                .symbols_named(&member.name)
+                .into_iter()
+                .filter(|symbol| {
+                    symbol.id.file == id.file
+                        && symbol.id.package == id.package
+                        && symbol.id.owner_path == owner_path
+                        && symbol.id.kind == "function"
+                })
+                .collect::<Vec<_>>();
+            let [symbol] = matches.as_slice() else {
+                return false;
+            };
+            provider.has_stable_noarg_jvm_signature(&symbol.id)
+        })
+}
+
+/// Whether a Kotlin descendant inherits a local property implementation from
+/// one of its Kotlin class ancestors. Used by retained-property repair: an
+/// explicit getter rewrite on the interface would break this inherited
+/// property implementation.
+fn retained_descendant_inherits_kotlin_property(
+    index: &SourceIndex,
+    declaration: &Declaration,
+    property: &crate::workspace::Member,
+) -> bool {
+    let Some(interface_file) = index.declaration_source_file(declaration) else {
+        return false;
+    };
+    let Some(interface_type) = property.type_name.as_deref() else {
+        return false;
+    };
+
+    let mut pending = index.direct_subtypes(declaration);
+    let mut visited = HashSet::new();
+    while let Some(descendant) = pending.pop() {
+        let Some(descendant_file) = index.declaration_source_file(descendant) else {
+            continue;
+        };
+        let descendant_id = crate::semantics::workspace_symbol(index, descendant);
+        if !visited.insert(descendant_id) {
+            continue;
+        }
+        pending.extend(index.direct_subtypes(descendant));
+        if descendant.kind != DeclarationKind::Class
+            || descendant.language != SourceLanguage::Kotlin
+        {
+            continue;
+        }
+
+        let mut ancestors = Vec::new();
+        ancestors.extend(descendant.supertypes.iter().filter_map(|supertype| {
+            let parent = index.resolve_type(descendant_file, supertype)?;
+            if parent.language != SourceLanguage::Kotlin || parent.kind != DeclarationKind::Class {
+                return None;
+            }
+            let parent_file = index.declaration_source_file(parent)?;
+            Some((parent_file, parent))
+        }));
+        let mut ancestor_ids = HashSet::new();
+        while let Some((class_file, class)) = ancestors.pop() {
+            let class_id = crate::semantics::workspace_symbol(index, class);
+            if !ancestor_ids.insert(class_id) {
+                continue;
+            }
+            if class.members.iter().any(|member| {
+                member.kind == MemberKind::Property
+                    && member.name == property.name
+                    && !member.is_static
+                    && matches!(member.visibility.as_deref(), None | Some("public"))
+                    && member
+                        .type_name
+                        .as_deref()
+                        .is_some_and(|implementation_type| {
+                            !type_mentions_any_parameter(implementation_type, &class.type_params)
+                                && !type_mentions_any_parameter(
+                                    interface_type,
+                                    &declaration.type_params,
+                                )
+                                && index.property_getter_return_compatible_in_files(
+                                    &class_file.path,
+                                    implementation_type,
+                                    &interface_file.path,
+                                    interface_type,
+                                )
+                        })
+            }) {
+                return true;
+            }
+            for supertype in &class.supertypes {
+                let Some(parent) = index.resolve_type(class_file, supertype) else {
+                    continue;
+                };
+                if parent.language != SourceLanguage::Kotlin
+                    || parent.kind != DeclarationKind::Class
+                {
+                    continue;
+                }
+                let Some(parent_file) = index.declaration_source_file(parent) else {
+                    continue;
+                };
+                ancestors.push((parent_file, parent));
+            }
+        }
+    }
+    false
+}
+
+fn plain_java_method_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '$'
+        })
+        && !matches!(
+            name,
+            "abstract"
+                | "assert"
+                | "boolean"
+                | "break"
+                | "byte"
+                | "case"
+                | "catch"
+                | "char"
+                | "class"
+                | "const"
+                | "continue"
+                | "default"
+                | "do"
+                | "double"
+                | "else"
+                | "enum"
+                | "extends"
+                | "final"
+                | "finally"
+                | "float"
+                | "for"
+                | "goto"
+                | "if"
+                | "implements"
+                | "import"
+                | "instanceof"
+                | "int"
+                | "interface"
+                | "long"
+                | "native"
+                | "new"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "return"
+                | "short"
+                | "static"
+                | "strictfp"
+                | "super"
+                | "switch"
+                | "synchronized"
+                | "this"
+                | "throw"
+                | "throws"
+                | "transient"
+                | "try"
+                | "void"
+                | "volatile"
+                | "while"
+                | "true"
+                | "false"
+                | "null"
+                | "_"
+        )
+}
+
+fn noarg_method_signatures_supported(target: &Declaration) -> bool {
     target.kind == DeclarationKind::Interface
         && !target.members.is_empty()
         && target.members.iter().all(|member| {
             member.kind == MemberKind::Method
                 && !member.is_static
                 && member.parameter_types.is_empty()
-                && getter_property(&member.name).is_some()
                 && member
                     .type_name
                     .as_deref()
@@ -321,31 +871,49 @@ pub(crate) fn retained_subtypes_bridge(
             "the root contract is empty",
         ));
     }
-    let mut visited = HashSet::new();
-    retained_descendants_repairable(
-        index,
-        target,
-        target,
-        &properties,
+    let private_storage_component = private_storage_component_members(index, target);
+    if crate::semantics::workspace_symbol(index, target)
+        .kind
+        .starts_with("ambiguous:")
+        || private_storage_component
+            .iter()
+            .any(|symbol| symbol.kind.starts_with("ambiguous:"))
+    {
+        return Err(bridge_rejected(
+            index,
+            target,
+            target,
+            "a declaration in the property hierarchy has an ambiguous source identity",
+        ));
+    }
+    let mut context = RetainedDescendantContext {
+        contract_owner: target,
         retained,
+        private_storage_component: &private_storage_component,
         translation_roots,
-        &mut visited,
-    )
+        visited: HashSet::new(),
+    };
+    retained_descendants_repairable(index, target, &properties, &mut context)
+}
+
+struct RetainedDescendantContext<'a> {
+    contract_owner: &'a Declaration,
+    retained: &'a HashSet<crate::semantics::SymbolId>,
+    private_storage_component: &'a HashSet<crate::semantics::SymbolId>,
+    translation_roots: &'a [std::path::PathBuf],
+    visited: HashSet<crate::semantics::SymbolId>,
 }
 
 fn retained_descendants_repairable(
     index: &SourceIndex,
     target: &Declaration,
-    contract_owner: &Declaration,
     properties: &[PropertyContract],
-    retained: &HashSet<crate::semantics::SymbolId>,
-    translation_roots: &[std::path::PathBuf],
-    visited: &mut HashSet<String>,
+    context: &mut RetainedDescendantContext<'_>,
 ) -> Result<(), PropertyBridgeFailure> {
-    if index.has_unselected_kotlin_subtype(target, translation_roots) {
+    if index.has_unselected_kotlin_subtype(target, context.translation_roots) {
         return Err(bridge_rejected(
             index,
-            contract_owner,
+            context.contract_owner,
             target,
             "a Kotlin subtype is outside the selected translation roots",
         ));
@@ -355,26 +923,26 @@ fn retained_descendants_repairable(
         .into_iter()
         .filter(|declaration| {
             declaration.language == SourceLanguage::Kotlin
-                && index.declaration_retained(declaration, retained)
+                && index.declaration_retained(declaration, context.retained)
         })
         .collect::<Vec<_>>();
     for subtype in matches {
         let Some(file) = index.declaration_source_file(subtype) else {
             return Err(bridge_rejected(
                 index,
-                contract_owner,
+                context.contract_owner,
                 subtype,
                 "the retained subtype has no indexed source file",
             ));
         };
-        let key = format!("{}:{}", file.path.display(), subtype.name);
-        if !visited.insert(key) {
+        let symbol = crate::semantics::workspace_symbol(index, subtype);
+        if !context.visited.insert(symbol) {
             continue;
         }
-        if !index.is_selected(&file.path, translation_roots) {
+        if !index.is_selected(&file.path, context.translation_roots) {
             return Err(bridge_rejected(
                 index,
-                contract_owner,
+                context.contract_owner,
                 subtype,
                 "the retained subtype is outside the selected translation roots",
             ));
@@ -384,7 +952,7 @@ fn retained_descendants_repairable(
         else {
             return Err(bridge_rejected(
                 index,
-                contract_owner,
+                context.contract_owner,
                 subtype,
                 "the generic supertype arguments cannot be resolved safely",
             ));
@@ -397,68 +965,109 @@ fn retained_descendants_repairable(
                 && subtype_properties
                     .iter()
                     .any(|property| property.name == member.name)
-                && inherits_retained_kotlin_property(index, subtype, &member.name, Some(retained))
+                && inherits_retained_kotlin_property(
+                    index,
+                    subtype,
+                    &member.name,
+                    Some(context.retained),
+                )
+                && !subtype_properties
+                    .iter()
+                    .find(|property| property.name == member.name)
+                    .is_some_and(|property| {
+                        !private_storage_has_external_retained_property_ancestor(
+                            index,
+                            subtype,
+                            std::slice::from_ref(property),
+                            context.retained,
+                            context.private_storage_component,
+                        )
+                    })
         }) {
             return Err(bridge_rejected(
                 index,
-                contract_owner,
+                context.contract_owner,
                 subtype,
                 "a constructor or class property also overrides a retained Kotlin property",
             ));
         }
         let covers_properties =
-            subtype_covers_properties(index, contract_owner, subtype, &subtype_properties);
+            subtype_covers_properties(index, context.contract_owner, subtype, &subtype_properties);
         let covers_or_inherits_properties = subtype_properties.iter().all(|property| {
             subtype_covers_properties(
                 index,
-                contract_owner,
+                context.contract_owner,
                 subtype,
                 std::slice::from_ref(property),
             ) || inherited_repairable_property_methods(
                 index,
-                contract_owner,
+                context.contract_owner,
                 subtype,
                 std::slice::from_ref(property),
             )
         });
-        // A class field bridge removes virtual property dispatch. Even a
-        // source class that appears final may have Java/Kotlin descendants
-        // elsewhere in the workspace, so only apply this check when this
-        // class actually owns the bridge. An abstract intermediate class may
-        // defer the Java getter contract to its concrete descendants.
+        let field_bridge_properties = subtype_properties
+            .iter()
+            .filter(|property| {
+                subtype.kind != DeclarationKind::Enum
+                    && subtype.members.iter().any(|member| {
+                        member.kind == MemberKind::Property
+                            && member.name == property.name
+                            && !member.has_plain_computed_getter
+                            && !member.has_custom_accessor
+                            && !member.is_jvm_field
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         if matches!(
             subtype.kind,
             DeclarationKind::Class | DeclarationKind::Object
         ) && covers_properties
-            && index.has_any_subtype(&subtype.name)
-            && !class_descendants_inherit_contracts(
-                index,
-                subtype,
-                &subtype_properties,
-                translation_roots,
-                &mut HashSet::new(),
-            )
+            && !field_bridge_properties.is_empty()
         {
-            return Err(bridge_rejected(
-                index,
-                contract_owner,
-                subtype,
-                "a class property bridge would be inherited by another indexed subtype",
-            ));
+            let is_data_class = source_class_is_data(index, subtype);
+            let private_storage_safe = !is_data_class
+                && private_storage_descendants_bridgeable(
+                    index,
+                    subtype,
+                    &field_bridge_properties,
+                    context.retained,
+                    context.private_storage_component,
+                    context.translation_roots,
+                    &mut HashSet::new(),
+                );
+            let data_field_safe = is_data_class
+                && (!index.has_any_subtype(&subtype.name)
+                    || class_descendants_inherit_contracts(
+                        index,
+                        subtype,
+                        &field_bridge_properties,
+                        context.translation_roots,
+                        &mut HashSet::new(),
+                    ));
+            if !private_storage_safe && !data_field_safe {
+                return Err(bridge_rejected(
+                    index,
+                    context.contract_owner,
+                    subtype,
+                    "a class property bridge would be inherited by a retained descendant whose accessor dispatch cannot be preserved",
+                ));
+            }
         }
         if matches!(
             subtype.kind,
             DeclarationKind::Class | DeclarationKind::Object
         ) && !class_supertype_properties_compatible(
             index,
-            contract_owner,
+            context.contract_owner,
             subtype,
             &subtype_properties,
-            translation_roots,
+            context.translation_roots,
         ) {
             return Err(bridge_rejected(
                 index,
-                contract_owner,
+                context.contract_owner,
                 subtype,
                 "another Kotlin supertype declares an incompatible property contract",
             ));
@@ -478,7 +1087,7 @@ fn retained_descendants_repairable(
                         .is_none_or(|property| {
                             interface_member_repairable(
                                 index,
-                                contract_owner,
+                                context.contract_owner,
                                 subtype,
                                 member,
                                 property,
@@ -491,28 +1100,22 @@ fn retained_descendants_repairable(
             && !subtype.members.iter().any(|member| {
                 subtype_properties.iter().any(|property| {
                     (member.kind == MemberKind::Property && member.name == property.name)
-                        || (member.kind == MemberKind::Method
-                            && (member.name == property.getter
-                                || property.setter.as_deref() == Some(member.name.as_str())))
+                        || method_overlaps_accessor(member, &property.getter, 0)
+                        || property
+                            .setter
+                            .as_deref()
+                            .is_some_and(|setter| method_overlaps_accessor(member, setter, 1))
                 })
             });
         if !(interface_repairable || covers_or_inherits_properties) && !abstract_intermediate {
             return Err(bridge_rejected(
                 index,
-                contract_owner,
+                context.contract_owner,
                 subtype,
                 "the property is missing or uses a shape that cannot be bridged safely",
             ));
         }
-        retained_descendants_repairable(
-            index,
-            subtype,
-            contract_owner,
-            &subtype_properties,
-            retained,
-            translation_roots,
-            visited,
-        )?;
+        retained_descendants_repairable(index, subtype, &subtype_properties, context)?;
     }
     Ok(())
 }
@@ -539,15 +1142,19 @@ fn class_descendants_inherit_contracts(
         if !visited.insert(key) {
             return true;
         }
-        child.language == SourceLanguage::Kotlin
+        (child.language == SourceLanguage::Kotlin
+            || (child.language == SourceLanguage::Java && child.kind == DeclarationKind::Class))
             && index.is_selected(&child_file.path, translation_roots)
             && !child.members.iter().any(|member| {
                 properties.iter().any(|property| {
-                    (member.kind == MemberKind::Property && member.name == property.name)
-                        || (member.kind == MemberKind::Method
-                            && (member.name == property.getter
-                                || property.setter.as_deref() == Some(member.name.as_str())
-                                || member.name == setter_name(&property.name)))
+                    (matches!(member.kind, MemberKind::Property | MemberKind::Field)
+                        && member.name == property.name)
+                        || method_overlaps_accessor(member, &property.getter, 0)
+                        || property
+                            .setter
+                            .as_deref()
+                            .is_some_and(|setter| method_overlaps_accessor(member, setter, 1))
+                        || method_overlaps_accessor(member, &setter_name(&property.name), 1)
                 })
             })
             && class_descendants_inherit_contracts(
@@ -558,6 +1165,488 @@ fn class_descendants_inherit_contracts(
                 visited,
             )
     })
+}
+
+fn private_storage_descendants_bridgeable(
+    index: &SourceIndex,
+    owner: &Declaration,
+    properties: &[PropertyContract],
+    retained: &HashSet<crate::semantics::SymbolId>,
+    component_members: &HashSet<crate::semantics::SymbolId>,
+    translation_roots: &[std::path::PathBuf],
+    visited: &mut HashSet<crate::semantics::SymbolId>,
+) -> bool {
+    let Some(owner_file) = index.declaration_source_file(owner) else {
+        return false;
+    };
+    if !matches!(
+        (owner.language, owner.kind),
+        (
+            SourceLanguage::Kotlin,
+            DeclarationKind::Class | DeclarationKind::Object
+        ) | (SourceLanguage::Java, DeclarationKind::Class)
+    ) || !index.is_selected(&owner_file.path, translation_roots)
+        || index.has_unresolved_supertype(owner)
+    {
+        log::debug!(
+            "private-storage hierarchy rejects {}: unsupported owner kind/language, unselected source, or unresolved supertype",
+            owner.name
+        );
+        return false;
+    }
+    let owner_symbol = crate::semantics::workspace_symbol(index, owner);
+    if !visited.insert(owner_symbol) {
+        return true;
+    }
+    // The caller and recursive edge pass properties in this owner's type
+    // parameter environment. Specialize only when stepping to each child.
+    let specialized = properties;
+    if private_storage_has_external_retained_property_ancestor(
+        index,
+        owner,
+        specialized,
+        retained,
+        component_members,
+    ) {
+        log::debug!(
+            "private-storage hierarchy rejects {}: a retained Kotlin class ancestor outside this bridge component still owns the property",
+            owner.name
+        );
+        return false;
+    }
+    if owner.language == SourceLanguage::Kotlin {
+        for property in specialized {
+            let Some(member) = owner
+                .members
+                .iter()
+                .find(|member| member.kind == MemberKind::Property && member.name == property.name)
+            else {
+                continue;
+            };
+            if !private_storage_bridge_supported(index, owner, Some(member), property)
+                || !private_storage_source_shape_supported(index, owner, &property.name)
+            {
+                log::debug!(
+                    "private-storage hierarchy rejects {}.{}: bridge_supported={}, source_shape_supported={}, member_kind={:?}, mutable={}, type={:?}, visibility={:?}, custom_accessor={}, computed_getter={}, jvm_field={}, exact_type={}, property_type={}",
+                    owner.name,
+                    property.name,
+                    private_storage_bridge_supported(index, owner, Some(member), property),
+                    private_storage_source_shape_supported(index, owner, &property.name),
+                    member.kind,
+                    member.is_mutable,
+                    member.type_name,
+                    member.visibility,
+                    member.has_custom_accessor,
+                    member.has_plain_computed_getter,
+                    member.is_jvm_field,
+                    exact_property_type_matches(index, owner, member, property),
+                    property_type_matches(index, owner, owner, member, property),
+                );
+                return false;
+            }
+            if member.visibility.as_deref() != Some("private")
+                && !crate::property_callsite::private_storage_accesses_supported(
+                    index, owner, member,
+                )
+            {
+                log::debug!(
+                    "private-storage hierarchy rejects {}.{}: source accesses are not repairable",
+                    owner.name,
+                    property.name
+                );
+                return false;
+            }
+        }
+    }
+    let children = index.direct_subtypes(owner);
+    if children.is_empty() {
+        let resolved = !index.has_unresolved_supertype(owner);
+        if !resolved {
+            log::debug!(
+                "private-storage hierarchy rejects {}: leaf has unresolved supertype",
+                owner.name
+            );
+        }
+        return resolved;
+    }
+    for child in children {
+        let Some(child_file) = index.declaration_source_file(child) else {
+            return false;
+        };
+        if !index.is_selected(&child_file.path, translation_roots)
+            || !matches!(
+                (child.language, child.kind),
+                (
+                    SourceLanguage::Kotlin,
+                    DeclarationKind::Class | DeclarationKind::Object
+                ) | (SourceLanguage::Java, DeclarationKind::Class)
+            )
+            || index.has_unresolved_supertype(child)
+        {
+            log::debug!(
+                "private-storage hierarchy rejects {}: child {} is unselected, unsupported, or has unresolved supertype",
+                owner.name,
+                child.name
+            );
+            return false;
+        }
+        let Some(child_specialized) =
+            specialize_contract_properties(index, owner, child, specialized)
+        else {
+            log::debug!(
+                "private-storage hierarchy rejects {}: cannot specialize properties through child {}",
+                owner.name,
+                child.name
+            );
+            return false;
+        };
+        for property in specialized {
+            let has_property = child
+                .members
+                .iter()
+                .any(|member| member.kind == MemberKind::Property && member.name == property.name);
+            let has_field = child
+                .members
+                .iter()
+                .any(|member| member.kind == MemberKind::Field && member.name == property.name);
+            if child.language == SourceLanguage::Kotlin && has_field && !has_property {
+                // A JVM field with no source property cannot be converted into
+                // the private backing field required by this bridge.
+                return false;
+            }
+            let setter = property.setter.as_deref().unwrap_or("");
+            if child.members.iter().any(|member| {
+                member.kind == MemberKind::Method
+                    && (method_overlaps_accessor(member, &property.getter, 0)
+                        || (!setter.is_empty() && method_overlaps_accessor(member, setter, 1)))
+            }) {
+                log::debug!(
+                    "private-storage hierarchy rejects {}.{}: child {} declares an accessor collision",
+                    owner.name,
+                    property.name,
+                    child.name
+                );
+                return false;
+            }
+        }
+        if !private_storage_descendants_bridgeable(
+            index,
+            child,
+            &child_specialized,
+            retained,
+            component_members,
+            translation_roots,
+            visited,
+        ) {
+            log::debug!(
+                "private-storage hierarchy rejects {}: descendant {} failed recursive proof",
+                owner.name,
+                child.name
+            );
+            return false;
+        }
+    }
+    true
+}
+
+fn private_storage_component_members(
+    index: &SourceIndex,
+    contract_owner: &Declaration,
+) -> HashSet<crate::semantics::SymbolId> {
+    let mut members = HashSet::new();
+    let mut pending = index.direct_subtypes(contract_owner);
+    while let Some(declaration) = pending.pop() {
+        if members.insert(crate::semantics::workspace_symbol(index, declaration)) {
+            pending.extend(index.direct_subtypes(declaration));
+        }
+    }
+    members
+}
+
+fn private_storage_has_external_retained_property_ancestor(
+    index: &SourceIndex,
+    owner: &Declaration,
+    properties: &[PropertyContract],
+    retained: &HashSet<crate::semantics::SymbolId>,
+    bridge_component: &HashSet<crate::semantics::SymbolId>,
+) -> bool {
+    let Some(owner_file) = index.declaration_source_file(owner) else {
+        return true;
+    };
+    let mut pending = owner
+        .supertypes
+        .iter()
+        .cloned()
+        .map(|supertype| (owner_file.path.clone(), supertype))
+        .collect::<Vec<_>>();
+    let mut visited: HashSet<crate::semantics::SymbolId> = HashSet::new();
+    while let Some((context_path, supertype)) = pending.pop() {
+        let Some(context) = index.source_file(&context_path) else {
+            return true;
+        };
+        let Some(parent) = index.resolve_type(context, &supertype) else {
+            continue;
+        };
+        let Some(parent_file) = index.declaration_source_file(parent) else {
+            return true;
+        };
+        let parent_symbol = crate::semantics::workspace_symbol(index, parent);
+        if !visited.insert(parent_symbol.clone()) {
+            continue;
+        }
+        if parent.language == SourceLanguage::Kotlin
+            && matches!(
+                parent.kind,
+                DeclarationKind::Class | DeclarationKind::Object
+            )
+            && index.declaration_retained(parent, retained)
+            && !bridge_component.contains(&parent_symbol)
+            && parent.members.iter().any(|member| {
+                member.kind == MemberKind::Property
+                    && !member.is_static
+                    && member.visibility.as_deref() != Some("private")
+                    && properties
+                        .iter()
+                        .any(|property| property.name == member.name)
+            })
+        {
+            return true;
+        }
+        pending.extend(
+            parent
+                .supertypes
+                .iter()
+                .cloned()
+                .map(|next| (parent_file.path.clone(), next)),
+        );
+    }
+    false
+}
+
+fn private_storage_property_ancestors_repairable(
+    index: &SourceIndex,
+    declaration: &Declaration,
+    property_name: &str,
+    contract_cache: &HashMap<String, Vec<PropertyContract>>,
+) -> bool {
+    let Some(source_file) = index.declaration_source_file(declaration) else {
+        return false;
+    };
+    let mut pending = declaration
+        .supertypes
+        .iter()
+        .cloned()
+        .map(|supertype| (source_file.path.clone(), supertype))
+        .collect::<Vec<_>>();
+    let mut visited: HashSet<crate::semantics::SymbolId> = HashSet::new();
+    while let Some((context_path, supertype)) = pending.pop() {
+        let Some(context) = index.source_file(&context_path) else {
+            return false;
+        };
+        let Some(parent) = index.resolve_type(context, &supertype) else {
+            continue;
+        };
+        let Some(parent_file) = index.declaration_source_file(parent) else {
+            return false;
+        };
+        let parent_symbol = crate::semantics::workspace_symbol(index, parent);
+        if !visited.insert(parent_symbol.clone()) {
+            continue;
+        }
+        if parent.language == SourceLanguage::Kotlin
+            && let Some(member) = parent.members.iter().find(|member| {
+                member.kind == MemberKind::Property
+                    && !member.is_static
+                    && member.name == property_name
+                    && member.visibility.as_deref() != Some("private")
+            })
+        {
+            let cache_key = format!("{}:{}", parent_file.path.display(), parent.name);
+            if parent_symbol.kind.starts_with("ambiguous:") {
+                return false;
+            }
+            let Some(parent_contract) = contract_cache.get(&cache_key).and_then(|contracts| {
+                contracts
+                    .iter()
+                    .find(|contract| contract.name == property_name)
+            }) else {
+                return false;
+            };
+            let supported = match parent.kind {
+                DeclarationKind::Interface => {
+                    interface_member_repairable(index, parent, parent, member, parent_contract)
+                }
+                DeclarationKind::Class | DeclarationKind::Object => {
+                    (private_storage_bridge_supported(index, parent, Some(member), parent_contract)
+                        && private_storage_source_shape_supported(index, parent, property_name))
+                        || (member.has_plain_computed_getter
+                            && property_type_matches(
+                                index,
+                                parent,
+                                parent,
+                                member,
+                                parent_contract,
+                            ))
+                }
+                _ => false,
+            };
+            if !supported {
+                return false;
+            }
+        }
+        pending.extend(
+            parent
+                .supertypes
+                .iter()
+                .cloned()
+                .map(|next| (parent_file.path.clone(), next)),
+        );
+    }
+    true
+}
+
+fn private_storage_source_shape_supported(
+    index: &SourceIndex,
+    declaration: &Declaration,
+    property: &str,
+) -> bool {
+    let Some(source_file) = index.declaration_source_file(declaration) else {
+        return false;
+    };
+    let source = source_file.source_text();
+    let tree = crate::transpiler::parse_tree(source);
+    let mut pending = vec![tree.root_node()];
+    let mut matching_declarations = Vec::new();
+    while let Some(node) = pending.pop() {
+        if declaration_node(node) && declaration_name(node, source) == declaration.name {
+            matching_declarations.push(node);
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    let [owner_node] = matching_declarations.as_slice() else {
+        return false;
+    };
+    if kotlin_data_class(*owner_node, source) {
+        return false;
+    }
+    let mut property_nodes = Vec::new();
+    let mut owner_cursor = owner_node.walk();
+    for child in owner_node.named_children(&mut owner_cursor) {
+        if child.kind() == "primary_constructor" {
+            let mut constructor_cursor = child.walk();
+            for parameters in child
+                .named_children(&mut constructor_cursor)
+                .filter(|node| node.kind() == "class_parameters")
+            {
+                let mut parameters_cursor = parameters.walk();
+                property_nodes.extend(
+                    parameters
+                        .named_children(&mut parameters_cursor)
+                        .filter(|node| node.kind() == "class_parameter")
+                        .filter(|node| property_keyword(*node, source).is_some()),
+                );
+            }
+        } else if child.kind() == "class_body" {
+            let mut body_cursor = child.walk();
+            property_nodes.extend(
+                child
+                    .named_children(&mut body_cursor)
+                    .filter(|node| node.kind() == "property_declaration"),
+            );
+        }
+    }
+    let matching = property_nodes
+        .into_iter()
+        .filter(|node| property_name(*node, source) == property)
+        .collect::<Vec<_>>();
+    let [property_node] = matching.as_slice() else {
+        return false;
+    };
+    property_type_from_node(*property_node, source).is_some()
+        && private_storage_source_node_supported(*property_node, source)
+}
+
+fn private_storage_source_node_supported(node: Node<'_>, source: &str) -> bool {
+    if node
+        .named_children(&mut node.walk())
+        .any(|child| child.kind() == "property_delegate")
+        || modifier_token_span(node, source, "lateinit").is_some()
+        || modifier_token_span(node, source, "abstract").is_some()
+    {
+        return false;
+    }
+    let Some(modifiers) = node
+        .children(&mut node.walk())
+        .find(|child| child.kind() == "modifiers")
+    else {
+        return true;
+    };
+    let mut pending = vec![modifiers];
+    while let Some(child) = pending.pop() {
+        if child.kind() == "annotation" {
+            let text = node_text(child, source).trim();
+            if text.starts_with("@JvmName") {
+                return false;
+            }
+            if let Some(target) = child
+                .named_children(&mut child.walk())
+                .find(|node| node.kind() == "use_site_target")
+                .map(|target| node_text(target, source).trim().trim_end_matches(':'))
+                && !matches!(target, "field" | "param" | "property")
+            {
+                return false;
+            }
+            continue;
+        } else if child.child_count() == 0 {
+            let modifier = node_text(child, source).trim();
+            if !modifier.is_empty()
+                && !matches!(
+                    modifier,
+                    "override" | "public" | "private" | "open" | "final"
+                )
+            {
+                return false;
+            }
+        }
+        pending.extend(child.named_children(&mut child.walk()));
+    }
+    true
+}
+
+fn source_class_is_data(index: &SourceIndex, declaration: &Declaration) -> bool {
+    let Some(source_file) = index.declaration_source_file(declaration) else {
+        return false;
+    };
+    let source = source_file.source_text();
+    let tree = crate::transpiler::parse_tree(source);
+    let mut pending = vec![tree.root_node()];
+    let mut matching_declarations = Vec::new();
+    while let Some(node) = pending.pop() {
+        if declaration_node(node) && declaration_name(node, source) == declaration.name {
+            matching_declarations.push(node);
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    match matching_declarations.as_slice() {
+        [node] => kotlin_data_class(*node, source),
+        _ => false,
+    }
+}
+
+/// Source argument shapes matter even when JVM descriptors differ: defaulted
+/// and vararg Kotlin overloads can still accept an accessor's argument count.
+/// Only an established, disjoint signature can be ignored by a bridge proof.
+fn method_overlaps_accessor(
+    member: &crate::workspace::Member,
+    accessor: &str,
+    arity: usize,
+) -> bool {
+    member.kind == MemberKind::Method
+        && member.name == accessor
+        && member
+            .callable_arity
+            .as_ref()
+            .is_none_or(|shape| shape.accepts_arity(arity))
 }
 
 fn interface_member_repairable(
@@ -574,9 +1663,10 @@ fn interface_member_repairable(
         && !member.has_unsupported_property_annotations
         && (property.setter.is_none() || member.is_mutable)
         && !owner.members.iter().any(|candidate| {
-            candidate.kind == MemberKind::Method
-                && (candidate.name == property.getter
-                    || setter.as_deref() == Some(candidate.name.as_str()))
+            method_overlaps_accessor(candidate, &property.getter, 0)
+                || setter
+                    .as_deref()
+                    .is_some_and(|setter| method_overlaps_accessor(candidate, setter, 1))
         })
 }
 
@@ -1007,6 +2097,7 @@ fn subtype_covers_properties(
                     DeclarationKind::Class | DeclarationKind::Object
                 ) || !member.has_custom_accessor
                     || member.is_constructor_property
+                    || member.has_plain_computed_getter
                     || computed_class_property_bridgeable(index, subtype))
                 && !member.has_unsupported_property_annotations
                 && !member.has_unsupported_property_shape
@@ -1014,9 +2105,10 @@ fn subtype_covers_properties(
                 && member.visibility.as_deref() != Some("protected")
                 && (!contract.setter.is_some() || member.is_mutable)
                 && !subtype.members.iter().any(|candidate| {
-                    candidate.kind == MemberKind::Method
-                        && (candidate.name == contract.getter
-                            || setter.as_deref() == Some(candidate.name.as_str()))
+                    method_overlaps_accessor(candidate, &contract.getter, 0)
+                        || setter
+                            .as_deref()
+                            .is_some_and(|setter| method_overlaps_accessor(candidate, setter, 1))
                 })
         });
         let method_covers = subtype
@@ -1295,7 +2387,7 @@ fn type_parameter_bound_satisfies_contract(
         )
 }
 
-fn inline_type_parameter_upper_bound(
+pub(crate) fn inline_type_parameter_upper_bound(
     index: &SourceIndex,
     owner: &Declaration,
     parameter: &str,
@@ -1423,6 +2515,18 @@ fn is_supported_parallel_getter_return_type(
 ) -> bool {
     is_jvm_getter_return_type(type_name)
         || is_readonly_collection_property_type(index, source_file, type_name)
+}
+
+fn builtin_property_getter_descriptor(
+    index: &SourceIndex,
+    owner: &Declaration,
+    source: &Path,
+    type_name: &str,
+) -> Option<&'static str> {
+    if type_mentions_any_parameter(type_name, &owner.type_params) {
+        return None;
+    }
+    index.builtin_getter_descriptor_in_file(source, type_name)
 }
 
 fn qualify_simple_type_argument(
@@ -1771,9 +2875,8 @@ fn class_supertype_properties_compatible(
                 declaration_is_subtype_of(index, parent, contract_owner)
                     || declaration_is_subtype_of(index, contract_owner, parent);
             let parallel_contract = !is_contract_owner && !parent_is_on_contract_chain;
-            let has_jvm_name_annotation = parallel_contract
-                && std::fs::read_to_string(&parent_file.path)
-                    .is_ok_and(|source| source.contains("@JvmName"));
+            let has_jvm_name_annotation =
+                parallel_contract && parent_file.source_text().contains("@JvmName");
             for member in parent
                 .members
                 .iter()
@@ -1785,6 +2888,16 @@ fn class_supertype_properties_compatible(
                 else {
                     continue;
                 };
+                if parallel_contract
+                    && retained_descendant_inherits_kotlin_property(index, parent, member)
+                {
+                    log::debug!(
+                        "parallel property contract {}.{} retained: a Kotlin class descendant uses its property contract",
+                        parent.name,
+                        member.name,
+                    );
+                    return false;
+                }
                 let inferred_member_type = member
                     .type_name
                     .is_none()
@@ -1858,10 +2971,23 @@ fn class_supertype_properties_compatible(
                 // retained default members and descendants. Scalar read-only
                 // contracts are safe when the selected interface is repaired
                 // and the concrete getter satisfies both declarations.
+                let root_builtin = builtin_property_getter_descriptor(
+                    index,
+                    contract_owner,
+                    &contract.type_source,
+                    &contract.type_name,
+                );
+                let local_builtin = builtin_property_getter_descriptor(
+                    index,
+                    parent,
+                    &parent_file.path,
+                    &specialized_member_type,
+                );
+                let exact_builtin = root_builtin.is_some() && root_builtin == local_builtin;
                 let local_readonly_contract = parallel_contract
-                    && member.kind == MemberKind::Property
                     && !member.is_mutable
                     && (is_scalar_reference_type(&specialized_member_type)
+                        || exact_builtin
                         || is_readonly_collection_property_type(
                             index,
                             parent_file,
@@ -1883,8 +3009,7 @@ fn class_supertype_properties_compatible(
                 }
                 // Unsupported property shapes and JVM accessor annotations
                 // remain blockers. Unrelated parallel supertypes are harmless.
-                if (member.has_custom_accessor && member.has_unsupported_property_shape)
-                    || member.has_unsupported_property_shape
+                if member.has_unsupported_property_shape
                     || member.has_unsupported_property_annotations
                     || has_jvm_name_annotation
                     || (parallel_contract && member.has_body && !local_readonly_contract)
@@ -1948,6 +3073,34 @@ fn class_supertype_properties_compatible(
                         );
                         return false;
                     };
+                    let provider_builtin =
+                        index.declaration_source_file(provider).and_then(|file| {
+                            builtin_property_getter_descriptor(
+                                index,
+                                provider,
+                                &file.path,
+                                implementation_member.type_name.as_deref()?,
+                            )
+                        });
+                    // Builtin return types use exact JVM slots. In particular,
+                    // int/long, boxed/unboxed and nullable/nonnullable returns
+                    // must not enter the ordinary reference covariance path.
+                    if (root_builtin.is_some()
+                        || local_builtin.is_some()
+                        || provider_builtin.is_some())
+                        && !(exact_builtin && provider_builtin == root_builtin)
+                    {
+                        log::debug!(
+                            "parallel builtin getter {}.{} rejected for {}: root={:?}, local={:?}, provider={:?}",
+                            parent.name,
+                            member.name,
+                            implementation.name,
+                            root_builtin,
+                            local_builtin,
+                            provider_builtin
+                        );
+                        return false;
+                    }
                     let root_covered = property_type_matches(
                         index,
                         contract_owner,
@@ -2055,6 +3208,13 @@ fn effective_readonly_scalar_property<'a>(
         return (!member.is_mutable
             && member.type_name.as_deref().is_some_and(|type_name| {
                 is_scalar_reference_type(type_name)
+                    || builtin_property_getter_descriptor(
+                        index,
+                        implementation,
+                        &implementation_file.path,
+                        type_name,
+                    )
+                    .is_some()
                     || is_readonly_collection_property_type(index, implementation_file, type_name)
             }))
         .then_some((implementation, member));
@@ -2097,10 +3257,16 @@ fn effective_readonly_scalar_property<'a>(
                         && member.has_body
                         && !member.has_unsupported_property_shape
                         && !member.has_unsupported_property_annotations
-                        && member
-                            .type_name
-                            .as_deref()
-                            .is_some_and(is_scalar_reference_type)
+                        && member.type_name.as_deref().is_some_and(|type_name| {
+                            is_scalar_reference_type(type_name)
+                                || builtin_property_getter_descriptor(
+                                    index,
+                                    parent,
+                                    &parent_file.path,
+                                    type_name,
+                                )
+                                .is_some()
+                        })
                 })
             {
                 providers.push((parent, member));
@@ -2937,6 +4103,7 @@ fn repair_source_cached(
                         path,
                         declaration,
                         contracts,
+                        contract_cache,
                         &mut edits,
                         &mut report,
                     );
@@ -3222,6 +4389,15 @@ fn contracts_for_repair_inner(
             else {
                 continue;
             };
+            if retained_descendant_inherits_kotlin_property(index, declaration, member) {
+                // This getter was imported from a parallel descendant, so no
+                // Java getter is inherited by this interface itself. Keep the
+                // Kotlin property contract when a retained class below it
+                // already supplies a compatible property. Replacing the
+                // property with `fun getX()` would make that inherited Kotlin
+                // property stop implementing the interface.
+                continue;
+            }
             if !parallel_readonly_contract_is_bridgeable(
                 index,
                 source_file,
@@ -3573,6 +4749,7 @@ fn repair_declaration(
     path: &Path,
     declaration: &Declaration,
     contracts: &[PropertyContract],
+    contract_cache: &HashMap<String, Vec<PropertyContract>>,
     edits: &mut Vec<crate::smart_cast::Edit>,
     report: &mut PlannedPropertyRepairs,
 ) {
@@ -3587,7 +4764,23 @@ fn repair_declaration(
                     .members
                     .iter()
                     .find(|member| member.kind == MemberKind::Property && member.name == name);
+                let private_storage_bridge = !is_interface
+                    && private_storage_bridge_supported(
+                        index,
+                        declaration,
+                        local_property,
+                        contract,
+                    )
+                    && private_storage_source_node_supported(child, source)
+                    && private_storage_property_ancestors_repairable(
+                        index,
+                        declaration,
+                        &name,
+                        contract_cache,
+                    )
+                    && !property_owner_is_data_class(child, source);
                 if !is_interface
+                    && !private_storage_bridge
                     && inherits_retained_kotlin_property(index, declaration, &name, None)
                 {
                     // In particular, preserve `override val id` primary-
@@ -3597,12 +4790,14 @@ fn repair_declaration(
                     // the base member.
                     continue;
                 }
-                if inherits_kotlin_property_on_java_getter_path(
-                    index,
-                    declaration,
-                    &name,
-                    &contract.getter,
-                ) {
+                if !private_storage_bridge
+                    && inherits_kotlin_property_on_java_getter_path(
+                        index,
+                        declaration,
+                        &name,
+                        &contract.getter,
+                    )
+                {
                     // The original Kotlin property already satisfies both
                     // the retained Kotlin override and the JavaBean getter.
                     // Replacing it with a same-named function would satisfy
@@ -3628,16 +4823,34 @@ fn repair_declaration(
                     continue;
                 }
                 let contract = inferred_contract.as_ref().unwrap_or(contract);
+                let mut bridge_contract = contract.clone();
+                if private_storage_bridge {
+                    if let Some(local_type) = property_type_from_node(child, source) {
+                        bridge_contract.type_name = local_type.to_string();
+                        bridge_contract.type_source = path.to_path_buf();
+                    }
+                    if local_property.is_some_and(|member| member.is_mutable) {
+                        bridge_contract
+                            .setter
+                            .get_or_insert_with(|| setter_name(&contract.name));
+                    }
+                }
                 let property_text = node_text(child, source);
-                if is_interface {
+                if is_interface
+                    || local_property.is_some_and(|member| member.has_plain_computed_getter)
+                {
                     let setter_override = has_inherited_setter(index, declaration, &contract.name);
-                    let replacement = interface_property_methods(
-                        index,
-                        declaration,
-                        property_text,
-                        contract,
-                        setter_override,
-                    );
+                    let replacement = if is_interface {
+                        interface_property_methods(
+                            index,
+                            declaration,
+                            property_text,
+                            contract,
+                            setter_override,
+                        )
+                    } else {
+                        plain_computed_property_method(index, declaration, child, source, contract)
+                    };
                     if let Some(replacement) = replacement {
                         let origin =
                             repair_property_origin(index, declaration, child, source, path);
@@ -3657,56 +4870,72 @@ fn repair_declaration(
                                 setter: contract.setter.clone(),
                             },
                         ));
-                        report.abi_contracts.push(PersistedPropertyContract {
-                            owner_file: path.to_path_buf(),
-                            owner_name: declaration.name.clone(),
-                            owner_package: declaration.package.clone(),
-                            owner_kind: declaration.kind,
-                            contract: contract.clone(),
-                        });
-                        report.repairs.push(crate::translation_plan::PlannedRepair {
-                            target: origin,
-                            kind: "property-abi-repair".into(),
-                            detail: format!(
+                        report.record_abi_repair(
+                            path,
+                            declaration,
+                            contract,
+                            origin,
+                            format!(
                                 "rewrote property {} to Java-compatible accessor declarations",
                                 contract.name
                             ),
-                        });
+                        );
                         edits.push(crate::smart_cast::Edit {
                             start: child.start_byte(),
                             end: child.end_byte(),
                             text: replacement,
                         });
                     }
-                } else if let Some((replacement, getter, setter)) = class_property_bridge(
-                    property_text,
-                    contract,
-                    contract.setter.is_some()
-                        || has_inherited_setter(index, declaration, &contract.name),
-                ) {
+                } else if let Some((replacement, getter, setter)) = if private_storage_bridge {
+                    private_storage_property_bridge(
+                        child,
+                        source,
+                        &bridge_contract,
+                        contract.setter.is_some()
+                            || has_inherited_setter(index, declaration, &contract.name),
+                    )
+                } else {
+                    class_property_bridge(
+                        property_text,
+                        &bridge_contract,
+                        bridge_contract.setter.is_some()
+                            || has_inherited_setter(index, declaration, &contract.name),
+                    )
+                } {
                     let origin = repair_property_origin(index, declaration, child, source, path);
                     record_repair_accessors(
                         report,
                         &origin,
-                        contract,
+                        &bridge_contract,
                         getter.is_some(),
-                        setter.is_some(),
+                        bridge_contract.setter.is_some() || setter.is_some(),
                     );
-                    report.abi_contracts.push(PersistedPropertyContract {
-                        owner_file: path.to_path_buf(),
-                        owner_name: declaration.name.clone(),
-                        owner_package: declaration.package.clone(),
-                        owner_kind: declaration.kind,
-                        contract: contract.clone(),
-                    });
-                    report.repairs.push(crate::translation_plan::PlannedRepair {
-                        target: origin,
-                        kind: "property-abi-repair".into(),
-                        detail: format!(
+                    if private_storage_bridge {
+                        let owner_type = declaration
+                            .package
+                            .as_ref()
+                            .map(|package| format!("{package}.{}", declaration.name))
+                            .unwrap_or_else(|| declaration.name.clone());
+                        report.callsite_contracts.push((
+                            path.to_path_buf(),
+                            PropertyAccessorContract {
+                                owner_type,
+                                property: bridge_contract.name.clone(),
+                                getter: bridge_contract.getter.clone(),
+                                setter: bridge_contract.setter.clone(),
+                            },
+                        ));
+                    }
+                    report.record_abi_repair(
+                        path,
+                        declaration,
+                        &bridge_contract,
+                        origin,
+                        format!(
                             "rewrote property {} and generated explicit accessor bridge(s)",
                             contract.name
                         ),
-                    });
+                    );
                     edits.push(crate::smart_cast::Edit {
                         start: child.start_byte(),
                         end: child.end_byte(),
@@ -3730,75 +4959,79 @@ fn repair_declaration(
         stack.extend(child.named_children(&mut child.walk()));
     }
     if !is_interface && !added_methods.is_empty() {
-        if let Some(body) = node
-            .named_children(&mut node.walk())
-            .find(|child| matches!(child.kind(), "class_body" | "enum_class_body"))
-        {
-            let close = body.end_byte().saturating_sub(1);
-            let last_enum_entry = last_descendant_of_kind(body, "enum_entry");
-            let enum_missing_separator = body.kind() == "enum_class_body"
-                && !contains_token(body, ";")
-                && last_enum_entry
-                    .is_some_and(|entry| source[entry.end_byte()..close].trim().is_empty());
-            let first = body.named_children(&mut body.walk()).next();
-            let indent = if let Some(first) = first {
-                let start = source[..first.start_byte()]
-                    .rfind('\n')
-                    .map(|index| index + 1)
-                    .unwrap_or(0);
-                let line = &source[start..first.start_byte()];
-                &line[..line.len() - line.trim_start().len()]
-            } else {
-                "    "
-            };
-            let newline = if source.contains("\r\n") {
-                "\r\n"
-            } else {
-                "\n"
-            };
-            let indent = if indent.is_empty() { "    " } else { indent };
-            let separator = format!("{newline}{indent}");
-            let methods = added_methods.join(&separator);
-            let (start, text) = if enum_missing_separator {
-                let last_entry = last_enum_entry.unwrap();
-                (
-                    last_entry.end_byte(),
-                    format!(";{newline}{indent}{methods}{newline}"),
-                )
-            } else {
-                let prefix = if body.kind() == "enum_class_body" && !contains_token(body, ";") {
-                    ";"
-                } else {
-                    ""
-                };
-                (
-                    close,
-                    format!("{prefix}{newline}{indent}{methods}{newline}"),
-                )
-            };
-            edits.push(crate::smart_cast::Edit {
-                start,
-                end: close,
-                text,
-            });
+        append_class_accessor_bridges(node, source, &added_methods, edits);
+    }
+}
+
+fn append_class_accessor_bridges(
+    node: Node<'_>,
+    source: &str,
+    methods: &[String],
+    edits: &mut Vec<crate::smart_cast::Edit>,
+) {
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    if let Some(body) = node
+        .named_children(&mut node.walk())
+        .find(|child| matches!(child.kind(), "class_body" | "enum_class_body"))
+    {
+        let close = body.end_byte().saturating_sub(1);
+        let needs_enum_separator = body.kind() == "enum_class_body" && !contains_token(body, ";");
+        let last_enum_entry = if needs_enum_separator {
+            last_descendant_of_kind(body, "enum_entry")
         } else {
-            let newline = if source.contains("\r\n") {
-                "\r\n"
-            } else {
-                "\n"
-            };
-            let indent = "    ";
-            let separator = format!("{newline}{indent}");
-            let text = format!(
-                " {{{newline}{indent}{}{newline}}}",
-                added_methods.join(&separator),
-            );
-            edits.push(crate::smart_cast::Edit {
-                start: node.end_byte(),
-                end: node.end_byte(),
-                text,
-            });
-        }
+            None
+        };
+        let enum_missing_separator = needs_enum_separator
+            && last_enum_entry
+                .is_some_and(|entry| source[entry.end_byte()..close].trim().is_empty());
+        let first = body.named_children(&mut body.walk()).next();
+        let indent = if let Some(first) = first {
+            let start = source[..first.start_byte()]
+                .rfind('\n')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let line = &source[start..first.start_byte()];
+            &line[..line.len() - line.trim_start().len()]
+        } else {
+            "    "
+        };
+        let indent = if indent.is_empty() { "    " } else { indent };
+        let separator = format!("{newline}{indent}");
+        let methods = methods.join(&separator);
+        let (start, text) = if enum_missing_separator {
+            let last_entry = last_enum_entry.unwrap();
+            (
+                last_entry.end_byte(),
+                format!(";{newline}{indent}{methods}{newline}"),
+            )
+        } else {
+            let prefix = if needs_enum_separator { ";" } else { "" };
+            (
+                close,
+                format!("{prefix}{newline}{indent}{methods}{newline}"),
+            )
+        };
+        edits.push(crate::smart_cast::Edit {
+            start,
+            end: close,
+            text,
+        });
+    } else {
+        let indent = "    ";
+        let separator = format!("{newline}{indent}");
+        let text = format!(
+            " {{{newline}{indent}{}{newline}}}",
+            methods.join(&separator),
+        );
+        edits.push(crate::smart_cast::Edit {
+            start: node.end_byte(),
+            end: node.end_byte(),
+            text,
+        });
     }
 }
 
@@ -3858,6 +5091,31 @@ fn last_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<
         stack.extend(current.children(&mut current.walk()));
     }
     last
+}
+
+/// A storage-free class getter can keep the original virtual method directly.
+/// The inherited Java getter also supplies Kotlin synthetic property syntax,
+/// including for callers outside this migration. No renamed property accessor
+/// or field is needed, and all-open plugins can keep the method overridable.
+fn plain_computed_property_method(
+    index: &SourceIndex,
+    declaration: &Declaration,
+    property: Node<'_>,
+    source: &str,
+    contract: &PropertyContract,
+) -> Option<String> {
+    if contract.setter.is_some() {
+        return None;
+    }
+    let getter = crate::workspace::plain_computed_property_getter(property, source)?;
+    let ty = node_text(getter.return_type, source);
+    Some(format!(
+        "{}{}override fun {}(): {ty} {}",
+        if getter.is_public { "public " } else { "" },
+        if getter.is_final { "final " } else { "" },
+        contract.getter,
+        rewrite_super_property_access(index, declaration, contract, node_text(getter.body, source)),
+    ))
 }
 
 fn interface_property_methods(
@@ -3931,6 +5189,9 @@ fn rewrite_super_property_access(
     contract: &PropertyContract,
     body: &str,
 ) -> String {
+    if !body.contains("super") {
+        return body.to_string();
+    }
     let Some(source_file) = index.declaration_source_file(declaration) else {
         return body.to_string();
     };
@@ -3953,21 +5214,78 @@ fn rewrite_super_property_access(
         }
     }
 
-    let property = &contract.name;
-    let getter = &contract.getter;
-    let mut rewritten = body.to_string();
-    for parent in &providers {
-        rewritten = rewritten.replace(
-            &format!("super<{parent}>.{property}"),
-            &format!("super<{parent}>.{getter}()"),
-        );
+    if providers.is_empty() {
+        return body.to_string();
     }
-    if providers.len() == 1 {
-        rewritten = rewritten.replace(
-            &format!("super.{property}"),
-            &format!("super<{}>.{getter}()", providers[0]),
-        );
+    // Rewrite syntax nodes, not matching text in comments or string literals.
+    // A function wrapper lets expression and block getter bodies share this
+    // path without changing their byte offsets within the original body.
+    let prefix = "class NotlinBody { fun notlinGetter() ";
+    let wrapped = format!("{prefix}{body}\n}}");
+    let tree = crate::transpiler::parse_tree(&wrapped);
+    let mut pending = vec![tree.root_node()];
+    let mut edits = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.start_byte() >= prefix.len()
+            && matches!(
+                node.kind(),
+                "class_declaration" | "object_declaration" | "object_literal"
+            )
+        {
+            // `super` inside a local class belongs to that class's parents.
+            continue;
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+        if node.kind() != "navigation_expression" {
+            continue;
+        }
+        let children = node
+            .named_children(&mut node.walk())
+            .filter(|child| !matches!(child.kind(), "line_comment" | "multiline_comment"))
+            .collect::<Vec<_>>();
+        let [receiver, member] = children.as_slice() else {
+            continue;
+        };
+        if receiver.kind() != "super_expression"
+            || member.kind() != "identifier"
+            || node_text(*member, &wrapped).trim_matches('`') != contract.name
+        {
+            continue;
+        }
+        let receiver_text = node_text(*receiver, &wrapped)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let unqualified = receiver_text == "super" && providers.len() == 1;
+        if !unqualified
+            && !providers
+                .iter()
+                .any(|parent| receiver_text == format!("super<{parent}>"))
+        {
+            continue;
+        }
+        edits.push(crate::smart_cast::Edit {
+            start: member.start_byte() - prefix.len(),
+            end: member.end_byte() - prefix.len(),
+            text: format!("{}()", contract.getter),
+        });
+        if unqualified {
+            edits.push(crate::smart_cast::Edit {
+                start: receiver.start_byte() - prefix.len(),
+                end: receiver.end_byte() - prefix.len(),
+                text: format!("super<{}>", providers[0]),
+            });
+        }
     }
+    edits.sort_by_key(|edit| edit.start);
+    let mut rewritten = String::with_capacity(body.len());
+    let mut cursor = 0;
+    for edit in edits {
+        rewritten.push_str(&body[cursor..edit.start]);
+        rewritten.push_str(&edit.text);
+        cursor = edit.end;
+    }
+    rewritten.push_str(&body[cursor..]);
     rewritten
 }
 
@@ -4054,6 +5372,300 @@ fn class_property_bridge(
     Some((replacement, Some(getter), setter))
 }
 
+fn private_storage_bridge_supported(
+    index: &SourceIndex,
+    declaration: &Declaration,
+    member: Option<&crate::workspace::Member>,
+    contract: &PropertyContract,
+) -> bool {
+    let Some(member) = member else {
+        return false;
+    };
+    if member.is_jvm_field {
+        return false;
+    }
+    if member.visibility.as_deref() == Some("private") {
+        return persisted_private_storage_bridge(index, declaration, member, contract);
+    }
+    if declaration.kind == DeclarationKind::Enum
+        || !matches!(
+            declaration.kind,
+            DeclarationKind::Class | DeclarationKind::Object
+        )
+        || member.kind != MemberKind::Property
+        || member.has_plain_computed_getter
+        || member.has_custom_accessor
+        || !matches!(member.visibility.as_deref(), None | Some("public"))
+        || (contract.setter.is_some() && !member.is_mutable)
+        || (contract.setter.is_some()
+            && !exact_property_type_matches(index, declaration, member, contract))
+        || !property_type_matches(index, declaration, declaration, member, contract)
+    {
+        return false;
+    }
+    let accessor_names = std::iter::once((&contract.getter, 0)).chain(
+        member
+            .is_mutable
+            .then_some((contract.setter.as_ref().unwrap_or(&contract.name), 1)),
+    );
+    for (name, arity) in accessor_names {
+        let expected = if arity == 1 && contract.setter.is_none() {
+            setter_name(&contract.name)
+        } else {
+            name.clone()
+        };
+        if declaration.members.iter().any(|candidate| {
+            candidate.kind == MemberKind::Method
+                && method_overlaps_accessor(candidate, &expected, arity)
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+fn exact_property_type_matches(
+    index: &SourceIndex,
+    declaration: &Declaration,
+    member: &crate::workspace::Member,
+    contract: &PropertyContract,
+) -> bool {
+    let Some(member_type) = member.type_name.as_deref() else {
+        return false;
+    };
+    let Some(member_file) = index.declaration_source_file(declaration) else {
+        return false;
+    };
+    let Some(contract_file) = index.source_file(&contract.type_source) else {
+        return false;
+    };
+    exact_type_tree_matches(
+        index,
+        contract_file,
+        &contract.type_name,
+        member_file,
+        member_type,
+    )
+}
+
+fn persisted_private_storage_bridge(
+    index: &SourceIndex,
+    declaration: &Declaration,
+    field: &crate::workspace::Member,
+    contract: &PropertyContract,
+) -> bool {
+    let Some(owner_file) = index.declaration_source_file(declaration) else {
+        return false;
+    };
+    if field.kind != MemberKind::Property
+        || field.visibility.as_deref() != Some("private")
+        || field.is_static
+        || field.is_jvm_field
+    {
+        return false;
+    }
+    let Some(getter) = declaration.members.iter().find(|member| {
+        member.kind == MemberKind::Method
+            && member.name == contract.getter
+            && member.parameter_types.is_empty()
+    }) else {
+        return false;
+    };
+    let setter = contract.setter.as_deref().map(|setter| {
+        declaration.members.iter().find(|member| {
+            member.kind == MemberKind::Method
+                && member.name == setter
+                && member.parameter_types.len() == 1
+        })
+    });
+    !getter.is_static
+        && getter.visibility.as_deref() != Some("private")
+        && getter.visibility.as_deref() != Some("protected")
+        && property_type_matches(index, declaration, declaration, field, contract)
+        && (contract.setter.is_none()
+            || exact_property_type_matches(index, declaration, field, contract))
+        && property_type_matches(index, declaration, declaration, getter, contract)
+        && setter.is_none_or(|setter| {
+            setter.is_some_and(|setter| {
+                !setter.is_static
+                    && setter.visibility.as_deref() != Some("private")
+                    && setter.visibility.as_deref() != Some("protected")
+                    && setter.parameter_types.first().is_some_and(|parameter| {
+                        exact_type_tree_matches(
+                            index,
+                            owner_file,
+                            &contract.type_name,
+                            owner_file,
+                            parameter,
+                        )
+                    })
+            })
+        })
+}
+
+fn kotlin_data_class(node: Node<'_>, source: &str) -> bool {
+    node.children(&mut node.walk())
+        .find(|child| child.kind() == "modifiers")
+        .is_some_and(|modifiers| {
+            modifiers
+                .children(&mut modifiers.walk())
+                .any(|modifier| node_text(modifier, source).trim() == "data")
+        })
+}
+
+fn property_owner_is_data_class(property: Node<'_>, source: &str) -> bool {
+    let mut parent = property.parent();
+    while let Some(node) = parent {
+        if declaration_node(node) {
+            return kotlin_data_class(node, source);
+        }
+        parent = node.parent();
+    }
+    false
+}
+
+fn private_storage_property_bridge(
+    node: Node<'_>,
+    source: &str,
+    contract: &PropertyContract,
+    setter_override: bool,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let keyword = property_keyword(node, source)?;
+    let mutable = node_text(keyword, source).trim() == "var";
+    let ty = property_type_from_node(node, source)?;
+    let text = node_text(node, source);
+    let mut replacement = text.to_string();
+    let mut removed_modifiers = ["override", "public", "open", "final"]
+        .into_iter()
+        .filter_map(|modifier| modifier_token_span(node, source, modifier))
+        .map(|modifier| {
+            (
+                modifier.start_byte() - node.start_byte(),
+                modifier.end_byte() - node.start_byte(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !removed_modifiers
+        .iter()
+        .any(|(start, end)| node_text(node, source)[*start..*end].trim() == "override")
+    {
+        return None;
+    }
+    removed_modifiers.sort_by_key(|(start, _)| std::cmp::Reverse(*start));
+    for (start, end) in removed_modifiers {
+        replacement.replace_range(start..end, "");
+    }
+    let original_keyword_offset = keyword.start_byte() - node.start_byte();
+    let removed_before_keyword = ["override", "public", "open", "final"]
+        .into_iter()
+        .filter_map(|modifier| modifier_token_span(node, source, modifier))
+        .filter(|modifier| modifier.end_byte() <= keyword.start_byte())
+        .map(|modifier| modifier.end_byte() - modifier.start_byte())
+        .sum::<usize>();
+    let keyword_offset = original_keyword_offset.checked_sub(removed_before_keyword)?;
+    replacement.insert_str(keyword_offset, "private ");
+
+    let explicit_final = modifier_token_span(node, source, "final").is_some();
+    let getter = format!(
+        "{}override fun {}(): {ty} = {}",
+        if explicit_final { "final " } else { "" },
+        contract.getter,
+        contract.name
+    );
+    let setter = mutable.then(|| {
+        let setter_name = contract
+            .setter
+            .clone()
+            .unwrap_or_else(|| setter_name(&contract.name));
+        let modifier = if setter_override && explicit_final {
+            "final override "
+        } else if setter_override {
+            "override "
+        } else if explicit_final {
+            "final "
+        } else if owner_is_open(node, source) {
+            "open "
+        } else {
+            ""
+        };
+        format!(
+            "{modifier}fun {setter_name}(value: {ty}) {{ {} = value }}",
+            contract.name
+        )
+    });
+    Some((replacement, Some(getter), setter))
+}
+
+fn property_keyword<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    node.children(&mut node.walk()).find(|child| {
+        !child.is_named() && matches!(node_text(*child, source).trim(), "val" | "var")
+    })
+}
+
+fn property_type_from_node<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let mut node_cursor = node.walk();
+    let declaration = node
+        .named_children(&mut node_cursor)
+        .find(|child| child.kind() == "variable_declaration")
+        .unwrap_or(node);
+    let mut cursor = declaration.walk();
+    let mut types = declaration.children(&mut cursor).filter(|child| {
+        matches!(
+            child.kind(),
+            "type" | "user_type" | "nullable_type" | "parenthesized_type" | "function_type"
+        )
+    });
+    let ty = types.next()?;
+    if types.next().is_some() {
+        return None;
+    }
+    let text = node_text(ty, source).trim();
+    (!text.is_empty()).then_some(text)
+}
+
+fn modifier_token_span<'tree>(
+    declaration: Node<'tree>,
+    source: &str,
+    wanted: &str,
+) -> Option<Node<'tree>> {
+    let modifiers = declaration
+        .children(&mut declaration.walk())
+        .find(|child| child.kind() == "modifiers")?;
+    let mut pending = vec![modifiers];
+    while let Some(node) = pending.pop() {
+        if node.child_count() == 0 && node_text(node, source).trim() == wanted {
+            return Some(node);
+        }
+        pending.extend(node.children(&mut node.walk()));
+    }
+    None
+}
+
+fn owner_is_open(property: Node<'_>, source: &str) -> bool {
+    let mut parent = property.parent();
+    while let Some(node) = parent {
+        if declaration_node(node) {
+            return node
+                .children(&mut node.walk())
+                .find(|child| child.kind() == "modifiers")
+                .is_some_and(|modifiers| {
+                    has_modifier(modifiers, source, "open")
+                        || has_modifier(modifiers, source, "abstract")
+                });
+        }
+        parent = node.parent();
+    }
+    false
+}
+
+fn has_modifier(node: Node<'_>, source: &str, wanted: &str) -> bool {
+    if node.child_count() == 0 && node_text(node, source).trim() == wanted {
+        return true;
+    }
+    node.children(&mut node.walk())
+        .any(|child| has_modifier(child, source, wanted))
+}
+
 fn property_prefix(text: &str) -> Option<(&str, bool)> {
     let val = text.find("val ");
     let var = text.find("var ");
@@ -4105,24 +5717,33 @@ fn property_type(text: &str) -> Option<&str> {
 }
 
 fn property_name(node: Node<'_>, source: &str) -> String {
-    let val = node_text(node, source)
-        .find("val ")
-        .map(|offset| offset + 4);
-    let var = node_text(node, source)
-        .find("var ")
-        .map(|offset| offset + 4);
-    let start = match (val, var) {
-        (Some(a), Some(b)) => a.min(b),
-        (Some(a), None) | (None, Some(a)) => a,
-        (None, None) => return String::new(),
-    };
-    let name_end = node_text(node, source)[start..]
-        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '`'))
-        .map(|offset| start + offset)
-        .unwrap_or(node.end_byte() - node.start_byte());
-    node_text(node, source)[start..name_end]
-        .trim_matches('`')
-        .to_string()
+    if node.kind() == "class_parameter" {
+        if property_keyword(node, source).is_none() {
+            return String::new();
+        }
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "identifier")
+            .map(|identifier| node_text(identifier, source).trim_matches('`').to_string())
+            .unwrap_or_default();
+    }
+    if node.kind() == "property_declaration" {
+        let mut node_cursor = node.walk();
+        let Some(variable) = node
+            .named_children(&mut node_cursor)
+            .find(|child| child.kind() == "variable_declaration")
+        else {
+            return String::new();
+        };
+        let mut variable_cursor = variable.walk();
+        return variable
+            .named_children(&mut variable_cursor)
+            .find(|child| child.kind() == "identifier")
+            .map(|identifier| node_text(identifier, source).trim_matches('`').to_string())
+            .unwrap_or_default();
+    }
+    String::new()
 }
 
 fn targeted_annotations(prefix: &str, target: &str) -> Vec<String> {
@@ -4702,6 +6323,72 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_noarg_interface_methods_share_the_checked_jvm_boundary() {
+        let fixture = Fixture::new();
+        fixture.write("Methods.kt", "package sample\ninterface Api<T> {\n    fun getValue(): T\n    fun describe(): String\n}\ninterface WithArgument {\n    fun describe(value: String): String\n}\ninterface WithCollection {\n    fun values(): List<String>\n}\ninterface WithPrivate {\n    private fun describe(): String = \"private\"\n}\ninterface WithKeyword {\n    fun synchronized(): String\n}\n");
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        for (name, supported) in [
+            ("Api", true),
+            ("WithArgument", false),
+            ("WithCollection", false),
+            ("WithPrivate", false),
+            ("WithKeyword", false),
+        ] {
+            let declaration = index
+                .declarations()
+                .find(|declaration| declaration.name == name)
+                .unwrap();
+            assert_eq!(
+                is_noarg_method_interface_candidate(declaration),
+                supported,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_accessor_method_interfaces_require_exact_bean_pairs() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "AccessorMethods.kt",
+            "package sample\n\
+             interface Mutable {\n    fun getId(): String\n    fun setId(value: String)\n    fun isReady(): Boolean\n    fun setReady(value: Boolean): Unit\n}\n\
+             interface BadDefault {\n    fun getId(): String\n    fun setId(value: String = \"x\")\n}\n\
+             interface BadVararg {\n    fun getId(): String\n    fun setId(vararg value: String)\n}\n\
+             interface BadType {\n    fun getId(): String\n    fun setId(value: Any)\n}\n\
+             interface BadReturn {\n    fun getId(): String\n    fun setId(value: String): String\n}\n\
+             interface BadGetterArity {\n    fun getId(value: String): String\n    fun setId(value: String)\n}\n\
+             interface BadExtension {\n    fun String.getId(): String\n    fun setId(value: String)\n}\n\
+             interface BadAnnotation {\n    @JvmName(\"renamed\") fun getId(): String\n    fun setId(value: String)\n}\n\
+             interface BadUnpaired {\n    fun getId(): String\n    fun setOther(value: String)\n}\n\
+             interface Readonly {\n    fun getId(): String\n}\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        for (name, expected) in [
+            ("Mutable", true),
+            ("BadDefault", false),
+            ("BadVararg", false),
+            ("BadType", false),
+            ("BadReturn", false),
+            ("BadGetterArity", false),
+            ("BadExtension", false),
+            ("BadAnnotation", false),
+            ("BadUnpaired", false),
+            ("Readonly", false),
+        ] {
+            let target = index
+                .declarations()
+                .find(|declaration| declaration.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                is_accessor_method_interface_candidate(&index, target),
+                expected,
+                "unexpected accessor method interface classification for {name}"
+            );
+        }
+    }
+
+    #[test]
     fn repairs_retained_interfaces_and_constructor_only_classes() {
         let fixture = Fixture::new();
         let java = fixture.write("java/Api.java", api_java());
@@ -4789,10 +6476,7 @@ mod tests {
         let source = fs::read_to_string(&implementation).unwrap();
         let (rewritten, count) = repair_file(&repair_index, &implementation, &source);
         assert_eq!(count, 4, "{rewritten}");
-        assert_eq!(
-            rewritten.matches("final @JvmField val referenceNo").count(),
-            2
-        );
+        assert_eq!(rewritten.matches("private val referenceNo").count(), 2);
         assert_eq!(
             rewritten
                 .matches("override fun getReferenceNo(): String = referenceNo")
@@ -4868,9 +6552,127 @@ mod tests {
         let source = fs::read_to_string(&implementation).unwrap();
         let (repaired, count) = repair_file(&repair_index, &implementation, &source);
         assert_eq!(count, 2, "{repaired}");
-        assert!(repaired.contains("final @JvmField val alias: String"));
+        assert!(repaired.contains("@JvmField val alias: String"));
         assert!(repaired.contains("override fun getAlias(): String = alias"));
         assert!(!repaired.contains("} {"), "{repaired}");
+    }
+
+    #[test]
+    fn inherited_accessor_bridges_ignore_only_disjoint_method_arities() {
+        for (methods, expected) in [
+            (
+                "fun <T> getId(type: Class<T>): String = id\nfun setId(value: String, index: Int): String = value",
+                true,
+            ),
+            (
+                "fun getId(type: Class<*> = String::class.java): String = id",
+                false,
+            ),
+            (
+                "@JvmOverloads fun getId(type: Class<*> = String::class.java): String = id",
+                false,
+            ),
+            ("fun getId(vararg types: Class<*>): String = id", false),
+            ("fun getId(): String = id", false),
+            ("private fun getId(): String = id", false),
+            ("fun setId(value: String): Unit {}", false),
+            ("fun setId(value: String, index: Int = 0): Unit {}", false),
+            ("fun setId(vararg values: String): Unit {}", false),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write(
+                "Api.kt",
+                "package sample\ninterface Api { var id: String }\n",
+            );
+            fixture.write(
+                "Base.kt",
+                "package sample\nopen class Base(override var id: String) : Api\n",
+            );
+            fixture.write("Child.kt", &format!("package sample\nopen class Child(id: String) : Base(id) {{ {methods} }}\nclass Leaf(id: String) : Child(id)\n"));
+            let mut index = SourceIndex::discover(&fixture.0).unwrap();
+            let target = index.declarations().find(|d| d.name == "Api").unwrap();
+            let result = retained_subtypes_bridge(
+                &index,
+                target,
+                &retained_names(&index, &["Base", "Child", "Leaf"]),
+                std::slice::from_ref(&fixture.0),
+            );
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "{methods}: {result:?}; child members: {:?}",
+                index
+                    .declarations()
+                    .find(|d| d.name == "Child")
+                    .unwrap()
+                    .members
+            );
+            if expected {
+                let child = index
+                    .files
+                    .iter_mut()
+                    .flat_map(|file| &mut file.declarations)
+                    .find(|declaration| declaration.name == "Child")
+                    .unwrap();
+                child
+                    .members
+                    .iter_mut()
+                    .find(|member| member.name == "getId")
+                    .unwrap()
+                    .callable_arity = None;
+                let target = index.declarations().find(|d| d.name == "Api").unwrap();
+                assert!(
+                    retained_subtypes_bridge(
+                        &index,
+                        target,
+                        &retained_names(&index, &["Base", "Child", "Leaf"]),
+                        std::slice::from_ref(&fixture.0),
+                    )
+                    .is_err(),
+                    "unknown method shapes must retain the contract"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_accessor_bridges_accept_java_descendants_without_property_overrides() {
+        for (members, expected) in [
+            (
+                "public String getId(Class<?> kind) { return super.getId(); } public void setId(String value, int revision) {}",
+                true,
+            ),
+            (
+                "@Override public String getId() { return \"child\"; }",
+                false,
+            ),
+            ("@Override public void setId(String value) {}", false),
+            ("private String id;", true),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write(
+                "Api.kt",
+                "package sample\ninterface Api { var id: String }\n",
+            );
+            fixture.write(
+                "Base.kt",
+                "package sample\nopen class Base(override var id: String) : Api\n",
+            );
+            fixture.write("Child.java", &format!("package sample; public class Child extends Base {{ public Child(String id) {{ super(id); }} {members} }}\n"));
+            fixture.write(
+                "Leaf.kt",
+                "package sample\nclass Leaf(id: String) : Child(id)\n",
+            );
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let target = index.declarations().find(|d| d.name == "Api").unwrap();
+            let result = retained_subtypes_bridge(
+                &index,
+                target,
+                &retained_names(&index, &["Base", "Leaf"]),
+                std::slice::from_ref(&fixture.0),
+            );
+            assert_eq!(result.is_ok(), expected, "{members}: {result:?}");
+        }
     }
 
     #[test]
@@ -4894,6 +6696,135 @@ mod tests {
                 .is_err_and(|error| error.reason.contains("retained Kotlin property")),
             "field-backed getter repair must be rejected while ParentRecord owns id: {result:?}"
         );
+    }
+
+    #[test]
+    fn planner_bridges_exact_builtin_parallel_getters_on_retained_classes() {
+        for ty in [
+            "String", "Boolean", "Byte", "Short", "Int", "Long", "Float", "Double", "Char",
+        ] {
+            let fixture = Fixture::new();
+            fixture.write(
+                "A.kt",
+                &format!("package sample\ninterface A {{\n val value: {ty}\n}}\n"),
+            );
+            fixture.write(
+                "B.kt",
+                &format!("package sample\ninterface B {{\n val value: {ty}\n}}\n"),
+            );
+            fixture.write("Both.kt", &format!("package sample\ndata class Both(override val value: {ty}) : A, B {{\n suspend fun retain() {{}}\n}}\n"));
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let target = index.declarations().find(|d| d.name == "A").unwrap();
+            let result = retained_subtypes_bridge(
+                &index,
+                target,
+                &retained_names(&index, &["Both"]),
+                std::slice::from_ref(&fixture.0),
+            );
+            assert!(result.is_ok(), "{ty}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn parallel_jvm_name_safeguard_uses_the_indexed_snapshot() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "A.kt",
+            "package sample\ninterface A { val value: String }\n",
+        );
+        let parallel = fixture.write(
+            "B.kt",
+            "package sample\ninterface B { val value: String }\n",
+        );
+        fixture.write("Both.kt", "package sample\ndata class Both(override val value: String) : A, B { suspend fun retain() {} }\n");
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let annotated = "package sample\ninterface B { val value: String }\n@JvmName(\"renamedHelper\") fun helper() {}\n";
+        let overlay = index
+            .with_overlays(&[crate::workspace::SourceOverlay::Replace {
+                path: parallel.clone(),
+                language: SourceLanguage::Kotlin,
+                source: annotated.into(),
+            }])
+            .unwrap();
+        let bridgeable = |snapshot: &SourceIndex| {
+            let target = snapshot.declarations().find(|d| d.name == "A").unwrap();
+            retained_subtypes_bridge(
+                snapshot,
+                target,
+                &retained_names(snapshot, &["Both"]),
+                std::slice::from_ref(&fixture.0),
+            )
+            .is_ok()
+        };
+        assert!(bridgeable(&index));
+        assert!(
+            !bridgeable(&overlay),
+            "virtual annotations must participate in planning"
+        );
+        fs::write(parallel, annotated).unwrap();
+        assert!(
+            bridgeable(&index),
+            "later disk changes must not replace the indexed snapshot"
+        );
+    }
+
+    #[test]
+    fn builtin_parallel_getters_require_exact_unboxed_nonnullable_slots() {
+        for (root, parallel, actual) in [
+            ("Int", "Number", "Int"),
+            ("Int?", "Int", "Int"),
+            ("String?", "String", "String"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write(
+                "A.kt",
+                &format!("package sample\ninterface A {{\n val value: {root}\n}}\n"),
+            );
+            fixture.write(
+                "B.kt",
+                &format!("package sample\ninterface B {{\n val value: {parallel}\n}}\n"),
+            );
+            fixture.write("Both.kt", &format!("package sample\ndata class Both(override val value: {actual}) : A, B {{\n suspend fun retain() {{}}\n}}\n"));
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let target = index.declarations().find(|d| d.name == "A").unwrap();
+            let result = retained_subtypes_bridge(
+                &index,
+                target,
+                &retained_names(&index, &["Both"]),
+                std::slice::from_ref(&fixture.0),
+            );
+            assert!(result.is_err(), "{root}/{parallel}/{actual}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn builtin_parallel_getter_proof_does_not_guess_aliases_or_source_collisions() {
+        for (definition, prefix) in [
+            ("package sample\ntypealias String = kotlin.String\n", ""),
+            ("package sample\nclass String\n", ""),
+            ("package other\nclass String\n", "import other.String\n"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write("Types.kt", definition);
+            fixture.write(
+                "A.kt",
+                &format!("package sample\n{prefix}interface A {{\n val value: String\n}}\n"),
+            );
+            fixture.write(
+                "B.kt",
+                &format!("package sample\n{prefix}interface B {{\n val value: String\n}}\n"),
+            );
+            fixture.write("Both.kt", &format!("package sample\n{prefix}data class Both(override val value: String) : A, B {{\n suspend fun retain() {{}}\n}}\n"));
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let target = index.declarations().find(|d| d.name == "A").unwrap();
+            let result = retained_subtypes_bridge(
+                &index,
+                target,
+                &retained_names(&index, &["Both"]),
+                std::slice::from_ref(&fixture.0),
+            );
+            assert!(result.is_err(), "{prefix}: {result:?}");
+        }
     }
 
     #[test]
@@ -5362,10 +7293,61 @@ mod tests {
             .declarations()
             .find(|declaration| declaration.name == "Api")
             .unwrap();
+        let implementation = index
+            .declarations()
+            .find(|declaration| declaration.name == "Impl")
+            .unwrap();
+        let field = implementation
+            .members
+            .iter()
+            .find(|member| member.kind == MemberKind::Property && member.name == "name")
+            .unwrap();
+        let contract = source_contract_properties(&index, target)
+            .unwrap()
+            .into_iter()
+            .find(|contract| contract.name == "name")
+            .unwrap();
+        assert!(field.is_jvm_field);
+        assert!(!private_storage_bridge_supported(
+            &index,
+            implementation,
+            Some(field),
+            &contract,
+        ));
         let retained = retained_names(&index, &["Impl"]);
         let result =
             retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn ambiguous_nested_storage_owners_retain_the_root_contract() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\ninterface Api { var id: String }\n",
+        );
+        fixture.write(
+            "Owners.kt",
+            "package sample\n\
+             class First {\n    class Child(override var id: String) : Api\n}\n\
+             class Second {\n    class Child(override var id: String) : Api\n}\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let root = index.declarations().find(|d| d.name == "Api").unwrap();
+        assert!(index.direct_subtypes(root).iter().any(|child| {
+            crate::semantics::workspace_symbol(&index, child)
+                .kind
+                .starts_with("ambiguous:")
+        }));
+        let retained = retained_names(&index, &["Child"]);
+        let failure =
+            retained_subtypes_bridge(&index, root, &retained, std::slice::from_ref(&fixture.0))
+                .unwrap_err();
+        assert!(
+            failure.reason.contains("ambiguous source identity"),
+            "{failure:?}"
+        );
     }
 
     #[test]
@@ -5499,7 +7481,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_rejects_all_open_computed_properties_but_accepts_final_ones() {
+    fn planner_accepts_storage_free_all_open_getters_and_stored_fields() {
         let (fixture, index, retained) = planner_fixture(
             "package sample\ninterface Child : Api\n@Entity class Impl : Child { override val name: String get() = \"name\"; override var enabled: Boolean = false }\n",
         );
@@ -5507,7 +7489,7 @@ mod tests {
             .declarations()
             .find(|declaration| declaration.name == "Api")
             .unwrap();
-        assert!(!retained_subtypes_repairable(
+        assert!(retained_subtypes_repairable(
             &index,
             target,
             &retained,
@@ -5544,6 +7526,206 @@ mod tests {
     }
 
     #[test]
+    fn plain_computed_method_preserves_modifiers_and_rejects_storage_or_annotations() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.java",
+            "// NOTLIN: generated from Api.kt\npackage sample; public interface Api { String getName(); }\n",
+        );
+        let path = fixture.write(
+            "Impl.kt",
+            "package sample\n@Entity open class Impl : Api { public final override val name: String\nget ( ) { return \"value\" }\n}\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let (repaired, count) = repair_file(&index, &path, &source);
+        assert_eq!(count, 1, "{repaired}");
+        assert!(
+            repaired.contains("public final override fun getName(): String { return \"value\" }"),
+            "{repaired}"
+        );
+        assert!(!repaired.contains("val name"), "{repaired}");
+        assert!(!repaired.contains("notlinProperty"), "{repaired}");
+
+        for property in [
+            "override val name: String = \"stored\"\nget() = \"value\"",
+            "override val name: String = \"stored\"\nget() = field",
+            "override val name: String get() = field",
+            "override var name: String\nget() = \"value\"\nset(value) {}",
+            "override val name by lazy { \"value\" }",
+            "@get:GetterOnly override val name: String get() = \"value\"",
+            "override val name: String\n@GetterOnly get() = \"value\"",
+            "private override val name: String get() = \"value\"",
+            "override val name get() = \"value\"",
+        ] {
+            let source = format!("class Impl {{\n{property}\n}}\n");
+            let tree = crate::transpiler::parse_tree(&source);
+            let mut pending = vec![tree.root_node()];
+            let mut found = false;
+            while let Some(node) = pending.pop() {
+                if node.kind() == "property_declaration" {
+                    found = true;
+                    assert!(
+                        crate::workspace::plain_computed_property_getter(node, &source).is_none(),
+                        "{property}"
+                    );
+                }
+                pending.extend(node.named_children(&mut node.walk()));
+            }
+            assert!(found, "missing property AST: {property}");
+        }
+    }
+
+    #[test]
+    fn computed_method_keeps_virtual_dispatch_for_indexed_java_subclasses() {
+        for (property, accepted) in [
+            ("override val name: String get() = \"value\"", true),
+            ("override val name: String = \"value\"", false),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write(
+                "Api.kt",
+                "package sample\ninterface Api { val name: String }\n",
+            );
+            fixture.write(
+                "Impl.kt",
+                &format!("package sample\nopen class Impl : Api {{ {property} }}\n"),
+            );
+            fixture.write("Child.java", "package sample; public class Child extends Impl { @Override public String getName() { return \"child\"; } }\n");
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let target = index
+                .declarations()
+                .find(|declaration| declaration.name == "Api")
+                .unwrap();
+            let retained = retained_names(&index, &["Impl"]);
+            let result = retained_subtypes_bridge(
+                &index,
+                target,
+                &retained,
+                std::slice::from_ref(&fixture.0),
+            );
+            assert_eq!(result.is_ok(), accepted, "{property}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn stored_class_overrides_keep_private_storage_and_virtual_accessor_bridges() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\ninterface Api { var id: String }\n",
+        );
+        fixture.write(
+            "Base.kt",
+            "package sample\nopen class Base(@field:Deprecated(\"public val id and var id\") public override var id: String) : Api { fun read(): String = id }\n",
+        );
+        fixture.write(
+            "Child.kt",
+            "package sample\nclass Child(override var id: String) : Base(id)\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "Api")
+            .unwrap();
+        let retained = retained_names(&index, &["Base", "Child"]);
+        let plan =
+            retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
+        assert!(plan.is_ok(), "{plan:?}");
+
+        fs::remove_file(fixture.0.join("Api.kt")).unwrap();
+        fixture.write(
+            "translated/Api.java",
+            "// NOTLIN: generated from Api.kt\npackage sample; public interface Api { String getId(); void setId(String value); }\n",
+        );
+        let repair_index = SourceIndex::discover(&fixture.0).unwrap();
+        let base_path = fixture.0.join("Base.kt");
+        let base_source = fs::read_to_string(&base_path).unwrap();
+        let (base, _) = repair_file(&repair_index, &base_path, &base_source);
+        assert!(base.contains("private var id: String"), "{base}");
+        assert!(
+            base.contains("@field:Deprecated(\"public val id and var id\")"),
+            "{base}"
+        );
+        assert!(base.contains("override fun getId(): String = id"), "{base}");
+        assert!(
+            base.contains("override fun setId(value: String) { id = value }"),
+            "{base}"
+        );
+        assert!(!base.contains("@JvmField"), "{base}");
+
+        let child_path = fixture.0.join("Child.kt");
+        let child_source = fs::read_to_string(&child_path).unwrap();
+        let (child, _) = repair_file(&repair_index, &child_path, &child_source);
+        assert!(child.contains("private var id: String"), "{child}");
+        assert!(
+            child.contains("override fun getId(): String = id"),
+            "{child}"
+        );
+        assert!(
+            child.contains("override fun setId(value: String) { id = value }"),
+            "{child}"
+        );
+    }
+
+    #[test]
+    fn private_storage_component_rejects_unrepaired_lambda_accesses() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\ninterface Api { val id: String }\n",
+        );
+        fixture.write(
+            "Impl.kt",
+            "package sample\nopen class Impl(override val id: String) : Api { fun deferred() = { id } }\n",
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "Api")
+            .unwrap();
+        let retained = retained_names(&index, &["Impl"]);
+        let result =
+            retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
+        assert!(
+            result.is_err(),
+            "private storage must preserve deferred dispatch: {result:?}"
+        );
+    }
+
+    #[test]
+    fn super_property_repair_preserves_literal_and_comment_contents() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            "package sample\ninterface Api { val name: String get() = \"default\" }\n",
+        );
+        fixture.write("Impl.kt", "package sample\nclass Impl : Api { override val name: String get() = \"super<Api>.name\" }\n");
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let api = index
+            .declarations()
+            .find(|declaration| declaration.name == "Api")
+            .unwrap();
+        let owner = index
+            .declarations()
+            .find(|declaration| declaration.name == "Impl")
+            .unwrap();
+        let contract = source_contract_properties(&index, api).unwrap().remove(0);
+        let body =
+            "{ // super<Api>.name\nreturn \"super<Api>.name\" + super<Api>.name + super.name\n}";
+        let repaired = rewrite_super_property_access(&index, owner, &contract, body);
+        assert_eq!(
+            repaired,
+            "{ // super<Api>.name\nreturn \"super<Api>.name\" + super<Api>.getName() + super<Api>.getName()\n}"
+        );
+        let nested = "{ class Nested : Other() { fun read() = super.name }; return super.name }";
+        assert_eq!(
+            rewrite_super_property_access(&index, owner, &contract, nested),
+            "{ class Nested : Other() { fun read() = super.name }; return super<Api>.getName() }"
+        );
+    }
+
+    #[test]
     fn all_open_safeguard_reads_speculative_source_overlay() {
         let (fixture, index, _) = planner_fixture(
             "package sample\ninterface Child : Api\nclass Impl : Child { override val name: String get() = \"name\"; override var enabled: Boolean = false }\n",
@@ -5553,7 +7735,7 @@ mod tests {
             .with_overlays(&[crate::workspace::SourceOverlay::Replace {
                 path: implementation.clone(),
                 language: SourceLanguage::Kotlin,
-                source: "package sample\nimport jakarta.persistence.Entity\ninterface Child : Api\n@Entity class Impl : Child { override val name: String get() = \"name\"; override var enabled: Boolean = false }\n".to_string(),
+                source: "package sample\nimport jakarta.persistence.Entity\ninterface Child : Api\n@Entity class Impl : Child { override val name: String = \"stored\"\nget() = \"name\"\noverride var enabled: Boolean = false }\n".to_string(),
             }])
             .unwrap();
         let target = overlay
@@ -6184,7 +8366,7 @@ mod tests {
     }
 
     #[test]
-    fn method_bearing_parallel_component_stays_kotlin() {
+    fn method_bearing_parallel_component_shares_exact_builtin_getter() {
         let fixture = Fixture::new();
         fixture.write(
             "Api.kt",
@@ -6194,7 +8376,7 @@ mod tests {
             "Parallel.kt",
             "package sample\ninterface Parallel { val enabled: Boolean }\n",
         );
-        fixture.write(
+        let model = fixture.write(
             "Model.kt",
             "package sample\ndata class Model(override val enabled: Boolean) : Api, Parallel { fun update(): Model = this }\n",
         );
@@ -6203,12 +8385,39 @@ mod tests {
             .declarations()
             .find(|declaration| declaration.name == "Api")
             .unwrap();
-        assert!(!retained_subtypes_repairable(
+        assert!(retained_subtypes_repairable(
             &index,
             target,
             &retained_names(&index, &["Model"]),
             std::slice::from_ref(&fixture.0),
         ));
+
+        for name in ["Api", "Parallel"] {
+            fs::remove_file(fixture.0.join(format!("{name}.kt"))).unwrap();
+            fixture.write(
+                &format!("{name}.java"),
+                &format!(
+                    "// NOTLIN: generated from {name}.kt\npackage sample;\npublic interface {name} {{ boolean getEnabled(); }}\n"
+                ),
+            );
+        }
+        let migrated_index = SourceIndex::discover(&fixture.0).unwrap();
+        let source = fs::read_to_string(&model).unwrap();
+        let (rewritten, count) = repair_file(&migrated_index, &model, &source);
+        assert_eq!(count, 2, "{rewritten}");
+        assert!(
+            rewritten.contains("@JvmField val enabled: Boolean"),
+            "{rewritten}"
+        );
+        assert_eq!(
+            rewritten.matches("override fun getEnabled()").count(),
+            1,
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("fun update(): Model = this"),
+            "{rewritten}"
+        );
     }
 
     #[test]
@@ -6541,7 +8750,7 @@ mod tests {
         );
         // Constructor-property exposure and accessor generation are separate edits.
         assert_eq!(second_report.count, 2, "{:?}", second_sources[0].1);
-        assert!(second_sources[0].1.contains("@JvmField val properties"));
+        assert!(second_sources[0].1.contains("private val properties"));
         assert!(
             second_sources[0]
                 .1
@@ -6744,7 +8953,7 @@ mod tests {
         );
 
         assert_eq!(count, 2);
-        assert!(rewritten.contains("@JvmField val enabled: Boolean"));
+        assert!(rewritten.contains("private val enabled: Boolean"));
         assert!(rewritten.contains("override fun getEnabled(): Boolean = enabled"));
     }
 

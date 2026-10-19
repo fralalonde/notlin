@@ -9,8 +9,8 @@
 //! erasure, and a call shape that could not be read.
 
 use notlin::ctor_defaults::{
-    CtorShape, call_sites, is_neutral_literal, lower_call_args, plan_ctor_defaults, resolve_args,
-    rewrite, trailing_patterns,
+    CtorShape, call_sites, is_neutral_literal, jvm_overload_patterns, lower_call_args,
+    plan_ctor_defaults, resolve_args, rewrite, trailing_patterns,
 };
 
 fn defaults(entries: &[Option<&str>]) -> Vec<Option<String>> {
@@ -84,6 +84,20 @@ fn a_positional_argument_after_a_named_one_is_not_resolvable() {
 }
 
 #[test]
+fn duplicate_arguments_cannot_overwrite_an_earlier_binding() {
+    let params = names(&["first", "last"]);
+    for args in [
+        vec![(None, "1".into()), (Some("first".into()), "2".into())],
+        vec![
+            (Some("first".into()), "1".into()),
+            (Some("first".into()), "2".into()),
+        ],
+    ] {
+        assert!(resolve_args(&params, &args).is_none());
+    }
+}
+
+#[test]
 fn an_unknown_name_or_an_overflowing_position_leaves_the_call_alone() {
     let params = names(&["first", "last"]);
     assert!(
@@ -105,7 +119,7 @@ fn an_unknown_name_or_an_overflowing_position_leaves_the_call_alone() {
 }
 
 #[test]
-fn a_literal_default_is_written_into_the_call_and_the_rest_are_left_to_the_overload() {
+fn a_nonliteral_default_preserves_the_complete_planned_omission_pattern() {
     let slots = vec![
         Some("\"x\"".to_string()),
         None,
@@ -116,10 +130,38 @@ fn a_literal_default_is_written_into_the_call_and_the_rest_are_left_to_the_overl
     let (args, left) = lower_call_args(&slots, &defaults);
     assert_eq!(
         args,
-        vec!["\"x\"".to_string(), "10".to_string(), "true".to_string()],
-        "the literal default goes in; the non-literal one is not invented"
+        vec!["\"x\"".to_string(), "true".to_string()],
+        "partial filling would call an overload for a different omission pattern"
     );
-    assert_eq!(left, vec![2], "the pattern keeps its delegating overload");
+    assert_eq!(
+        left,
+        vec![1, 2],
+        "the exact planned overload supplies both defaults"
+    );
+}
+
+#[test]
+fn mixed_trailing_defaults_keep_the_zero_argument_constructor_call() {
+    let defaults = defaults(&[
+        Some("Settings()"),
+        Some("null"),
+        Some("null"),
+        Some("Lines()"),
+    ]);
+    let (args, left) = lower_call_args(&vec![None; defaults.len()], &defaults);
+    assert!(
+        args.is_empty(),
+        "two inserted nulls would bind to the wrong overload"
+    );
+    assert_eq!(left, vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn exclusively_neutral_omissions_use_the_canonical_constructor() {
+    let defaults = defaults(&[None, Some("10"), Some("null")]);
+    let (args, left) = lower_call_args(&[Some("input".into()), None, None], &defaults);
+    assert_eq!(args, vec!["input", "10", "null"]);
+    assert!(left.is_empty());
 }
 
 #[test]
@@ -175,6 +217,27 @@ fn a_pattern_the_trailing_ladder_already_covers_is_not_written_twice() {
     });
     assert!(plan.overloads.is_empty(), "the ladder rung already exists");
     assert!(plan.blocked.is_none());
+}
+
+#[test]
+fn jvm_overloads_remove_defaulted_parameters_right_to_left_across_required_suffixes() {
+    let defaults = defaults(&[
+        Some("first()"),
+        None,
+        Some("middle()"),
+        None,
+        Some("last()"),
+    ]);
+    assert_eq!(
+        jvm_overload_patterns(&defaults),
+        vec![vec![4], vec![2, 4], vec![0, 2, 4]],
+        "required parameters remain in the signature while each defaulted parameter is removed"
+    );
+}
+
+#[test]
+fn jvm_overloads_emit_no_patterns_when_every_parameter_is_required() {
+    assert!(jvm_overload_patterns(&defaults(&[None, None, None])).is_empty());
 }
 
 #[test]

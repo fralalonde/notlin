@@ -327,6 +327,14 @@ fn print_run_summary(
         "java".bold(),
         format!("{} written", counts.java_written).bright_black()
     );
+    if let Some(coverage) = &counts.coverage {
+        eprintln!(
+            "  {} {:<11} {}",
+            "├─".bright_black(),
+            "coverage".bold(),
+            coverage.summary().bright_black()
+        );
+    }
     if !outcomes.is_empty() {
         eprintln!(
             "  {} {:<11} {}",
@@ -445,6 +453,19 @@ fn annotate_manual_marks(
 
 fn run(cli: &Cli) -> Result<ExitCode, String> {
     let run_started = Instant::now();
+    if let Some(path) = &cli.coverage_report {
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            return Err("--coverage-report requires a .json output path".into());
+        }
+        if cli.dump_ast {
+            return Err("--coverage-report cannot be combined with --dump-ast".into());
+        }
+        if let (Ok(report), Some(config)) = (std::fs::canonicalize(path), &cli.validation_config)
+            && std::fs::canonicalize(config).is_ok_and(|config| config == report)
+        {
+            return Err("coverage report must not overwrite the validation configuration".into());
+        }
+    }
     if cli.dump_ast {
         let files = collect_inputs(&cli.input)?;
         if files.is_empty() {
@@ -604,6 +625,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 .values()
                 .map(|plan| plan.declarations.len())
                 .sum();
+            let coverage = notlin::coverage::CoverageReport::collect(
+                plan.translation_plans.values(),
+                plan.generated_java
+                    .iter()
+                    .map(|output| (output.path.as_path(), output.owners.as_slice())),
+            )?;
             plan_progress.finish(format!(
                 "converged in {} · {}",
                 item_count(plan.rounds, "pass", "passes"),
@@ -648,9 +675,15 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 )?;
             }
             notlin::migration_pipeline::verify_original_snapshots(&plan)?;
-            progress_start("write", "applying the converged migration");
-            let apply_migration =
-                cli.workspace_root.is_some() || files.len() > 1 || cli.migrates_in_place();
+            let apply_migration = cli.migrates_in_place();
+            progress_start(
+                "write",
+                if apply_migration {
+                    "applying the converged migration"
+                } else {
+                    "writing accepted Java outputs"
+                },
+            );
             let final_plans = &plan.final_plans;
             for file_plan in final_plans {
                 log::debug!(
@@ -689,6 +722,10 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                     remove_stale_generated_outputs(
                         path,
                         emitted_by_origin.get(path).cloned().unwrap_or_default(),
+                        plan.translation_plans
+                            .get(path)
+                            .map(retained_java_type_names)
+                            .unwrap_or_default(),
                     )?;
                 }
             }
@@ -736,6 +773,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                     errors: total_errors,
                     warnings: total_warnings,
                     java_written,
+                    coverage: Some(coverage),
                 },
                 &outcomes,
                 &mut stdout,
@@ -745,6 +783,8 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     }
 
     let mut declaration_count = 0usize;
+    let mut coverage_plans = Vec::new();
+    let mut coverage_outputs = Vec::new();
     let mut parsed_files = 0usize;
     progress_start(
         "translate",
@@ -781,7 +821,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 kotlin_scope_counts(declaration_count, parsed_files)
             ),
         );
-        let (java_files, errors, warnings, coverage) = transpiler::transpile_with_tree_hint(
+        let planned = transpiler::plan_with_tree_hint(
             &source,
             &tree,
             file,
@@ -793,6 +833,26 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             },
             true,
         );
+        if planned.emission_failed {
+            return Err(format!(
+                "{}: accepted Java emission failed",
+                notlin::paths::display(file)
+            ));
+        }
+        coverage_outputs.extend(planned.emitted_file_owners.iter().map(|(name, owners)| {
+            (
+                cli.out_dir
+                    .as_deref()
+                    .or_else(|| file.parent())
+                    .unwrap_or(Path::new("."))
+                    .join(name),
+                owners.clone(),
+            )
+        }));
+        let retained_java_types = retained_java_type_names(&planned.plan);
+        coverage_plans.push(planned.plan);
+        let java_files = planned.accepted.emit();
+        let (errors, warnings, coverage) = (planned.errors, planned.warnings, planned.coverage);
         total_errors += errors;
         total_warnings += warnings;
 
@@ -865,43 +925,17 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                             "{}: no translated content; untouched",
                             notlin::paths::display(file)
                         );
-                        // Orphan cleanup: a prior run may have generated Java
-                        // outputs whose declarations this run retained in
-                        // Kotlin. Generated outputs are marked with the
-                        // `NOTLIN: generated from <source>` header — delete
-                        // those whose source is THIS file, otherwise javac
-                        // keeps compiling a stale class that no longer
-                        // matches the retained Kotlin ABI. Generated outputs
-                        // land next to the source in in-place mode.
-                        if effective_out_dir.is_none()
-                            && let Some(dir) = file.parent()
-                        {
-                            let source_canon =
-                                std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
-                            let source_text = source_canon.to_string_lossy().replace('\\', "/");
-                            if let Ok(entries) = std::fs::read_dir(dir) {
-                                for entry in entries.flatten() {
-                                    let path = entry.path();
-                                    if path.extension().and_then(|e| e.to_str()) != Some("java") {
-                                        continue;
-                                    }
-                                    if let Ok(first_line) =
-                                        std::fs::read_to_string(&path).map(|content| {
-                                            content.lines().next().unwrap_or("").to_string()
-                                        })
-                                        && first_line.contains("NOTLIN: generated from")
-                                        && first_line.contains(&source_text)
-                                    {
-                                        let _ = std::fs::remove_file(&path);
-                                        log::info!(
-                                            "deleted orphan {}",
-                                            notlin::paths::display(&path)
-                                        );
-                                    }
-                                }
-                            }
-                        }
                     }
+                }
+                // Clean stale outputs after any successful in-place migration,
+                // including a trim that translated other declarations from
+                // this file. Preserve outputs for absent Kotlin owners.
+                if effective_out_dir.is_none() {
+                    remove_stale_generated_outputs(
+                        file,
+                        java_files.iter().map(|(name, _)| name.clone()).collect(),
+                        retained_java_types.clone(),
+                    )?;
                 }
                 annotate_manual_marks(file, &outcome, &index, false);
                 outcomes.push((file.clone(), outcome));
@@ -930,6 +964,16 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             errors: total_errors,
             warnings: total_warnings,
             java_written,
+            coverage: if cli.dump_ast {
+                None
+            } else {
+                Some(notlin::coverage::CoverageReport::collect(
+                    &coverage_plans,
+                    coverage_outputs
+                        .iter()
+                        .map(|(path, owners)| (path.as_path(), owners.as_slice())),
+                )?)
+            },
         },
         &outcomes,
         &mut stdout,
@@ -988,12 +1032,14 @@ fn write_java_files(
 fn remove_stale_generated_outputs(
     source: &Path,
     emitted_names: HashSet<String>,
+    retained_java_types: HashSet<String>,
 ) -> Result<(), String> {
     let Some(directory) = source.parent() else {
         return Ok(());
     };
     let source_canon = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     let source_text = source_canon.to_string_lossy().replace('\\', "/");
+    let source_display = notlin::paths::display(source);
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Ok(());
     };
@@ -1008,12 +1054,60 @@ fn remove_stale_generated_outputs(
         {
             continue;
         }
-        let generated_from_source = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| content.lines().next().map(str::to_string))
-            .is_some_and(|first_line| {
-                first_line.contains("NOTLIN: generated from") && first_line.contains(&source_text)
+        let generated_from_source = std::fs::read_to_string(&path).ok().is_some_and(|content| {
+            let type_name = path.file_stem().and_then(|stem| stem.to_str());
+            let header_matches = content.lines().next().is_some_and(|first_line| {
+                let Some((_, marker)) = first_line.split_once("NOTLIN: generated from") else {
+                    return false;
+                };
+                let normalize = |path: &str| {
+                    let path = path.trim().replace('\\', "/");
+                    if cfg!(windows) {
+                        path.to_ascii_lowercase()
+                    } else {
+                        path
+                    }
+                };
+                let marker = normalize(marker);
+                [normalize(&source_text), normalize(&source_display)]
+                    .iter()
+                    .any(|candidate| {
+                        marker == *candidate
+                            || marker
+                                .strip_prefix(candidate)
+                                .is_some_and(|suffix| suffix.starts_with(" —"))
+                    })
             });
+            let declared_type = notlin::java_ir::parse_java(&content).ok().and_then(|unit| {
+                let declarations = unit
+                    .root
+                    .children
+                    .iter()
+                    .filter_map(|element| match element {
+                        notlin::java_ir::JavaElement::Declaration(node)
+                            if matches!(
+                                node.kind.as_str(),
+                                "class_declaration"
+                                    | "interface_declaration"
+                                    | "enum_declaration"
+                                    | "annotation_type_declaration"
+                                    | "record_declaration"
+                            ) =>
+                        {
+                            Some(node)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                (declarations.len() == 1)
+                    .then(|| java_declared_name(declarations[0]))
+                    .flatten()
+            });
+            header_matches
+                && type_name.is_some_and(|name| {
+                    retained_java_types.contains(name) && declared_type.as_deref() == Some(name)
+                })
+        });
         if generated_from_source {
             std::fs::remove_file(&path)
                 .map_err(|error| format!("{}: {error}", notlin::paths::display(&path)))?;
@@ -1026,6 +1120,62 @@ fn remove_stale_generated_outputs(
     Ok(())
 }
 
+fn java_declared_name(node: &notlin::java_ir::JavaSyntaxNode) -> Option<String> {
+    use notlin::java_ir::JavaElement;
+    fn find(node: &notlin::java_ir::JavaSyntaxNode) -> Option<String> {
+        for child in &node.children {
+            match child {
+                JavaElement::Token(token) if token.field_name.as_deref() == Some("name") => {
+                    return Some(token.text.clone());
+                }
+                JavaElement::Declaration(n)
+                | JavaElement::Type(n)
+                | JavaElement::Expression(n)
+                | JavaElement::Statement(n)
+                | JavaElement::Annotation(n)
+                | JavaElement::Import(n)
+                | JavaElement::Other(n)
+                    if n.field_name.as_deref() == Some("name") =>
+                {
+                    return n.children.iter().find_map(|child| match child {
+                        JavaElement::Token(token) => Some(token.text.clone()),
+                        _ => None,
+                    });
+                }
+                JavaElement::Declaration(n)
+                | JavaElement::Type(n)
+                | JavaElement::Expression(n)
+                | JavaElement::Statement(n)
+                | JavaElement::Annotation(n)
+                | JavaElement::Import(n)
+                | JavaElement::Other(n) => {
+                    if let Some(name) = find(n) {
+                        return Some(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    find(node)
+}
+
+fn retained_java_type_names(plan: &notlin::translation_plan::TranslationPlan) -> HashSet<String> {
+    plan.declarations
+        .iter()
+        .filter(|decision| {
+            decision.final_owner == Some(notlin::translation_plan::BackendOwner::Kotlin)
+                && decision.symbol_id.owner_path.is_empty()
+                && matches!(
+                    decision.symbol_id.kind.as_str(),
+                    "class" | "object" | "interface" | "enum" | "annotation"
+                )
+        })
+        .map(|decision| decision.symbol_id.name.clone())
+        .collect()
+}
+
 /// Shared run summary: failure policy, migration tally, final line.
 #[derive(Default)]
 struct RunCounts {
@@ -1034,6 +1184,7 @@ struct RunCounts {
     errors: usize,
     warnings: usize,
     java_written: usize,
+    coverage: Option<notlin::coverage::CoverageReport>,
 }
 
 fn finish_run(
@@ -1048,7 +1199,16 @@ fn finish_run(
         || (untranslatable_strict && counts.warnings > 0)
         || (cli.deny_warnings && counts.warnings > 0);
     stdout.flush().map_err(|error| format!("stdout: {error}"))?;
-    print_retention_report();
+    if let Some(path) = &cli.coverage_report {
+        let coverage = counts
+            .coverage
+            .as_ref()
+            .ok_or("coverage is unavailable in --dump-ast mode")?;
+        let json = serde_json::to_vec_pretty(coverage).map_err(|error| error.to_string())?;
+        std::fs::write(path, json)
+            .map_err(|error| format!("{}: {error}", notlin::paths::display(path)))?;
+    }
+    print_retention_report(counts.coverage.as_ref(), cli.verbose);
     print_run_summary(&counts, outcomes, failed, run_started.elapsed());
     Ok(if failed {
         ExitCode::FAILURE
@@ -1059,8 +1219,16 @@ fn finish_run(
 
 /// Run-end retention table: what stayed Kotlin, why, how much of it, and where
 /// a human has to decide. Part of the run summary, printed before exit.
-fn print_retention_report() {
-    if let Some(report) = notlin::diagnostics::retention_report() {
+fn print_retention_report(coverage: Option<&notlin::coverage::CoverageReport>, verbose: u8) {
+    if let Some(coverage) = coverage.filter(|coverage| coverage.retained > 0) {
+        eprint!("{}", coverage.retention_summary());
+    }
+    if verbose >= 2
+        && let Some(report) = notlin::diagnostics::retention_report()
+    {
+        eprintln!(
+            "\nnotlin: partial diagnostic-site hints; joined by names, not declaration coverage or unlock forecasts"
+        );
         eprint!("{report}");
     }
 }

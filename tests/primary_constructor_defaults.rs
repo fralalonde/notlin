@@ -36,7 +36,7 @@ fn jvm_overloads_primary_constructor_emits_every_trailing_default_overload() {
         "missing one-default constructor overload:\n{java}"
     );
     assert!(
-        java.contains("public Endpoint(String host)") && java.contains("this(host, 8080, false);"),
+        java.contains("public Endpoint(String host)") && java.contains("this(host, 8080);"),
         "missing two-default constructor overload:\n{java}"
     );
     assert!(
@@ -76,7 +76,7 @@ fn jvm_overloads_plain_primary_constructor_emits_every_trailing_default_overload
         "missing one-default plain-class constructor overload:\n{java}"
     );
     assert!(
-        java.contains("public Client(String address)") && java.contains("this(address, 3, false);"),
+        java.contains("public Client(String address)") && java.contains("this(address, 3);"),
         "missing two-default plain-class constructor overload:\n{java}"
     );
 

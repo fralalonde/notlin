@@ -7,14 +7,14 @@
 //! here follows from picking between them, not from the mere presence of a
 //! default:
 //!
-//! - **The default is a language-neutral literal** (`10`, `"x"`, `true`): a
+//! - **Every omitted default is a language-neutral literal** (`10`, `"x"`, `true`): a
 //!   translated call site writes it into the call itself, which becomes the
 //!   canonical all-arguments one — `new Example(first, 10, last)`.
-//! - **Anything else** (a constructor call, a companion reference, an expression
+//! - **Any other omitted default** (a constructor call, a companion reference, an expression
 //!   over other parameters): the emitter writes ONE delegating overload for the
 //!   exact omission pattern a caller uses —
 //!   `Example(String first, boolean last) { this(first, 10, last); }` — and the
-//!   caller drops the omitted arguments, so a retained Kotlin named-argument
+//!   caller drops all omitted arguments, so a retained Kotlin named-argument
 //!   call and a translated Java one both land on it. Never all 2^n
 //!   combinations: only the shapes call sites actually use.
 //!
@@ -53,6 +53,9 @@ pub fn resolve_args(
             Some(name) => {
                 named_seen = true;
                 let index = param_names.iter().position(|param| param == name)?;
+                if slots[index].is_some() {
+                    return None;
+                }
                 slots[index] = Some(text.clone());
             }
             None => {
@@ -76,22 +79,29 @@ pub fn resolve_args(
 /// The argument list to write for a translated call that omits some parameters,
 /// plus the indices left to the declaration's delegating overload.
 ///
-/// An omitted parameter whose default is a language-neutral literal is written
-/// into the call, so the call keeps the canonical all-arguments shape. The rest
-/// are dropped: the emitter writes one overload per pattern a call site uses,
-/// and the overload supplies the default inside the declaration, where every
-/// parameter is in scope.
+/// When every omitted default is a language-neutral literal, write all of them
+/// into the canonical call. Otherwise preserve the entire omission pattern:
+/// the declaration's planned overload supplies all omitted defaults. Filling
+/// only some omissions would select a different, unplanned overload, which can
+/// compile while binding values to the wrong parameters.
 pub fn lower_call_args(
     slots: &[Option<String>],
     defaults: &[Option<String>],
 ) -> (Vec<String>, Vec<usize>) {
+    let needs_overload = slots.iter().enumerate().any(|(index, slot)| {
+        slot.is_none()
+            && defaults
+                .get(index)
+                .and_then(Option::as_deref)
+                .is_none_or(|default| !is_neutral_literal(default))
+    });
     let mut args = Vec::with_capacity(slots.len());
     let mut left_to_overload = Vec::new();
     for (index, slot) in slots.iter().enumerate() {
         match slot {
             Some(value) => args.push(value.clone()),
             None => match defaults.get(index).and_then(Option::as_deref) {
-                Some(default) if is_neutral_literal(default) => {
+                Some(default) if !needs_overload && is_neutral_literal(default) => {
                     args.push(default.trim().to_string())
                 }
                 _ => left_to_overload.push(index),
@@ -263,7 +273,7 @@ pub struct CtorShape<'a> {
     pub param_types: &'a [String],
     /// Omission patterns call sites actually use.
     pub patterns: &'a [Vec<usize>],
-    /// Trailing patterns the emitter writes anyway (a `@JvmOverloads` request,
+    /// Patterns the emitter writes anyway (a `@JvmOverloads` request,
     /// or the in-place ladder that keeps Kotlin's positional ABI). They are
     /// already covered, but they still occupy signatures.
     pub ladder: &'a [Vec<usize>],
@@ -382,8 +392,33 @@ pub fn trailing_patterns(defaults: &[Option<String>]) -> Vec<Vec<usize>> {
         .rev()
         .take_while(|default| default.is_some())
         .count();
-    (1..=trailing)
-        .map(|omitted| (defaults.len() - omitted..defaults.len()).collect())
+    cumulative_omission_patterns((defaults.len() - trailing..defaults.len()).rev())
+}
+
+/// The cumulative parameter-omission patterns requested by Kotlin
+/// `@JvmOverloads`, removing every defaulted parameter from right to left while
+/// keeping required parameters in each overload. Unlike [`trailing_patterns`],
+/// this includes defaults before a required suffix.
+pub fn jvm_overload_patterns(defaults: &[Option<String>]) -> Vec<Vec<usize>> {
+    cumulative_omission_patterns(
+        defaults
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(index, default)| default.is_some().then_some(index)),
+    )
+}
+
+fn cumulative_omission_patterns(indices: impl IntoIterator<Item = usize>) -> Vec<Vec<usize>> {
+    let mut omitted = Vec::new();
+    indices
+        .into_iter()
+        .map(|index| {
+            omitted.push(index);
+            let mut pattern = omitted.clone();
+            pattern.sort_unstable();
+            pattern
+        })
         .collect()
 }
 

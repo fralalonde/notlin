@@ -239,7 +239,13 @@ fn whole_workspace_retains_class_whose_supertype_member_type_differs() {
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .args(["--root", root.to_str().unwrap(), "--lombok", "--in-place"])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "--lombok",
+            "--in-place",
+            "-vv",
+        ])
         .arg(root.to_str().unwrap())
         .output()
         .expect("run notlin");

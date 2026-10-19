@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 /// A data-class receiver's implicit `copy(field = value)` must become a
 /// constructor call with the unchanged components read through this class's
-/// Java accessors. Java has no generated Kotlin copy() method.
+/// Java accessors. The call is curried so receiver/argument evaluation order is
+/// preserved; Java has no generated Kotlin copy() method.
 #[test]
 fn implicit_data_class_copy_rebuilds_current_instance() {
     let source = concat!(
@@ -27,8 +28,14 @@ fn implicit_data_class_copy_rebuilds_current_instance() {
         "Kotlin copy leaked into Java:\n{java}"
     );
     assert!(
-        java.contains("new Holder(name, this.count())"),
-        "implicit copy must preserve unchanged components:\n{java}"
+        java.contains("java.util.function.Function<Holder"),
+        "{java}"
+    );
+    assert!(
+        java.contains("new Holder(__notlinCopyArg")
+            && java.contains("__notlinCopyReceiver")
+            && java.contains(".count())"),
+        "implicit copy must capture its named value and read the unchanged record component:\n{java}"
     );
 }
 

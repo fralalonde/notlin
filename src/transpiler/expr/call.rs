@@ -6,7 +6,364 @@ use crate::transpiler::kt;
 use crate::transpiler::unit::{instance_property_count, primitive_array_factory};
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
+    fn function_return_type_node<'node>(
+        &self,
+        function: tree_sitter::Node<'node>,
+    ) -> Option<tree_sitter::Node<'node>> {
+        let mut after_parameters = false;
+        for child in function.children(&mut function.walk()) {
+            if child.kind() == "function_value_parameters" {
+                after_parameters = true;
+                continue;
+            }
+            if after_parameters
+                && matches!(
+                    child.kind(),
+                    "user_type" | "nullable_type" | "parenthesized_type"
+                )
+            {
+                return Some(child);
+            }
+        }
+        None
+    }
+
+    fn expected_map_factory_type_arguments(
+        &self,
+        call: tree_sitter::Node<'_>,
+    ) -> Option<(String, String)> {
+        let mut value = call;
+        let mut context = value.parent()?;
+        while context.kind() == "parenthesized_expression" {
+            value = context;
+            context = value.parent()?;
+        }
+
+        let type_node = match context.kind() {
+            "function_body" => {
+                let function = context
+                    .parent()
+                    .filter(|node| node.kind() == "function_declaration")?;
+                self.function_return_type_node(function)?
+            }
+            "return_expression" => {
+                let mut owner = context.parent()?;
+                while owner.kind() != "function_declaration" {
+                    if matches!(
+                        owner.kind(),
+                        "lambda_literal" | "function_literal" | "anonymous_function"
+                    ) {
+                        return None;
+                    }
+                    owner = owner.parent()?;
+                }
+                self.function_return_type_node(owner)?
+            }
+            "property_declaration" => {
+                let declaration = kt::child(context, "variable_declaration")?;
+                kt::child(declaration, "user_type")
+                    .or_else(|| kt::child(declaration, "nullable_type"))?
+            }
+            "class_parameter" => {
+                kt::child(context, "user_type").or_else(|| kt::child(context, "nullable_type"))?
+            }
+            _ => return None,
+        };
+
+        let (name, args) = self.map_type_name_and_arguments(type_node)?;
+        if !matches!(
+            name.as_str(),
+            "Map" | "MutableMap" | "kotlin.collections.Map" | "kotlin.collections.MutableMap"
+        ) || args.len() != 2
+        {
+            return None;
+        }
+        Some((args[0].clone(), args[1].clone()))
+    }
+
+    fn map_type_name_and_arguments(
+        &self,
+        type_node: tree_sitter::Node<'_>,
+    ) -> Option<(String, Vec<String>)> {
+        self.map_type_name_and_arguments_depth(type_node, 0)
+    }
+
+    fn map_type_name_and_arguments_depth(
+        &self,
+        type_node: tree_sitter::Node<'_>,
+        alias_depth: usize,
+    ) -> Option<(String, Vec<String>)> {
+        if alias_depth > 16 {
+            return None;
+        }
+        let source = self.unit.source;
+        if type_node.kind() == "nullable_type" {
+            return self.map_type_name_and_arguments_depth(
+                kt::child(type_node, "user_type")?,
+                alias_depth,
+            );
+        }
+        if type_node.kind() != "user_type" {
+            return None;
+        }
+        let raw = self.unit.text(type_node).trim();
+        let name = raw.split('<').next()?.trim();
+        let args_node = kt::child(type_node, "type_arguments");
+        if !matches!(
+            name,
+            "Map" | "MutableMap" | "kotlin.collections.Map" | "kotlin.collections.MutableMap"
+        ) {
+            if args_node.is_some() {
+                return None;
+            }
+            let tree = crate::transpiler::parse_tree(self.unit.source);
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "type_alias"
+                    && kt::field(node, "type").is_some_and(|alias| self.unit.text(alias) == name)
+                {
+                    if kt::child(node, "type_parameters").is_some() {
+                        return None;
+                    }
+                    return node
+                        .named_children(&mut node.walk())
+                        .find(|child| child.kind() == "user_type")
+                        .and_then(|target_node| {
+                            self.map_type_name_and_arguments_depth(target_node, alias_depth + 1)
+                        });
+                }
+                stack.extend(node.named_children(&mut node.walk()));
+            }
+            // The current source does not own the alias declaration, so its
+            // type-parameter shape is not available to this conservative proof.
+            return None;
+        }
+        let args_node = args_node?;
+        let mut args = Vec::new();
+        for projection in args_node.named_children(&mut args_node.walk()) {
+            if projection.kind() != "type_projection"
+                || self.unit.text(projection).trim().starts_with("in ")
+                || self.unit.text(projection).trim().starts_with("out ")
+                || self.unit.text(projection).trim() == "*"
+            {
+                return None;
+            }
+            let mut cursor = projection.walk();
+            let mut children = projection.named_children(&mut cursor);
+            let ty = children.next()?;
+            if children.next().is_some() {
+                return None;
+            }
+            let java = kt::java_type_ann(ty, source, self.unit.annots);
+            let java = java.trim_start_matches("@Nullable ").trim();
+            let boxed = crate::transpiler::types::boxed_name(java).unwrap_or(java);
+            if boxed.contains('?') || boxed.is_empty() {
+                return None;
+            }
+            args.push(boxed.to_string());
+        }
+        Some((name.to_string(), args))
+    }
+
+    fn proven_collection_factory(
+        &self,
+        call: tree_sitter::Node<'_>,
+        callee: Option<tree_sitter::Node<'_>>,
+        name: &str,
+    ) -> bool {
+        let (Some(callee), Some(provider)) = (callee, self.unit.semantic_provider) else {
+            return false;
+        };
+        crate::semantics::known_collection_factory_shape(
+            self.unit.source,
+            call,
+            callee,
+            name,
+            provider,
+        )
+    }
+
+    fn map_factory_has_direct_null_component(&self, call: tree_sitter::Node<'_>) -> bool {
+        let Some(arguments) = kt::child(call, "value_arguments") else {
+            return false;
+        };
+        arguments
+            .named_children(&mut arguments.walk())
+            .any(|argument| {
+                if argument.kind() != "value_argument" {
+                    return false;
+                }
+                let Some(expression) = argument.named_children(&mut argument.walk()).next() else {
+                    return false;
+                };
+                if expression.kind() != "infix_expression" {
+                    return false;
+                }
+                let children: Vec<_> = expression
+                    .children(&mut expression.walk())
+                    .filter(|child| child.is_named())
+                    .collect();
+                if children.len() != 3 || self.unit.text(children[1]).trim() != "to" {
+                    return false;
+                }
+                [children[0], children[2]].into_iter().any(|mut component| {
+                    while component.kind() == "parenthesized_expression" {
+                        let Some(inner) = component.named_children(&mut component.walk()).next()
+                        else {
+                            return false;
+                        };
+                        component = inner;
+                    }
+                    component.kind() == "identifier" && self.unit.text(component).trim() == "null"
+                })
+            })
+    }
+
     pub(crate) fn call(&mut self, node: tree_sitter::Node) -> String {
+        let mut result = self.call_body(node);
+        if let Some(fact) = self
+            .unit
+            .container_calls
+            .get(&(node.start_byte(), node.end_byte()))
+        {
+            assert_eq!(fact.location.snapshot_hash, self.unit.source_hash);
+            if let Some(expected) = &fact.expected_type
+                && let crate::semantics::KotlinType::Named { name, .. } = &expected.ty.ty
+                && let Some(wrapper) = fact.return_type.as_deref()
+                && matches!(
+                    (name.rsplit('.').next().unwrap_or(name), wrapper),
+                    ("Optional", "java.util.Optional") | ("Stream", "java.util.stream.Stream")
+                )
+            {
+                assert_eq!(expected.location.snapshot_hash, self.unit.source_hash);
+                let mut root = node;
+                while let Some(parent) = root.parent() {
+                    root = parent;
+                }
+                let ty_node = root
+                    .named_descendant_for_byte_range(
+                        expected.location.start_byte,
+                        expected.location.end_byte,
+                    )
+                    .expect("planned result type exists in its snapshot");
+                let target = kt::java_type(ty_node, self.unit.source);
+                result = format!("({target}) ({wrapper}<?>) ({result})");
+            }
+            if let Some(message) = &fact.result_check {
+                return format!(
+                    "java.util.Objects.requireNonNull({result}, {})",
+                    serde_json::to_string(message)
+                        .expect("null-check message is a Java string literal")
+                );
+            }
+        }
+        if let Some(fact) = self
+            .unit
+            .exact_overload_calls
+            .get(&(node.start_byte(), node.end_byte()))
+            && let Some(message) = &fact.result_check
+        {
+            assert_eq!(fact.location.snapshot_hash, self.unit.source_hash);
+            return format!(
+                "java.util.Objects.requireNonNull({result}, {})",
+                serde_json::to_string(message)
+                    .expect("planned null-check message is a Java string literal")
+            );
+        }
+        result
+    }
+
+    fn call_body(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(fact) = self
+            .unit
+            .reified_class_calls
+            .get(&(node.start_byte(), node.end_byte()))
+            .cloned()
+        {
+            assert_eq!(fact.location.snapshot_hash, self.unit.source_hash);
+            assert_eq!(fact.receiver.snapshot_hash, self.unit.source_hash);
+            let mut root = node;
+            while let Some(parent) = root.parent() {
+                root = parent;
+            }
+            let receiver = root
+                .named_descendant_for_byte_range(fact.receiver.start_byte, fact.receiver.end_byte)
+                .expect("planned reified receiver exists in its snapshot");
+            let receiver_java = self.transpile(receiver);
+            let mut type_parts = Vec::new();
+            if !fact.type_argument.package.is_empty() {
+                type_parts.push(fact.type_argument.package.clone());
+            }
+            type_parts.extend(fact.type_argument.owner_path.clone());
+            type_parts.push(fact.type_argument.name.clone());
+            // Kotlin inlines the wrapper's call against its declaring class.
+            // Anchor Java lookup there too, even if surrounding flow casts
+            // narrowed the rendered receiver to a subtype or interface.
+            let mut owner_parts = Vec::new();
+            if !fact.java_target.package.is_empty() {
+                owner_parts.push(fact.java_target.package.clone());
+            }
+            owner_parts.extend(fact.java_target.owner_path.clone());
+            return format!(
+                "(({}) {receiver_java}).{}({}.class)",
+                owner_parts.join("."),
+                fact.java_target.name,
+                type_parts.join(".")
+            );
+        }
+        if let Some(fact) = self
+            .unit
+            .reference_string_calls
+            .get(&(node.start_byte(), node.end_byte()))
+            .cloned()
+            && fact.kind == crate::semantics::ReferenceStringCallKind::ObjectToString
+            && let crate::semantics::ReferenceStringReceiver::Returned {
+                expression,
+                nullability,
+                ..
+            } = fact.receiver
+            && nullability == crate::semantics::ReferenceReturnNullability::Nullable
+        {
+            assert_eq!(fact.location.snapshot_hash, self.unit.source_hash);
+            assert_eq!(expression.snapshot_hash, self.unit.source_hash);
+            let receiver = node
+                .named_descendant_for_byte_range(expression.start_byte, expression.end_byte)
+                .expect("planned reference receiver exists in its snapshot");
+            assert_eq!(
+                (receiver.start_byte(), receiver.end_byte()),
+                (expression.start_byte, expression.end_byte)
+            );
+            // The Object overload preserves Kotlin Any?.toString, including
+            // null, without duplicating the producer's evaluation.
+            return format!(
+                "java.lang.String.valueOf((java.lang.Object) {})",
+                self.transpile(receiver)
+            );
+        }
+        if let Some(lowering) = self.unit.todo_lowerings.get(&node.start_byte()).cloned() {
+            assert_eq!(lowering.location.snapshot_hash, self.unit.source_hash);
+            assert_eq!(
+                (lowering.location.start_byte, lowering.location.end_byte),
+                (node.start_byte(), node.end_byte())
+            );
+            let message = if let Some(reason) = lowering.reason {
+                assert_eq!(reason.snapshot_hash, self.unit.source_hash);
+                let expression = node
+                    .named_descendant_for_byte_range(reason.start_byte, reason.end_byte)
+                    .expect("planned TODO reason exists in its snapshot");
+                assert_eq!(
+                    (expression.start_byte(), expression.end_byte()),
+                    (reason.start_byte, reason.end_byte)
+                );
+                format!(
+                    "\"An operation is not implemented: \" + {}",
+                    self.transpile(expression)
+                )
+            } else {
+                "\"An operation is not implemented.\"".into()
+            };
+            return format!("throw new kotlin.NotImplementedError({message})");
+        }
         let mut cursor = node.walk();
         let kids: Vec<_> = node.children(&mut cursor).collect();
 
@@ -37,6 +394,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         });
 
         let mut args: Vec<String> = Vec::new();
+        let mut copy_arg_values: Vec<String> = Vec::new();
+        let mut arg_names: Vec<Option<String>> = Vec::new();
         if let Some(an) = args_node {
             let mut inner = an.walk();
             for arg in an.children(&mut inner) {
@@ -49,11 +408,16 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     // `y = 9`: two named kids (identifier + value) and the
                     // raw text carries `=`. Emit `y = 9` so data-class copy
                     // reassembly can substitute by component name.
-                    if namedkids.len() == 2 && self.unit.text(arg).contains('=') {
-                        let name = self.unit.text(namedkids[0]).trim().to_string();
-                        args.push(format!("{} = {}", name, self.transpile(namedkids[1])));
+                    if namedkids.len() == 2
+                        && let Some(name) = named_argument_name(self.unit.text(arg))
+                    {
+                        arg_names.push(Some(name.clone()));
+                        let value = self.transpile(namedkids[1]);
+                        copy_arg_values.push(value.clone());
+                        args.push(format!("{name} = {value}"));
                         continue;
                     }
+                    arg_names.push(None);
                     let expr = namedkids
                         .first()
                         .map(|e| {
@@ -67,6 +431,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                             }
                         })
                         .unwrap_or_default();
+                    copy_arg_values.push(expr.clone());
                     args.push(expr);
                 } else if arg.kind() == "named_argument" {
                     // `y = 9` — keep as `y = 9` text so downstream maps
@@ -77,13 +442,33 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         // identifier, then value
                         let name = self.unit.text(pair[0]).trim().to_string();
                         let vexpr = pair[pair.len() - 1];
-                        args.push(format!("{} = {}", name, self.transpile(vexpr)));
+                        arg_names.push(Some(name.clone()));
+                        let value = self.transpile(vexpr);
+                        copy_arg_values.push(value.clone());
+                        args.push(format!("{name} = {value}"));
                     }
                 }
             }
         }
         if let Some(l) = lambda_arg {
-            args.push(self.transpile(l));
+            arg_names.push(None);
+            let value = self.transpile(l);
+            copy_arg_values.push(value.clone());
+            args.push(value);
+        }
+
+        if let Some(provider) = self.unit.semantic_provider
+            && let Some(classifier) = crate::semantics::established_platform_constructor(
+                self.unit.source,
+                self.unit
+                    .workspace_file
+                    .as_deref()
+                    .unwrap_or(self.unit.file),
+                node,
+                provider,
+            )
+        {
+            return format!("new {}({})", classifier, args.join(", "));
         }
 
         // Navigation callee with type context: array `.size`/`.length` and
@@ -429,11 +814,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         if callee_java == "print" {
             return format!("System.out.print({})", args.join(", "));
         }
-        // Kotlin stdlib `TODO(msg)` has type `Nothing` and always throws
-        // (NotImplementedError); Java has no such class. Lower to a THROW
-        // expression so statement emitters render it as `throw ...;`
-        // instead of `return new TODO(...);` (which references a class
-        // that does not exist).
+        // Unplanned TODO forms keep the approximation-only fallback. Proven
+        // stdlib calls above preserve kotlin.NotImplementedError and its message.
         if callee_java == "TODO" {
             self.unit.diags.warn_approx(
                 node,
@@ -448,110 +830,224 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             };
         }
 
-        // Implicit `copy(x = 1)` inside a data class targets `this`. Java
-        // records/classes have no Kotlin-generated copy member, so rebuild
-        // the current instance from its component accessors.
-        if callee_java == "copy"
-            && let Some(owner) = self.unit.current_decl.and_then(|decl| {
-                kt::field(decl, "name").map(|name| self.unit.text(name).trim().to_string())
-            })
-            && let Some(comps) = self.unit.data_components.get(&owner).cloned()
-        {
-            let mut replacements = std::collections::HashMap::<String, String>::new();
-            for arg in &args {
-                if let Some((name, value)) = arg.split_once(" = ") {
-                    replacements.insert(name.trim().to_string(), value.trim().to_string());
-                }
-            }
-            let values = comps
-                .iter()
-                .map(|(_, name)| {
-                    replacements.remove(name).unwrap_or_else(|| {
-                        if self.unit.lombok || !self.unit.record_types.contains(&owner) {
-                            let mut chars = name.chars();
-                            let cap = chars
-                                .next()
-                                .map(|first| {
-                                    first.to_uppercase().collect::<String>() + chars.as_str()
-                                })
-                                .unwrap_or_default();
-                            format!("this.get{}()", cap)
-                        } else {
-                            format!("this.{}()", name)
-                        }
-                    })
+        // A Kotlin data-class copy call is lowered only when its receiver's
+        // component schema is known. Capture the receiver once, then evaluate
+        // supplied arguments in source order before reading omitted components.
+        // This preserves Kotlin's receiver/argument evaluation order even when
+        // named arguments are reordered or leave gaps.
+        let copy_shadowed = has_explicit_copy_declaration(self.unit.current_decl, self.unit.source);
+        let is_copy_callee = callee_java == "copy"
+            || callee.is_some_and(|callee| {
+                callee.kind() == "navigation_expression"
+                    && self
+                        .unit
+                        .nav_base_member(callee)
+                        .is_some_and(|(_, member)| member == "copy")
+            });
+        let copy_receiver = if !copy_shadowed && is_copy_callee && callee_java == "copy" {
+            self.unit.current_decl.and_then(|decl| {
+                kt::field(decl, "name").map(|name| {
+                    let owner = self.unit.text(name).trim().to_string();
+                    let type_params = kt::child(decl, "type_parameters")
+                        .map(|params| {
+                            params
+                                .children(&mut params.walk())
+                                .filter(|param| param.kind() == "type_parameter")
+                                .filter_map(|param| kt::child(param, "identifier"))
+                                .map(|param| self.unit.text(param).trim().to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let receiver_type = if type_params.is_empty() {
+                        owner
+                    } else {
+                        format!("{}<{}>", owner, type_params.join(", "))
+                    };
+                    ("this".to_string(), receiver_type)
                 })
-                .collect::<Vec<_>>();
-            return format!("new {}({})", owner, values.join(", "));
-        }
-
-        // `Receiver.copy(x = 1, z = 2)` on a data-class/record receiver:
-        // Java records have no copy() — rebuild: `new Receiver(k, v, …)`
-        // with named args substituted in declared component order.
-        if let Some(cpos) = callee_java.rfind(".copy")
-            && callee_java.ends_with(".copy")
+            })
+        } else if !copy_shadowed
+            && is_copy_callee
+            && let Some(nav) = callee.filter(|callee| callee.kind() == "navigation_expression")
         {
-            let recv = callee_java[..cpos].to_string();
-            if let Some(ctor) = recv.strip_prefix("new ") {
-                let tname = ctor.split('(').next().unwrap_or("").trim().to_string();
-                if let Some(comps) = self.unit.data_components.get(&tname).cloned() {
-                    // ctor args, in order
-                    if let (Some(op), Some(cp)) = (ctor.find('('), ctor.rfind(')')) {
-                        let inner = &ctor[op + 1..cp];
-                        let mut cargs: Vec<String> = if inner.trim().is_empty() {
-                            Vec::new()
-                        } else {
-                            inner.split(',').map(|s| s.trim().to_string()).collect()
+            self.unit.nav_base_member(nav).and_then(|(base, member)| {
+                (member == "copy").then(|| {
+                    let receiver = self.transpile(base);
+                    let receiver_type = self.unit.infer_type(base);
+                    (receiver, receiver_type)
+                })
+            })
+        } else {
+            None
+        };
+        if let Some((receiver, receiver_type)) = copy_receiver {
+            let owner = receiver_type
+                .split('<')
+                .next()
+                .unwrap_or(&receiver_type)
+                .trim()
+                .to_string();
+            if let Some(comps) = self.unit.data_components.get(&owner).cloned() {
+                let parameters = comps
+                    .iter()
+                    .map(|(_, name)| name.clone())
+                    .collect::<Vec<_>>();
+                let supplied = copy_arg_values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| (arg_names.get(index).cloned().flatten(), arg.clone()))
+                    .collect::<Vec<_>>();
+                if crate::ctor_defaults::resolve_args(&parameters, &supplied).is_some() {
+                    let Some(substitutions) = copy_type_substitutions(
+                        self.unit.source,
+                        self.unit.current_decl,
+                        &owner,
+                        &receiver_type,
+                    ) else {
+                        self.unit.diag_untranslatable(
+                            node,
+                            "generic data-class `copy(...)` receiver type arguments are unknown",
+                        );
+                        return "null".to_string();
+                    };
+                    let mut suffix = node.start_byte().to_string();
+                    let mut collision = 0usize;
+                    while self
+                        .unit
+                        .source
+                        .contains(&format!("__notlinCopyReceiver{suffix}"))
+                        || self
+                            .unit
+                            .source
+                            .contains(&format!("__notlinCopyArg{suffix}_"))
+                    {
+                        collision += 1;
+                        suffix = format!("{}{collision}", node.start_byte());
+                    }
+                    let temp_receiver = format!("__notlinCopyReceiver{suffix}");
+                    let mut slots = vec![None; parameters.len()];
+                    let mut captured_args = Vec::new();
+                    let mut next_positional = 0usize;
+                    for (arg_index, (name, value)) in supplied.iter().enumerate() {
+                        let parameter_index = match name {
+                            Some(name) => parameters.iter().position(|p| p == name),
+                            None => {
+                                let index = next_positional;
+                                next_positional += 1;
+                                Some(index)
+                            }
                         };
-                        // Named args (`y = 9`) keep their `name = value`
-                        // text through `args`; parse it back here.
-                        let mut arg_pairs: Vec<(String, String)> = Vec::new();
-                        for arg in &args {
-                            if let Some(eq) = arg.find(" = ") {
-                                arg_pairs.push((
-                                    arg[..eq].trim().to_string(),
-                                    arg[eq + 3..].trim().to_string(),
-                                ));
-                            }
+                        if let Some(index) = parameter_index.filter(|index| *index < slots.len()) {
+                            let temp = format!("__notlinCopyArg{suffix}_{arg_index}");
+                            let arg_ty =
+                                substitute_type_parameters(comps[index].0.trim(), &substitutions);
+                            captured_args.push((
+                                temp.clone(),
+                                java_function_type_arg(&arg_ty),
+                                value.clone(),
+                            ));
+                            slots[index] = Some(temp);
                         }
-                        for (n, v) in &arg_pairs {
-                            if let Some(idx) =
-                                comps.iter().position(|(_ct, cn)| cn.trim() == n.trim())
-                            {
-                                while cargs.len() < comps.len() {
-                                    cargs.push(String::new());
-                                }
-                                cargs[idx] = v.clone();
-                            }
-                        }
-                        let _ = &mut cargs;
-                        let full: Vec<String> = comps
+                    }
+                    let has_unproven_omitted_accessor =
+                        comps
                             .iter()
                             .enumerate()
-                            .map(|(i, _)| cargs.get(i).cloned().unwrap_or_default())
-                            .collect();
-                        let full = if full.iter().any(|s| s.is_empty()) {
-                            // cannot fill every component positionally —
-                            // mark instead of emitting broken Java.
-                            self.unit.diags.warn_approx(
-                                node,
-                                self.unit.file,
-                                "data-class `copy` with gaps: component defaults unavailable, entity marked for manual review",
-                            );
-                            comps
-                                .iter()
-                                .enumerate()
-                                .map(|(i, _)| {
-                                    cargs.get(i).cloned().unwrap_or_else(|| "0".to_string())
-                                })
-                                .collect::<Vec<_>>()
-                        } else {
-                            full
-                        };
-                        return format!("new {}({})", tname, full.join(", "));
+                            .any(|(index, (component_type, name))| {
+                                if slots.get(index).is_some_and(Option::is_some) {
+                                    return false;
+                                }
+                                let record =
+                                    !self.unit.lombok && self.unit.record_types.contains(&owner);
+                                let lombok_boolean_is = self.unit.lombok
+                                    && component_type.trim() == "boolean"
+                                    && name.starts_with("is")
+                                    && name.chars().nth(2).is_some_and(|c| c.is_ascii_uppercase());
+                                let accessor = if record || lombok_boolean_is {
+                                    name.clone()
+                                } else {
+                                    format!("get{}", capitalize_copy_name(name))
+                                };
+                                has_direct_copy_accessor(
+                                    self.unit.current_decl,
+                                    self.unit.source,
+                                    &owner,
+                                    &accessor,
+                                )
+                                .unwrap_or(true)
+                            });
+                    if has_unproven_omitted_accessor {
+                        self.unit.diag_untranslatable(
+                            node,
+                            "data-class `copy(...)` cannot read omitted constructor fields through custom or unresolved accessors",
+                        );
+                        return "null".to_string();
                     }
+                    let values = comps
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (component_type, name))| {
+                            slots.get(index).and_then(Clone::clone).unwrap_or_else(|| {
+                                let record =
+                                    !self.unit.lombok && self.unit.record_types.contains(&owner);
+                                let lombok_boolean_is = self.unit.lombok
+                                    && component_type.trim() == "boolean"
+                                    && name.starts_with("is")
+                                    && name.chars().nth(2).is_some_and(|c| c.is_ascii_uppercase());
+                                let accessor = if record || lombok_boolean_is {
+                                    name.clone()
+                                } else {
+                                    format!("get{}", capitalize_copy_name(name))
+                                };
+                                format!("{temp_receiver}.{accessor}()")
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let typed_receiver = receiver_type.clone();
+                    let constructor_type = if typed_receiver.contains('<') {
+                        format!("{owner}<>")
+                    } else {
+                        owner.clone()
+                    };
+                    let construction = format!("new {}({})", constructor_type, values.join(", "));
+                    let mut result_type = typed_receiver.clone();
+                    let mut argument_lambda = None;
+                    for (arg_name, arg_type, _) in captured_args.iter().rev() {
+                        argument_lambda = Some(match argument_lambda {
+                            None => format!(
+                                "{arg_name} -> {{ java.util.Objects.requireNonNull({temp_receiver}); return {construction}; }}"
+                            ),
+                            Some(inner) => format!("{arg_name} -> {{ return {inner}; }}"),
+                        });
+                        result_type =
+                            format!("java.util.function.Function<{arg_type}, {result_type}>");
+                    }
+                    let lambda = match argument_lambda {
+                        Some(inner) => format!("{temp_receiver} -> {{ return {inner}; }}"),
+                        None => format!(
+                            "{temp_receiver} -> {{ java.util.Objects.requireNonNull({temp_receiver}); return {construction}; }}"
+                        ),
+                    };
+                    let function_type =
+                        format!("java.util.function.Function<{typed_receiver}, {result_type}>");
+                    let mut expression =
+                        format!("(({function_type}) ({lambda})).apply({receiver})");
+                    for (_, _, value) in &captured_args {
+                        expression.push_str(&format!(".apply({value})"));
+                    }
+                    return expression;
                 }
+                self.unit.diag_untranslatable(
+                    node,
+                    "data-class `copy(...)` arguments cannot be mapped to the known component schema",
+                );
+                return "null".to_string();
             }
+            self.unit.diag_untranslatable(
+                node,
+                "data-class `copy(...)` receiver type has no known component schema",
+            );
+            return "null".to_string();
         }
         // A qualified Kotlin `copy` whose data-class component schema is not
         // available in this Unit cannot be faithfully reconstructed. Never
@@ -778,7 +1274,18 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     b.to_string()
                 }
             };
-            let is_direct_java_stream = base.starts_with("java.util.Arrays.stream")
+            let planned_container = self
+                .unit
+                .container_calls
+                .get(&(node.start_byte(), node.end_byte()));
+            if let Some(fact) = planned_container {
+                assert_eq!(fact.location.snapshot_hash, self.unit.source_hash);
+            }
+            let is_direct_java_optional =
+                planned_container.is_some_and(|fact| fact.receiver_type == "java.util.Optional");
+            let is_direct_java_stream = planned_container
+                .is_some_and(|fact| fact.receiver_type == "java.util.stream.Stream")
+                || base.starts_with("java.util.Arrays.stream")
                 || base.ends_with(".stream()")
                 || (base.contains(".stream()")
                     && !base.contains(".collect(")
@@ -824,7 +1331,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 "sorted" => "sorted",
                 other => other,
             };
-            if !is_direct_java_stream {
+            if !is_direct_java_stream && !is_direct_java_optional {
                 self.unit.diags.warn_approx(
                     node,
                     self.unit.file,
@@ -871,7 +1378,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             if matches!(
                 member,
                 "map" | "mapNotNull" | "mapIndexed" | "filter" | "filterIndexed" | "flatMap"
-            ) && {
+            ) && (is_direct_java_optional || {
                 let recv_name = |s: &String| {
                     s.rsplit('.')
                         .next()
@@ -911,7 +1418,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         )
                     })
                     .is_some_and(|t| t.contains("Optional<"))
-            } {
+            }) {
                 return format!("{}.{}({})", base_str, stream_fn, mapped_lambda);
             }
             match member {
@@ -1005,6 +1512,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             } else {
                 mapped_lambda
             };
+            if is_direct_java_stream && matches!(member, "map" | "filter" | "flatMap") {
+                return format!("{base_str}.{stream_fn}({mapped_lambda})");
+            }
             // Kotlin collection operators are eager, so an isolated
             // `filter`/`map` is collected to a List. When another stream
             // operator immediately consumes that generated list, fuse the
@@ -1072,12 +1582,25 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         // mutableListOf<String>(...) etc. -> new ArrayList<>()
         match callee_java.as_str() {
             "mutableListOf" | "arrayListOf" | "listOf" => {
-                let elem_ty = self.type_arg_of(node);
-                let _ = elem_ty;
+                if !args.is_empty() && !self.proven_collection_factory(node, callee, &callee_java) {
+                    self.unit.diag_untranslatable(
+                        node,
+                        "collection factory argument shape cannot be lowered without changing Kotlin semantics",
+                    );
+                    return "null".to_string();
+                }
                 if args.is_empty() {
                     "new ArrayList<>()".to_string()
+                } else if args.len() == 1 {
+                    format!(
+                        "new ArrayList<>(java.util.Collections.singletonList({}))",
+                        args[0]
+                    )
                 } else {
-                    format!("new ArrayList<>(List.of({}))", args.join(", "))
+                    format!(
+                        "new ArrayList<>(java.util.Arrays.asList({}))",
+                        args.join(", ")
+                    )
                 }
             }
             "listOfNotNull" => {
@@ -1093,7 +1616,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     args.join(", ")
                 )
             }
-            "mutableMapOf" | "mapOf" | "hashMapOf" => {
+            "mutableMapOf" | "mapOf" | "linkedMapOf" | "hashMapOf" => {
                 let map_type = if callee_java == "hashMapOf" {
                     "HashMap"
                 } else {
@@ -1102,34 +1625,41 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 if args.is_empty() {
                     format!("new {map_type}<>()")
                 } else {
-                    // Pair lowering supplies Map.Entry values. Expose the
-                    // result through a mutable Java map under the collection
-                    // mapping policy; existing approximation checks still
-                    // govern populated Pair/spread forms.
-                    let entries: Vec<String> = args
-                        .iter()
-                        .map(|a| {
-                            a.trim_start_matches("Map.ofEntries(")
-                                .trim_end()
-                                .to_string()
+                    if !self.proven_collection_factory(node, callee, &callee_java)
+                        || args.iter().any(|arg| {
+                            !arg.starts_with("new java.util.AbstractMap.SimpleImmutableEntry<")
                         })
-                        .collect();
-                    if args.len() == 1 {
-                        format!("new {map_type}<>(java.util.Map.ofEntries({}))", entries[0])
-                    } else {
-                        self.unit.diags.warn_approx(
+                    {
+                        self.unit.diag_untranslatable(
                             node,
-                            self.unit.file,
-                            "mapOf with multiple entries: Map.ofEntries(e1, e2, ...)",
+                            "map factory requires proven stdlib Pair arguments using infix `to`",
                         );
-                        format!(
-                            "new {map_type}<>(java.util.Map.ofEntries({}))",
-                            entries.join(", ")
-                        )
+                        return "null".to_string();
                     }
+                    let expected_types = self.expected_map_factory_type_arguments(node);
+                    if self.map_factory_has_direct_null_component(node) && expected_types.is_none()
+                    {
+                        self.unit.diag_untranslatable(
+                            node,
+                            "map factory with a null Pair component needs a proven expected Map<K, V> type for Java generic inference",
+                        );
+                        return "null".to_string();
+                    }
+                    let (map, entry) = collection_temp_names(self.unit.source, node.start_byte());
+                    let stream = if let Some((key, value)) = expected_types {
+                        format!(
+                            "java.util.stream.Stream.<java.util.Map.Entry<{key}, {value}>>of({})",
+                            args.join(", ")
+                        )
+                    } else {
+                        format!("java.util.stream.Stream.of({})", args.join(", "))
+                    };
+                    format!(
+                        "{stream}.collect(java.util.{map_type}::new, ({map}, {entry}) -> {map}.put({entry}.getKey(), {entry}.getValue()), java.util.{map_type}::putAll)"
+                    )
                 }
             }
-            "mutableSetOf" | "setOf" | "hashSetOf" => {
+            "mutableSetOf" | "setOf" | "linkedSetOf" | "hashSetOf" => {
                 let set_type = if callee_java == "hashSetOf" {
                     "HashSet"
                 } else {
@@ -1137,8 +1667,22 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 };
                 if args.is_empty() {
                     format!("new {set_type}<>()")
+                } else if !self.proven_collection_factory(node, callee, &callee_java) {
+                    self.unit.diag_untranslatable(
+                        node,
+                        "collection factory argument shape cannot be lowered without changing Kotlin semantics",
+                    );
+                    "null".to_string()
+                } else if args.len() == 1 {
+                    format!(
+                        "new {set_type}<>(java.util.Collections.singletonList({}))",
+                        args[0]
+                    )
                 } else {
-                    format!("new {set_type}<>(Set.of({}))", args.join(", "))
+                    format!(
+                        "new {set_type}<>(java.util.Arrays.asList({}))",
+                        args.join(", ")
+                    )
                 }
             }
             "emptyList" => "new ArrayList<>()".to_string(),
@@ -1306,11 +1850,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         // Kotlin named arguments have no Java form
                         // (`new MethodCall(name = "x", params = p)` is not
                         // Java). Lower them to the callee's declared parameter
-                        // order. A parameter the caller omits is served by the
-                        // default itself when it is a literal that reads the same
-                        // in Java (`new Example(first, 10, last)`), and otherwise
-                        // by the delegating overload the emitter writes for that
-                        // exact omission pattern (N87CB).
+                        // order. Fill omitted defaults only when all are neutral
+                        // literals; otherwise use the planned overload for the
+                        // complete original omission pattern (N87CB).
                         let arity = |d: &crate::workspace::Declaration| {
                             if d.constructor_param_count > 0 {
                                 d.constructor_param_count
@@ -1372,9 +1914,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         }) {
                             // A positional call that stops early: Kotlin fills the
                             // missing trailing parameters from their defaults. The
-                            // ones that are literals go into the call; the rest are
-                            // dropped onto the delegating overload written for this
-                            // pattern.
+                            // complete omission pattern must survive when any
+                            // default needs the declaration's scope.
                             let mut slots: Vec<Option<String>> =
                                 ctor_args.iter().cloned().map(Some).collect();
                             slots.resize(arity(decl), None);
@@ -1451,49 +1992,142 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         match node.kind() {
             "identifier" => {
                 let callee = self.unit.text(node).to_string();
-                // A bare call to a file-local top-level function that REMAINED
-                // Kotlin (in coverage.untranslated) cannot resolve in the
-                // translated Java — taint the calling declaration instead of
-                // emitting an uncompilable reference.
-                if self.unit.is_untranslated_file_function(&callee) {
-                    self.unit
-                        .diag_untranslatable(node, format!("call to `{callee}` resolves to a top-level function that remains Kotlin"));
-                }
                 if let Some(provider) = self.unit.semantic_provider {
-                    let targets = provider
-                        .symbols_named(&callee)
-                        .into_iter()
-                        .filter(|symbol| {
-                            symbol.id.kind == "function"
-                                && symbol.id.name == callee
-                                && symbol.id.owner_path.is_empty()
+                    // Most calls are member or constructor calls and cannot
+                    // become a file facade. Avoid the full scoped resolver
+                    // unless the spelling has a top-level function candidate.
+                    let has_top_level_candidate =
+                        provider.symbols_named(&callee).iter().any(|symbol| {
+                            symbol.id.kind == "function" && symbol.id.owner_path.is_empty()
+                        }) || self
+                            .unit
+                            .import_alias_targets
+                            .get(&callee)
+                            .is_some_and(|name| {
+                                provider.symbols_named(name).iter().any(|symbol| {
+                                    symbol.id.kind == "function" && symbol.id.owner_path.is_empty()
+                                })
+                            });
+                    let call = has_top_level_candidate
+                        .then(|| {
+                            node.parent()
+                                .filter(|parent| parent.kind() == "call_expression")
                         })
-                        .collect::<Vec<_>>();
-                    if let [target] = targets.as_slice() {
-                        let retained = self.unit.retained_hint.is_some_and(|retained| {
-                            crate::transpiler::retention_queries::contains(retained, &target.id)
-                        });
-                        let selected = self.unit.workspace.is_none_or(|workspace| {
-                            workspace.is_selected(&target.id.file, self.unit.translation_roots)
-                        });
-                        if retained || !selected {
-                            self.unit.diag_untranslatable(node, format!("top-level function `{callee}` remains Kotlin; its callable facade is not accepted for Java ownership"));
-                        } else {
-                            let original = self
-                                .unit
-                                .workspace
-                                .and_then(|workspace| workspace.source_file(&target.id.file))
-                                .map(|file| file.source_text())
-                                .unwrap_or(self.unit.source);
-                            let facade =
-                                crate::function_callsite::facade_name(original, &target.id.file);
-                            let package = if target.id.package.is_empty() {
-                                String::new()
-                            } else {
-                                format!("{}.", target.id.package)
-                            };
-                            return format!("{package}{facade}.{callee}");
+                        .flatten();
+                    let resolution = call.map(|call| {
+                        let file = self
+                            .unit
+                            .workspace_file
+                            .as_deref()
+                            .unwrap_or(self.unit.file);
+                        crate::semantics::resolve_required_call(
+                            self.unit.source,
+                            file,
+                            call,
+                            node,
+                            &callee,
+                            provider,
+                        )
+                    });
+                    if let Some(crate::semantics::FactStatus::Established(target_id)) =
+                        resolution.as_ref()
+                    {
+                        if target_id.kind == "function"
+                            && target_id.owner_path.is_empty()
+                            && target_id.receiver.is_none()
+                        {
+                            if let Some(target) = provider
+                                .symbols_named(&target_id.name)
+                                .into_iter()
+                                .find(|symbol| symbol.id == *target_id)
+                            {
+                                let retained = self.unit.retained_hint.is_some_and(|retained| {
+                                    crate::transpiler::retention_queries::contains(
+                                        retained, &target.id,
+                                    )
+                                }) || ((target.id.file == self.unit.file
+                                    || self.unit.workspace_file.as_deref()
+                                        == Some(target.id.file.as_path()))
+                                    && self.unit.is_untranslated_file_function(&target.id.name));
+                                let selected = self.unit.workspace.is_none_or(|workspace| {
+                                    workspace
+                                        .is_selected(&target.id.file, self.unit.translation_roots)
+                                });
+                                if retained || !selected {
+                                    self.unit.diag_untranslatable(
+                                        node,
+                                        format!(
+                                            "top-level function `{}` remains Kotlin; its callable facade is not accepted for Java ownership",
+                                            target.id.name
+                                        ),
+                                    );
+                                } else {
+                                    let original = self
+                                        .unit
+                                        .workspace
+                                        .and_then(|workspace| {
+                                            workspace.source_file(&target.id.file)
+                                        })
+                                        .map(|file| file.source_text())
+                                        .unwrap_or(self.unit.source);
+                                    let facade = crate::function_callsite::facade_name(
+                                        original,
+                                        &target.id.file,
+                                    );
+                                    let package = if target.id.package.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("{}.", target.id.package)
+                                    };
+                                    return format!("{package}{facade}.{}", target.id.name);
+                                }
+                            }
+                        } else if target_id.kind == "function"
+                            && target_id.owner_path.is_empty()
+                            && target_id.receiver.is_some()
+                        {
+                            self.unit.diag_untranslatable(
+                                node,
+                                format!(
+                                    "extension function `{callee}` requires receiver-aware call lowering"
+                                ),
+                            );
+                        } else if let Some(call) = call {
+                            let argument_count = kt::child(call, "value_arguments")
+                                .map(|arguments| {
+                                    arguments
+                                        .named_children(&mut arguments.walk())
+                                        .filter(|argument| argument.kind() == "value_argument")
+                                        .count()
+                                })
+                                .unwrap_or(0)
+                                + call
+                                    .named_children(&mut call.walk())
+                                    .filter(|argument| {
+                                        matches!(
+                                            argument.kind(),
+                                            "annotated_lambda" | "lambda_literal"
+                                        )
+                                    })
+                                    .count();
+                            if target_id.parameters.len() != argument_count {
+                                self.unit.diag_untranslatable(
+                                    node,
+                                    format!(
+                                        "call to `{callee}` matches an enclosing member name but its arity is unresolved"
+                                    ),
+                                );
+                            }
                         }
+                    } else if self.unit.is_untranslated_file_function(&callee) {
+                        // A bare call to a file-local top-level function that
+                        // remained Kotlin cannot resolve in translated Java.
+                        self.unit.diag_untranslatable(
+                            node,
+                            format!(
+                                "call to `{callee}` resolves to a top-level function that remains Kotlin"
+                            ),
+                        );
                     }
                 }
                 callee
@@ -1594,6 +2228,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         // top-level rewrites intact; raw text pass-through loses them.
         let mut cursor = node.walk();
         let kids: Vec<_> = node.children(&mut cursor).collect();
+        let prior_smart_casts = self.unit.flow_smart_casts.clone();
         // params
         let mut params_java = String::new();
         // lambda params registered as locals for the body; popped after
@@ -1616,6 +2251,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     // through to workspace property resolution and gets
                     // rewritten to a spurious `this.getX()`.
                     for n in &names {
+                        self.unit.flow_smart_casts.remove(n);
                         if !self.unit.var_types.contains_key(n) {
                             self.unit
                                 .var_types
@@ -1636,6 +2272,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 _ => {}
             }
         }
+        if params_java.is_empty() {
+            self.unit.flow_smart_casts.remove("it");
+        }
         // body statements -> `\n`-joined expressions (Kotlin lambda bodies
         // here are single expressions in practice)
         let mut body_java = String::new();
@@ -1648,6 +2287,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         for n in &inserted {
             self.unit.var_types.remove(n);
         }
+        self.unit.flow_smart_casts = prior_smart_casts;
         if body_java.is_empty() {
             body_java = "{}".to_string();
             self.unit.diags.warn_approx(
@@ -1791,6 +2431,210 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 .find(|child| child.is_named())
                 .is_some_and(|argument| self.is_known_string_expression(argument))
     }
+}
+
+fn collection_temp_names(source: &str, start: usize) -> (String, String) {
+    let mut suffix = start;
+    loop {
+        let map = format!("__notlinMap{suffix}");
+        let entry = format!("__notlinEntry{suffix}");
+        if !source.contains(&map) && !source.contains(&entry) {
+            return (map, entry);
+        }
+        suffix += 1;
+    }
+}
+
+fn named_argument_name(text: &str) -> Option<String> {
+    let (prefix, suffix) = text.split_once('=')?;
+    if suffix.trim_start().starts_with('=') || prefix.trim_end().ends_with(['=', '!', '<', '>']) {
+        return None;
+    }
+    let name = prefix.trim();
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    (first == '_' || first.is_ascii_alphabetic()).then_some(())?;
+    chars
+        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        .then(|| name.to_string())
+}
+
+fn has_explicit_copy_declaration(
+    current_decl: Option<tree_sitter::Node<'_>>,
+    source: &str,
+) -> bool {
+    let mut current = current_decl;
+    while let Some(node) = current {
+        if matches!(node.kind(), "function_declaration" | "class_declaration") {
+            let mut stack = node.children(&mut node.walk()).collect::<Vec<_>>();
+            while let Some(child) = stack.pop() {
+                if child.kind() == "function_declaration"
+                    && kt::field(child, "name")
+                        .is_some_and(|name| name.utf8_text(source.as_bytes()).ok() == Some("copy"))
+                {
+                    return true;
+                }
+                stack.extend(child.children(&mut child.walk()));
+            }
+        }
+        current = node.parent();
+    }
+    false
+}
+
+fn has_direct_copy_accessor(
+    current_decl: Option<tree_sitter::Node<'_>>,
+    source: &str,
+    owner: &str,
+    accessor: &str,
+) -> Option<bool> {
+    let mut current = current_decl;
+    while let Some(node) = current {
+        if node.kind() == "class_declaration"
+            && kt::field(node, "name")
+                .is_some_and(|name| name.utf8_text(source.as_bytes()).ok() == Some(owner))
+        {
+            let Some(body) = kt::child(node, "class_body") else {
+                return Some(false);
+            };
+            return Some(
+                body.named_children(&mut body.walk())
+                    .filter(|member| member.kind() == "function_declaration")
+                    .any(|function| {
+                        kt::field(function, "name").is_some_and(|name| {
+                            name.utf8_text(source.as_bytes()).ok() == Some(accessor)
+                        }) && kt::child(function, "function_value_parameters").is_some_and(
+                            |params| {
+                                !params
+                                    .named_children(&mut params.walk())
+                                    .any(|parameter| parameter.kind() == "parameter")
+                            },
+                        )
+                    }),
+            );
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn copy_type_substitutions<'tree>(
+    source: &str,
+    current_decl: Option<tree_sitter::Node<'tree>>,
+    owner: &str,
+    receiver_type: &str,
+) -> Option<std::collections::HashMap<String, String>> {
+    let mut root = current_decl?;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut stack = vec![root];
+    let mut type_params = None;
+    while let Some(node) = stack.pop() {
+        if node.kind() == "class_declaration"
+            && kt::field(node, "name")
+                .is_some_and(|name| name.utf8_text(source.as_bytes()).ok() == Some(owner))
+        {
+            let params = kt::child(node, "type_parameters")
+                .map(|list| {
+                    list.children(&mut list.walk())
+                        .filter(|param| param.kind() == "type_parameter")
+                        .filter_map(|param| kt::child(param, "identifier"))
+                        .filter_map(|name| name.utf8_text(source.as_bytes()).ok())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            type_params = Some(params);
+            break;
+        }
+        stack.extend(node.children(&mut node.walk()));
+    }
+    let type_params = type_params?;
+    if type_params.is_empty() {
+        return Some(std::collections::HashMap::new());
+    }
+    let actual = type_arguments(receiver_type)?;
+    if actual.len() != type_params.len() {
+        return None;
+    }
+    Some(type_params.into_iter().zip(actual).collect())
+}
+
+fn type_arguments(ty: &str) -> Option<Vec<String>> {
+    let open = ty.find('<')?;
+    let mut depth = 0usize;
+    let mut start = open + 1;
+    let mut args = Vec::new();
+    for (offset, ch) in ty.char_indices().skip_while(|(offset, _)| *offset <= open) {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                if depth == 0 {
+                    args.push(ty[start..offset].trim().to_string());
+                    return Some(args);
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 => {
+                args.push(ty[start..offset].trim().to_string());
+                start = offset + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn substitute_type_parameters(
+    java_type: &str,
+    substitutions: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut output = String::new();
+    let chars = java_type.char_indices().collect::<Vec<_>>();
+    let mut cursor = 0usize;
+    for (index, (start, ch)) in chars.iter().enumerate() {
+        if !(*ch == '_' || ch.is_ascii_alphabetic()) || *start < cursor {
+            continue;
+        }
+        let end_index = chars[index..]
+            .iter()
+            .take_while(|(_, c)| *c == '_' || c.is_ascii_alphanumeric())
+            .count();
+        let end = chars
+            .get(index + end_index)
+            .map_or(java_type.len(), |(at, _)| *at);
+        let token = &java_type[*start..end];
+        if let Some(replacement) = substitutions.get(token) {
+            output.push_str(&java_type[cursor..*start]);
+            output.push_str(replacement);
+            cursor = end;
+        }
+    }
+    output.push_str(&java_type[cursor..]);
+    output
+}
+
+fn java_function_type_arg(ty: &str) -> String {
+    match ty {
+        "boolean" => "Boolean".into(),
+        "byte" => "Byte".into(),
+        "short" => "Short".into(),
+        "int" => "Integer".into(),
+        "long" => "Long".into(),
+        "char" => "Character".into(),
+        "float" => "Float".into(),
+        "double" => "Double".into(),
+        _ => ty.to_string(),
+    }
+}
+
+fn capitalize_copy_name(name: &str) -> String {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
 }
 
 fn negate_predicate_lambda(mapped: &str) -> String {

@@ -37,6 +37,22 @@ pub struct Unit<'src, 'tree> {
     )>,
     pub output_owners: std::collections::HashMap<String, Vec<crate::semantics::SymbolId>>,
     pub semantic_provider: Option<&'src dyn crate::semantics::SemanticProvider>,
+    pub(crate) enum_when_lowerings:
+        std::collections::HashMap<usize, crate::semantics::EnumWhenLowering>,
+    pub(crate) todo_lowerings: std::collections::HashMap<usize, crate::semantics::TodoLowering>,
+    pub(crate) reference_string_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::ReferenceStringCall>,
+    pub(crate) container_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::ContainerMemberCall>,
+    pub(crate) exact_overload_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::ExactOverloadCall>,
+    pub(crate) reified_class_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::ReifiedClassCall>,
+    pub(crate) constructor_delegations: std::collections::HashMap<
+        (usize, usize),
+        crate::translation_plan::PlannedConstructorDelegation,
+    >,
+    pub(crate) default_getter_bridges: Vec<crate::translation_plan::PlannedDefaultGetterBridge>,
     declaration_diagnostic_start: usize,
     /// Per-file coverage: which declarations translated, which didn't.
     pub coverage: FileCoverage,
@@ -157,6 +173,8 @@ pub struct Unit<'src, 'tree> {
     /// Visible Kotlin typealiases, resolved once per source file instead of
     /// once for every Java type emitted from that source.
     pub(crate) visible_typealiases: Vec<(String, String)>,
+    /// Imported alias -> original spelling, collected once from import nodes.
+    pub(crate) import_alias_targets: std::collections::HashMap<String, String>,
     pub(crate) translation_roots: &'src [PathBuf],
     /// Retention-fixpoint retained set from the caller (probe passes): names
     /// known to be retained in Kotlin for intrinsic reasons. When Some, the
@@ -333,6 +351,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             type_facts: Vec::new(),
             output_owners: std::collections::HashMap::new(),
             semantic_provider: None,
+            enum_when_lowerings: std::collections::HashMap::new(),
+            todo_lowerings: std::collections::HashMap::new(),
+            reference_string_calls: std::collections::HashMap::new(),
+            container_calls: std::collections::HashMap::new(),
+            exact_overload_calls: std::collections::HashMap::new(),
+            reified_class_calls: std::collections::HashMap::new(),
+            constructor_delegations: std::collections::HashMap::new(),
+            default_getter_bridges: Vec::new(),
             tainted_declarations: std::collections::HashSet::new(),
             current_decl: None,
             decl_labels: std::collections::HashMap::new(),
@@ -367,6 +393,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             workspace: None,
             workspace_file: None,
             visible_typealiases: Vec::new(),
+            import_alias_targets: std::collections::HashMap::new(),
             translation_roots: &[],
             retained_hint: None,
             hoisted_annotations: std::collections::HashMap::new(),
@@ -450,6 +477,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         None
     }
 
+    fn annotated_annotation_class_parsed_as_expression(
+        &self,
+        node: tree_sitter::Node,
+    ) -> Option<String> {
+        crate::semantics::recovered_annotation_class_name(node, self.source)
+    }
+
     /// Kotlin's parser can represent a stacked class annotation block as a
     /// chain of `annotated_expression` wrappers instead of putting the
     /// annotations in the declaration's `modifiers`. Preserve every wrapper
@@ -511,11 +545,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         self.referenced_by_surviving_kotlin(name)
     }
 
-    /// A Kotlin reference that survives the run: with a fixpoint hint only
-    /// references from declarations that THEMSELVES stay Kotlin keep the
-    /// referenced declaration in Kotlin — a file that translates away lowers
-    /// its own references in the same run. Without a hint (single-file mode)
-    /// nothing says what will translate later, so any Kotlin reference counts.
+    /// Only surviving Kotlin callers constrain the unchanged function and
+    /// companion-call ABI. Property field references are planned separately.
     fn referenced_by_surviving_kotlin(&self, name: &str) -> bool {
         let Some(workspace) = self.workspace else {
             return false;
@@ -853,6 +884,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .unwrap_or(raw)
             .trim_end_matches(';')
             .trim();
+        let imported_path = path
+            .split_once(" as ")
+            .map_or(path, |(path, _)| path.trim());
+        // Kotlin imports can name top-level properties and functions. Their
+        // callers use a qualified facade after translation, while a use that
+        // still needs its Kotlin owner keeps this unit out of Java emission.
+        // Omit the import instead of rendering `import pkg.value` as an invalid
+        // Java type import (or an accidental static member import).
+        if self.is_indexed_top_level_property_or_function_import(imported_path) {
+            return String::new();
+        }
         // kotlin.reflect / kotlin.jvm.* machinery has no Java counterpart:
         // importing it produces "cannot find symbol" noise. Drop them; the
         // using sites are warned separately as approximations.
@@ -900,6 +942,40 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
     }
 
+    fn is_indexed_top_level_property_or_function_import(&self, path: &str) -> bool {
+        let Some((package, name)) = path.rsplit_once('.') else {
+            return false;
+        };
+        let Some(provider) = self.semantic_provider else {
+            return false;
+        };
+        let symbols = provider.symbols_named(name);
+        // A Kotlin factory and a classifier may share the imported spelling.
+        // Keep the Java type import when it also names an actual classifier.
+        if symbols.iter().any(|symbol| {
+            symbol.id.owner_path.is_empty()
+                && symbol.id.package == package
+                && matches!(
+                    symbol.id.kind.as_str(),
+                    "class" | "interface" | "object" | "enum" | "annotation"
+                )
+        }) {
+            return false;
+        }
+        symbols.into_iter().any(|symbol| {
+            matches!(symbol.id.kind.as_str(), "property" | "function")
+                && symbol.id.owner_path.is_empty()
+                && symbol.id.package == package
+                && symbol.id.file != self.file
+                && (symbol.id.kind != "function"
+                    || symbol
+                        .id
+                        .file
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("kt")))
+        })
+    }
+
     /// An import path's last segment refers to an enum constant when the
     /// parent type is a known enum in the workspace index and the last
     /// segment starts uppercase but isn't itself a known type.
@@ -936,6 +1012,72 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         plan: &crate::translation_plan::TranslationPlan,
     ) -> Vec<(String, String)> {
         // Collect top-level structure
+        assert_eq!(
+            plan.source_hash, self.source_hash,
+            "Java preparation requires the planned snapshot"
+        );
+        self.enum_when_lowerings = plan
+            .enum_when_lowerings
+            .iter()
+            .map(|lowering| (lowering.location.start_byte, lowering.clone()))
+            .collect();
+        self.default_getter_bridges = plan.default_getter_bridges.clone();
+        self.todo_lowerings = plan
+            .todo_lowerings
+            .iter()
+            .map(|lowering| (lowering.location.start_byte, lowering.clone()))
+            .collect();
+        self.reference_string_calls = plan
+            .reference_string_calls
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.container_calls = plan
+            .container_calls
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.exact_overload_calls = plan
+            .exact_overload_calls
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.reified_class_calls = plan
+            .reified_class_calls
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.constructor_delegations = plan
+            .constructor_delegations
+            .iter()
+            .map(|fact| {
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
+            .collect();
+        self.import_alias_targets.clear();
         let mut package = String::new();
         let mut imports: Vec<String> = Vec::new();
         let mut decls: Vec<tree_sitter::Node> = Vec::new();
@@ -959,6 +1101,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     }
                 }
                 "import" => {
+                    let alias = self
+                        .text(child)
+                        .trim()
+                        .strip_prefix("import ")
+                        .and_then(|import| import.split_once(" as "))
+                        .and_then(|(path, alias)| {
+                            Some((
+                                alias.trim().to_owned(),
+                                path.trim().rsplit('.').next()?.to_owned(),
+                            ))
+                        });
+                    if let Some((alias, target)) = alias {
+                        self.import_alias_targets.insert(alias, target);
+                    }
                     let imp = self.kotlin_import_to_java(child);
                     if !imp.is_empty() {
                         imports.push(imp);
@@ -970,9 +1126,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     // declaration-dispatch pass below. That pass runs after
                     // class-body facts and plans have been prepared.
                     if child.kind() == "annotated_expression"
-                        && self
+                        && (self
                             .annotated_interface_parsed_as_expression(child)
                             .is_some()
+                            || self
+                                .annotated_annotation_class_parsed_as_expression(child)
+                                .is_some())
                     {
                         decls.push(child);
                         wrapper_spans_for_next.clear();
@@ -1078,6 +1237,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     let original_decl = *decl;
                     let recovery_name = if original_decl.kind() == "annotated_expression" {
                         self.annotated_interface_parsed_as_expression(original_decl)
+                            .or_else(|| {
+                                self.annotated_annotation_class_parsed_as_expression(original_decl)
+                            })
                     } else {
                         None
                     };
@@ -1101,7 +1263,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         self.diag_untranslatable_coded(
                             original_decl,
                             format!(
-                                "annotated top-level expression contains an unparsed declaration; retained in Kotlin; affected declaration: interface {name}"
+                                "annotated top-level expression contains an unparsed declaration; retained in Kotlin; affected declaration: {name}"
                             ),
                             Some("N47BC".to_string()),
                         );
@@ -1285,13 +1447,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     member.indent = out.indent;
                     if unit.apply_preflight_retention(**decl, plan) {
                         // The plan already owns this declaration in Kotlin.
-                    } else if decl.kind() == "property_declaration"
-                        && unit.workspace_requires_top_level_retention(&label)
-                    {
-                        unit.diag_untranslatable(
-                            **decl,
-                            "top-level declaration is referenced by retained Kotlin source",
-                        );
                     } else {
                         match decl.kind() {
                             "function_declaration" => {
