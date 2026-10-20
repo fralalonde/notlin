@@ -3,7 +3,7 @@ use super::*;
 
 pub(crate) fn established_platform_constructor<P: SemanticProvider + ?Sized>(
     source: &str,
-    _file: &Path,
+    file: &Path,
     call: tree_sitter::Node<'_>,
     provider: &P,
 ) -> Option<&'static str> {
@@ -63,57 +63,15 @@ pub(crate) fn established_platform_constructor<P: SemanticProvider + ?Sized>(
             }
         }
     }
-    match (canonical, call_argument_count(call)) {
-        ("java.lang.StringBuilder", 0) => Some(canonical),
-        ("java.lang.IllegalArgumentException" | "java.lang.IllegalStateException", 0) => {
-            Some(canonical)
-        }
-        ("java.lang.IllegalArgumentException" | "java.lang.IllegalStateException", 1) => {
-            (argument_kind(source, call, single_positional_argument(call)?, provider)
-                == Some("String"))
-            .then_some(canonical)
-        }
-        ("java.math.BigDecimal", 1) => {
-            let argument = single_positional_argument(call)?;
-            matches!(
-                argument_kind(source, call, argument, provider),
-                Some("Int" | "Long" | "Double" | "String")
-            )
-            .then_some(canonical)
-        }
-        _ => None,
-    }
-}
-
-pub(super) fn established_builder_call<P: SemanticProvider + ?Sized>(
-    source: &str,
-    file: &Path,
-    call: tree_sitter::Node<'_>,
-    provider: &P,
-) -> Option<&'static str> {
-    let callee = call_callee_node(call)?;
-    let name = callee.utf8_text(source.as_bytes()).ok()?;
-    if !matches!(name, "append" | "toString")
-        || explicit_receiver_is_type_qualifier(source, call, callee, file, provider)
-    {
-        return None;
-    }
-    let receiver = explicit_receiver_type(source, call, callee, file, provider)?;
-    if standard_external_type(source, provider, &receiver, false).as_deref()
-        != Some("java.lang.StringBuilder")
-    {
-        return None;
-    }
-    match (name, call_argument_count(call)) {
-        ("toString", 0) => Some("java.lang.String"),
-        ("append", 1)
-            if argument_kind(source, call, single_positional_argument(call)?, provider)
-                .is_some() =>
-        {
-            Some("java.lang.StringBuilder")
-        }
-        _ => None,
-    }
+    platform_members::applicable(
+        source,
+        file,
+        call,
+        canonical,
+        "<init>",
+        platform_members::Dispatch::Constructor,
+        provider,
+    )
 }
 
 /// An immutable local keeps a proven initializer classifier within its block.
@@ -204,93 +162,4 @@ pub(super) fn established_local_platform_classifier<P: SemanticProvider + ?Sized
         return Some(classifier);
     }
     None
-}
-
-fn argument_kind<P: SemanticProvider + ?Sized>(
-    source: &str,
-    call: tree_sitter::Node<'_>,
-    expression: tree_sitter::Node<'_>,
-    provider: &P,
-) -> Option<&'static str> {
-    match expression.kind() {
-        "parenthesized_expression" | "prefix_expression" | "unary_expression" => {
-            let mut cursor = expression.walk();
-            let children = expression.named_children(&mut cursor).collect::<Vec<_>>();
-            let [inner] = children.as_slice() else {
-                return None;
-            };
-            if expression.kind() != "parenthesized_expression" {
-                let text = expression.utf8_text(source.as_bytes()).ok()?.trim();
-                if !text.starts_with(['-', '+']) {
-                    return None;
-                }
-            }
-            let kind = argument_kind(source, call, *inner, provider)?;
-            (expression.kind() == "parenthesized_expression" || kind != "String").then_some(kind)
-        }
-        "string_literal" => Some("String"),
-        "number_literal" | "float_literal" | "real_literal" | "long_literal" => {
-            let text = expression
-                .utf8_text(source.as_bytes())
-                .ok()?
-                .replace('_', "");
-            if let Some(value) = text.strip_suffix('L') {
-                value.parse::<i64>().ok().map(|_| "Long")
-            } else if text.contains(['.', 'e', 'E']) && !text.ends_with(['f', 'F']) {
-                text.parse::<f64>().ok().map(|_| "Double")
-            } else {
-                text.parse::<i32>().ok().map(|_| "Int")
-            }
-        }
-        "identifier" | "simple_identifier" => {
-            let name = expression.utf8_text(source.as_bytes()).ok()?.trim();
-            let ty = lexical_parameter_type(source, call, name)?;
-            if ty.nullable {
-                return None;
-            }
-            match ty.ty {
-                KotlinType::Primitive(ref name)
-                    if matches!(name.as_str(), "Int" | "Long" | "Double") =>
-                {
-                    // Primitive spellings in source type positions may also be
-                    // imported classifiers or aliases. Literal types above do
-                    // not depend on those spellings.
-                    if !provider.symbols_named(name).is_empty()
-                        || provider.has_type_alias_in_package(&package_name(source), name)
-                        || kotlin_import_lines(source).any(|import| {
-                            let (path, alias) = import
-                                .split_once(" as ")
-                                .map_or((import, None), |(path, alias)| {
-                                    (path.trim(), Some(alias.trim()))
-                                });
-                            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == name
-                                && path != format!("kotlin.{name}")
-                                || path.ends_with(".*")
-                                    && !is_known_jdk_wildcard(path)
-                                    && path != "kotlin.*"
-                        })
-                    {
-                        return None;
-                    }
-                    match name.as_str() {
-                        "Int" => Some("Int"),
-                        "Long" => Some("Long"),
-                        "Double" => Some("Double"),
-                        _ => None,
-                    }
-                }
-                KotlinType::Named {
-                    ref name,
-                    ref arguments,
-                } if arguments.is_empty()
-                    && standard_external_type(source, provider, name, false).as_deref()
-                        == Some("java.lang.String") =>
-                {
-                    Some("String")
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
 }

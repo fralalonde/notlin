@@ -104,6 +104,25 @@ The proof preserves nullability and lexical type parameters. Positive and
 negative inferred returns are memoized within their source snapshot; cache hits
 replay their dependencies into any enclosing bridge query.
 
+## External JVM signatures
+
+Ordinary external JVM constructors and methods share a signature applicability
+model (`semantics/platform_members.rs`). The bounded library declarations record
+canonical owner, constructor/static/instance dispatch, supported parameter types
+and result classifier. One resolver checks positional arguments, receiver
+evidence and unique applicability. Required-call analysis and chained result
+inference consume the same facts. Decimal arithmetic, builder calls, unchecked
+exception constructors and zero-argument JDK factories no longer have separate
+applicability algorithms. Static members require a proven type qualifier;
+an instance of the declaring type cannot stand in for one.
+
+These declarations are a limited substitute for classpath signatures. They do
+not establish non-null platform returns or authorize arbitrary overloads.
+Checked exceptions, generic substitution and nullable argument conversions need
+additional shared facts before extending this subset. Kotlin operations with
+different evaluation or dispatch semantics still need a lowering justified by
+those semantics, as below.
+
 ## Exact eager collection operations
 
 Proven Kotlin `Iterable.map` and `filterNot` calls carry snapshot locations,

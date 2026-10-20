@@ -75,6 +75,27 @@ Things that have bitten us. Check here before guessing AST shape:
 
 ## Translation semantics
 
+Prefer translation from language and JVM contracts over rules for individual
+methods or annotations. Before adding a special case, identify the missing fact
+(binding, type, dispatch, nullability, evaluation order, annotation target, or
+generated ABI) and extend the shared semantic model. Lowerers consume that fact;
+they must not independently recognize the same spelling and guess its meaning.
+Unknown required facts continue to retain Kotlin.
+
+Ordinary external calls use the shared signature applicability model in
+`src/semantics/platform_members.rs`: canonical declaring type, dispatch,
+parameter types and result classifier. Its bounded library declarations supply
+classpath facts, not per-method translation algorithms. Constructor binding,
+argument parsing, receiver evidence and chained results are shared. Expand this
+declaration model when more library evidence is available; do not add another
+`established_<method>_call` path. A signature alone does not prove nullability,
+checked exceptions, Kotlin extension binding or evaluation semantics.
+
+Annotation support should likewise describe resolved identity, use-site target
+and its effect on the JVM contract. A new annotation name is not itself a new
+translation rule. Library behavior that observes Kotlin metadata requires an
+explicit capability proof; recognizing an annotation is insufficient.
+
 - Kotlin `==` is structural equality: emitted as `Objects.equals(a, b)` when an
   operand is a known non-primitive (via `var_types` tracking); `!=` likewise.
   Primitives keep `==`.

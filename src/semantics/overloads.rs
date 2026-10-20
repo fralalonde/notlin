@@ -527,7 +527,7 @@ fn candidate_parameter_types<P: SemanticProvider + ?Sized>(
     Some(result)
 }
 
-fn positional_arguments(call: Node<'_>) -> Option<Vec<Node<'_>>> {
+pub(super) fn positional_arguments(call: Node<'_>) -> Option<Vec<Node<'_>>> {
     if super::direct_trailing_lambda(call).is_some() {
         return None;
     }

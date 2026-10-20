@@ -26,6 +26,7 @@ mod java_property_reads;
 mod object_calls;
 mod overloads;
 mod platform_constructors;
+mod platform_members;
 mod property_getter_equivalence;
 mod reified_calls;
 mod source_calls;
@@ -5309,6 +5310,9 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
         {
             return Some(return_type);
         }
+        if let Some(result) = platform_members::establish(source, file, receiver, provider) {
+            return Some(result.to_owned());
+        }
         if let Some(inner_receiver_type) =
             explicit_receiver_type(source, receiver, constructor, file, provider)
             && let Some(inner_type) = standard_external_type(
@@ -5325,7 +5329,6 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
                 {
                     Some("java.util.List")
                 }
-                ("java.lang.StringBuilder", "append", 1) => Some("java.lang.StringBuilder"),
                 ("java.util.stream.Stream", "filter", 1) => Some("java.util.stream.Stream"),
                 (
                     "java.util.List"
@@ -6777,39 +6780,7 @@ pub(crate) fn established_platform_call_return_type<P: SemanticProvider + ?Sized
     if let Some(constructor) = established_platform_constructor(source, file, call, provider) {
         return Some(constructor);
     }
-    if let Some(result) = established_decimal_call(source, file, call, callee, name, provider) {
-        return Some(result);
-    }
-    if let Some(result) =
-        platform_constructors::established_builder_call(source, file, call, provider)
-    {
-        return Some(result);
-    }
-    if !matches!(name, "randomUUID" | "getDefault" | "now") || call_argument_count(call) != 0 {
-        return None;
-    }
-    if explicit_receiver_node(call, callee).is_none()
-        || !matches!(
-            resolve_required_call(source, file, call, callee, name, provider),
-            FactStatus::Unknown
-        )
-        || !known_external_member_call(source, file, call, callee, name, provider)
-    {
-        return None;
-    }
-    let receiver_type = explicit_receiver_type(source, call, callee, file, provider)?;
-    let receiver_type = standard_external_type(
-        source,
-        provider,
-        &receiver_type,
-        call.kind() == "method_invocation",
-    )?;
-    match (receiver_type.as_str(), name, call_argument_count(call)) {
-        ("java.util.UUID", "randomUUID", 0) => Some("java.util.UUID"),
-        ("java.util.Locale", "getDefault", 0) => Some("java.util.Locale"),
-        ("java.time.Instant", "now", 0) => Some("java.time.Instant"),
-        _ => None,
-    }
+    platform_members::establish(source, file, call, provider)
 }
 
 /// Shared proof for Kotlin String case conversion calls. The Locale overload
@@ -6879,144 +6850,6 @@ pub(crate) fn established_java_callable_member<P: SemanticProvider + ?Sized>(
         || established_projected_receiver_instance_call(source, call, file, provider)
 }
 
-/// A member fact requires both receiver and argument types, so an inapplicable
-/// JDK overload cannot accidentally stand in for a Kotlin extension call.
-fn established_decimal_call<P: SemanticProvider + ?Sized>(
-    source: &str,
-    file: &Path,
-    call: tree_sitter::Node<'_>,
-    callee: tree_sitter::Node<'_>,
-    name: &str,
-    provider: &P,
-) -> Option<&'static str> {
-    let (arity, result) = match name {
-        "add" | "subtract" | "multiply" | "divide" | "remainder" => (1, "java.math.BigDecimal"),
-        "compareTo" => (1, "kotlin.Int"),
-        "abs" | "negate" | "stripTrailingZeros" => (0, "java.math.BigDecimal"),
-        "toPlainString" => (0, "java.lang.String"),
-        _ => return None,
-    };
-    if call_argument_count(call) != arity {
-        return None;
-    }
-    let receiver = explicit_receiver_node(call, callee)?;
-    if !established_decimal_value(source, file, call, receiver, provider) {
-        return None;
-    }
-    if arity == 1
-        && !established_decimal_value(
-            source,
-            file,
-            call,
-            single_positional_argument(call)?,
-            provider,
-        )
-    {
-        return None;
-    }
-    Some(result)
-}
-
-fn single_positional_argument(call: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
-    let arguments = call.child_by_field_name("arguments").or_else(|| {
-        let mut cursor = call.walk();
-        call.named_children(&mut cursor).find(|child| {
-            matches!(
-                child.kind(),
-                "value_arguments" | "argument_list" | "arguments"
-            )
-        })
-    })?;
-    let mut cursor = arguments.walk();
-    let values = arguments
-        .named_children(&mut cursor)
-        .filter(|child| matches!(child.kind(), "value_argument" | "argument"))
-        .collect::<Vec<_>>();
-    let [argument] = values.as_slice() else {
-        return None;
-    };
-    let mut cursor = argument.walk();
-    let expressions = argument
-        .named_children(&mut cursor)
-        .filter(|child| !child.kind().contains("comment"))
-        .collect::<Vec<_>>();
-    let [expression] = expressions.as_slice() else {
-        return None;
-    };
-    Some(*expression)
-}
-
-fn established_decimal_value<P: SemanticProvider + ?Sized>(
-    source: &str,
-    file: &Path,
-    context: tree_sitter::Node<'_>,
-    expression: tree_sitter::Node<'_>,
-    provider: &P,
-) -> bool {
-    match expression.kind() {
-        "identifier" | "simple_identifier" => {
-            let Ok(spelling) = expression.utf8_text(source.as_bytes()) else {
-                return false;
-            };
-            let parameter_is_decimal =
-                match lexical_parameter_type(source, context, spelling.trim()) {
-                    Some(TypeRef {
-                        ty: KotlinType::Named { name, arguments },
-                        nullable: false,
-                    }) => {
-                        arguments.is_empty()
-                            && standard_external_type(source, provider, &name, false).as_deref()
-                                == Some("java.math.BigDecimal")
-                    }
-                    _ => false,
-                };
-            parameter_is_decimal
-                || platform_constructors::established_local_platform_classifier(
-                    source, expression, file, provider,
-                ) == Some("java.math.BigDecimal")
-                || unqualified_instance_property_classifier(
-                    source,
-                    expression,
-                    file,
-                    spelling.trim(),
-                    provider,
-                )
-                .as_deref()
-                    == Some("java.math.BigDecimal")
-        }
-        "navigation_expression" => {
-            if established_direct_property_receiver_type(
-                source, context, expression, file, provider,
-            )
-            .as_deref()
-                == Some("java.math.BigDecimal")
-            {
-                return true;
-            }
-            let Ok(text) = expression.utf8_text(source.as_bytes()) else {
-                return false;
-            };
-            let Some((qualifier, member)) = text.trim().rsplit_once('.') else {
-                return false;
-            };
-            let root = qualifier.trim().split('.').next().unwrap_or("");
-            matches!(member, "ZERO" | "ONE" | "TEN")
-                && !is_proven_local_shadow(expression, root, source)
-                && !provider
-                    .symbols_named(root)
-                    .iter()
-                    .any(|symbol| !is_type_symbol(&symbol.id))
-                && standard_external_type(source, provider, qualifier.trim(), false).as_deref()
-                    == Some("java.math.BigDecimal")
-        }
-        "call_expression" => {
-            established_platform_call_return_type(source, file, expression, provider)
-                == Some("java.math.BigDecimal")
-        }
-        _ => false,
-    }
-}
-
 fn known_external_member_call<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
@@ -7028,7 +6861,7 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
     if container_calls::establish(source, file, call, provider).is_some() {
         return true;
     }
-    if established_decimal_call(source, file, call, callee, name, provider).is_some() {
+    if platform_members::establish(source, file, call, provider).is_some() {
         return true;
     }
     if object_calls::established_object_to_string(source, file, call, callee, name, provider)
@@ -7085,10 +6918,7 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
     }
     matches!(
         (receiver_type.as_str(), name, arity),
-        ("java.util.UUID", "randomUUID", 0)
-            | ("java.util.Locale", "getDefault", 0)
-            | ("java.time.Instant", "now", 0)
-            | ("java.util.UUID", "toString" | "hashCode", 0)
+        ("java.util.UUID", "toString" | "hashCode", 0)
             | ("java.util.UUID", "equals", 1)
             | (
                 "java.lang.String",
@@ -7096,8 +6926,6 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
                 0
             )
             | ("java.lang.String", "equals" | "compareTo", 1)
-            | ("java.lang.StringBuilder", "toString", 0)
-            | ("java.lang.StringBuilder", "append", 1)
             | (
                 "java.util.Map"
                     | "java.util.HashMap"
