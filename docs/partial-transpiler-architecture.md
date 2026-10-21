@@ -123,6 +123,76 @@ additional shared facts before extending this subset. Kotlin operations with
 different evaluation or dispatch semantics still need a lowering justified by
 those semantics, as below.
 
+## Kotlin call-site facts (Track B)
+
+Kotlin-owned callees — stdlib extensions such as `let`, `takeIf`, `any`, `map`,
+member calls on Kotlin classes — are invisible to reflection. They come from a
+second fact source: the JVM facts helper (`jvm-facts/`) runs a K2
+`StandaloneAnalysisAPISession` and answers one `ResolveCalls { file }` batch per
+file with every call expression in it (`byte_offset`, expression `text`,
+`status`, Kotlin callee owner/name, parameter and result types, result
+nullability, erased JVM descriptor).
+
+**The seam.** `SemanticProvider::established_call_site(file, byte_offset,
+source_hash)` is the only door into that data. `FactsProvider` implements it as a
+hash-guarded lookup; `resolve_required_call` calls it *after* the syntax resolver
+answered `Unknown`/`Ambiguous` and turns an `Established` site into
+`FactStatus::Established` for a **fact identity**: `module = "jvm-facts"`, the
+helper's `callee_owner` split at its last dot into `package` / `owner_path`, and
+the K2 parameter renderings. That identity cannot collide with an indexed
+declaration, and rules phrased about *user declarations* (builtin shadowing) skip
+it. The decorator answers the typed view of the same identity
+(`explicit_nongeneric_kotlin_return`) from the site's result type, mapped through
+`TypeRef`, so a resolved call can feed the existing type machinery instead of
+being a bare boolean. Nothing keys on the name: a call resolves because the
+helper resolved *that call expression*, never because it is spelled `let`.
+
+**The hash guard.** The Analysis API answers for the file *on disk*, while notlin
+plans on snapshots (overlays, speculative repairs, candidate revisions).
+`call_site_at` therefore refuses — without consulting the helper — unless the
+blake3 of the snapshot being planned equals the bytes currently on disk, and the
+batch memo is keyed on `(canonical path, source hash)`. A speculative snapshot
+therefore never inherits facts about text the helper never saw; it keeps the
+syntax layer's answer. `tests/facts_required_call_facts.rs` pins exactly that.
+
+**Offset alignment.** The helper reports `KtCallExpression::getTextOffset` mapped
+to on-disk UTF-8 bytes, i.e. the start of the callee *selector* (`add` in
+`list.add(1)`, after the dot). notlin asks about
+`semantics::kotlin_call_site_offset`, which is the same node (`call_callee_node`
+already returns the selector), so no adjustment is needed;
+`tests/facts_call_site_alignment.rs` proves it against the helper's own `text`
+field, and a miss is simply "no fact".
+
+**Status semantics.** Only `Established` is a fact: the helper resolved one
+callable *and* every type involved is real. `Ambiguous` (an error type, or
+candidates it could not choose between) and `Unknown` (no candidates) carry no
+data, so the call keeps today's retention — `S001`/`S002` — unchanged.
+
+**Launch contract.** `notlin` passes the run's Kotlin source roots
+(`configure_kotlin_sources`, canonicalized parent directories of the selected
+inputs) and the validation config's classpath to the helper child as
+`NOTLIN_KOTLIN_SOURCES`/`NOTLIN_CLASSPATH`, and adds `--kotlin` only when the jar
+is the full one *and* sources exist (the helper treats the flag without sources
+as a fatal startup error; without the flag it serves Track A and never answers
+`ResolveCalls`, which is the same fail-closed `Unknown`). `NOTLIN_JAVA` /
+`JAVA_HOME` choose the JVM: the session needs a HotSpot VM with JFR — an
+OpenJ9/Semeru `JAVA_HOME` fails at the first resolution, and the run then
+degrades to no facts rather than hanging (the helper halts on a fatal request
+thread so the parent sees EOF).
+
+**Caveat.** Track B depends on `kotlin-analysis-api-standalone-implementation`
+`2.5.0-Beta2`, the only published Analysis API standalone artifact. It is
+pinned permanently to a pre-release and carries ~39 jars / ~148 MiB of IntelliJ
+platform code next to the full jar; upgrading it is a deliberate, separately
+validated change, and the slim jar (Track A only) does not carry any of it.
+
+**Measured effect.** With helper and sources enabled: `samples/` 12/25 → 14/25
+declarations; the jackson-module-kotlin slice 1/127 → 1/127 *translated* while
+`S001`-retained declarations drop 106 → 14 (the rest move to preparation
+blockers: approximation rules, unsigned-type semantic loss). Resolution was the
+binding constraint the facts removed; emission, not resolution, is what blocks
+the remaining declarations.
+
 ## Exact eager collection operations
 
 Proven Kotlin `Iterable.map` and `filterNot` calls carry snapshot locations,
