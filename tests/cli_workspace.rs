@@ -1,8 +1,26 @@
 use clap::Parser;
-use notlin::cli::Cli;
+use notlin::cli::{Cli, JvmFactsMode};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+
+#[test]
+fn jvm_facts_mode_parses_default_auto_and_overrides() {
+    assert_eq!(Cli::parse_from(["notlin"]).jvm_facts, JvmFactsMode::Auto);
+    assert_eq!(
+        Cli::parse_from(["notlin", "--jvm-facts=off"]).jvm_facts,
+        JvmFactsMode::Off
+    );
+    assert_eq!(
+        Cli::parse_from(["notlin", "--jvm-facts=on"]).jvm_facts,
+        JvmFactsMode::On
+    );
+    assert_eq!(
+        Cli::parse_from(["notlin", "--jvm-facts=auto"]).jvm_facts,
+        JvmFactsMode::Auto
+    );
+    assert!(Cli::try_parse_from(["notlin", "--jvm-facts=bogus"]).is_err());
+}
 
 #[test]
 fn max_pass_preserves_default_and_requires_a_positive_count() {

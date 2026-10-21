@@ -23,6 +23,12 @@ pub struct Cli {
     #[arg(long = "root", alias = "workspace-root")]
     pub workspace_root: Option<PathBuf>,
 
+    /// Fact source policy. `auto` (default) uses the JVM facts helper when a
+    /// JDK is available; `off` never starts it; `on` requires it and fails
+    /// the run when it cannot start.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub jvm_facts: JvmFactsMode,
+
     /// Output directory for generated .java files (default: alongside input)
     #[arg(short, long)]
     pub out_dir: Option<PathBuf>,
@@ -95,6 +101,16 @@ impl Cli {
     pub fn migrates_in_place(&self) -> bool {
         self.in_place || (self.out_dir.is_none() && self.input.iter().any(|input| input.is_dir()))
     }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JvmFactsMode {
+    /// Use the JVM facts helper when a helper jar is configured.
+    Auto,
+    /// Require the JVM facts helper; the run fails when it cannot start.
+    On,
+    /// Never start the JVM facts helper.
+    Off,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
