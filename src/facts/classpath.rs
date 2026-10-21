@@ -15,9 +15,86 @@
 //!   larger, riskier edit that buys nothing at runtime — the strings still die
 //!   with the process.
 
-use super::protocol::MemberFacts;
+use super::protocol::{CallSite, MemberFacts};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+/// blake3 of an in-memory source, in the byte-array form the rest of notlin
+/// already uses for source hashes (`transpiler`, `property_callsite`). Callers
+/// planning on a snapshot pass this to `FactsRuntime::call_site_at`, which
+/// compares it against the bytes actually on disk.
+pub fn source_hash(source: &str) -> [u8; 32] {
+    *blake3::hash(source.as_bytes()).as_bytes()
+}
+
+/// blake3 of a file's current bytes. `None` when the file cannot be read: an
+/// unreadable file has no call-site answer, and mutating a cache keyed on
+/// "whatever was there" would be worse than answering nothing.
+pub fn file_hash(file: &Path) -> Option<[u8; 32]> {
+    let bytes = std::fs::read(file).ok()?;
+    Some(*blake3::hash(&bytes).as_bytes())
+}
+
+/// One file's last batch, together with the disk bytes it was produced from.
+struct CallSiteMemo {
+    source_hash: [u8; 32],
+    /// `None` records a helper that could not establish anything for these
+    /// bytes. Negative answers are memoized on purpose: the planner treats
+    /// them as `Unknown` either way, and a dead helper must not be re-asked at
+    /// every call site (the fail-closed rule in `runtime.rs`).
+    sites: Option<Arc<Vec<CallSite>>>,
+}
+
+/// Memoized call-site batches for the whole run, keyed by canonical path.
+///
+/// Only the newest hash per file is kept: the helper answers for the bytes it
+/// read, so a batch produced from an older revision can never be served for a
+/// newer one (nor the reverse) — a mismatch is a new query, never a stale hit.
+#[derive(Default)]
+pub struct CallSiteFacts {
+    files: Mutex<HashMap<PathBuf, CallSiteMemo>>,
+}
+
+impl CallSiteFacts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The batch for `file` as produced from `source_hash`-matching bytes.
+    ///
+    /// A memo hit requires the recorded hash to equal `source_hash` exactly,
+    /// so a caller that hashed different bytes gets a fresh query rather than
+    /// somebody else's answer. `load` is not called under the table lock.
+    pub fn sites_at(
+        &self,
+        file: &Path,
+        source_hash: [u8; 32],
+        load: impl FnOnce() -> Option<Vec<CallSite>>,
+    ) -> Option<Arc<Vec<CallSite>>> {
+        {
+            let files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(memo) = files
+                .get(file)
+                .filter(|memo| memo.source_hash == source_hash)
+            {
+                // A matched hash is a hit even when `sites` is `None`: a helper
+                // that established nothing for these bytes must not be re-asked.
+                return memo.sites.clone();
+            }
+        }
+        let loaded = load().map(Arc::new);
+        let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+        files.insert(
+            file.to_path_buf(),
+            CallSiteMemo {
+                source_hash,
+                sites: loaded.clone(),
+            },
+        );
+        loaded
+    }
+}
 
 /// Memoized classpath member facts for the whole run.
 #[derive(Default)]

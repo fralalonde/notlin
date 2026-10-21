@@ -3,6 +3,7 @@
 //! answered independently; an unanswered/invalid line fails closed (Unknown).
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -11,6 +12,10 @@ pub enum Query {
     /// All public/protected members of a classpath type, plus its hierarchy
     /// chain availability. `owner` is a binary name (`java.math.BigDecimal`).
     ClassMembers { owner: String },
+    /// Every call site the Analysis API can see in one file, in one batch.
+    /// `file` is a path the helper can open: the runtime canonicalizes before
+    /// asking, so the bytes the helper reads are the bytes the caller hashed.
+    ResolveCalls { file: PathBuf },
     /// Capability probe so the Rust side can fail fast and log once.
     Ping,
 }
@@ -28,10 +33,12 @@ impl Serialize for Query {
         #[derive(Serialize)]
         enum Wire<'a> {
             ClassMembers { owner: &'a str },
+            ResolveCalls { file: &'a Path },
             Ping(()),
         }
         match self {
             Query::ClassMembers { owner } => Wire::ClassMembers { owner },
+            Query::ResolveCalls { file } => Wire::ResolveCalls { file },
             Query::Ping => Wire::Ping(()),
         }
         .serialize(serializer)
@@ -45,9 +52,48 @@ pub enum Answer {
         /// Absent means the helper could not load the type: unknown, not empty.
         members: Option<Vec<MemberFacts>>,
     },
+    /// One batch per file: the helper pays FIR setup once and answers every
+    /// call site in it. An empty `sites` list is a real answer ("this file
+    /// calls nothing we can see"), distinct from the helper being unable to
+    /// answer at all, which is the absence of this variant.
+    CallSites {
+        file: PathBuf,
+        sites: Vec<CallSite>,
+    },
     Pong {
         version: u32,
     },
+}
+
+/// How far the helper got with one call site. Serialized spellings
+/// (`Established`/`Ambiguous`/`Unknown`) are pinned: the Rust side treats
+/// anything else as a malformed line, never as a weaker certainty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SiteStatus {
+    /// The Analysis API resolved the callee: the fields below are its answer.
+    Established,
+    /// Overloads the helper cannot choose between for this argument shape.
+    Ambiguous,
+    /// Nothing established (unresolved, dynamic dispatch, or out of scope).
+    Unknown,
+}
+
+/// One call expression as the JVM-side Analysis API sees it.
+///
+/// Field names and order are the wire contract (`tests/fixtures/facts_callsites/`);
+/// `parameter_types` are Kotlin spellings (`Int`, `kotlin.String`), while
+/// `jvm_descriptor` is the erased JVM shape when the helper could produce it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallSite {
+    pub byte_offset: u64,
+    pub text: String,
+    pub status: SiteStatus,
+    pub callee_owner: Option<String>,
+    pub callee_name: Option<String>,
+    pub parameter_types: Vec<String>,
+    pub result_type: Option<String>,
+    pub result_nullable: bool,
+    pub jvm_descriptor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

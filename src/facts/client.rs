@@ -81,12 +81,22 @@ impl FactsClient {
         if let Some(cached) = self.cache.get(&query) {
             return Some(cached.clone());
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        let line = encode_request(id, query.clone());
-        let answer = self.exchange(id, &line)?;
+        let answer = self.query_uncached(query.clone())?;
         self.cache.insert(query, answer.clone());
         Some(answer)
+    }
+
+    /// Uncached exchange, for questions whose answer depends on state the wire
+    /// does not carry. `ResolveCalls` names a file, and the file's contents can
+    /// change between two identical queries: the per-query cache would answer
+    /// the second one with the batch fetched for the earlier revision. Callers
+    /// that memoize on their own content hash (`facts::runtime::call_sites`)
+    /// must therefore reach the helper on every new hash.
+    pub fn query_uncached(&mut self, query: Query) -> Option<super::protocol::Answer> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let line = encode_request(id, query);
+        self.exchange(id, &line)
     }
 
     /// Capability probe: the helper is alive and speaking our protocol version.

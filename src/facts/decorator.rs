@@ -11,7 +11,7 @@
 //! constructs share one helper and one memo table.
 
 use crate::cli::JvmFactsMode;
-use crate::facts::protocol::MemberFacts;
+use crate::facts::protocol::{CallSite, MemberFacts};
 use crate::facts::runtime::{self, FactsRuntime};
 use crate::semantics::{
     FactStatus, InheritedPropertyAccess, JavaPropertyRead, KotlinConstructorMetadataDependency,
@@ -72,6 +72,34 @@ impl FactsProvider {
     /// syntax provider's.
     pub fn has_helper(&self) -> bool {
         self.runtime.is_some()
+    }
+
+    /// The run's call-site batch for `file`, read from the helper's view of the
+    /// file on disk (`FactsRuntime::call_sites`). `None` when this run has no
+    /// helper or the batch could not be established — callers treat that as
+    /// `Unknown`, never as "no calls".
+    ///
+    /// Deliberately *not* a `SemanticProvider` method yet: wiring call sites
+    /// into required-call resolution is the next wave. Until then this is a
+    /// pure addition next to the forwarding decorator, so helper-off runs are
+    /// byte-identical.
+    pub fn call_sites(&self, file: &Path) -> Option<Arc<Vec<CallSite>>> {
+        self.runtime.as_ref()?.call_sites(file)
+    }
+
+    /// One hash-guarded call site: see `FactsRuntime::call_site_at` for the
+    /// soundness rule. `expected_source_hash` must be the blake3 of the source
+    /// being planned; a mismatch with the bytes on disk yields `None` without
+    /// consulting the helper (speculative overlays get no facts).
+    pub fn call_site_at(
+        &self,
+        file: &Path,
+        byte_offset: u64,
+        expected_source_hash: &[u8; 32],
+    ) -> Option<CallSite> {
+        self.runtime
+            .as_ref()?
+            .call_site_at(file, byte_offset, expected_source_hash)
     }
 }
 
