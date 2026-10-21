@@ -197,6 +197,159 @@ fn same_file(answered: &Path, requested: &Path) -> bool {
 /// stable decision: the helper is never started later by another code path.
 static RUNTIME: OnceLock<Option<Arc<FactsRuntime>>> = OnceLock::new();
 
+/// What the run wants the helper child process to index.
+///
+/// This is *run configuration*, not process environment: it is applied to the
+/// child's `Command` ([`super::client::FactsClient::jar_command`]), so a notlin
+/// process never mutates its own environment and two runs in one process (the
+/// tests) cannot leak sources into each other.
+///
+/// Values are already rendered (`join_paths`) because the child reads them as
+/// single colon-separated strings.
+#[derive(Default)]
+struct ChildConfig {
+    kotlin_sources: Option<std::ffi::OsString>,
+    classpath: Option<std::ffi::OsString>,
+}
+
+static CHILD_CONFIG: Mutex<ChildConfig> = Mutex::new(ChildConfig {
+    kotlin_sources: None,
+    classpath: None,
+});
+
+/// Tell the helper which Kotlin sources this run is planning on.
+///
+/// Entries may be directories or `.kt` files (a file contributes its parent
+/// directory, exactly as the helper's `NOTLIN_KOTLIN_SOURCES` contract says);
+/// the paths are canonicalized here because the helper resolves them against
+/// its own working directory. Only the source *roots* are passed, deduplicated
+/// in input order: the Analysis API indexes by root, so two files in one
+/// directory are one root.
+///
+/// Called once per run, before the first provider is built. A run with no
+/// entries (stdin input) leaves the helper's own environment alone.
+pub fn configure_kotlin_sources<I, P>(entries: I)
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry.as_ref();
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let root = if path.is_dir() {
+            path
+        } else {
+            match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                _ => continue,
+            }
+        };
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    if roots.is_empty() {
+        return;
+    }
+    let rendered = std::env::join_paths(&roots).ok();
+    let mut config = CHILD_CONFIG.lock().unwrap_or_else(PoisonError::into_inner);
+    config.kotlin_sources = rendered;
+}
+
+/// Tell the helper which jars/class directories the run validates against.
+///
+/// The validation config's classpath is the same one the Java side compiles
+/// against, so Kotlin call sites resolve through it too. Explicit configuration
+/// wins over an inherited `NOTLIN_CLASSPATH`; when nothing is configured the
+/// child simply inherits whatever the user exported.
+pub fn configure_classpath<I, P>(entries: I)
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let entries = entries
+        .into_iter()
+        .map(|entry| entry.as_ref().to_path_buf())
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return;
+    }
+    let rendered = std::env::join_paths(&entries).ok();
+    let mut config = CHILD_CONFIG.lock().unwrap_or_else(PoisonError::into_inner);
+    config.classpath = rendered;
+}
+
+/// The `NOTLIN_KOTLIN_SOURCES` value for the child: configured roots first,
+/// else whatever the caller exported, else nothing.
+pub(super) fn kotlin_sources_env() -> Option<std::ffi::OsString> {
+    let configured = CHILD_CONFIG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .kotlin_sources
+        .clone();
+    configured
+        .or_else(|| std::env::var_os("NOTLIN_KOTLIN_SOURCES").filter(|value| !value.is_empty()))
+}
+
+/// The `NOTLIN_CLASSPATH` value for the child, when this run configured one.
+pub(super) fn classpath_env() -> Option<std::ffi::OsString> {
+    CHILD_CONFIG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .classpath
+        .clone()
+}
+
+/// Whether the helper jar carries Track B, and therefore wants `--kotlin`.
+///
+/// Detection is by file name (`…-full.jar`, the artifact `jvm-facts/build.sh`
+/// produces): the slim jar has no Kotlin code at all, and the full jar answers
+/// nothing for `ResolveCalls` unless the flag is passed. `NOTLIN_JVM_FACTS_KOTLIN`
+/// (`0`/`false` or `1`/`true`) overrides the guess for a renamed jar.
+fn is_full_jar(jar: &Path) -> bool {
+    specifies_full_jar(jar, std::env::var_os("NOTLIN_JVM_FACTS_KOTLIN").as_deref())
+}
+
+/// The pure half of [`is_full_jar`]: does this jar carry Track B?
+///
+/// `override_value` is the `NOTLIN_JVM_FACTS_KOTLIN` value (`0`/`false`/`off`/
+/// `no` forces off, anything else forces on) or `None` to fall back to the file
+/// name. Split out so the decision is testable without mutating the process
+/// environment.
+pub fn specifies_full_jar(jar: &Path, override_value: Option<&std::ffi::OsStr>) -> bool {
+    if let Some(value) = override_value {
+        let value = value.to_string_lossy().to_ascii_lowercase();
+        return !matches!(value.as_str(), "" | "0" | "false" | "off" | "no");
+    }
+    jar.file_name()
+        .is_some_and(|name| name.to_string_lossy().contains("-full"))
+}
+
+/// Whether to launch the helper with `--kotlin`.
+///
+/// Only when both halves are true: the jar is the full one, and there are
+/// Kotlin sources to index. The second half is not optional — the full jar
+/// treats `--kotlin` without `NOTLIN_KOTLIN_SOURCES` as a startup failure
+/// (exit 2) because a session with no module can never answer anything, and
+/// that would take Track A down with it. Without the flag the full jar still
+/// serves `Ping`/`ClassMembers` and simply never answers `ResolveCalls`; the
+/// Rust side reads a missing answer as `Unknown`, which is the same
+/// fail-closed path the slim jar takes. So the slim jar needs no flag and gets
+/// none, and a full jar with no sources runs as a Track A helper.
+pub(super) fn pass_kotlin_flag(jar: &Path) -> bool {
+    if !is_full_jar(jar) {
+        return false;
+    }
+    let present = kotlin_sources_env().is_some();
+    if !present {
+        log::debug!(
+            "jvm facts helper is the full jar but no Kotlin sources are configured; launching without --kotlin (call sites stay Unknown)"
+        );
+    }
+    present
+}
+
 /// Resolve the run's runtime under a fact-source policy.
 ///
 /// `Off` never consults or populates the slot (a run told to go without facts

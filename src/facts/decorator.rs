@@ -11,36 +11,59 @@
 //! constructs share one helper and one memo table.
 
 use crate::cli::JvmFactsMode;
-use crate::facts::protocol::{CallSite, MemberFacts};
+use crate::facts::protocol::{CallSite, MemberFacts, SiteStatus};
 use crate::facts::runtime::{self, FactsRuntime};
 use crate::semantics::{
     FactStatus, InheritedPropertyAccess, JavaPropertyRead, KotlinConstructorMetadataDependency,
-    MapAliasTypeArguments, MemberReceiverCapability, ReferenceReturnNullability, SemanticProvider,
-    SemanticSymbol, SymbolId, SyntaxSemanticProvider, TypeAliasDefinition, TypeRef,
+    KotlinType, MapAliasTypeArguments, MemberReceiverCapability, ReferenceReturnNullability,
+    SemanticProvider, SemanticSymbol, SymbolId, SyntaxSemanticProvider, TypeAliasDefinition,
+    TypeRef,
 };
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub struct FactsProvider {
     inner: SyntaxSemanticProvider,
     runtime: Option<Arc<FactsRuntime>>,
+    /// Call-site facts this provider handed out, keyed by the identity it
+    /// minted for each ([`crate::facts::call_site_symbol`]).
+    ///
+    /// The identity is not an indexed declaration, so the syntax index cannot
+    /// answer anything about it. Keeping the fact here is what lets the typed
+    /// view of the same call — its K2 result type — answer for that id instead
+    /// of falling through to "unknown".
+    call_facts: Mutex<BTreeMap<SymbolId, CallSite>>,
+}
+
+impl FactsProvider {
+    fn from_parts(inner: SyntaxSemanticProvider, runtime: Option<Arc<FactsRuntime>>) -> Self {
+        Self {
+            inner,
+            runtime,
+            call_facts: Mutex::new(BTreeMap::new()),
+        }
+    }
 }
 
 impl FactsProvider {
     /// Transparent wrapper: no helper, every answer comes from `inner`.
     pub fn transparent(inner: SyntaxSemanticProvider) -> Self {
-        Self {
-            inner,
-            runtime: None,
-        }
+        Self::from_parts(inner, None)
     }
 
     /// Wrapper over an already-installed run runtime.
     pub fn with_runtime(inner: SyntaxSemanticProvider, runtime: Arc<FactsRuntime>) -> Self {
-        Self {
-            inner,
-            runtime: Some(runtime),
-        }
+        Self::from_parts(inner, Some(runtime))
+    }
+
+    /// The call-site fact this provider minted `member` from, if it did.
+    fn call_fact(&self, member: &SymbolId) -> Option<CallSite> {
+        self.call_facts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(member)
+            .cloned()
     }
 
     /// Start (or join) the run's helper according to the CLI policy. `On` fails
@@ -79,10 +102,9 @@ impl FactsProvider {
     /// helper or the batch could not be established — callers treat that as
     /// `Unknown`, never as "no calls".
     ///
-    /// Deliberately *not* a `SemanticProvider` method yet: wiring call sites
-    /// into required-call resolution is the next wave. Until then this is a
-    /// pure addition next to the forwarding decorator, so helper-off runs are
-    /// byte-identical.
+    /// This is the whole batch; required-call resolution goes through
+    /// [`SemanticProvider::established_call_site`], which is the same answer
+    /// narrowed to one hash-guarded offset.
     pub fn call_sites(&self, file: &Path) -> Option<Arc<Vec<CallSite>>> {
         self.runtime.as_ref()?.call_sites(file)
     }
@@ -110,6 +132,69 @@ impl SemanticProvider for FactsProvider {
 
     fn classpath_member_facts(&self, owner: &str) -> Option<Arc<Vec<MemberFacts>>> {
         self.runtime.as_ref()?.member_facts(owner)
+    }
+
+    /// One Track B call site, hash-guarded end to end.
+    ///
+    /// Three gates, in order, and each one is a way to answer *nothing*:
+    /// the file must be a Kotlin source the session indexed (the helper never
+    /// parses Java), the run must have a helper, and the helper must have a
+    /// site *at that exact offset* for bytes hashing to `source_hash`. The
+    /// last gate is the soundness rule: `FactsRuntime::call_site_at` refuses
+    /// when the snapshot being planned is not the text on disk, so a candidate
+    /// revision or an in-memory overlay never inherits disk facts.
+    ///
+    /// Only `Established` sites leave this function. The fact is remembered
+    /// under the identity minted for it, so the typed view
+    /// ([`Self::explicit_nongeneric_kotlin_return`]) can answer for that id.
+    fn established_call_site(
+        &self,
+        file: &Path,
+        byte_offset: u64,
+        source_hash: &[u8; 32],
+    ) -> Option<CallSite> {
+        if !file
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("kt"))
+        {
+            return None;
+        }
+        let site = self
+            .runtime
+            .as_ref()?
+            .call_site_at(file, byte_offset, source_hash)?;
+        if site.status != SiteStatus::Established {
+            return None;
+        }
+        let id = crate::facts::call_site_symbol(file, &site)?;
+        let mut facts = self
+            .call_facts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        facts.insert(id, site.clone());
+        // The memo is per provider and bounded by the calls this run asked
+        // about; two providers in one run each hold their own copy, which is
+        // cheap and keeps the decorator free of a shared lock across the run.
+        Some(site)
+    }
+
+    /// The K2 result type of a call this provider established.
+    ///
+    /// The trait's contract says *nongeneric*: K2 renders parameterized results
+    /// (`kotlin.collections.Iterator<kotlin.Any?>`) with substituted arguments,
+    /// which is a stronger fact than this method promises to carry, so a
+    /// parameterized rendering is withheld rather than narrowed. Nullability is
+    /// already folded into the `TypeRef` from the wire's `result_nullable`.
+    fn explicit_nongeneric_kotlin_return(&self, member: &SymbolId) -> Option<TypeRef> {
+        if crate::facts::is_fact_symbol(member) {
+            let site = self.call_fact(member)?;
+            let ty = crate::facts::call_site_result_type(&site)?;
+            return match &ty.ty {
+                KotlinType::Named { arguments, .. } if arguments.is_empty() => Some(ty),
+                _ => None,
+            };
+        }
+        self.inner.explicit_nongeneric_kotlin_return(member)
     }
 
     fn resolve(&self, name: &str) -> FactStatus<SymbolId> {
@@ -204,10 +289,6 @@ impl SemanticProvider for FactsProvider {
 
     fn has_stable_noarg_jvm_signature(&self, member: &SymbolId) -> bool {
         self.inner.has_stable_noarg_jvm_signature(member)
-    }
-
-    fn explicit_nongeneric_kotlin_return(&self, member: &SymbolId) -> Option<TypeRef> {
-        self.inner.explicit_nongeneric_kotlin_return(member)
     }
 
     fn reference_return_nullability(

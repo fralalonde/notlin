@@ -42,6 +42,18 @@ public final class FullMain {
     }
 
     public static void main(String[] args) throws Exception {
+        // A request thread that dies (K2 throwing an InternalError, a VM without
+        // JFR, a type-provider LinkageError inside a callback) must end the
+        // process. The Kotlin session leaves non-daemon threads behind, so the
+        // JVM would stay alive holding stdout open — and the parent's read on
+        // this pipe would block forever instead of seeing EOF and failing
+        // closed. Halting turns a crash into "helper gone", which the Rust side
+        // already handles (Unknown, never a guess).
+        Thread.setDefaultUncaughtExceptionHandler((thread, failure) -> {
+            Facts.warn("fatal: request thread failed: " + failure);
+            failure.printStackTrace();
+            Runtime.getRuntime().halt(3);
+        });
         boolean kotlin = false;
         for (String arg : args) {
             switch (arg) {

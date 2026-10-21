@@ -300,17 +300,7 @@ pub fn load_validation_config(
     path: &Path,
     output_dir: PathBuf,
 ) -> Result<JvmValidationConfig, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut raw: ValidationFile =
-        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    if raw.version != 1 {
-        return Err(format!(
-            "unsupported validation config version {} (expected 1)",
-            raw.version
-        ));
-    }
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    let resolve = |p: PathBuf| if p.is_absolute() { p } else { base.join(p) };
+    let (mut raw, resolve) = read_validation_file(path)?;
     Ok(JvmValidationConfig {
         kotlinc: resolve(raw.kotlinc),
         javac: resolve(raw.javac),
@@ -324,6 +314,37 @@ pub fn load_validation_config(
         kotlinc_args: raw.kotlinc_args.into_iter().map(OsString::from).collect(),
         javac_args: raw.javac_args.into_iter().map(OsString::from).collect(),
     })
+}
+
+/// The classpath a validation config names, without staging anything.
+///
+/// The JVM facts helper reads the same jars the Java side compiles against, so
+/// its startup needs exactly this list and nothing else from the config
+/// (no `output_dir`: that is a staging detail of a compile that has not run
+/// yet). Relative entries resolve against the config file, as everywhere else.
+pub fn validation_classpath(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let (mut raw, resolve) = read_validation_file(path)?;
+    Ok(raw.classpath.drain(..).map(&resolve).collect())
+}
+
+fn read_validation_file(
+    path: &Path,
+) -> Result<(ValidationFile, impl Fn(PathBuf) -> PathBuf), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let raw: ValidationFile =
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    if raw.version != 1 {
+        return Err(format!(
+            "unsupported validation config version {} (expected 1)",
+            raw.version
+        ));
+    }
+    let base = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let resolve = move |p: PathBuf| if p.is_absolute() { p } else { base.join(p) };
+    Ok((raw, resolve))
 }
 
 fn compiler_classpath(

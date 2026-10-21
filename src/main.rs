@@ -542,6 +542,22 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     };
     progress_start("input", "discovering Kotlin sources");
     let files = collect_inputs(&cli.input)?;
+    // Track B facts are indexed per *module*: the helper needs the run's Kotlin
+    // source roots, and the same classpath the Java side validates against. Both
+    // are child-process configuration, applied before any provider exists (the
+    // fixpoint provider is what installs the helper). `--jvm-facts=off` stays a
+    // hard no-op here: no configuration means no reason to touch anything.
+    if cli.jvm_facts != JvmFactsMode::Off && files.iter().all(|file| file.as_os_str() != "-") {
+        notlin::facts::runtime::configure_kotlin_sources(files.iter().cloned());
+        if let Some(config_path) = &cli.validation_config {
+            match notlin::jvm_validation::validation_classpath(config_path) {
+                Ok(classpath) => notlin::facts::runtime::configure_classpath(classpath),
+                Err(error) => log::debug!(
+                    "validation classpath unavailable for the JVM facts helper: {error}"
+                ),
+            }
+        }
+    }
     let selected_declarations = indexed_input_declarations(&index, &files);
     progress_done(
         "input",

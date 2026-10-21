@@ -2081,6 +2081,26 @@ pub trait SemanticProvider: Send + Sync {
     ) -> Option<Arc<Vec<crate::facts::protocol::MemberFacts>>> {
         None
     }
+    /// A Track B (Kotlin) call-site fact for one call expression, or `None`.
+    ///
+    /// `byte_offset` is the offset of the *callee selector* — the function name
+    /// itself, which is the node the helper keys its batch on
+    /// ([`kotlin_call_site_offset`]) — and `source_hash` is the blake3 of the
+    /// exact source text being planned. An implementation must answer only when
+    /// the bytes it has facts for hash to `source_hash`: a speculative snapshot
+    /// (an overlay, a candidate revision) must never inherit facts about the
+    /// text on disk (see `FactsRuntime::call_site_at`).
+    ///
+    /// Only `Established` facts are returned. `Ambiguous`/`Unknown` answers are
+    /// not facts, and the caller keeps whatever it could prove without one.
+    fn established_call_site(
+        &self,
+        _file: &Path,
+        _byte_offset: u64,
+        _source_hash: &[u8; 32],
+    ) -> Option<crate::facts::protocol::CallSite> {
+        None
+    }
     fn kotlin_constructor_metadata_dependency(
         &self,
         _owner: &SymbolId,
@@ -4587,9 +4607,12 @@ pub fn plan_required_calls(
                                     location,
                                 });
                             }
-                            FactStatus::Established(_) => {
+                            FactStatus::Established(target) => {
                                 plan.require_symbol(index, name.clone(), fact.clone());
-                                if known_builtin(&name) {
+                                // A helper fact names an external callee, not a
+                                // user declaration: it cannot shadow a builtin
+                                // *with a declaration of its own*.
+                                if known_builtin(&name) && !crate::facts::is_fact_symbol(target) {
                                     let decision = &mut plan.declarations[index];
                                     let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
                                         kind: crate::translation_plan::PreparationBlockerKind::UnresolvedAssumption,
@@ -4624,6 +4647,80 @@ fn inside_annotation(mut node: tree_sitter::Node) -> bool {
     false
 }
 pub(crate) fn resolve_required_call<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node,
+    callee: tree_sitter::Node,
+    name: &str,
+    provider: &P,
+) -> FactStatus<SymbolId> {
+    let fact = resolve_required_call_in_source(source, file, call, callee, name, provider);
+    // A proven lexical shadow names a local value, not a callee the helper's
+    // module-level view can answer for; that proof keeps its `Unknown`.
+    if matches!(fact, FactStatus::Established(_)) || is_proven_local_shadow(callee, name, source) {
+        return fact;
+    }
+    established_call_site_fact(source, file, call, provider).unwrap_or(fact)
+}
+
+/// Track B: the helper's own answer for `call`, or `None` when this run has no
+/// such fact.
+///
+/// The query is keyed by two things that must both describe the text being
+/// planned: the offset of the callee selector ([`kotlin_call_site_offset`],
+/// the node the Analysis API reports as the call expression's start) and the
+/// blake3 of `source`. A snapshot whose bytes differ from the file on disk —
+/// an overlay, a speculative candidate — therefore gets `None` from the
+/// provider and keeps the syntax layer's answer.
+///
+/// There is deliberately no name gate here: `let`, `takeIf` or `any` resolve
+/// because the helper resolved *this call*, not because of how it is spelled.
+fn established_call_site_fact<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<FactStatus<SymbolId>> {
+    let offset = kotlin_call_site_offset(call)?;
+    let site = provider.established_call_site(
+        file,
+        offset as u64,
+        &crate::facts::classpath::source_hash(source),
+    )?;
+    if site.status != crate::facts::protocol::SiteStatus::Established {
+        return None;
+    }
+    Some(FactStatus::Established(crate::facts::call_site_symbol(
+        file, &site,
+    )?))
+}
+
+/// The byte offset the Track B helper keys a call site on: the start of the
+/// callee *selector*, i.e. the function name, not the receiver.
+///
+/// The helper emits `KtCallExpression::getTextOffset`, which for `list.add(1)`
+/// is the offset of `add` — the PSI call expression covers `add(1)` and sits
+/// inside the qualified expression that holds `list`. `call_callee_node`
+/// already returns exactly that selector for Kotlin calls, so the two sides
+/// agree without adjustment; `tests/facts_call_site_alignment.rs` pins the
+/// agreement against the helper's own `text` field (the helper sends the
+/// expression text next to the offset, so a mismatch is observable).
+///
+/// Java `method_invocation` nodes go through the same function: the helper
+/// only indexes Kotlin sources, so a Java offset simply finds no site and the
+/// caller keeps its syntax answer.
+pub fn kotlin_call_site_offset(call: tree_sitter::Node<'_>) -> Option<usize> {
+    if !matches!(call.kind(), "call_expression" | "method_invocation") {
+        return None;
+    }
+    let callee = call_callee_node(call)?;
+    Some(callee.start_byte())
+}
+
+/// The syntax-only resolver: declarations the source index can prove, receiver
+/// facts, capabilities. Everything Track A (classpath) and Track B (call-site)
+/// answer is layered on top of this in [`resolve_required_call`].
+fn resolve_required_call_in_source<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
     call: tree_sitter::Node,

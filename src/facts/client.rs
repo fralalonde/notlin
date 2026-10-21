@@ -42,9 +42,35 @@ impl FactsClient {
 
     /// The `java -jar <helper>` command, before it is spawned. Exposed so the
     /// run-scoped runtime and tests build the process the same way.
+    ///
+    /// Two things beyond the jar path are decided here:
+    ///
+    /// * **The run's Kotlin sources and classpath.** They go on the *child's*
+    ///   environment, never the parent's: `NOTLIN_KOTLIN_SOURCES` from
+    ///   [`super::runtime::configure_kotlin_sources`] (falling back to whatever
+    ///   the caller exported) and `NOTLIN_CLASSPATH` from
+    ///   [`super::runtime::configure_classpath`]. A child that inherits a
+    ///   source list from the shell keeps working when nothing is configured.
+    /// * **`--kotlin`, for the full jar only.** Track B is opt-in on the helper
+    ///   side; without the flag the full jar answers `ClassMembers` exactly like
+    ///   the slim one and never answers `ResolveCalls`. The flag is *not* passed
+    ///   to the slim jar (it has no such code) and *not* passed to a full jar
+    ///   with no sources — the helper treats that combination as a startup
+    ///   failure, and a missing answer is already the fail-closed path the Rust
+    ///   side wants (`Unknown`, never a guess). See
+    ///   [`super::runtime::pass_kotlin_flag`].
     pub fn jar_command(jar: &Path) -> Command {
         let mut command = Command::new(Self::java_program());
         command.arg("-jar").arg(jar);
+        if let Some(sources) = super::runtime::kotlin_sources_env() {
+            command.env("NOTLIN_KOTLIN_SOURCES", sources);
+        }
+        if let Some(classpath) = super::runtime::classpath_env() {
+            command.env("NOTLIN_CLASSPATH", classpath);
+        }
+        if super::runtime::pass_kotlin_flag(jar) {
+            command.arg("--kotlin");
+        }
         command
     }
 
