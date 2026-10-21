@@ -1,22 +1,37 @@
 # jvm-facts — stdio facts helper
 
-A small plain-Java program (JDK only, no Gradle, no third-party dependencies) that
-answers questions about the JVM classes a translation run can see, one JSON line
-in, one JSON line out. notlin's Rust side spawns it when `NOTLIN_JVM_FACTS_JAR`
-points at a built jar; without it the transpiler behaves exactly as before.
+A small program that answers questions about the JVM classes and Kotlin call
+sites a translation run can see, one JSON line in, one JSON line out. notlin's
+Rust side spawns it when `NOTLIN_JVM_FACTS_JAR` points at a built jar; without it
+the transpiler behaves exactly as before.
 
-This is Track A of the fact-sourcing plan: reflection over the Java classpath.
-Kotlin facts (Track B) are a later phase and are not implemented here.
+Two jars, one code base:
+
+| jar | contents | needs |
+|---|---|---|
+| `build/notlin-jvm-facts.jar` (**slim**) | Track A: reflection + class-file facts, JDK only | nothing |
+| `build/notlin-jvm-facts-full.jar` (**full**) | slim **+** Track B: K2 `ResolveCalls` behind `--kotlin` | the 38 deps-locked jars in `spike/libs/` |
+
+The slim jar is the one Track A has always produced: same 6 class files, byte for
+byte. The full jar is additive — same main loop, plus one new query
+discriminator, off unless `--kotlin` is passed.
 
 ## Build
 
 ```bash
-bash jvm-facts/build.sh   # -> build/notlin-jvm-facts.jar
+bash jvm-facts/build.sh            # slim, plus full when spike/libs has the deps
+bash jvm-facts/build.sh --slim     # slim only (JDK only, no third-party deps)
+bash jvm-facts/build.sh --full     # both; fails if ./fetch-deps.sh was never run
+jvm-facts/fetch-deps.sh            # 39 pinned jars, sha256-verified (148 MiB)
 ```
 
 The script uses `~/.rsdk/tools/java/25.0.4-tem/bin/{javac,jar}` by default;
-override with `JAVAC=...` / `JAR=...`. It compiles `src/**/*.java` into
-`build/classes` and packs a single runnable jar (`build/` is git-ignored).
+override with `JAVAC=...` / `JAR=...`. `build/` is git-ignored.
+
+The full jar carries **no** Analysis API code: its manifest `Class-Path` points at
+`../spike/libs/*.jar` (relative to the jar), which is why it has to stay next to
+`spike/`. The build-scope `kotlin-compiler` jar is deliberately *not* on that
+list — it is a compiler, not a runtime dependency.
 
 ## Pointing notlin at it
 
@@ -35,15 +50,16 @@ NOTLIN_CLASSPATH=/path/to/app.jar:/path/to/other.jar \
 ## Wire format
 
 Newline-delimited JSON, one request per line, at most one answer line per
-request. Field names are fixed by `src/facts/protocol.rs` on the Rust side and
-by this helper; both ends are ours, so the helper parses with a rigid string
-scanner instead of a JSON library and serializes with a `StringBuilder`.
+answered request. Field names are fixed by `src/facts/protocol.rs` on the Rust
+side and by this helper; both ends are ours, so the helper parses with a rigid
+string scanner instead of a JSON library and serializes with a `StringBuilder`.
 
 Requests:
 
 ```json
 {"version":1,"id":N,"query":{"Ping":null}}
 {"version":1,"id":N,"query":{"ClassMembers":{"owner":"binary.Name"}}}
+{"version":1,"id":N,"query":{"ResolveCalls":{"file":"/abs/path.kt"}}}   // full jar with --kotlin only
 ```
 
 Answers:
@@ -51,6 +67,7 @@ Answers:
 ```json
 {"version":1,"id":N,"answer":{"Pong":{"version":1}}}
 {"version":1,"id":N,"answer":{"Members":{"owner":"<echo>","members":[...] or null}}}
+{"version":1,"id":N,"answer":{"CallSites":{"file":"<echo>","sites":[...]}}}
 ```
 
 Each member object:
@@ -81,18 +98,123 @@ Each member object:
   EOF exits 0. It never crashes the loop. The Rust client treats a missing answer
   as `Unknown`.
 - `parameter_nullability` / `result_nullability` are `non_null` or `nullable`
-  only when a **runtime-visible** `org.jetbrains.annotations.NotNull` /
-  `org.jetbrains.annotations.Nullable` annotation is present; otherwise
-  `unknown`. Nothing is inferred from JDK convention, `Optional`, or Kotlin
-  metadata.
+  only when proven: class-file `RuntimeInvisibleAnnotations` (JDK 22+
+  `java.lang.classfile`, which is how the CLASS-retained
+  `org.jetbrains.annotations` annotations become visible) first, runtime-visible
+  annotations second; otherwise `unknown`. Nothing is inferred from JDK
+  convention, `Optional`, or Kotlin metadata.
 
-### Known limitation: annotation retention
+## Kotlin facts (`--kotlin`, Track B)
 
-`vendor/jetbrains-annotations.jar` declares `@NotNull`/`@Nullable` with
-`RetentionPolicy.CLASS`, so plain reflection cannot see them on those
-declarations and the helper reports `unknown` there. The check is written
-against annotation names, not compiled-in types, so any runtime-retained
-`NotNull`/`Nullable` on the classpath is honored — verified with a scratch
-annotation of the same FQN at `RetentionPolicy.RUNTIME`. Reading CLASS-retained
-annotations would require parsing class files; that is deliberately out of scope
-here (fail closed, never guess).
+```bash
+java --sun-misc-unsafe-memory-access=allow \
+     -jar jvm-facts/build/notlin-jvm-facts-full.jar --kotlin
+```
+
+The optional JVM flag only silences the `sun.misc.Unsafe` deprecation lines that
+the IntelliJ core prints on stderr under JDK 24+; it changes no behavior.
+
+`--kotlin` builds **one** K2 `StandaloneAnalysisAPISession` at startup
+(~1.1 s for 2 files, ~2.1 s for the 23-file bench module), then answers one
+`ResolveCalls` batch per file over the same session. The first batch pays FIR
+front-end initialization (~1.4 s on the fixture, ~2.6 s on a 56-call bench file),
+later batches are tens of milliseconds — measured on the bench slice:
+2555 ms, then 645 ms, then **22 ms** for a repeated file.
+
+### Environment contract
+
+| variable | required | meaning |
+|---|---|---|
+| `NOTLIN_KOTLIN_SOURCES` | **yes** with `--kotlin` | colon-separated **directories** or **`.kt` files**. A directory becomes a source root (recursively indexed). A file adds its **parent directory** as the root, because K2 indexes by root and cross-file resolution (`Counter.add` called from `Site.kt`) needs the siblings in the same module. Missing/empty ⇒ the helper logs why and exits 2. |
+| `NOTLIN_CLASSPATH` | no | same jars/class-dirs Track A uses; they become one extra library module, a dependency of the source module. Best effort: a type that cannot be resolved becomes an error type and the sites that touch it are `Ambiguous`, never guessed. |
+| `NOTLIN_KOTLIN_STDLIB` | no | explicit stdlib jar. Default: the code source of the already-loaded `kotlin.Unit` class (the full jar's manifest `Class-Path` puts the deps-locked stdlib there), then `java.class.path`, then a `libs/` directory near the jar. |
+
+The JDK is added to the session as an sdk module
+(`addBinaryRootsFromJdkHome(java.home)`). This is not optional: without it the
+session cannot see `java.lang` *at all*, and a 56-call bench file produced 168
+errors with every Java-touching site degraded — the difference between 33/56 and
+56/56 `Established` on that file.
+
+### CallSites wire shape
+
+```json
+{"byte_offset":406,"text":"add(value)","status":"Established",
+ "callee_owner":"fixture.Counter","callee_name":"add","parameter_types":["kotlin.Int"],
+ "result_type":"kotlin.String","result_nullable":false,"jvm_descriptor":"(I)Ljava/lang/String;"}
+```
+
+- `byte_offset` — UTF-8 byte offset of the call expression **in the file on
+  disk**. PSI offsets are char offsets in a line-ending/BOM-normalized copy, so
+  they are mapped, not copied; the two coincide for plain ASCII/LF sources.
+- `callee_owner` — the K2 `ClassId` (`fixture.Counter`,
+  `kotlin.collections.MutableList`), not a JVM binary name. For a top-level
+  function, where there is no class id, it is the **JVM facade class**
+  (`kotlin.StandardKt` for `let`, `kotlin.io.ConsoleKt` for `println`,
+  `…KotlinModuleKt` for `isKotlinClass`) via
+  `getContainingJvmClassName`. Constructors report the constructed class.
+- `callee_name` — Kotlin simple name; `<init>` for constructors.
+- `parameter_types`, `result_type` — K2 renderings, substituted at the call site,
+  normalized to plain Kotlin names: `kotlin.Int`, `kotlin.String?`,
+  `kotlin.collections.MutableList<kotlin.Int>`, `(kotlin.String) -> kotlin.Boolean`
+  for function types. Flexible (Java platform) types render as their non-null
+  lower bound and K2's `!` markers are dropped, because `A..B` / `String!` are not
+  Kotlin type names.
+- `result_nullable` — true when the result is marked nullable **or** has flexible
+  (platform) nullability. Descriptors are erased, so this is the only nullability
+  signal on the wire; there is no per-parameter nullability field, so a dropped
+  `!` on a parameter is information the wire never had a slot for.
+- `jvm_descriptor` — erased descriptor of the *substituted* call-site view:
+  `(I)Ljava/lang/String;`, `(I)Z` for `MutableList<Int>.add`, `(…)V` for
+  constructors. For an extension call this is the value-parameter list and the
+  result (the spike's convention); the extension receiver is not prepended.
+
+One batch walks **every** call expression in the file (nested ones included,
+outer first), so a file is one request, not one request per site.
+
+### Status rules (fail closed)
+
+| status | when | fields |
+|---|---|---|
+| `Established` | resolved to one callable, and the expression, every parameter and the result type are real K2 types | all filled |
+| `Ambiguous` | resolution succeeded **but** an error type was involved (unresolved external, incomplete classpath, failed inference), **or** resolution failed while K2 saw candidates | `callee_owner`/`callee_name`/`result_type`/`jvm_descriptor` are `null`, `parameter_types` is `[]`, `result_nullable` is `false` |
+| `Unknown` | resolution failed with no candidates at all (unresolved name, non-call construct) | same as `Ambiguous` |
+
+`Established` is the only status whose fact fields mean anything; a consumer must
+gate on it. Nothing is ever inferred from a partial resolution.
+
+### Session lifecycle
+
+`stdin` EOF ⇒ the session is disposed on a bounded (1.5 s) daemon thread and the
+JVM is then halted. This is deliberate: the standalone K2 session leaves
+non-daemon threads behind, so a plain `return` from `main` keeps the process
+alive forever (observed: minutes). Measured EOF→exit: 0.03 s with `--kotlin`,
+0.01 s without, 0.00 s on the slim jar.
+
+## Probes
+
+```bash
+jvm-facts/kotlin-probe.sh            # [1] build [2] Ping [3] fixture [4] bench [5] EOF [6] BigDecimal
+```
+
+`kotlin-probe.sh` is the evidence script: both jars build, `Ping` answers on
+both, `ResolveCalls` is refused without `--kotlin`, the spike fixture resolves
+to the exact values recorded in `docs/analysis-api-spike.md`, the bench slice
+resolves `let`/`takeIf`/`add`/`get`/constructors with Kotlin names and
+descriptors, EOF exits under 2 s in all three modes, and the slim jar still
+reports 6 `divide` rows for `java.math.BigDecimal` (80 members).
+
+## Known limitations
+
+- The Analysis API is a **pre-release** (`2.5.0-Beta2`, the only published
+  version) and its standalone bootstrap is unstable by JetBrains' own
+  classification. Everything that touches it lives in
+  `src/notlin/facts/kotlin/` so an upgrade is a local change; the query surface
+  (`KaResolver`, `KaFunctionSignature`, `mapToJvmTypeDescriptor`, …) is stable.
+- The session's classpath is best effort by design: notlin's `NOTLIN_CLASSPATH`
+  is what the caller passed, so a source tree that needs more jars than that
+  gets `Ambiguous` on the affected sites (reported honestly) rather than a guess.
+- Java interop needed no Kotlin bridge: the API's `context`/member extensions are
+  plain interface methods after lowering (`session.isMarkedNullable(type)`,
+  `RenderingKt.render(session, type, Variance.INVARIANT)`,
+  `KaCallInfoKt.successfulFunctionCallOrNull(info)`), so the driver is Java like
+  the rest of the helper and `build.sh` needs no `kotlinc`.
