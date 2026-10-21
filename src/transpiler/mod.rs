@@ -357,7 +357,7 @@ fn lower_with_plan(
         if let Some(index) = scope.index {
             provider.enrich_workspace_type_facts(index);
         }
-        provider
+        crate::facts::decorator::FactsProvider::policy_or_transparent(provider, cli.jvm_facts)
     });
     let semantic_provider: &dyn crate::semantics::SemanticProvider = scope
         .semantic_provider

@@ -1,6 +1,6 @@
 use clap::Parser as _;
 use colored::Colorize;
-use notlin::cli::{Cli, UntranslatableMode};
+use notlin::cli::{Cli, JvmFactsMode, UntranslatableMode};
 use notlin::migrate::{self, MigrateOutcome};
 use notlin::transpiler;
 use notlin::workspace::SourceIndex;
@@ -453,6 +453,12 @@ fn annotate_manual_marks(
 
 fn run(cli: &Cli) -> Result<ExitCode, String> {
     let run_started = Instant::now();
+    // Fail before any workspace scan or write: `on` means the helper is not
+    // optional, and its absence is a configuration error, not a silent fallback.
+    if cli.jvm_facts == JvmFactsMode::On && notlin::facts::client::FactsClient::jar_path().is_none()
+    {
+        return Err("--jvm-facts=on requires NOTLIN_JVM_FACTS_JAR".into());
+    }
     if let Some(path) = &cli.coverage_report {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             return Err("--coverage-report requires a .json output path".into());

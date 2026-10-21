@@ -319,6 +319,11 @@ fn plan_workspace_cold_mode(
     let semantic_collect_elapsed = semantic_started.elapsed();
     let enrich_started = std::time::Instant::now();
     semantic_provider.enrich_workspace_type_facts(index);
+    // JVM facts (when a helper is configured) decorate the syntax provider.
+    // Without a helper this is the identical provider, so behavior is
+    // unchanged; `--jvm-facts=on` turns startup failure into a run error.
+    let semantic_provider =
+        crate::facts::decorator::FactsProvider::from_policy(semantic_provider, cli.jvm_facts)?;
     use crate::semantics::SemanticProvider;
     if crate::workspace::profile::enabled() {
         eprintln!(
