@@ -1,0 +1,4 @@
+[
+  {"name":"append","static_member":false,"parameter_types":["java.lang.String"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["java.lang.String"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"}
+]

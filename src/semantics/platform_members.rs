@@ -86,10 +86,6 @@ impl Row<'_> {
             Self::Classpath(row) => row.result,
         }
     }
-
-    fn is_classpath(&self) -> bool {
-        matches!(self, Self::Classpath(_))
-    }
 }
 
 enum RowIter<'a> {
@@ -255,10 +251,9 @@ pub(super) fn applicable<P: SemanticProvider + ?Sized>(
                 .all(|(alternatives, argument)| {
                     alternatives.iter().any(|expected| {
                         value_has_type(source, file, call, *argument, expected, provider)
-                            || row.is_classpath()
-                                && classpath_value_has_type(
-                                    source, file, call, *argument, expected, provider,
-                                )
+                            || classpath_value_has_type(
+                                source, file, call, *argument, expected, provider,
+                            )
                     })
                 })
         });
@@ -329,11 +324,19 @@ fn establish_from_table<P: SemanticProvider + ?Sized>(
             provider,
         );
     }
+    // Instance dispatch proves the receiver twice over: by the owner identity
+    // its declared type resolves to (an import alias names the same class a
+    // plain spelling does), and by the platform classifier proofs the table
+    // accepts. A receiver typed `Any`, `String` or an unrelated class matches
+    // neither, whatever the row's name says.
+    let receiver_owner = receiver_owner(source, file, call, receiver, provider);
     for signature in SIGNATURES
         .iter()
         .filter(|signature| signature.name == name && signature.dispatch == Dispatch::Instance)
     {
-        if value_has_type(source, file, call, receiver, signature.owner, provider) {
+        if receiver_owner.as_deref() == Some(signature.owner)
+            || value_has_type(source, file, call, receiver, signature.owner, provider)
+        {
             return applicable(
                 source,
                 file,
@@ -399,8 +402,7 @@ fn establish_from_classpath<P: SemanticProvider + ?Sized>(
             };
             (owner, Dispatch::Static)
         } else {
-            let Some(owner) = classpath_receiver_owner(source, file, call, receiver, provider)
-            else {
+            let Some(owner) = receiver_owner(source, file, call, receiver, provider) else {
                 return ClasspathAnswer::Unavailable;
             };
             (owner, Dispatch::Instance)
@@ -547,8 +549,13 @@ fn is_external_owner(path: &str) -> bool {
         && path.split('.').all(|segment| !segment.is_empty())
 }
 
-/// The owner of an instance receiver, proved from its declared type only.
-fn classpath_receiver_owner<P: SemanticProvider + ?Sized>(
+/// The owner identity a receiver's *declared* type resolves to.
+///
+/// This is a spelling-and-imports resolution, not a fact source: `Decimal`
+/// imported as an alias for `java.math.BigDecimal` and the plain spelling
+/// `BigDecimal` answer the same binary owner, while a foreign class that merely
+/// spells `BigDecimal` answers none.
+fn receiver_owner<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
     call: tree_sitter::Node<'_>,
@@ -582,11 +589,12 @@ fn classpath_receiver_owner<P: SemanticProvider + ?Sized>(
 
 /// `value_has_type` for an argument whose declared type is itself external.
 ///
-/// The static table never needs this (it only accepts the platform spellings the
-/// syntax layer canonicalizes); classpath rows can name any classpath type, so a
-/// parameter typed `com.example.Foo` must be provable from a local's declared
-/// type. Table decisions are unchanged because the caller only reaches here for
-/// classpath rows.
+/// The platform spellings the table accepts are canonical classifiers the
+/// syntax layer already knows; a classpath row can name any classpath type, so
+/// a parameter typed `com.example.Foo` must be provable from a local's declared
+/// type. Both row sources use this, which is what makes an import alias an
+/// argument proof in either one: the argument is compared by the owner identity
+/// its declared type resolves to, exactly like the receiver.
 fn classpath_value_has_type<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,

@@ -1,0 +1,4 @@
+[
+  {"name":"compareTo","static_member":false,"parameter_types":["java.math.BigDecimal"],"result_type":"int","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"compareTo","static_member":false,"parameter_types":["java.lang.Object"],"result_type":"int","parameter_nullability":["unknown"],"result_nullability":"unknown"}
+]
