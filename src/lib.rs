@@ -9,6 +9,7 @@ pub mod ctor_defaults;
 mod default_getter_repair;
 pub mod diagnostics;
 mod eager_collection_helpers;
+pub mod facts;
 pub mod function_callsite;
 pub mod java_ir;
 pub mod jvm_validation;
