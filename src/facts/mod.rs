@@ -5,6 +5,10 @@
 
 pub mod protocol;
 
+pub mod classpath;
+
 pub mod client;
 
 pub mod decorator;
+
+pub mod runtime;

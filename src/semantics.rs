@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod map_alias;
 
@@ -2060,6 +2061,26 @@ pub struct MapAliasTypeArguments {
 pub trait SemanticProvider: Send + Sync {
     fn resolve(&self, name: &str) -> FactStatus<SymbolId>;
     fn symbols(&self) -> &[SemanticSymbol];
+    /// Whether this run has a fact source beyond the syntax index and the
+    /// static fallback table (currently the JVM helper). Callers use this as a
+    /// cheap gate before asking for [`Self::classpath_member_facts`], so a
+    /// jar-less run takes exactly the pre-helper code path.
+    fn has_classpath_facts(&self) -> bool {
+        false
+    }
+    /// Public/protected member facts for an external owner (a JVM binary name
+    /// such as `java.math.BigDecimal`), as the fact source established them.
+    ///
+    /// `None` means "no facts": no source this run, or a source that cannot
+    /// load the type. Both mean the caller keeps whatever it could prove
+    /// without facts — the answer is never an empty member list standing in for
+    /// a failed load.
+    fn classpath_member_facts(
+        &self,
+        _owner: &str,
+    ) -> Option<Arc<Vec<crate::facts::protocol::MemberFacts>>> {
+        None
+    }
     fn kotlin_constructor_metadata_dependency(
         &self,
         _owner: &SymbolId,

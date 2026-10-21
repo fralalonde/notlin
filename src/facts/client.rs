@@ -37,9 +37,15 @@ impl FactsClient {
 
     /// Start the helper jar with the java binary chosen by the environment.
     pub fn start(jar: &Path) -> Result<Self, String> {
+        Self::start_with_command(Self::jar_command(jar))
+    }
+
+    /// The `java -jar <helper>` command, before it is spawned. Exposed so the
+    /// run-scoped runtime and tests build the process the same way.
+    pub fn jar_command(jar: &Path) -> Command {
         let mut command = Command::new(Self::java_program());
         command.arg("-jar").arg(jar);
-        Self::start_with_command(command)
+        command
     }
 
     /// Test seam: spawn any program that speaks the line protocol. No argument

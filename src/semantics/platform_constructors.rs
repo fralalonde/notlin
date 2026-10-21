@@ -67,9 +67,12 @@ pub(crate) fn established_platform_constructor<P: SemanticProvider + ?Sized>(
         source,
         file,
         call,
-        canonical,
-        "<init>",
-        platform_members::Dispatch::Constructor,
+        platform_members::Target {
+            owner: canonical,
+            name: "<init>",
+            dispatch: platform_members::Dispatch::Constructor,
+        },
+        platform_members::SignatureSource::Table,
         provider,
     )
 }

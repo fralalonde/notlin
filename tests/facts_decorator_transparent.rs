@@ -3,9 +3,8 @@
 //! wrapped syntax provider returns.
 
 use notlin::cli::JvmFactsMode;
-use notlin::facts::client::FactsClient;
 use notlin::facts::decorator::FactsProvider;
-use notlin::facts::protocol::Query;
+use notlin::facts::runtime::FactsRuntime;
 use notlin::semantics::{FactStatus, SemanticProvider, SyntaxSemanticProvider};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -177,7 +176,12 @@ fn assert_transparent(provider: &FactsProvider) {
 fn without_a_helper_every_answer_comes_from_the_inner_provider() {
     let provider = FactsProvider::transparent(inner());
     assert!(!provider.has_helper());
-    assert!(provider.query(Query::Ping).is_none());
+    assert!(!provider.has_classpath_facts());
+    assert!(
+        provider
+            .classpath_member_facts("java.math.BigDecimal")
+            .is_none()
+    );
     assert_transparent(&provider);
 }
 
@@ -193,12 +197,16 @@ fn off_policy_never_starts_a_helper() {
 fn a_silent_helper_changes_no_answer() {
     let mut command = Command::new("sh");
     command.arg("-c").arg("exit 0");
-    let client = FactsClient::start_with_command(command).expect("fake helper starts");
-    let provider = FactsProvider::with_client(inner(), client);
+    let runtime = FactsRuntime::with_command(command).expect("fake helper starts");
+    let provider = FactsProvider::with_runtime(inner(), runtime);
     assert!(provider.has_helper());
-    // No upgraded answers exist yet: a helper that answers nothing yields
-    // Unknown-equivalent results, which are the inner provider's answers.
-    assert!(provider.query(Query::Ping).is_none());
+    // A helper that dies establishes nothing, and "nothing" must read exactly
+    // like "no helper": the classpath answer is absent, not empty.
+    assert!(
+        provider
+            .classpath_member_facts("java.math.BigDecimal")
+            .is_none()
+    );
     assert_transparent(&provider);
 }
 

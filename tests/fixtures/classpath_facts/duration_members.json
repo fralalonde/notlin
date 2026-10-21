@@ -1,0 +1,7 @@
+[
+  {"name":"plus","static_member":false,"parameter_types":["java.time.Duration"],"result_type":"java.time.Duration","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"plusDays","static_member":false,"parameter_types":["long"],"result_type":"java.time.Duration","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"plusSeconds","static_member":false,"parameter_types":["long"],"result_type":"java.time.Duration","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"toString","static_member":false,"parameter_types":[],"result_type":"java.lang.String","parameter_nullability":[],"result_nullability":"unknown"},
+  {"name":"ofDays","static_member":true,"parameter_types":["long"],"result_type":"java.time.Duration","parameter_nullability":["unknown"],"result_nullability":"unknown"}
+]

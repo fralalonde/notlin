@@ -1,25 +1,29 @@
-//! A `SemanticProvider` decorator that will answer from the JVM facts helper.
+//! A `SemanticProvider` decorator that answers from the JVM facts helper.
 //!
-//! Phase 0 plumbing only: every trait method forwards to the wrapped syntax
-//! provider unchanged, so the decorator is byte-for-byte transparent and a
-//! run with or without a helper produces the same plan. Later phases override
-//! individual methods to upgrade `Unknown`/`Ambiguous` answers that the helper
-//! establishes; they must never downgrade an answer.
+//! The decorator wraps the syntax provider and only *adds* facts: every
+//! override either forwards unchanged or answers where the syntax provider (and
+//! the static fallback table in `semantics::platform_members`) had nothing.
+//! It never downgrades an answer, so a run with a helper is a superset of the
+//! same run without one.
+//!
+//! The helper itself is run-scoped (`facts::runtime`): this type holds a handle
+//! to the shared runtime, not its own process, so the two providers a run
+//! constructs share one helper and one memo table.
 
 use crate::cli::JvmFactsMode;
-use crate::facts::client::FactsClient;
-use crate::facts::protocol::{Answer, Query};
+use crate::facts::protocol::MemberFacts;
+use crate::facts::runtime::{self, FactsRuntime};
 use crate::semantics::{
     FactStatus, InheritedPropertyAccess, JavaPropertyRead, KotlinConstructorMetadataDependency,
     MapAliasTypeArguments, MemberReceiverCapability, ReferenceReturnNullability, SemanticProvider,
     SemanticSymbol, SymbolId, SyntaxSemanticProvider, TypeAliasDefinition, TypeRef,
 };
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 pub struct FactsProvider {
     inner: SyntaxSemanticProvider,
-    client: Option<Mutex<FactsClient>>,
+    runtime: Option<Arc<FactsRuntime>>,
 }
 
 impl FactsProvider {
@@ -27,24 +31,24 @@ impl FactsProvider {
     pub fn transparent(inner: SyntaxSemanticProvider) -> Self {
         Self {
             inner,
-            client: None,
+            runtime: None,
         }
     }
 
-    /// Wrapper over an already-started helper process.
-    pub fn with_client(inner: SyntaxSemanticProvider, client: FactsClient) -> Self {
+    /// Wrapper over an already-installed run runtime.
+    pub fn with_runtime(inner: SyntaxSemanticProvider, runtime: Arc<FactsRuntime>) -> Self {
         Self {
             inner,
-            client: Some(Mutex::new(client)),
+            runtime: Some(runtime),
         }
     }
 
-    /// Start the helper according to the CLI policy. `On` fails loudly; `Auto`
-    /// silently keeps the transparent wrapper when the helper is unavailable.
+    /// Start (or join) the run's helper according to the CLI policy. `On` fails
+    /// loudly; `Auto` silently keeps the transparent wrapper when the helper is
+    /// unavailable.
     pub fn from_policy(inner: SyntaxSemanticProvider, mode: JvmFactsMode) -> Result<Self, String> {
-        let client = Self::start_client(mode)?;
-        Ok(match client {
-            Some(client) => Self::with_client(inner, client),
+        Ok(match runtime::install(mode)? {
+            Some(runtime) => Self::with_runtime(inner, runtime),
             None => Self::transparent(inner),
         })
     }
@@ -54,8 +58,8 @@ impl FactsProvider {
     /// without a jar before any work happens, so an error here is a spawn
     /// failure: log it and continue without facts rather than abort.
     pub fn policy_or_transparent(inner: SyntaxSemanticProvider, mode: JvmFactsMode) -> Self {
-        match Self::start_client(mode) {
-            Ok(Some(client)) => Self::with_client(inner, client),
+        match runtime::install(mode) {
+            Ok(Some(runtime)) => Self::with_runtime(inner, runtime),
             Ok(None) => Self::transparent(inner),
             Err(error) => {
                 log::warn!("{error}; continuing without JVM facts");
@@ -64,46 +68,22 @@ impl FactsProvider {
         }
     }
 
-    fn start_client(mode: JvmFactsMode) -> Result<Option<FactsClient>, String> {
-        if matches!(mode, JvmFactsMode::Off) {
-            return Ok(None);
-        }
-        let Some(jar) = FactsClient::jar_path() else {
-            return match mode {
-                JvmFactsMode::On => Err("--jvm-facts=on requires NOTLIN_JVM_FACTS_JAR".to_string()),
-                _ => Ok(None),
-            };
-        };
-        match FactsClient::start(&jar) {
-            Ok(client) => Ok(Some(client)),
-            Err(error) => match mode {
-                JvmFactsMode::On => Err(error),
-                _ => {
-                    log::debug!("{error}; continuing without JVM facts");
-                    Ok(None)
-                }
-            },
-        }
-    }
-
     /// Whether this run has a live helper. `false` means every answer is the
     /// syntax provider's.
     pub fn has_helper(&self) -> bool {
-        self.client.is_some()
-    }
-
-    /// A memoized helper query. `None` means the helper established nothing;
-    /// callers map it to `FactStatus::Unknown`, never to a planner error.
-    pub fn query(&self, query: Query) -> Option<Answer> {
-        let client = self.client.as_ref()?;
-        let mut client = client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        client.query(query)
+        self.runtime.is_some()
     }
 }
 
 impl SemanticProvider for FactsProvider {
+    fn has_classpath_facts(&self) -> bool {
+        self.runtime.is_some()
+    }
+
+    fn classpath_member_facts(&self, owner: &str) -> Option<Arc<Vec<MemberFacts>>> {
+        self.runtime.as_ref()?.member_facts(owner)
+    }
+
     fn resolve(&self, name: &str) -> FactStatus<SymbolId> {
         self.inner.resolve(name)
     }

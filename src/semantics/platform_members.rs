@@ -4,6 +4,7 @@
 //! resolver proves arguments, dispatch and results for every signature; adding
 //! a declaration does not add a new translation algorithm.
 use super::*;
+use crate::facts::classpath::{intern, intern_alternatives};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Dispatch {
@@ -18,6 +19,125 @@ struct Signature {
     dispatch: Dispatch,
     parameters: &'static [&'static [&'static str]],
     result: &'static str,
+}
+
+/// One member row materialized from classpath facts for this run.
+///
+/// Parameter spellings are the Kotlin-side names the resolver already proves
+/// (`kotlin.Int` for a JVM `int`/`java.lang.Integer`), because `value_has_type`
+/// answers in those spellings. The result is the JVM binary owner name, interned
+/// for the process: `establish()` returns `&'static str` at every call site, and
+/// a runtime string cannot satisfy that without an arena (see
+/// `facts::classpath::intern`).
+pub(super) struct ClasspathRow {
+    owner: String,
+    name: String,
+    dispatch: Dispatch,
+    parameters: Vec<&'static [&'static str]>,
+    result: &'static str,
+}
+
+/// One signature row, seen through the same accessors whether it came from the
+/// static fallback table or from this run's classpath facts.
+///
+/// Deliberate shape (versus giving `Signature` `Cow` fields): the table stays a
+/// `const` of borrowed literals, no `OnceLock`/lazy init appears in the hot
+/// path, and `applicable()` keeps exactly one filter algorithm over one row
+/// view instead of two near-duplicates. Classpath rows are owned per decision
+/// and dropped with it; only the `&'static str` result needs the arena.
+#[derive(Clone, Copy)]
+enum Row<'a> {
+    Table(&'a Signature),
+    Classpath(&'a ClasspathRow),
+}
+
+impl Row<'_> {
+    fn owner(&self) -> &str {
+        match self {
+            Self::Table(signature) => signature.owner,
+            Self::Classpath(row) => &row.owner,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Table(signature) => signature.name,
+            Self::Classpath(row) => &row.name,
+        }
+    }
+
+    fn dispatch(&self) -> Dispatch {
+        match self {
+            Self::Table(signature) => signature.dispatch,
+            Self::Classpath(row) => row.dispatch,
+        }
+    }
+
+    fn parameters(&self) -> &[&'static [&'static str]] {
+        match self {
+            Self::Table(signature) => signature.parameters,
+            Self::Classpath(row) => &row.parameters,
+        }
+    }
+
+    fn result(&self) -> &'static str {
+        match self {
+            Self::Table(signature) => signature.result,
+            Self::Classpath(row) => row.result,
+        }
+    }
+
+    fn is_classpath(&self) -> bool {
+        matches!(self, Self::Classpath(_))
+    }
+}
+
+enum RowIter<'a> {
+    Table(std::slice::Iter<'static, Signature>),
+    Classpath(std::slice::Iter<'a, ClasspathRow>),
+}
+
+impl<'a> Iterator for RowIter<'a> {
+    type Item = Row<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Table(rows) => rows.next().map(Row::Table),
+            Self::Classpath(rows) => rows.next().map(Row::Classpath),
+        }
+    }
+}
+
+/// Where the applicability resolver reads its rows this run.
+///
+/// The two sources are exclusive per decision, never merged: when classpath
+/// facts cover an owner they are the whole truth for it, and the hand-declared
+/// rows for that owner are stale bootstrapping, not extra candidates. Merging
+/// them would fake unique applicability or fake ambiguity depending on which
+/// side happens to be narrower.
+pub(super) enum SignatureSource<'a> {
+    Table,
+    Classpath(&'a [ClasspathRow]),
+}
+
+/// The member a decision is about.
+#[derive(Clone, Copy)]
+pub(super) struct Target<'a> {
+    pub(super) owner: &'a str,
+    pub(super) name: &'a str,
+    pub(super) dispatch: Dispatch,
+}
+
+impl<'a> SignatureSource<'a> {
+    fn rows(&self) -> RowIter<'a> {
+        match self {
+            Self::Table => RowIter::Table(SIGNATURES.iter()),
+            Self::Classpath(rows) => {
+                let rows: &'a [ClasspathRow] = rows;
+                RowIter::Classpath(rows.iter())
+            }
+        }
+    }
 }
 
 const DECIMAL: &str = "java.math.BigDecimal";
@@ -114,37 +234,65 @@ pub(super) fn applicable<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
     call: tree_sitter::Node<'_>,
-    owner: &str,
-    name: &str,
-    dispatch: Dispatch,
+    target: Target<'_>,
+    signatures: SignatureSource<'_>,
     provider: &P,
 ) -> Option<&'static str> {
     let arguments = overloads::positional_arguments(call)?;
     let arity = arguments.len();
-    let mut matches = SIGNATURES
-        .iter()
-        .filter(|signature| {
-            signature.owner == owner
-                && signature.name == name
-                && signature.dispatch == dispatch
-                && signature.parameters.len() == arity
+    let mut matches = signatures
+        .rows()
+        .filter(|row| {
+            row.owner() == target.owner
+                && row.name() == target.name
+                && row.dispatch() == target.dispatch
+                && row.parameters().len() == arity
         })
-        .filter(|signature| {
-            signature
-                .parameters
+        .filter(|row| {
+            row.parameters()
                 .iter()
                 .zip(&arguments)
                 .all(|(alternatives, argument)| {
                     alternatives.iter().any(|expected| {
                         value_has_type(source, file, call, *argument, expected, provider)
+                            || row.is_classpath()
+                                && classpath_value_has_type(
+                                    source, file, call, *argument, expected, provider,
+                                )
                     })
                 })
         });
     let selected = matches.next()?;
-    matches.next().is_none().then_some(selected.result)
+    matches.next().is_none().then_some(selected.result())
+}
+
+/// How a classpath fact source answered one call.
+///
+/// `NotApplicable` is a *final negative*: the source covers this owner, so the
+/// fallback table's rows for the same owner must not be consulted afterwards
+/// (they are stale facts, not additional candidates).
+enum ClasspathAnswer {
+    Established(&'static str),
+    NotApplicable,
+    Unavailable,
 }
 
 pub(super) fn establish<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<&'static str> {
+    match establish_from_classpath(source, file, call, provider) {
+        ClasspathAnswer::Established(result) => return Some(result),
+        ClasspathAnswer::NotApplicable => return None,
+        ClasspathAnswer::Unavailable => {}
+    }
+    establish_from_table(source, file, call, provider)
+}
+
+/// The pre-helper path, unchanged: a jar-less run must take exactly this code.
+fn establish_from_table<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
     call: tree_sitter::Node<'_>,
@@ -168,7 +316,18 @@ pub(super) fn establish<P: SemanticProvider + ?Sized>(
         let owner = explicit_receiver_type(source, call, callee, file, provider)?;
         let owner =
             standard_external_type(source, provider, &owner, call.kind() == "method_invocation")?;
-        return applicable(source, file, call, &owner, name, Dispatch::Static, provider);
+        return applicable(
+            source,
+            file,
+            call,
+            Target {
+                owner: &owner,
+                name,
+                dispatch: Dispatch::Static,
+            },
+            SignatureSource::Table,
+            provider,
+        );
     }
     for signature in SIGNATURES
         .iter()
@@ -179,14 +338,285 @@ pub(super) fn establish<P: SemanticProvider + ?Sized>(
                 source,
                 file,
                 call,
-                signature.owner,
-                name,
-                Dispatch::Instance,
+                Target {
+                    owner: signature.owner,
+                    name,
+                    dispatch: Dispatch::Instance,
+                },
+                SignatureSource::Table,
                 provider,
             );
         }
     }
     None
+}
+
+/// The same resolver, reading the owner's classpath facts instead of the table.
+///
+/// Only owners this file can name as an external JVM type reach the source:
+/// a fully-qualified spelling, an exact import, or a platform classifier the
+/// syntax layer already canonicalizes. Kotlin owners are deliberately excluded
+/// — reflection cannot see extension functions or default bodies, and those
+/// callees belong to the Kotlin fact track, not to this one.
+fn establish_from_classpath<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    provider: &P,
+) -> ClasspathAnswer {
+    if !provider.has_classpath_facts() {
+        return ClasspathAnswer::Unavailable;
+    }
+    let Some(callee) = call_callee_node(call) else {
+        return ClasspathAnswer::Unavailable;
+    };
+    let Ok(name) = callee.utf8_text(source.as_bytes()) else {
+        return ClasspathAnswer::Unavailable;
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return ClasspathAnswer::Unavailable;
+    }
+    let Some(receiver) = explicit_receiver_node(call, callee) else {
+        return ClasspathAnswer::Unavailable;
+    };
+    let (owner, dispatch) =
+        if explicit_receiver_is_type_qualifier(source, call, callee, file, provider) {
+            // Same guard as the table path: a call the syntax index already
+            // resolves is not an external member.
+            if !matches!(
+                resolve_required_call(source, file, call, callee, name, provider),
+                FactStatus::Unknown
+            ) {
+                return ClasspathAnswer::Unavailable;
+            }
+            let Some(spelling) = explicit_receiver_type(source, call, callee, file, provider)
+            else {
+                return ClasspathAnswer::Unavailable;
+            };
+            let Some(owner) = classpath_owner(source, provider, &spelling) else {
+                return ClasspathAnswer::Unavailable;
+            };
+            (owner, Dispatch::Static)
+        } else {
+            let Some(owner) = classpath_receiver_owner(source, file, call, receiver, provider)
+            else {
+                return ClasspathAnswer::Unavailable;
+            };
+            (owner, Dispatch::Instance)
+        };
+    let Some(rows) = classpath_rows(provider, &owner, name, dispatch) else {
+        return ClasspathAnswer::Unavailable;
+    };
+    match applicable(
+        source,
+        file,
+        call,
+        Target {
+            owner: &owner,
+            name,
+            dispatch,
+        },
+        SignatureSource::Classpath(&rows),
+        provider,
+    ) {
+        Some(result) => ClasspathAnswer::Established(result),
+        None => ClasspathAnswer::NotApplicable,
+    }
+}
+
+/// Rows for one `owner`/`name`/`dispatch`, or `None` when the source has no
+/// facts for that owner at all. An empty `Some` is a real answer: the owner is
+/// known and does not declare that member.
+fn classpath_rows<P: SemanticProvider + ?Sized>(
+    provider: &P,
+    owner: &str,
+    name: &str,
+    dispatch: Dispatch,
+) -> Option<Vec<ClasspathRow>> {
+    let facts = provider.classpath_member_facts(owner)?;
+    let rows = facts
+        .iter()
+        .filter_map(|member| {
+            let member_dispatch = if member.name == "<init>" {
+                Dispatch::Constructor
+            } else if member.static_member {
+                Dispatch::Static
+            } else {
+                Dispatch::Instance
+            };
+            if member.name != name || member_dispatch != dispatch {
+                return None;
+            }
+            let parameters = member
+                .parameter_types
+                .iter()
+                .map(|parameter| {
+                    let alternative = classifier(parameter);
+                    intern_alternatives(std::slice::from_ref(&alternative))
+                })
+                .collect();
+            let result = if member.name == "<init>" {
+                owner.to_string()
+            } else {
+                classifier(&member.result_type)
+            };
+            Some(ClasspathRow {
+                owner: owner.to_string(),
+                name: name.to_string(),
+                dispatch,
+                parameters,
+                result: intern(&result),
+            })
+        })
+        .collect();
+    Some(rows)
+}
+
+/// JVM classifier name as the resolver's argument types spell it.
+fn classifier(name: &str) -> String {
+    match name {
+        "<void>" => "kotlin.Unit".to_string(),
+        "int" | "java.lang.Integer" => "kotlin.Int".to_string(),
+        "long" | "java.lang.Long" => "kotlin.Long".to_string(),
+        "double" | "java.lang.Double" => "kotlin.Double".to_string(),
+        "float" | "java.lang.Float" => "kotlin.Float".to_string(),
+        "boolean" | "java.lang.Boolean" => "kotlin.Boolean".to_string(),
+        "short" | "java.lang.Short" => "kotlin.Short".to_string(),
+        "byte" | "java.lang.Byte" => "kotlin.Byte".to_string(),
+        "char" | "java.lang.Character" => "kotlin.Char".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The owner a classpath fact source may be asked about for `spelling`.
+///
+/// Deliberately narrow: a fully-qualified name, an exact import, or a platform
+/// classifier the syntax layer canonicalizes. Kotlin packages are never
+/// accepted, and a type the index declares itself always wins over an external
+/// one with the same name.
+fn classpath_owner<P: SemanticProvider + ?Sized>(
+    source: &str,
+    provider: &P,
+    spelling: &str,
+) -> Option<String> {
+    let spelling = spelling
+        .trim()
+        .trim_end_matches('?')
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if spelling.is_empty() {
+        return None;
+    }
+    let simple = spelling.rsplit('.').next().unwrap_or(spelling);
+    if provider
+        .symbols_named(simple)
+        .iter()
+        .any(|symbol| is_type_symbol(&symbol.id))
+    {
+        return None;
+    }
+    if is_external_owner(spelling) {
+        return Some(spelling.to_string());
+    }
+    if spelling.contains('.') {
+        return None;
+    }
+    kotlin_import_lines(source)
+        .find_map(|import| {
+            let (path, alias) = import
+                .split_once(" as ")
+                .map_or((import, None), |(path, alias)| {
+                    (path.trim(), Some(alias.trim()))
+                });
+            let imported = alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path));
+            (imported == simple && is_external_owner(path)).then(|| path.to_string())
+        })
+        .or_else(|| {
+            standard_external_type(source, provider, spelling, false)
+                .filter(|owner| is_external_owner(owner))
+        })
+}
+
+/// A binary name whose members reflection can actually answer for.
+fn is_external_owner(path: &str) -> bool {
+    path.contains('.')
+        && !path.starts_with("kotlin.")
+        && path.split('.').all(|segment| !segment.is_empty())
+}
+
+/// The owner of an instance receiver, proved from its declared type only.
+fn classpath_receiver_owner<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    receiver: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<String> {
+    match receiver.kind() {
+        "identifier" | "simple_identifier" => {
+            let spelling = receiver.utf8_text(source.as_bytes()).ok()?.trim();
+            let ty = container_types::parameter_type(source, file, call, spelling, provider)
+                .or_else(|| lexical_parameter_type(source, call, spelling))?;
+            if ty.nullable {
+                return None;
+            }
+            let KotlinType::Named { name, arguments } = ty.ty else {
+                return None;
+            };
+            if !arguments.is_empty() {
+                return None;
+            }
+            classpath_owner(source, provider, &name)
+        }
+        "navigation_expression" => {
+            let owner =
+                established_direct_property_receiver_type(source, call, receiver, file, provider)?;
+            classpath_owner(source, provider, &owner)
+        }
+        _ => None,
+    }
+}
+
+/// `value_has_type` for an argument whose declared type is itself external.
+///
+/// The static table never needs this (it only accepts the platform spellings the
+/// syntax layer canonicalizes); classpath rows can name any classpath type, so a
+/// parameter typed `com.example.Foo` must be provable from a local's declared
+/// type. Table decisions are unchanged because the caller only reaches here for
+/// classpath rows.
+fn classpath_value_has_type<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    expression: tree_sitter::Node<'_>,
+    expected: &str,
+    provider: &P,
+) -> bool {
+    if !matches!(expression.kind(), "identifier" | "simple_identifier") {
+        return false;
+    }
+    let Ok(spelling) = expression.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    let spelling = spelling.trim();
+    let Some(ty) = container_types::parameter_type(source, file, call, spelling, provider)
+        .or_else(|| lexical_parameter_type(source, call, spelling))
+    else {
+        return false;
+    };
+    if ty.nullable {
+        return false;
+    }
+    let KotlinType::Named { name, arguments } = ty.ty else {
+        return false;
+    };
+    if !arguments.is_empty() {
+        return false;
+    }
+    classpath_owner(source, provider, &name).as_deref() == Some(expected)
 }
 
 fn value_has_type<P: SemanticProvider + ?Sized>(
