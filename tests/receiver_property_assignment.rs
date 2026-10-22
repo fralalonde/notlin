@@ -104,6 +104,55 @@ class Hub3 {\n    fun link(h: Hub3, other: Thing3) {\n        other.parent = h\n
 }
 
 #[test]
+fn annotated_receiver_property_still_uses_the_plain_setter() {
+    // Serialization/tooling annotations on the receiver's property do not
+    // change the setter ABI: callers still write through `setParent`.
+    let root = workspace("receiver-write-annotated");
+    let source = "package neutral.receiverwriteannotated\n\
+annotation class WireRef\n\
+class Hub5 {\n    fun link(other: Thing5, h: Hub5) {\n        other.parent = h\n    }\n\
+}\n\nclass Thing5 {\n    @WireRef\n    var parent: Hub5? = null\n}\n";
+    fs::write(root.join("RWA.kt"), source).unwrap();
+    let (files, errors) = transpile_in_workspace(&root, "RWA.kt", source);
+    assert_eq!(
+        errors, 0,
+        "declaration annotations must not block the caller write"
+    );
+    let hub = files
+        .iter()
+        .find(|(name, _)| name == "Hub5.java")
+        .map(|(_, text)| text.clone())
+        .expect("Hub5.java");
+    assert!(
+        hub.contains("other.setParent(h);"),
+        "expected the plain setter ABI, got:\n{hub}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn renamed_setter_property_is_not_guessed() {
+    // @set:JvmName renames the Java setter: the caller must not assume
+    // `setParent`; no invented rewrite on this path either way.
+    let root = workspace("receiver-write-jvmname");
+    let source = "package neutral.receiverwritejvmname\n\
+class Hub6 {\n    fun link(other: Thing6, h: Hub6) {\n        other.parent = h\n    }\n\
+}\n\nclass Thing6 {\n    @set:JvmName(\"assignParent\")\n    var parent: Hub6? = null\n}\n";
+    fs::write(root.join("RWJ.kt"), source).unwrap();
+    let (files, _errors) = transpile_in_workspace(&root, "RWJ.kt", source);
+    let hub = files
+        .iter()
+        .find(|(name, _)| name == "Hub6.java")
+        .map(|(_, text)| text.clone())
+        .unwrap_or_default();
+    assert!(
+        !hub.contains("other.setParent(h);"),
+        "a renamed setter must not be assumed by the caller:\n{hub}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unresolvable_receiver_keeps_the_existing_conservative_behaviour() {
     // A receiver whose type is not proven (here: a chained member of unknown
     // type) must NOT gain a guessed setter rewrite; today that call site is

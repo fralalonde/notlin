@@ -25,7 +25,8 @@ pub(crate) mod profile;
 // 26: constructor-property visibility is indexed for inherited setter proofs.
 // 28: value-class identity excludes unboxed getters from reference covariance.
 // 29: method-generic and inline-bound header facts reuse the indexing parse.
-const CACHE_VERSION: u32 = 30;
+// 31: setter_name_renamed indexes @JvmName presence on properties.
+const CACHE_VERSION: u32 = 31;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -160,6 +161,12 @@ pub struct Member {
     /// bridgeable in all-open/JPA classes, while a custom accessor is virtual.
     #[serde(default)]
     pub has_custom_accessor: bool,
+    /// The Java setter name is not the JavaBean default because the property
+    /// carries `@set:JvmName`. Declaration-site annotations (serialization,
+    /// tooling) do NOT rename accessors and must not carry this flag. Only a
+    /// proven ordinary `setX` name is safe for caller-side write rewrites.
+    #[serde(default)]
+    pub setter_name_renamed: bool,
     /// An explicitly typed, annotation-free readonly getter with no initializer,
     /// delegate or backing-field access. It can retain its JVM method body
     /// without introducing a storage property when a Java contract owns it.
@@ -6051,6 +6058,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 has_unsupported_property_shape: false,
                 is_constructor_property: false,
                 has_custom_accessor: false,
+                setter_name_renamed: false,
                 has_plain_computed_getter: false,
                 has_inline_getter: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
@@ -6121,6 +6129,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                         .any(|child| child.kind() == "property_delegate"),
                 is_constructor_property: true,
                 has_custom_accessor: false,
+                setter_name_renamed: parameter_text.contains("JvmName"),
                 has_plain_computed_getter: false,
                 has_inline_getter: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
@@ -6547,6 +6556,18 @@ fn member_from_node(
             && node
                 .named_children(&mut node.walk())
                 .any(|child| matches!(child.kind(), "getter" | "setter")),
+        // Conservative: any mention of JvmName (on the property, an accessor,
+        // or a `@set:`/`@get:` target) may change the Java accessor name, and
+        // cheap text cannot prove which. Consumers must not assume a setter
+        // name on a property that carries it.
+
+        // Conservative: any mention of JvmName (on the property, an accessor,
+        // or a `@set:`/`@get:` target) may change the Java accessor name, and
+        // cheap text cannot prove which. Consumers must not assume a setter
+        // name on a property that carries it.
+        setter_name_renamed: kind == MemberKind::Property
+            && language == SourceLanguage::Kotlin
+            && member_text.contains("JvmName"),
         has_plain_computed_getter: kind == MemberKind::Property
             && language == SourceLanguage::Kotlin
             && plain_computed_property_getter(node, source).is_some(),

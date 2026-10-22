@@ -522,11 +522,14 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     /// properties, and falling through to the read path emits the illegal
     /// `other.getParent() = v`. Allowed only when the receiver spelling has a
     /// proven local/parameter type resolving to exactly one indexed Kotlin
-    /// declaration whose plain public `var` property exposes the ordinary
+    /// class whose plain public `var` property exposes the ordinary
     /// JavaBean setter ABI. `@JvmField` properties have no setter method,
-    /// and explicit accessor blocks (which can carry `private set` or
-    /// `@JvmName`) are not trusted here; both keep today's behavior.
-    /// Returns just the setter name; the caller composes `base + setter + "("`.
+    /// a custom accessor block can hide the setter (`private set`), and
+    /// `@JvmName` can rename it — indexed as `setter_name_renamed`; all of
+    /// those keep today's behavior. Declaration-site annotations such as
+    /// serialization or tooling markers do not change the setter name and
+    /// do NOT block this rewrite. Returns just the setter name; the caller
+    /// composes `base + setter + "("`.
     fn receiver_owned_property_setter(
         &self,
         node: tree_sitter::Node,
@@ -590,7 +593,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         if !property.is_mutable
             || property.is_jvm_field
             || property.has_custom_accessor
-            || property.has_unsupported_property_annotations
+            || property.setter_name_renamed
             || !matches!(
                 property.visibility.as_deref(),
                 None | Some("public") | Some("protected")
