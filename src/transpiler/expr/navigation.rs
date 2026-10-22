@@ -7,6 +7,11 @@ use crate::transpiler::unit::capitalize;
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
+        if let Some((owner, member, _)) = self.unit.semantic_provider.and_then(|provider| {
+            crate::semantics::external_static_field_access(self.unit.source, node, provider)
+        }) {
+            return format!("{owner}.{member}");
+        }
         if let Some(java) = self.planned_container_property_access(node) {
             return java;
         }

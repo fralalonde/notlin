@@ -46,6 +46,7 @@ pub use inherited_properties::InheritedPropertyAccess;
 pub use object_calls::{ReferenceStringCall, ReferenceStringCallKind, ReferenceStringReceiver};
 pub use overloads::ExactOverloadCall;
 pub(crate) use platform_constructors::established_platform_constructor;
+pub(crate) use platform_members::external_static_field_access;
 pub use reified_calls::ReifiedClassCall;
 pub use todo::TodoLowering;
 
@@ -7426,7 +7427,23 @@ fn explicit_receiver_is_type_qualifier<P: SemanticProvider + ?Sized>(
     let Some(spelling) = explicit_receiver_spelling(source, call, callee) else {
         return false;
     };
-    if explicit_receiver_node(call, callee).is_some_and(|node| node.kind() == "call_expression") {
+    let Some(receiver) = explicit_receiver_node(call, callee) else {
+        return false;
+    };
+    if receiver.kind() == "call_expression" {
+        return false;
+    }
+    // A dotted receiver may be a value reached through a static field. Its
+    // leading capital only identifies the root, not the entire expression.
+    // Require a classifier fact for the complete path before static dispatch;
+    // instance dispatch can independently prove a field value's type.
+    if receiver.kind() == "navigation_expression"
+        && standard_external_type(source, provider, spelling, false).is_none()
+        && !matches!(
+            provider.resolve_type_in_file(file, &package_name(source), spelling),
+            FactStatus::Established(id) if is_type_symbol(&id)
+        )
+    {
         return false;
     }
     spelling.chars().next().is_some_and(char::is_uppercase)

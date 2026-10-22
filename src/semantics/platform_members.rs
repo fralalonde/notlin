@@ -627,6 +627,41 @@ fn classpath_value_has_type<P: SemanticProvider + ?Sized>(
     classpath_owner(source, provider, &name).as_deref() == Some(expected)
 }
 
+/// A bounded external field declaration, shared by dispatch and emission.
+/// Returns (canonical JVM owner, field name, result classifier), never a
+/// guess based on capitalization. Aliases and shadowing use the same owner
+/// identity proof as ordinary external calls.
+pub(crate) fn external_static_field_access<P: SemanticProvider + ?Sized>(
+    source: &str,
+    expression: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if expression.kind() != "navigation_expression" {
+        return None;
+    }
+    let text = expression.utf8_text(source.as_bytes()).ok()?;
+    let (qualifier, member) = text.trim().rsplit_once('.')?;
+    let root = qualifier.trim().split('.').next().unwrap_or("");
+    if is_proven_local_shadow(expression, root, source)
+        || provider
+            .symbols_named(root)
+            .iter()
+            .any(|symbol| !is_type_symbol(&symbol.id))
+    {
+        return None;
+    }
+    let owner = classpath_owner(source, provider, qualifier.trim())?;
+    const FIELDS: &[(&str, &str, &str)] = &[
+        (DECIMAL, "ZERO", DECIMAL),
+        (DECIMAL, "ONE", DECIMAL),
+        (DECIMAL, "TEN", DECIMAL),
+    ];
+    FIELDS
+        .iter()
+        .find(|(declaring, name, _)| *declaring == owner && *name == member)
+        .copied()
+}
+
 fn value_has_type<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
@@ -677,27 +712,8 @@ fn value_has_type<P: SemanticProvider + ?Sized>(
             {
                 return true;
             }
-            let Ok(text) = expression.utf8_text(source.as_bytes()) else {
-                return false;
-            };
-            let Some((qualifier, member)) = text.trim().rsplit_once('.') else {
-                return false;
-            };
-            // Source-backed fields use the property path above. External fields
-            // require declarations too; their names alone never prove a type.
-            const FIELDS: &[(&str, &str, &str)] = &[
-                (DECIMAL, "ZERO", DECIMAL),
-                (DECIMAL, "ONE", DECIMAL),
-                (DECIMAL, "TEN", DECIMAL),
-            ];
-            let root = qualifier.trim().split('.').next().unwrap_or("");
-            !is_proven_local_shadow(expression, root, source)
-                && !provider
-                    .symbols_named(root)
-                    .iter()
-                    .any(|symbol| !is_type_symbol(&symbol.id))
-                && standard_external_type(source, provider, qualifier.trim(), false)
-                    .is_some_and(|owner| FIELDS.contains(&(owner.as_str(), member, expected)))
+            external_static_field_access(source, expression, provider)
+                .is_some_and(|(_, _, result)| result == expected)
         }
         "call_expression" => {
             established_platform_call_return_type(source, file, expression, provider)

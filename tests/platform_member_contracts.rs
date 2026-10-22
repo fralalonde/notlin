@@ -106,6 +106,40 @@ fn facts_provider(
 }
 
 #[test]
+fn static_field_values_are_instance_receivers_not_type_qualifiers() {
+    for (imports, expression) in [
+        ("import java.math.BigDecimal", "BigDecimal.ONE.abs()"),
+        (
+            "import java.math.BigDecimal as Decimal",
+            "Decimal.ZERO.abs()",
+        ),
+        ("", "java.math.BigDecimal.TEN.abs()"),
+    ] {
+        let source = format!("{imports}\nfun magnitude(): java.math.BigDecimal = {expression}");
+        assert!(
+            unresolved(&source).is_empty(),
+            "field receiver was misclassified: {source}: {:?}",
+            unresolved(&source)
+        );
+    }
+}
+
+#[test]
+fn static_field_receiver_proofs_reject_unknown_and_shadowed_values() {
+    for source in [
+        "import java.math.BigDecimal\nfun magnitude() = BigDecimal.UNKNOWN.abs()",
+        "import foreign.math.BigDecimal as Decimal\nfun magnitude() = Decimal.ONE.abs()",
+        "import java.math.BigDecimal\nfun magnitude(BigDecimal: Any) = BigDecimal.ONE.abs()",
+        "import java.util.Locale\nfun locale() = Locale.ROOT.getDefault()",
+    ] {
+        assert!(
+            !unresolved(source).is_empty(),
+            "unproven field receiver gained a call fact: {source}"
+        );
+    }
+}
+
+#[test]
 fn signatures_compose_across_constructors_members_and_factories() {
     for source in [
         "fun text(n: Int): String = StringBuilder().append(n).append(\"!\").toString()",
