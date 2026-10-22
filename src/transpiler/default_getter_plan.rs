@@ -146,10 +146,30 @@ pub(super) fn plan_default_getters(
                 // The direct super qualifier can remain Kotlin when it
                 // inherits this exact Java default. Workspace bridge analysis
                 // has already rejected overrides, reabstraction and ambiguity.
-                if bridges.iter().any(|bridge| !java_default_owner(&bridge.target)) {
-                    Err("inherited covariant getter needs a concrete Java bridge, but its default provider remains Kotlin".to_owned())
-                } else {
+                let mut blocked = bridges
+                    .iter()
+                    .filter(|bridge| !java_default_owner(&bridge.target))
+                    .map(|bridge| {
+                        let target = &bridge.target;
+                        let mut path = target.owner_path.clone();
+                        path.push(target.name.clone());
+                        let owner = if target.package.is_empty() {
+                            path.join(".")
+                        } else {
+                            format!("{}.{}", target.package, path.join("."))
+                        };
+                        format!("`{owner}#{}`", bridge.method_name)
+                    })
+                    .collect::<Vec<_>>();
+                blocked.sort();
+                blocked.dedup();
+                if blocked.is_empty() {
                     Ok(bridges)
+                } else {
+                    Err(format!(
+                        "inherited covariant getter needs a concrete Java bridge, but its default provider remains Kotlin: {}",
+                        blocked.join(", ")
+                    ))
                 }
             });
         results.push((
@@ -378,6 +398,16 @@ mod tests {
                     BackendOwner::Kotlin
                 );
                 assert!(plan.default_getter_bridges.is_empty());
+                assert!(
+                    decision(&plan, "Child")
+                        .retention_reasons
+                        .iter()
+                        .any(|reason| {
+                            matches!(reason, RetentionReason::PreparationBlocker { message, .. }
+                            if message.contains("sample.Middle") && message.contains("getCode"))
+                        }),
+                    "retention must identify the exact default provider and getter"
+                );
             } else {
                 assert_eq!(decision(&plan, "Child").candidate_owner, BackendOwner::Java);
                 let [bridge] = plan.default_getter_bridges.as_slice() else {
