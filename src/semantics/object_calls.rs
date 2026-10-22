@@ -55,10 +55,9 @@ pub(super) fn establish<P: SemanticProvider + ?Sized>(
             object_receiver(source, file, call, callee, name, provider)?,
             ReferenceStringCallKind::ObjectToString,
         )
-    } else if name == "lowercase"
-        && call_argument_count(call) == 0
-        && direct_trailing_lambda(call).is_none()
-        && super::established_standard_string_case_call(source, file, call, provider)
+    } else if let Some(case) = super::string_case::establish(source, file, call, provider)
+        && case.direction == super::string_case::StringCaseDirection::Lowercase
+        && case.locale == super::string_case::StringCaseLocale::Invariant
     {
         let receiver = explicit_receiver_node(call, callee)?;
         let inner_callee = super::call_callee_node(receiver)?;

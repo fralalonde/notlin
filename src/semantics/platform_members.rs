@@ -286,6 +286,27 @@ pub(super) fn establish<P: SemanticProvider + ?Sized>(
     establish_from_table(source, file, call, provider)
 }
 
+/// Whether no *source* declaration owns this call.
+///
+/// [`resolve_required_call`] layers Track B call-site facts on top of the source
+/// index, so an `Established` answer may be the helper stating that the callee is
+/// exactly the external member being asked about. That is not a competing
+/// declaration; only an indexed symbol keeps the platform proof away.
+fn source_call_is_unknown<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    callee: tree_sitter::Node<'_>,
+    name: &str,
+    provider: &P,
+) -> bool {
+    match resolve_required_call(source, file, call, callee, name, provider) {
+        FactStatus::Unknown => true,
+        FactStatus::Established(target) => crate::facts::is_fact_symbol(&target),
+        FactStatus::Inferred(_) | FactStatus::Ambiguous(_) => false,
+    }
+}
+
 /// The pre-helper path, unchanged: a jar-less run must take exactly this code.
 fn establish_from_table<P: SemanticProvider + ?Sized>(
     source: &str,
@@ -302,10 +323,12 @@ fn establish_from_table<P: SemanticProvider + ?Sized>(
     let receiver = explicit_receiver_node(call, callee)?;
     let static_call = explicit_receiver_is_type_qualifier(source, call, callee, file, provider);
     if static_call {
-        if !matches!(
-            resolve_required_call(source, file, call, callee, name, provider),
-            FactStatus::Unknown
-        ) {
+        // Only a *source* declaration owns this call. A Track B call-site fact
+        // for the same static member (`Locale.getDefault()` resolves to
+        // `java.util.Locale` in K2) is another statement of the same external
+        // truth, not a competing declaration; refusing it would drop the
+        // platform proof exactly when the helper runs.
+        if !source_call_is_unknown(source, file, call, callee, name, provider) {
             return None;
         }
         let owner = explicit_receiver_type(source, call, callee, file, provider)?;
@@ -385,12 +408,10 @@ fn establish_from_classpath<P: SemanticProvider + ?Sized>(
     };
     let (owner, dispatch) =
         if explicit_receiver_is_type_qualifier(source, call, callee, file, provider) {
-            // Same guard as the table path: a call the syntax index already
-            // resolves is not an external member.
-            if !matches!(
-                resolve_required_call(source, file, call, callee, name, provider),
-                FactStatus::Unknown
-            ) {
+            // Same guard as the table path: a call a *source* declaration
+            // already resolves is not an external member. Helper facts for the
+            // same external member do not disqualify it.
+            if !source_call_is_unknown(source, file, call, callee, name, provider) {
                 return ClasspathAnswer::Unavailable;
             }
             let Some(spelling) = explicit_receiver_type(source, call, callee, file, provider)

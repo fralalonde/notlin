@@ -1947,8 +1947,6 @@ fn base_text(s: &str) -> bool {
 
 fn kotlin_member_to_java(member: &str) -> Option<String> {
     let mapped: Option<&str> = match member {
-        "uppercase" => Some("toUpperCase"),
-        "lowercase" => Some("toLowerCase"),
         "keys" => Some("keySet"),
         "entries" => Some("entrySet"),
         "stream" => Some("stream()"),

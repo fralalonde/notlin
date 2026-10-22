@@ -2,6 +2,7 @@
 //! dispatch, trailing lambdas.
 
 use super::Expr;
+use crate::semantics::string_case::StringCaseLocale;
 use crate::transpiler::kt;
 use crate::transpiler::unit::{instance_property_count, primitive_array_factory};
 
@@ -524,22 +525,34 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .copied()
             && let Some((base, member)) = self.unit.nav_base_member(nav)
         {
-            if matches!(member.as_str(), "lowercase" | "uppercase")
-                && args.len() <= 1
-                && self.unit.established_standard_string_case_call(node)
+            if let Some(case) = self.unit.string_case_call(node)
+                && case.argument_count() == args.len()
+                && case.receiver.start_byte == base.start_byte()
+                && case.receiver.end_byte == base.end_byte()
             {
-                // Kotlin's no-argument case conversion uses the invariant
-                // locale; Java's no-argument methods use the process default.
-                let locale = args
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or("java.util.Locale.ROOT");
-                let method = if member == "lowercase" {
-                    "toLowerCase"
-                } else {
-                    "toUpperCase"
+                // Kotlin's no-argument case conversion is invariant; Java's
+                // no-argument methods use the process default, so the proven
+                // fact pins `Locale.ROOT`. An explicit Locale argument is
+                // passed through untouched.
+                //
+                // `args` keeps the `name = value` spelling so data-class copy
+                // reassembly can match components by name; a Java method call
+                // takes the value only. `copy_arg_values` holds the same
+                // arguments in the same order with that reassembly prefix
+                // stripped, so named-Locale call sites read it here instead.
+                let locale = match case.locale {
+                    StringCaseLocale::Invariant => "java.util.Locale.ROOT".to_string(),
+                    StringCaseLocale::Explicit => copy_arg_values
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "java.util.Locale.ROOT".to_string()),
                 };
-                return format!("({}).{}({})", self.transpile(base), method, locale);
+                return format!(
+                    "({}).{}({})",
+                    self.transpile(base),
+                    case.direction.java_method(),
+                    locale
+                );
             }
             // Kotlin String.split is a literal-delimiter operation which
             // keeps trailing empty fields. Java String.split is regex-based

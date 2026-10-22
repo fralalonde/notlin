@@ -263,15 +263,27 @@ pub struct UnitOptions {
 }
 
 impl<'src, 'tree> Unit<'src, 'tree> {
-    pub(crate) fn established_standard_string_case_call(&self, node: tree_sitter::Node) -> bool {
-        self.semantic_provider.is_some_and(|provider| {
-            crate::semantics::established_standard_string_case_call(
-                self.source,
-                self.workspace_file.as_deref().unwrap_or(self.file),
-                node,
-                provider,
-            )
-        })
+    /// The shared Kotlin `String.lowercase`/`uppercase` fact for this call,
+    /// when the run has proven it. Applicability and emission read the same
+    /// answer, so a call cannot be planned as translatable and then lowered
+    /// from its spelling.
+    pub(crate) fn string_case_call(
+        &self,
+        node: tree_sitter::Node,
+    ) -> Option<crate::semantics::string_case::StringCaseCall> {
+        let provider = self.semantic_provider?;
+        let call = if node.kind() == "call_expression" {
+            node
+        } else {
+            node.parent()
+                .filter(|parent| parent.kind() == "call_expression")?
+        };
+        crate::semantics::string_case::establish(
+            self.source,
+            self.workspace_file.as_deref().unwrap_or(self.file),
+            call,
+            provider,
+        )
     }
 
     pub(crate) fn established_java_callable_member(&self, node: tree_sitter::Node) -> bool {

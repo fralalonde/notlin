@@ -31,6 +31,7 @@ mod platform_members;
 mod property_getter_equivalence;
 mod reified_calls;
 mod source_calls;
+pub(crate) mod string_case;
 mod todo;
 pub(crate) use class_literals::{
     contains_unlowerable_class_literal, established_default_companion_call,
@@ -4625,6 +4626,39 @@ pub fn plan_required_calls(
                                             crate::translation_plan::BackendOwner::Kotlin;
                                     }
                                 }
+                                // A `String` receiver is not evidence that a
+                                // `lowercase`/`uppercase` call is the stdlib
+                                // conversion: the resolved callee has to be
+                                // the shared fact. Anything else — a workspace
+                                // extension, another stdlib function, or a
+                                // shape this lowering does not implement — is
+                                // retained here, because the emitter has no
+                                // Java form for the Kotlin spelling.
+                                if string_case::spelling_claims_string_case(
+                                    source, file, node, callee, &name, provider,
+                                ) && string_case::establish(source, file, node, provider)
+                                    .is_none()
+                                {
+                                    let decision = &mut plan.declarations[index];
+                                    let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
+                                        kind: crate::translation_plan::PreparationBlockerKind::UnresolvedAssumption,
+                                        message: format!(
+                                            "call `{name}` is not the proven String case conversion"
+                                        ),
+                                    };
+                                    if !decision.retention_reasons.contains(&reason) {
+                                        decision.retention_reasons.push(reason);
+                                        decision.candidate_owner =
+                                            crate::translation_plan::BackendOwner::Kotlin;
+                                    }
+                                    plan.diagnostics.push(SemanticDiagnostic {
+                                        code: "S001".into(),
+                                        message: format!(
+                                            "call `{name}` is not the proven String case conversion"
+                                        ),
+                                        location,
+                                    });
+                                }
                             }
                         }
                     }
@@ -6902,55 +6936,6 @@ pub(crate) fn established_platform_call_return_type<P: SemanticProvider + ?Sized
     platform_members::establish(source, file, call, provider)
 }
 
-/// Shared proof for Kotlin String case conversion calls. The Locale overload
-/// is accepted only when its sole argument has a proven `java.util.Locale`
-/// type, and an indexed workspace extension takes precedence over this fact.
-pub(crate) fn established_standard_string_case_call<P: SemanticProvider + ?Sized>(
-    source: &str,
-    file: &Path,
-    call: tree_sitter::Node<'_>,
-    provider: &P,
-) -> bool {
-    let Some(callee) = call_callee_node(call) else {
-        return false;
-    };
-    let name = callee.utf8_text(source.as_bytes()).unwrap_or("").trim();
-    if !matches!(name, "lowercase" | "uppercase")
-        || provider.symbols_named(name).iter().any(|symbol| {
-            symbol.id.receiver.is_some() && matches!(symbol.id.kind.as_str(), "function" | "method")
-        })
-        || kotlin_import_lines(source).any(|import| {
-            let (path, alias) = import
-                .split_once(" as ")
-                .map_or((import, None), |(path, alias)| {
-                    (path.trim(), Some(alias.trim()))
-                });
-            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or("")) == name
-                && path != format!("kotlin.text.{name}")
-        })
-        || explicit_receiver_node(call, callee).is_none()
-        || !matches!(
-            resolve_required_call(source, file, call, callee, name, provider),
-            FactStatus::Unknown
-        )
-    {
-        return false;
-    }
-    let Some(receiver_type) = explicit_receiver_type(source, call, callee, file, provider) else {
-        return false;
-    };
-    if standard_external_type(source, provider, &receiver_type, false).as_deref()
-        != Some("java.lang.String")
-    {
-        return false;
-    }
-    match call_argument_count(call) {
-        0 => true,
-        1 => known_locale_argument(source, file, call, provider),
-        _ => false,
-    }
-}
-
 pub(crate) fn established_java_callable_member<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
@@ -6988,6 +6973,17 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
     {
         return true;
     }
+    // The String case conversion is one typed fact (direction and locale
+    // contract from the resolved callee), not a spelling table: an alias such
+    // as `value.fold()` is only this call when the fact says so.
+    if string_case::establish(source, file, call, provider).is_some() {
+        return true;
+    }
+    if matches!(name, "lowercase" | "uppercase") {
+        // The stdlib case conversion either proved itself above or is not this
+        // call. Its spelling is never evidence of its own.
+        return false;
+    }
     let Some(receiver_type) = explicit_receiver_type(source, call, callee, file, provider) else {
         return false;
     };
@@ -7008,9 +7004,6 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
             return matches!(arity, 1 | 2);
         }
         return arity == 1 && known_string_split_argument(source, file, call, provider);
-    }
-    if receiver_type == "java.lang.String" && matches!(name, "lowercase" | "uppercase") {
-        return established_standard_string_case_call(source, file, call, provider);
     }
     if matches!(name, "mapKeys" | "filterValues")
         && matches!(
@@ -7039,11 +7032,7 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
         (receiver_type.as_str(), name, arity),
         ("java.util.UUID", "toString" | "hashCode", 0)
             | ("java.util.UUID", "equals", 1)
-            | (
-                "java.lang.String",
-                "toString" | "hashCode" | "lowercase" | "uppercase" | "trim",
-                0
-            )
+            | ("java.lang.String", "toString" | "hashCode" | "trim", 0)
             | ("java.lang.String", "equals" | "compareTo", 1)
             | (
                 "java.util.Map"
