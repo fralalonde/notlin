@@ -753,8 +753,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // Kotlin's Suppress is SOURCE-retained compiler metadata, not a Java
         // annotation. Drop it only with an unambiguous Kotlin binding; never
         // erase a user annotation just because its short name matches.
-        if self.kotlin_suppress_binding(node) == Some(true) {
+        if self.kotlin_builtin_annotation_binding(node, "kotlin.Suppress") == Some(true) {
             return Some(String::new());
+        }
+        if self.kotlin_builtin_annotation_binding(node, "kotlin.Deprecated") == Some(true) {
+            return Some("@java.lang.Deprecated".to_string());
         }
         // Kotlin-only argument shapes taint immediately — except a
         // `Name::class` class literal, which rewrites to `Name.class` in Java
@@ -823,28 +826,33 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         Some(rebuilt.trim_end().to_string())
     }
 
-    /// Some(true) proves Kotlin's compiler-only annotation; None means a
-    /// wildcard import could bind the short spelling to another annotation.
-    fn kotlin_suppress_binding(&self, annotation: tree_sitter::Node<'_>) -> Option<bool> {
+    /// Some(true) proves a builtin identity; None means a wildcard import
+    /// could bind the short spelling to a different annotation.
+    fn kotlin_builtin_annotation_binding(
+        &self,
+        annotation: tree_sitter::Node<'_>,
+        canonical: &str,
+    ) -> Option<bool> {
         let Some(name) = annotation_fq_name(annotation, self.source) else {
             return Some(false);
         };
         let name = annotation_import_name(name, self.source);
-        if name == "kotlin.Suppress" {
+        if name == canonical {
             return Some(true);
         }
-        if name != "Suppress" {
+        let simple = canonical.rsplit('.').next()?;
+        if name != simple {
             return Some(false);
         }
         let file = self.workspace.and_then(|index| {
             index.source_file(self.workspace_file.as_deref().unwrap_or(self.file))
         });
-        if annotation_type_is_local(self.workspace, file, "Suppress") {
+        if annotation_type_is_local(self.workspace, file, simple) {
             return Some(false);
         }
         let imports = annotation_imports(self.source).collect::<Vec<_>>();
         if imports.iter().any(|(path, alias)| {
-            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == "Suppress"
+            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == simple
         }) {
             return Some(false);
         }
@@ -857,11 +865,31 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         Some(true)
     }
 
-    pub(crate) fn check_suppress_bindings(&mut self, decl: tree_sitter::Node<'_>) {
+    pub(crate) fn check_builtin_annotation_contracts(&mut self, decl: tree_sitter::Node<'_>) {
         let mut nodes = vec![decl];
+        // Parser-recovered annotation wrappers can be siblings of the owning
+        // declaration rather than children of its modifiers.
+        let mut previous = decl.prev_named_sibling();
+        while let Some(wrapper) = previous.filter(|node| node.kind() == "annotated_expression") {
+            nodes.push(wrapper);
+            previous = wrapper.prev_named_sibling();
+        }
         while let Some(node) = nodes.pop() {
-            if node.kind() == "annotation" && self.kotlin_suppress_binding(node).is_none() {
-                self.diag_untranslatable(node, "Suppress annotation binding is uncertain under wildcard imports; retained rather than guessing annotation identity");
+            if node.kind() == "annotation" {
+                for canonical in ["kotlin.Suppress", "kotlin.Deprecated"] {
+                    match self.kotlin_builtin_annotation_binding(node, canonical) {
+                        None => self.diag_untranslatable(node, format!(
+                            "{} annotation binding is uncertain under wildcard imports; retained rather than guessing annotation identity",
+                            canonical.rsplit('.').next().unwrap_or(canonical)
+                        )),
+                        Some(true) if canonical == "kotlin.Deprecated" => {
+                            let message = "Kotlin deprecation metadata (message, replacement, and level) dropped; emitted Java @Deprecated";
+                            self.diags.warn_approx(node, self.file, message);
+                            self.diag_approx(node, message);
+                        }
+                        _ => {}
+                    }
+                }
             }
             nodes.extend(node.named_children(&mut node.walk()));
         }
@@ -1367,7 +1395,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
-        self.check_suppress_bindings(decl);
+        self.check_builtin_annotation_contracts(decl);
         // `KClass<T>` type references lower to Java `Class<T>` (kt.rs /
         // types.rs interop mapping). That ABI change is only compatible
         // when no RESIDUAL Kotlin file consumes this declaration: a

@@ -229,7 +229,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // Fresh scope per property: getter/setter bodies must not see locals
         // declared while a previous property was translated.
         self.var_types.clear();
-        self.check_suppress_bindings(decl);
+        self.check_builtin_annotation_contracts(decl);
 
         let is_val = kt::child(decl, "val").is_some();
         let vd = kt::child(decl, "variable_declaration");
