@@ -336,6 +336,92 @@ fn constructor_has_jvm_overloads(
     false
 }
 
+/// One inherited interface member with the declaration that owns it, so the
+/// forwarding gate can resolve its type spelling in the declaring file's scope.
+type InterfaceObligation<'a> = (
+    &'a crate::workspace::Declaration,
+    &'a crate::workspace::Member,
+);
+
+/// A JVM method spelling the forwarding emitter can re-create: a non-empty
+/// ASCII Java identifier made of letters, digits and `_`. The Kotlin proof may
+/// accept Unicode source identifiers, but the emitted Java accessors cannot,
+/// so an unsupported spelling must be declined here rather than asserted
+/// later in the emitter.
+fn plain_java_method_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Interface members are public unless the source says otherwise. Kotlin and
+/// Java interface declarations typically omit the redundant modifier.
+fn public_jvm_member(member: &crate::workspace::Member) -> bool {
+    matches!(member.visibility.as_deref(), None | Some("public"))
+}
+
+/// The exact non-nullable, non-generic type spelling of a member, or `None`
+/// when its JVM return needs projection this slice cannot prove.
+fn plain_jvm_type_spelling(member: &crate::workspace::Member) -> Option<&str> {
+    let spelling = member.type_name.as_deref()?.trim();
+    (!spelling.is_empty()
+        && !spelling.ends_with('?')
+        && !spelling.contains('<')
+        && !spelling.contains("->"))
+    .then_some(spelling)
+}
+
+/// Prove that the bridge's concrete return type is the obligation's return or
+/// a source-resolved subtype of it, which is what makes the Java override
+/// satisfy every ancestor interface method with the same name and arity.
+fn forwarding_return_is_subtype(
+    workspace: &crate::workspace::SourceIndex,
+    bridge_return: &str,
+    contract_file: &crate::workspace::SourceFile,
+    contract_return: &str,
+) -> bool {
+    if matches!(
+        contract_return,
+        "Any" | "Object" | "kotlin.Any" | "java.lang.Object"
+    ) {
+        return true;
+    }
+    let (Some(concrete), Some(contract)) = (
+        workspace.resolve_type(contract_file, bridge_return),
+        workspace.resolve_type(contract_file, contract_return),
+    ) else {
+        return false;
+    };
+    let contract_id = crate::semantics::workspace_symbol(workspace, contract);
+    let mut pending = vec![concrete];
+    let mut visited = HashSet::new();
+    while let Some(declaration) = pending.pop() {
+        let id = crate::semantics::workspace_symbol(workspace, declaration);
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        if id == contract_id {
+            return true;
+        }
+        let Some(file) = workspace.declaration_source_file(declaration) else {
+            continue;
+        };
+        for spelling in &declaration.supertypes {
+            let spelling = spelling.trim();
+            // A generic instantiation edge is not a source subtype proof.
+            if spelling.is_empty() || spelling.contains('<') || spelling.contains('(') {
+                continue;
+            }
+            if let Some(parent) = workspace.resolve_type(file, spelling) {
+                pending.push(parent);
+            }
+        }
+    }
+    false
+}
+
 /// One companion fn captured for the nested `Companion` bridge.
 struct BridgeSig {
     signature: String,
@@ -1151,7 +1237,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                     workspace, target, parent, retained, provider,
                                 )
                             });
-                        !(forwards_interface || proven_property_interface || proven_method_interface)
+                        let proven_forwarding_interface = is_interface
+                            && self.forwarding_bridge_covers_retained_interface(
+                                workspace, target, parent,
+                            );
+                        !(forwards_interface
+                            || proven_property_interface
+                            || proven_method_interface
+                            || proven_forwarding_interface)
                             && !self.retained_class_super_is_java_compatible(source_file, decl, spelling)
                     })
             })
@@ -1163,6 +1256,220 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             ));
         }
         None
+    }
+
+    /// A translated class may implement a retained Kotlin interface when the
+    /// accepted plan re-creates every method obligation with proven
+    /// source-forwarding bridges, and the class itself declares matching public
+    /// readonly properties for every property obligation. The class then
+    /// *implements* the interface's JVM obligations instead of inheriting them
+    /// from Kotlin metadata, which makes the retained provider harmless.
+    ///
+    /// Any method without such a bridge (an extra default method, a `suspend`
+    /// member, a renamed accessor) leaves the parent incompatible:
+    /// whether such a member is abstract in the JVM interface depends on the
+    /// retained provider's `-jvm-default` mode, which this run cannot know.
+    fn forwarding_bridge_covers_retained_interface(
+        &self,
+        workspace: &crate::workspace::SourceIndex,
+        target: &crate::workspace::Declaration,
+        parent: &crate::workspace::Declaration,
+    ) -> bool {
+        let owner = crate::semantics::workspace_symbol(workspace, target);
+        let parent_id = crate::semantics::workspace_symbol(workspace, parent);
+        let bridges = self
+            .default_getter_bridges
+            .iter()
+            .filter(|bridge| {
+                bridge.owner == owner
+                    && bridge.target == parent_id
+                    && matches!(
+                        bridge.body,
+                        crate::translation_plan::PlannedDefaultGetterBody::SourceForwarding { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        if bridges.is_empty() {
+            return false;
+        }
+        let Some(obligations) = self.retained_interface_obligations(workspace, parent) else {
+            return false;
+        };
+        let Some(target_file) = workspace.declaration_source_file(target) else {
+            return false;
+        };
+        obligations.into_iter().all(|(contract_owner, member)| {
+            if member.is_static {
+                return true;
+            }
+            match member.kind {
+                // A method is a JVM signature, not a name. Only the exact
+                // planned default getter that this proof re-creates may cover
+                // it; a same-named overload, private helper or `suspend`
+                // member is a different obligation and must retain.
+                crate::workspace::MemberKind::Method => self.forwarding_bridge_covers_method(
+                    workspace,
+                    contract_owner,
+                    member,
+                    &bridges,
+                ),
+                // A property getter is covered only by an own readonly,
+                // public, non-nullable property of the exact same type; field
+                // or private presence alone implements no JVM getter.
+                crate::workspace::MemberKind::Property => self.forwarding_property_covers(
+                    workspace,
+                    target,
+                    target_file,
+                    contract_owner,
+                    member,
+                ),
+                // Constructors and fields are never interface getter
+                // obligations, and an unknown shape must not be assumed.
+                crate::workspace::MemberKind::Constructor | crate::workspace::MemberKind::Field => {
+                    false
+                }
+            }
+        })
+    }
+
+    /// Every instance member a Java implementor of `parent` owes its JVM
+    /// interface, including all transitive interface ancestors.
+    ///
+    /// The Kotlin compiler decides per `-jvm-default` mode whether a default
+    /// body stays on the interface, so any inherited member the child does not
+    /// physically implement may be abstract at run time. The walk therefore
+    /// fails closed on an unresolvable, generic or non-interface ancestor
+    /// instead of trusting the declaring interface's own member list.
+    fn retained_interface_obligations<'a>(
+        &self,
+        workspace: &'a crate::workspace::SourceIndex,
+        parent: &'a crate::workspace::Declaration,
+    ) -> Option<Vec<InterfaceObligation<'a>>> {
+        let mut obligations = Vec::new();
+        let mut pending = vec![parent];
+        let mut visited = HashSet::new();
+        while let Some(declaration) = pending.pop() {
+            if declaration.kind != crate::workspace::DeclarationKind::Interface {
+                return None;
+            }
+            let id = crate::semantics::workspace_symbol(workspace, declaration);
+            if !visited.insert(id) {
+                // A repeated edge is a cycle or diamond; its members were
+                // already collected exactly once.
+                continue;
+            }
+            let file = workspace.declaration_source_file(declaration)?;
+            for member in &declaration.members {
+                obligations.push((declaration, member));
+            }
+            for spelling in &declaration.supertypes {
+                let spelling = spelling.trim();
+                // A generic supertype changes every inherited member's JVM
+                // descriptor; no such obligation is proven here.
+                if spelling.is_empty() || spelling.contains('<') || spelling.contains('(') {
+                    return None;
+                }
+                let ancestor = workspace.resolve_type(file, spelling)?;
+                if ancestor.kind != crate::workspace::DeclarationKind::Interface {
+                    return None;
+                }
+                pending.push(ancestor);
+            }
+        }
+        Some(obligations)
+    }
+
+    /// A planned default getter re-creates exactly one method. Its name must
+    /// match, the obligation must be a public zero-argument non-null method,
+    /// and the bridge's proven concrete return must be the obligation's return
+    /// or a source-proven subtype of it (a JVM covariant override).
+    fn forwarding_bridge_covers_method(
+        &self,
+        workspace: &crate::workspace::SourceIndex,
+        contract_owner: &crate::workspace::Declaration,
+        member: &crate::workspace::Member,
+        bridges: &[&crate::translation_plan::PlannedDefaultGetterBridge],
+    ) -> bool {
+        if !plain_java_method_name(&member.name)
+            || !member.parameter_types.is_empty()
+            || member.is_nullable
+            || !public_jvm_member(member)
+        {
+            return false;
+        }
+        let Some(contract_return) = plain_jvm_type_spelling(member) else {
+            return false;
+        };
+        let Some(contract_file) = workspace.declaration_source_file(contract_owner) else {
+            return false;
+        };
+        bridges.iter().any(|bridge| {
+            bridge.method_name == member.name
+                && forwarding_return_is_subtype(
+                    workspace,
+                    &bridge.return_type,
+                    contract_file,
+                    contract_return,
+                )
+        })
+    }
+
+    /// A non-bridged property obligation is covered only by the target's own
+    /// declaration of the same readonly, public, non-nullable property with
+    /// the identical resolved type.
+    fn forwarding_property_covers(
+        &self,
+        workspace: &crate::workspace::SourceIndex,
+        target: &crate::workspace::Declaration,
+        target_file: &crate::workspace::SourceFile,
+        contract_owner: &crate::workspace::Declaration,
+        member: &crate::workspace::Member,
+    ) -> bool {
+        if !public_jvm_member(member)
+            || member.is_mutable
+            || member.is_jvm_field
+            || member.is_nullable
+            || member.has_unsupported_property_annotations
+            || member.has_unsupported_property_shape
+        {
+            return false;
+        }
+        let accessor = crate::workspace::property_accessor_name(&member.name);
+        if !plain_java_method_name(&accessor) {
+            return false;
+        }
+        let Some(contract_type) = plain_jvm_type_spelling(member) else {
+            return false;
+        };
+        let Some(contract_file) = workspace.declaration_source_file(contract_owner) else {
+            return false;
+        };
+        let mut declared = target.members.iter().filter(|own| {
+            own.kind == crate::workspace::MemberKind::Property && own.name == member.name
+        });
+        let (Some(own), None) = (declared.next(), declared.next()) else {
+            return false;
+        };
+        if !public_jvm_member(own)
+            || own.is_mutable
+            || own.is_jvm_field
+            || own.is_nullable
+            || own.has_unsupported_property_annotations
+            || own.has_unsupported_property_shape
+        {
+            return false;
+        }
+        let Some(own_type) = plain_jvm_type_spelling(own) else {
+            return false;
+        };
+        let (Some(own_declaration), Some(contract_declaration)) = (
+            workspace.resolve_type(target_file, own_type),
+            workspace.resolve_type(contract_file, contract_type),
+        ) else {
+            return false;
+        };
+        crate::semantics::workspace_symbol(workspace, own_declaration)
+            == crate::semantics::workspace_symbol(workspace, contract_declaration)
     }
 
     /// A JVM class with an explicit open/abstract boundary and a complete
@@ -5576,15 +5883,36 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             parts.extend(provider.owner_path.iter().map(String::as_str));
             parts.push(provider.name.as_str());
             let provider_name = parts.join(".");
+            let body = match &bridge.body {
+                crate::translation_plan::PlannedDefaultGetterBody::JavaSuperDelegation => {
+                    format!("return {provider_name}.super.{}();", bridge.method_name)
+                }
+                crate::translation_plan::PlannedDefaultGetterBody::SourceForwarding {
+                    accessors,
+                } => {
+                    let mut call = String::from("this");
+                    for accessor in accessors {
+                        assert!(
+                            !accessor.is_empty()
+                                && accessor
+                                    .chars()
+                                    .all(|character| character.is_ascii_alphanumeric()
+                                        || character == '_'),
+                            "accepted forwarding accessor must be a plain method name"
+                        );
+                        call.push('.');
+                        call.push_str(accessor);
+                        call.push_str("()");
+                    }
+                    format!("return {call};")
+                }
+            };
             out.line("@Override");
             out.open(format!(
                 "public {} {}()",
                 bridge.return_type, bridge.method_name
             ));
-            out.line(format!(
-                "return {provider_name}.super.{}();",
-                bridge.method_name
-            ));
+            out.line(&body);
             out.close();
             out.blank();
         }

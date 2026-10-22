@@ -1,7 +1,7 @@
 use crate::semantics::{SourceLocation, SymbolId};
 use crate::translation_plan::{
-    BackendOwner, PlannedDefaultGetterBridge, PreparationBlockerKind, RetentionReason,
-    TranslationPlan,
+    BackendOwner, PlannedDefaultGetterBody, PlannedDefaultGetterBridge, PreparationBlockerKind,
+    RetentionReason, TranslationPlan,
 };
 use crate::workspace::SourceIndex;
 use std::collections::{HashMap, HashSet};
@@ -146,10 +146,23 @@ pub(super) fn plan_default_getters(
                 // The direct super qualifier can remain Kotlin when it
                 // inherits this exact Java default. Workspace bridge analysis
                 // has already rejected overrides, reabstraction and ambiguity.
-                let mut blocked = bridges
-                    .iter()
-                    .filter(|bridge| !java_default_owner(&bridge.target))
-                    .map(|bridge| {
+                // When the selected default itself stays Kotlin, its accepted
+                // source-forwarding proof decides whether the bridge can be
+                // re-created on this Java class.
+                let mut accepted = Vec::with_capacity(bridges.len());
+                let mut blocked = Vec::new();
+                for bridge in bridges {
+                    if java_default_owner(&bridge.target) {
+                        accepted.push((bridge, PlannedDefaultGetterBody::JavaSuperDelegation));
+                        continue;
+                    }
+                    let accessors = bridge.body.as_ref().map(|body| {
+                        body.steps
+                            .iter()
+                            .map(|step| step.accessor.clone())
+                            .collect::<Vec<_>>()
+                    });
+                    let Some(accessors) = accessors else {
                         let target = &bridge.target;
                         let mut path = target.owner_path.clone();
                         path.push(target.name.clone());
@@ -158,13 +171,18 @@ pub(super) fn plan_default_getters(
                         } else {
                             format!("{}.{}", target.package, path.join("."))
                         };
-                        format!("`{owner}#{}`", bridge.method_name)
-                    })
-                    .collect::<Vec<_>>();
+                        blocked.push(format!("`{owner}#{}`", bridge.method_name));
+                        continue;
+                    };
+                    accepted.push((
+                        bridge,
+                        PlannedDefaultGetterBody::SourceForwarding { accessors },
+                    ));
+                }
                 blocked.sort();
                 blocked.dedup();
                 if blocked.is_empty() {
-                    Ok(bridges)
+                    Ok(accepted)
                 } else {
                     Err(format!(
                         "inherited covariant getter needs a concrete Java bridge, but its default provider remains Kotlin: {}",
@@ -206,7 +224,7 @@ pub(super) fn plan_default_getters(
         if failed_boundaries.contains(&boundary) {
             continue;
         }
-        for bridge in bridges {
+        for (bridge, body) in bridges {
             let location = SourceLocation {
                 file: file.to_path_buf(),
                 snapshot_hash: plan.source_hash,
@@ -227,6 +245,7 @@ pub(super) fn plan_default_getters(
                     method_name: bridge.method_name,
                     return_type: bridge.return_type,
                     return_type_ref: bridge.return_type_ref,
+                    body,
                 });
         }
     }
@@ -363,6 +382,47 @@ mod tests {
         (Fixture(root.clone()), file, index, plan)
     }
 
+    fn fixture_files(
+        providers: &str,
+        child: &str,
+    ) -> (Fixture, PathBuf, SourceIndex, TranslationPlan) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-temp")
+            .join(format!(
+                "forwarding-default-getter-plan-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Providers.kt"), providers).unwrap();
+        let file = root.join("Child.kt");
+        fs::write(&file, child).unwrap();
+        let index = SourceIndex::discover(&root).unwrap();
+        let tree = crate::transpiler::parse_tree(child);
+        let plan = translation_plan::analyze(child, tree.root_node(), &file);
+        (Fixture(root.clone()), file, index, plan)
+    }
+
+    /// The exact source identity of one declaration in the fixture, so a test
+    /// never relies on a first-same-name or global-name guess.
+    fn symbol_of(index: &SourceIndex, file_name: &str, name: &str) -> SymbolId {
+        let source_file = index
+            .files
+            .iter()
+            .find(|file| file.path.file_name().is_some_and(|file| file == file_name))
+            .unwrap_or_else(|| panic!("{file_name} is indexed"));
+        let matching = source_file
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.name == name)
+            .collect::<Vec<_>>();
+        let [declaration] = matching.as_slice() else {
+            panic!("{name} is declared exactly once in {file_name}");
+        };
+        crate::semantics::workspace_symbol(index, declaration)
+    }
+
     fn decision<'a>(
         plan: &'a TranslationPlan,
         name: &str,
@@ -483,5 +543,108 @@ mod tests {
             BackendOwner::Java
         );
         assert!(plan.default_getter_bridges.is_empty());
+    }
+
+    /// Planning-only: an accepted `SourceForwarding` body makes the plan
+    /// choose Java for the child. This does NOT prove the retained-supertype
+    /// eligibility gate accepts the hierarchy; the CLI translation plus the
+    /// three-mode JVM differential in `tests/default_getter_forwarding_jvm.rs`
+    /// carries that end-to-end proof. The fixture is deliberately the exact
+    /// shape the CLI accepts (no extra unimplemented member).
+    #[test]
+    fn planning_only_proven_forwarding_body_plans_the_child_past_a_retained_kotlin_provider() {
+        let providers = r#"
+            package sample
+            interface View { val text: String }
+            class Marker(override val text: String) : View
+            class Envelope(private val stored: Marker) {
+                val marker: Marker get() = stored
+            }
+            interface Wide { fun getMarker(): View }
+            interface Provider : Wide {
+                val envelope: Envelope
+                override fun getMarker(): Marker = envelope.marker
+            }
+        "#;
+        let child = r#"
+            package sample
+            class Child(private val storage: Envelope) : Provider {
+                override val envelope: Envelope get() = storage
+            }
+        "#;
+        let (_fixture, file, index, mut plan) = fixture_files(providers, child);
+        let roots = vec![file.parent().unwrap().to_path_buf()];
+        let retained = HashSet::from([symbol_of(&index, "Providers.kt", "Provider")]);
+        assert!(index.is_selected(&file, &roots));
+        plan_default_getters(&index, &file, &retained, &roots, &mut plan);
+
+        assert_eq!(
+            decision(&plan, "Child").candidate_owner,
+            BackendOwner::Java,
+            "a proven forwarding body must not retain the child: {:?}",
+            decision(&plan, "Child").retention_reasons
+        );
+        let [bridge] = plan.default_getter_bridges.as_slice() else {
+            panic!("expected one bridge: {:?}", plan.default_getter_bridges);
+        };
+        assert_eq!(bridge.method_name, "getMarker");
+        assert_eq!(bridge.provider.name, "Provider");
+        assert_eq!(bridge.target.name, "Provider");
+        assert_eq!(bridge.return_type, "sample.Marker");
+        assert_eq!(
+            bridge.body,
+            PlannedDefaultGetterBody::SourceForwarding {
+                accessors: vec!["getEnvelope".to_owned(), "getMarker".to_owned()],
+            }
+        );
+    }
+
+    /// An unproven forwarding body keeps the existing guard: the child stays
+    /// Kotlin and the retention message names the exact provider.
+    #[test]
+    fn unproven_or_generic_default_bodies_still_retain_the_child() {
+        let cases = [
+            (
+                "a body that calls a method",
+                "override fun getMarker(): Marker = envelope.pick()",
+            ),
+            (
+                "a generic default return",
+                "override fun getMarker(): T = current\n                val current: T",
+            ),
+        ];
+        for (label, body) in cases {
+            let providers = format!(
+                "package sample\n\
+                 interface View {{ val text: String }}\n\
+                 class Marker(override val text: String) : View\n\
+                 class Envelope(private val stored: Marker) {{\n\
+                     val marker: Marker get() = stored\n\
+                     fun pick(): Marker = stored\n\
+                 }}\n\
+                 interface Wide {{ fun getMarker(): View }}\n\
+                 interface Provider<T : Marker> : Wide {{\n\
+                     val envelope: Envelope\n\
+                     {body}\n\
+                 }}\n"
+            );
+            let child = "package sample\n\
+                 class Child(private val storage: Envelope) : Provider<Marker> {\n\
+                     override val envelope: Envelope get() = storage\n\
+                 }\n";
+            let (_fixture, file, index, mut plan) = fixture_files(&providers, child);
+            let roots = vec![file.parent().unwrap().to_path_buf()];
+            let retained = HashSet::from([symbol_of(&index, "Providers.kt", "Provider")]);
+            plan_default_getters(&index, &file, &retained, &roots, &mut plan);
+            assert_eq!(
+                decision(&plan, "Child").candidate_owner,
+                BackendOwner::Kotlin,
+                "{label}: a non-forwardable default must retain the child"
+            );
+            assert!(
+                plan.default_getter_bridges.is_empty(),
+                "{label}: no bridge may be planned"
+            );
+        }
     }
 }

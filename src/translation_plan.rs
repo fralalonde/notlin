@@ -242,19 +242,39 @@ pub struct PlannedEagerCollectionHelper {
     pub operation: crate::semantics::EagerCollectionOperation,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlannedDefaultGetterBody {
+    /// Delegate to the direct interface's inherited Java default
+    /// (`Provider.super.getX()`). Valid only when that interface supplies Java
+    /// method semantics.
+    #[default]
+    JavaSuperDelegation,
+    /// Re-create the Kotlin default's own body, which was proven to be a chain
+    /// of public zero-argument accessors rooted at `this`. The listed accessors
+    /// are exactly the steps of that proven chain.
+    SourceForwarding { accessors: Vec<String> },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedDefaultGetterBridge {
     pub owner: SymbolId,
     pub location: crate::semantics::SourceLocation,
-    /// Declaring interface of the effective default; this owner must use Java
-    /// method semantics before the bridge can be emitted or repaired.
+    /// Declaring interface of the effective default. A bridge either inherits
+    /// that owner's Java method semantics (`JavaSuperDelegation`) or re-creates
+    /// the default's own proven body (`SourceForwarding`), so a Kotlin-retained
+    /// owner is only acceptable with the latter.
     pub target: SymbolId,
     /// Direct interface qualifier for the super call. It may remain Kotlin
-    /// when it inherits the selected Java default without overriding it.
+    /// when it inherits the selected Java default without overriding it. It is
+    /// unused by a source-forwarding body.
     pub provider: SymbolId,
     pub method_name: String,
     pub return_type: String,
     pub return_type_ref: crate::semantics::TypeRef,
+    /// How the accepted bridge re-creates the selected default's body. Old
+    /// plans predate this field and only ever used the Java-super delegation.
+    #[serde(default)]
+    pub body: PlannedDefaultGetterBody,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedRepair {
