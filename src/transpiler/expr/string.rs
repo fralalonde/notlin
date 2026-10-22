@@ -112,6 +112,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         ident: &str,
         reference: tree_sitter::Node,
     ) -> String {
+        if crate::function_callsite::local_shadow(reference, ident, self.unit.source) {
+            return ident.to_string();
+        }
         if self.unit.current_object.as_deref() == Some(ident) {
             return format!("{}.INSTANCE", ident);
         }

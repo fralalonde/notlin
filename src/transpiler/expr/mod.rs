@@ -153,6 +153,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 if let Some(alias) = self.unit.local_expression_aliases.get(&name) {
                     return alias.clone();
                 }
+                // Lexical bindings win before every implicit-receiver or
+                // workspace-name lookup, even when their type is unknown.
+                if crate::function_callsite::local_shadow(node, &name, self.unit.source) {
+                    return self.narrowed_receiver(&name, &name);
+                }
                 let implicit_this = self.narrowed_receiver("this", "this");
                 // Bare self-reference inside an object body: Kotlin resolves
                 // `Registry` to the singleton; Java needs `Registry.INSTANCE`.

@@ -177,6 +177,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // supertype declares this member with a different type, keep the
         // declaration in Kotlin.
         self.current_function_name = None;
+        self.check_suppress_bindings(decl);
         self.current_function_returns_value = false;
         self.current_function_return_type = None;
         if self.is_property_repair_bridge(decl) {

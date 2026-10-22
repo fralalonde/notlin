@@ -750,6 +750,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // name so the alias cannot become an unresolved annotation or bind to
         // a different type with the same simple name.
         let name = annotation_import_name(name, self.source);
+        // Kotlin's Suppress is SOURCE-retained compiler metadata, not a Java
+        // annotation. Drop it only with an unambiguous Kotlin binding; never
+        // erase a user annotation just because its short name matches.
+        if self.kotlin_suppress_binding(node) == Some(true) {
+            return Some(String::new());
+        }
         // Kotlin-only argument shapes taint immediately — except a
         // `Name::class` class literal, which rewrites to `Name.class` in Java
         // when `Name` resolves to a Java-visible declaration (checked below);
@@ -815,6 +821,50 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // appear here (parsed as value arguments), but a trailing semicolon
         // or whitespace from multi-annotation lines would break Java.
         Some(rebuilt.trim_end().to_string())
+    }
+
+    /// Some(true) proves Kotlin's compiler-only annotation; None means a
+    /// wildcard import could bind the short spelling to another annotation.
+    fn kotlin_suppress_binding(&self, annotation: tree_sitter::Node<'_>) -> Option<bool> {
+        let Some(name) = annotation_fq_name(annotation, self.source) else {
+            return Some(false);
+        };
+        let name = annotation_import_name(name, self.source);
+        if name == "kotlin.Suppress" {
+            return Some(true);
+        }
+        if name != "Suppress" {
+            return Some(false);
+        }
+        let file = self.workspace.and_then(|index| {
+            index.source_file(self.workspace_file.as_deref().unwrap_or(self.file))
+        });
+        if annotation_type_is_local(self.workspace, file, "Suppress") {
+            return Some(false);
+        }
+        let imports = annotation_imports(self.source).collect::<Vec<_>>();
+        if imports.iter().any(|(path, alias)| {
+            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == "Suppress"
+        }) {
+            return Some(false);
+        }
+        if imports
+            .iter()
+            .any(|(path, _)| path.ends_with(".*") && *path != "kotlin.*")
+        {
+            return None;
+        }
+        Some(true)
+    }
+
+    pub(crate) fn check_suppress_bindings(&mut self, decl: tree_sitter::Node<'_>) {
+        let mut nodes = vec![decl];
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "annotation" && self.kotlin_suppress_binding(node).is_none() {
+                self.diag_untranslatable(node, "Suppress annotation binding is uncertain under wildcard imports; retained rather than guessing annotation identity");
+            }
+            nodes.extend(node.named_children(&mut node.walk()));
+        }
     }
 
     /// Why this declaration cannot be translated away, or `None` when it can.
@@ -1317,6 +1367,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
+        self.check_suppress_bindings(decl);
         // `KClass<T>` type references lower to Java `Class<T>` (kt.rs /
         // types.rs interop mapping). That ABI change is only compatible
         // when no RESIDUAL Kotlin file consumes this declaration: a
