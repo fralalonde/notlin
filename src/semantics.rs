@@ -23,7 +23,9 @@ mod generated_getter_tests;
 mod inherited_calls;
 mod inherited_properties;
 mod jackson_defaults;
+mod java_member_calls;
 mod java_property_reads;
+mod lowering_contract;
 mod object_calls;
 mod overloads;
 mod platform_constructors;
@@ -50,6 +52,21 @@ pub(crate) use platform_constructors::established_platform_constructor;
 pub(crate) use platform_members::external_static_field_access;
 pub use reified_calls::ReifiedClassCall;
 pub use todo::TodoLowering;
+
+// Declaration-wide lowering contracts (§4.5). The data types are part of the
+// plan surface (`TranslationPlan::call_receipts`), so every consumer —
+// planning, type inference, emission — reads the same recorded object.
+pub use lowering_contract::{AbiProof, RequiredContract, SlotProof};
+pub use lowering_contract::{
+    ArgumentMapping, Behavior, CallReceipt, CalleeIdentity, CheckedEffects, Dispatch, JavaOutcome,
+    JavaRepresentation, Nullability, ReceiptEvidence, ReprKind,
+};
+pub(crate) use lowering_contract::{
+    OperationRefusal, ReturnAbi, SiteRecord, TypeBindings, UseContext, classify_use,
+    declaration_abi, declaration_returns, declarations_requiring_coverage, descriptor_arity,
+    descriptor_result_matches, plan_contracts, record_receipts, representation_from_row,
+    retain_contract, unconsumed_receipts,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SymbolId {
@@ -4492,8 +4509,34 @@ pub fn plan_required_calls(
     allow_approximations: bool,
     plan: &mut crate::translation_plan::TranslationPlan,
 ) {
+    let annots = plan.annotations;
     let hash = *blake3::hash(source.as_bytes()).as_bytes();
     let owners = DeclarationOwnerIndex::new(plan);
+    // Per-declaration, call-scoped checked-exception audit. A `Prepared`
+    // declaration is a Java method with no `throws`/`catch` model, so one
+    // physically checked callee makes the whole emitted file invalid. Which
+    // call made the declaration eligible is irrelevant: this audit does not
+    // consult the fact's `Established`/platform status to decide *whether* to
+    // look, only this call's own site and physical rows to decide *what* it
+    // found.
+    let mut throws_audit = vec![DeclarationThrowsAudit::default(); plan.declarations.len()];
+    // The co-emitted unit of a Kotlin file is its top-level declaration (a
+    // class carries every member), which is the granularity `plan.declarations`
+    // and the emitter's preflight use. Both halves of the inventory below need
+    // the unit node itself, so it is resolved once from the exact span.
+    let unit_nodes = declaration_unit_nodes(tree.root_node(), plan);
+    // Declared type spellings are resolved through one binding table per file,
+    // shared by every ABI slot and every use-context proof.
+    let bindings = TypeBindings::build(source, tree.root_node());
+    // Return proofs do not depend on receipts, so they are cached while the
+    // call-site walk classifies each value's use context.
+    let mut returns_cache: Vec<Option<ReturnAbi>> =
+        (0..plan.declarations.len()).map(|_| None).collect();
+    // Whole-declaration inventory: every call site this walk sees, with what
+    // the planners could sign for it. `plan_contracts` turns the inventory into
+    // a verdict after the walk, because required mode depends on whether *any*
+    // receipt exists in the declaration.
+    let mut sites: Vec<SiteRecord> = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if matches!(node.kind(), "call_expression" | "method_invocation") {
@@ -4506,6 +4549,90 @@ pub fn plan_required_calls(
                 {
                     let locally_shadowed = is_proven_local_shadow(callee, &name, source);
                     let fact = resolve_required_call(source, file, node, callee, &name, provider);
+                    // Call-scoped physical visibility (§4.4). This runs before
+                    // every older eligibility path below and does not depend
+                    // on any of them: a resolution answer is not emission
+                    // evidence.
+                    if matches!(fact, FactStatus::Established(_)) {
+                        let audit = &mut throws_audit[index];
+                        let location = SourceLocation {
+                            file: file.to_path_buf(),
+                            snapshot_hash: hash,
+                            start_byte: node.start_byte(),
+                            end_byte: node.end_byte(),
+                        };
+                        let effects =
+                            match java_member_calls::checked_throws(source, file, node, provider) {
+                                java_member_calls::CheckedThrows::Checked(exceptions) => {
+                                    audit.checked.get_or_insert_with(|| {
+                                        (name.clone(), exceptions.clone(), location.clone())
+                                    });
+                                    Some(CheckedEffects::Checked(exceptions))
+                                }
+                                java_member_calls::CheckedThrows::Unknown => {
+                                    audit
+                                        .unknown
+                                        .get_or_insert_with(|| (name.clone(), location.clone()));
+                                    Some(CheckedEffects::Unknown)
+                                }
+                                java_member_calls::CheckedThrows::None => {
+                                    Some(CheckedEffects::None)
+                                }
+                                java_member_calls::CheckedThrows::Unidentified => None,
+                            };
+                        // The one receipt builder of this slice. A receipt is
+                        // what activates required mode for the declaration;
+                        // the throws audit above stays the independent
+                        // call-scoped refusal for sites this builder cannot
+                        // sign at all (arguments, static dispatch, unknown
+                        // metadata).
+                        let receipt = java_member_calls::propose(source, file, node, provider);
+                        if receipt.is_some() {
+                            audit.newly_proved = true;
+                        }
+                        let use_context = if receipt.is_some() {
+                            ensure_unit_returns(
+                                &mut returns_cache,
+                                index,
+                                unit_nodes.get(index).copied().flatten(),
+                                source,
+                                &bindings,
+                                provider,
+                                annots,
+                            );
+                            match returns_cache.get(index).and_then(Option::as_ref) {
+                                Some(returns) => classify_use(source, node, returns),
+                                None => UseContext::Observing("value position"),
+                            }
+                        } else {
+                            UseContext::Observing("value position")
+                        };
+                        sites.push(SiteRecord {
+                            declaration: index,
+                            name: name.clone(),
+                            location,
+                            receipt,
+                            use_context,
+                            effects,
+                        });
+                    } else {
+                        // Not established by any fact: still an operation in
+                        // the declaration's emission closure, so the inventory
+                        // must see it.
+                        sites.push(SiteRecord {
+                            declaration: index,
+                            name: name.clone(),
+                            location: SourceLocation {
+                                file: file.to_path_buf(),
+                                snapshot_hash: hash,
+                                start_byte: node.start_byte(),
+                                end_byte: node.end_byte(),
+                            },
+                            receipt: None,
+                            use_context: UseContext::Observing("value position"),
+                            effects: None,
+                        });
+                    }
                     if let FactStatus::Established(target) = &fact
                         && let Some(overload) =
                             overloads::establish(source, file, node, target, provider)
@@ -4667,6 +4794,215 @@ pub fn plan_required_calls(
         }
         let mut c = node.walk();
         stack.extend(node.named_children(&mut c));
+    }
+    apply_checked_throws_retention(&throws_audit, plan);
+    // Receipts are recorded exactly once, *before* either inventory reads them.
+    // Recording inside `plan_contracts` (after `inventory_operations`) made the
+    // signed-call half of both inventories structurally dead: every call looked
+    // unsigned and the receipt coverage claim was never exercised.
+    crate::semantics::record_receipts(&sites, plan);
+    // Declaration-wide contract, last: it needs the whole walk's inventory and
+    // the recorded receipts, and its verdicts land as preflight blockers
+    // exactly like the audit's.
+    let required = declarations_requiring_coverage(&sites, plan.declarations.len());
+    let mut operations: Vec<OperationRefusal> = Vec::new();
+    for (index, unit) in unit_nodes.iter().enumerate() {
+        if !required.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(unit) = unit else {
+            // A Required declaration with no resolved unit node is not proved.
+            let Some(decision) = plan.declarations.get(index) else {
+                continue;
+            };
+            let location = SourceLocation {
+                file: file.to_path_buf(),
+                snapshot_hash: hash,
+                start_byte: decision.id.start_byte,
+                end_byte: decision.id.end_byte,
+            };
+            retain_contract(
+                plan,
+                index,
+                "the declaration's unit node could not be resolved in this snapshot, so its \
+                 lowering contract cannot be proved"
+                    .to_string(),
+                location,
+            );
+            continue;
+        };
+        // One closed walk proves every emitted ABI slot and every executable
+        // operation of the co-emitted unit, reading the receipts recorded
+        // above.
+        let abi = crate::semantics::declaration_abi(
+            source,
+            *unit,
+            &bindings,
+            provider,
+            annots,
+            &plan.call_receipts,
+        );
+        if let Some(decision) = plan.declarations.get_mut(index) {
+            decision.lowering_contract = abi.contract();
+        }
+        for slot in abi.unproved() {
+            operations.push(OperationRefusal {
+                declaration: index,
+                message: slot.message(),
+                location: SourceLocation {
+                    file: file.to_path_buf(),
+                    snapshot_hash: hash,
+                    start_byte: slot.start_byte(),
+                    end_byte: slot.end_byte(),
+                },
+            });
+        }
+        for refusal in abi.refusals() {
+            operations.push(OperationRefusal {
+                declaration: index,
+                message: refusal.message.clone(),
+                location: SourceLocation {
+                    file: file.to_path_buf(),
+                    snapshot_hash: hash,
+                    start_byte: refusal.start_byte,
+                    end_byte: refusal.end_byte,
+                },
+            });
+        }
+    }
+    plan_contracts(&sites, &operations, plan);
+}
+
+/// Prove (and cache) the declared return types of one co-emitted unit.
+///
+/// This half does not read receipts: the call-site walk needs a value's use
+/// context before any receipt is recorded, and a return classification is a
+/// property of the declaration alone.
+#[allow(clippy::too_many_arguments)]
+fn ensure_unit_returns<'tree>(
+    cache: &mut [Option<ReturnAbi>],
+    index: usize,
+    unit: Option<tree_sitter::Node<'tree>>,
+    source: &str,
+    bindings: &TypeBindings,
+    provider: &(impl SemanticProvider + ?Sized),
+    annots: crate::transpiler::types::AnnotationSet,
+) {
+    if cache.get(index).is_some_and(Option::is_some) {
+        return;
+    }
+    let Some(unit) = unit else {
+        return;
+    };
+    let returns = crate::semantics::declaration_returns(source, unit, bindings, provider, annots);
+    if let Some(slot) = cache.get_mut(index) {
+        *slot = Some(returns);
+    }
+}
+
+/// Resolve each planned declaration's exact node in this file's tree.
+fn declaration_unit_nodes<'tree>(
+    root: tree_sitter::Node<'tree>,
+    plan: &crate::translation_plan::TranslationPlan,
+) -> Vec<Option<tree_sitter::Node<'tree>>> {
+    let mut nodes = vec![None; plan.declarations.len()];
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        for (index, decision) in plan.declarations.iter().enumerate() {
+            if nodes[index].is_none()
+                && decision.id.start_byte == node.start_byte()
+                && decision.id.end_byte == node.end_byte()
+            {
+                nodes[index] = Some(node);
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    nodes
+}
+
+/// What one declaration's own call sites proved about checked exceptions.
+///
+/// `newly_proved` records that at least one call in the declaration is
+/// established by the call-scoped member proof, i.e. the declaration's
+/// migration is *newly* unlocked. That is the only state in which an absent
+/// throws metadata field can be treated as a reason to keep today's retention:
+/// with a helper that does not answer the field at all, nothing is newly
+/// proved and the floor is untouched.
+#[derive(Clone, Default)]
+struct DeclarationThrowsAudit {
+    newly_proved: bool,
+    /// First call proved to denote a physical member that declares checked
+    /// exceptions: `(selector, exceptions, location)`.
+    checked: Option<(String, Vec<String>, SourceLocation)>,
+    /// First call whose identified physical member carries no throws metadata
+    /// at all. Unknown is never "proved none".
+    unknown: Option<(String, SourceLocation)>,
+}
+
+/// Retain every declaration that a Java method cannot express.
+///
+/// The emitted Java has no `throws`/`catch` model, so a call to a declaration
+/// that throws a checked exception cannot be written at that site. Retention is
+/// recorded as a `PreparationBlocker`, which the preflight consumes before any
+/// lowering runs, so no older Established/platform/member path can override it
+/// and `--allow-approximations` cannot opt out of it.
+///
+/// Boundary (deliberate, and reported rather than patched around):
+/// * a Kotlin `try`/`catch` around the call is *also* retained — this cycle
+///   does not model handler scope, and over-retention is the honest floor;
+/// * a call whose physical member this slice cannot identify
+///   (`CheckedThrows::Unidentified`: no site, non-JDK owner, contradictory
+///   rows) keeps today's answer. It is not a no-throws verdict, and this
+///   function does not invent one;
+/// * absent metadata keeps today's answer unless the declaration is newly
+///   unlocked by the member proof.
+fn apply_checked_throws_retention(
+    audits: &[DeclarationThrowsAudit],
+    plan: &mut crate::translation_plan::TranslationPlan,
+) {
+    for (index, audit) in audits.iter().enumerate() {
+        let (message, location) = if let Some((name, exceptions, location)) = &audit.checked {
+            let plural = if exceptions.len() == 1 { "" } else { "s" };
+            (
+                format!(
+                    "call `{name}` declares checked exception{plural} {}; the emitted Java method \
+                     has no `throws`/`catch` model",
+                    exceptions.join(", ")
+                ),
+                location.clone(),
+            )
+        } else if audit.newly_proved {
+            let Some((name, location)) = &audit.unknown else {
+                continue;
+            };
+            (
+                format!(
+                    "call `{name}` has no checked-exception evidence; a declaration this proof \
+                     newly unlocks must not assume a callee throws nothing"
+                ),
+                location.clone(),
+            )
+        } else {
+            continue;
+        };
+        let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
+            kind: crate::translation_plan::PreparationBlockerKind::SemanticLoss,
+            message,
+        };
+        if let Some(decision) = plan.declarations.get_mut(index) {
+            if decision.retention_reasons.contains(&reason) {
+                continue;
+            }
+            decision.retention_reasons.push(reason.clone());
+            decision.candidate_owner = crate::translation_plan::BackendOwner::Kotlin;
+        }
+        plan.diagnostics.push(SemanticDiagnostic {
+            code: reason.code().into(),
+            message: reason.message(),
+            location,
+        });
     }
 }
 fn inside_annotation(mut node: tree_sitter::Node) -> bool {
@@ -5289,7 +5625,7 @@ fn declaration_supertypes(source: &str, node: tree_sitter::Node<'_>, file: &Path
     names
 }
 
-fn call_callee_node(call: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+pub(crate) fn call_callee_node(call: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     if let Some(name) = call.child_by_field_name("name") {
         return Some(name);
     }
@@ -6949,9 +7285,22 @@ pub(crate) fn established_java_callable_member<P: SemanticProvider + ?Sized>(
         return false;
     }
     let name = callee.utf8_text(source.as_bytes()).unwrap_or("");
-    matches!(resolve_required_call(source, file, call, callee, name, provider),
-        FactStatus::Established(id) if provider.is_java_callable_member(&id))
-        || established_projected_receiver_instance_call(source, call, file, provider)
+    // Source-only, exactly as before 4.4: the declaration-index predicate.
+    //
+    // A helper fact identity carries no declaration answer, so a fact
+    // `Established` call is not an unconditional positive here. Emission of a
+    // helper-proved call must consume the planned `CallReceipt` (see
+    // `Unit::call_receipt`); admitting it from the fact identity instead would
+    // bypass the declaration-wide contract that decided the call may be
+    // emitted at all, which is how a `Stream.sorted()` proof leaked
+    // unproved sibling lowerings into the same declaration.
+    let established = match resolve_required_call(source, file, call, callee, name, provider) {
+        FactStatus::Established(id) if !crate::facts::is_fact_symbol(&id) => {
+            provider.is_java_callable_member(&id)
+        }
+        _ => false,
+    };
+    established || established_projected_receiver_instance_call(source, call, file, provider)
 }
 
 fn known_external_member_call<P: SemanticProvider + ?Sized>(
@@ -7385,7 +7734,7 @@ fn explicit_receiver_spelling<'a>(
     receiver.utf8_text(source.as_bytes()).ok().map(str::trim)
 }
 
-fn explicit_receiver_node<'tree>(
+pub(crate) fn explicit_receiver_node<'tree>(
     call: tree_sitter::Node<'tree>,
     callee: tree_sitter::Node<'tree>,
 ) -> Option<tree_sitter::Node<'tree>> {

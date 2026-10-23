@@ -672,6 +672,30 @@ fn lower_with_plan(
         unit.semantic_provider = Some(semantic_provider);
         unit.add_proven_map_aliases(tree.root_node());
         let java_files = unit.run_planned(tree.root_node(), &plan);
+        // Emission-consumption invariant (§4.5, obligation 9).
+        //
+        // Every receipt the plan signed inside a declaration that is being
+        // translated must have been read by the emitter — and every emitted
+        // call the contract admitted must therefore have come from the plan
+        // rather than from a name table. A receipt planning required but
+        // emission never consumed means the two disagree about what the call
+        // is; that is a controlled pre-write failure (no Java is written and
+        // the file is reported), never a best-effort file.
+        let mut preparation_failure = unit.preparation_failure.take();
+        if preparation_failure.is_none() {
+            let unconsumed = crate::semantics::unconsumed_receipts(
+                &plan.call_receipts,
+                &unit.coverage.translated_spans,
+                &unit.consumed_receipts,
+            );
+            if !unconsumed.is_empty() {
+                preparation_failure = Some(format!(
+                    "declaration lowering contract was not consumed by emission for {}; the \
+                     planned receipt and the emitted Java disagree, so no output is written",
+                    unconsumed.join(", ")
+                ));
+            }
+        }
         let java_files = java_files
             .into_iter()
             .map(|(path, source)| crate::planning::PreparedJavaFile {
@@ -689,7 +713,7 @@ fn lower_with_plan(
             approx,
             coverage,
             type_facts,
-            unit.preparation_failure,
+            preparation_failure,
         )
     };
     if profile {
@@ -727,10 +751,16 @@ fn lower_with_plan(
     if profile {
         record_profile(&PROFILE_DIAGNOSTICS_NS, started.elapsed());
     }
-    plan.reconcile(source, &coverage)
-        .expect("lowering uses the analyzed source snapshot");
+    // Reconciliation is where the plan learns which declarations the lowerer
+    // actually covered. It must not panic: a contract-refused declaration that
+    // arrives here as translated is a plan/emitter disagreement, and the
+    // honest answer is a controlled pre-write failure.
+    let reconcile_failure = plan.reconcile(source, &coverage).err();
     plan.type_facts.extend(type_facts);
     let acceptance_started = profile_enabled().then(Instant::now);
+    let preparation_failure = preparation_failure.or_else(|| {
+        reconcile_failure.map(|message| format!("declaration lowering contract: {message}"))
+    });
     let acceptance = match preparation_failure {
         Some(message) => Err(crate::planning::AcceptedPlanError {
             path: file.display().to_string(),
@@ -740,10 +770,13 @@ fn lower_with_plan(
                 end_byte: 0,
             },
         }),
-        None => crate::planning::AcceptedTranslationPlan::accept(
+        None => crate::planning::AcceptedTranslationPlan::accept_with_source(
             plan.clone(),
             candidate_java_files,
             Some(semantic_provider),
+            source,
+            tree,
+            annots,
         ),
     };
     let (accepted, emission_failed) = match acceptance {
@@ -847,6 +880,11 @@ fn build_static_plan(
     provider: &dyn crate::semantics::SemanticProvider,
 ) -> crate::translation_plan::TranslationPlan {
     let mut plan = crate::translation_plan::analyze(source, tree.root_node(), identity_path);
+    plan.annotations = match cli.annotations {
+        Annotations::Jetbrains => types::AnnotationSet::Jetbrains,
+        Annotations::Jspecify => types::AnnotationSet::Jspecify,
+        Annotations::None => types::AnnotationSet::None,
+    };
     plan.plan_type_losses(source, tree.root_node(), cli.allow_approximations);
     plan.plan_constructor_metadata_losses(identity_path, provider, cli.allow_approximations);
     plan.plan_jackson_default_constructor_losses(identity_path, provider, cli.allow_approximations);

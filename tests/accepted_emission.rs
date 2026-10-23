@@ -35,6 +35,9 @@ fn plan_with_java_owner() -> TranslationPlan {
             retention_reasons: vec![],
             preparation_outcome: Some(PreparationOutcome::Prepared),
             final_owner: Some(BackendOwner::Java),
+            required_mode: false,
+            lowering_contract: None,
+            contract_retained: false,
         }],
         ..TranslationPlan::default()
     }

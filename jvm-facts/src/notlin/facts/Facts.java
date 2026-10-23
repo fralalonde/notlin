@@ -111,7 +111,8 @@ public final class Facts {
             List<String> parameterTypes,
             String resultType,
             List<String> parameterNullability,
-            String resultNullability) {
+            String resultNullability,
+            List<String> checkedExceptions) {
     }
 
     /**
@@ -147,7 +148,8 @@ public final class Facts {
                     continue;
                 }
                 members.add(row(type, "<init>", modifiers, constructor.getParameterTypes(), void.class,
-                        constructor.getParameterAnnotations(), constructor));
+                        constructor.getParameterAnnotations(), constructor,
+                        constructor.getExceptionTypes()));
             }
             for (Class<?> current : hierarchy(type)) {
                 for (Method method : current.getDeclaredMethods()) {
@@ -164,7 +166,8 @@ public final class Facts {
                         continue;
                     }
                     members.add(row(current, method.getName(), modifiers, method.getParameterTypes(),
-                            method.getReturnType(), method.getParameterAnnotations(), method));
+                            method.getReturnType(), method.getParameterAnnotations(), method,
+                            method.getExceptionTypes()));
                 }
             }
         } catch (LinkageError | RuntimeException failure) {
@@ -274,7 +277,8 @@ public final class Facts {
     }
 
     private Member row(Class<?> declaring, String name, int modifiers, Class<?>[] parameters,
-            Class<?> result, Annotation[][] parameterAnnotations, AnnotatedElement element) {
+            Class<?> result, Annotation[][] parameterAnnotations, AnnotatedElement element,
+            Class<?>[] exceptions) {
         String[] fromClassFile = classFiles == null ? null
                 : classFiles.nullability(declaring, name, parameters, result);
         List<String> parameterTypes = new ArrayList<>(parameters.length);
@@ -301,7 +305,39 @@ public final class Facts {
                 List.copyOf(parameterTypes),
                 result == void.class ? "<void>" : result.getName(),
                 List.copyOf(parameterNullability),
-                resultNullability);
+                resultNullability,
+                checkedExceptions(exceptions));
+    }
+
+    /**
+     * Checked exception binary names of one physical declaration.
+     *
+     * <p>An exception type is checked unless it is assignable to
+     * {@link RuntimeException} or {@link Error}. Anything the helper cannot
+     * classify is treated as checked: that answer is the conservative one for
+     * the only consumer (a Java call the emitter may write verbatim, which has
+     * no {@code throws}/{@code catch} model). This never fabricates an empty
+     * list: an exception type that cannot be inspected stays in the list.
+     *
+     * <p>If the enumeration itself raises a linkage error, {@link #members}
+     * aborts and answers {@code members: null} — whole-owner Unknown — rather
+     * than returning rows with an invented empty throws list.
+     */
+    private static List<String> checkedExceptions(Class<?>[] exceptions) {
+        List<String> checked = new ArrayList<>(exceptions.length);
+        for (Class<?> exception : exceptions) {
+            boolean unchecked;
+            try {
+                unchecked = RuntimeException.class.isAssignableFrom(exception)
+                        || Error.class.isAssignableFrom(exception);
+            } catch (LinkageError | RuntimeException cannotClassify) {
+                unchecked = false;
+            }
+            if (!unchecked) {
+                checked.add(exception.getName());
+            }
+        }
+        return List.copyOf(checked);
     }
 
     /** {@code non_null} / {@code nullable} only when proven; otherwise {@code unknown}. */
@@ -338,6 +374,8 @@ public final class Facts {
         appendStrings(out, member.parameterNullability());
         out.append(",\"result_nullability\":");
         appendString(out, member.resultNullability());
+        out.append(",\"checked_exceptions\":");
+        appendStrings(out, member.checkedExceptions());
         out.append('}');
     }
 

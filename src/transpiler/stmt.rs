@@ -338,11 +338,7 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
     }
 
     fn transpile_return(&mut self, stmt: tree_sitter::Node, out: &mut JavaOut) {
-        let mut cursor = stmt.walk();
-        let exprs: Vec<_> = stmt
-            .children(&mut cursor)
-            .filter(|c| c.is_named())
-            .collect();
+        let exprs = self.unit.expression_children(stmt);
         if let Some(expr) = exprs.first().copied()
             && expr.kind() == "if_expression"
             && expr

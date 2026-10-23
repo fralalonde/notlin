@@ -1,0 +1,6 @@
+[
+  {"name":"sorted","static_member":false,"parameter_types":[],"result_type":"java.util.stream.Stream","parameter_nullability":[],"result_nullability":"unknown","checked_exceptions":[]},
+  {"name":"sorted","static_member":false,"parameter_types":["java.util.Comparator"],"result_type":"java.util.stream.Stream","parameter_nullability":["unknown"],"result_nullability":"unknown","checked_exceptions":[]},
+  {"name":"close","static_member":false,"parameter_types":[],"result_type":"<void>","parameter_nullability":[],"result_nullability":"unknown","checked_exceptions":[]},
+  {"name":"toString","static_member":false,"parameter_types":[],"result_type":"java.lang.String","parameter_nullability":[],"result_nullability":"unknown","checked_exceptions":[]}
+]

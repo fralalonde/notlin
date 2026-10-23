@@ -30,6 +30,436 @@ pub struct AcceptedPlanError {
     pub error: JavaIrError,
 }
 
+/// Pre-write invariants over the plan's signed call receipts.
+///
+/// `parse_java` proves syntax, not agreement: it cannot notice that a receipt
+/// belongs to different source bytes, that a receipt sits outside every
+/// declaration the plan owns (so nothing could ever consume it), or that a call
+/// span carries two different contracts. Those are plan/emitter disagreements,
+/// and the honest answer is a controlled error before any file is written.
+///
+/// Emission *consumption* (a receipt that planning required and emission never
+/// read) is checked where it is observable — in `lower_with_plan`, against the
+/// unit's translated spans — and reaches this function as a preparation
+/// failure.
+fn ensure_call_receipt_invariants(translation: &TranslationPlan) -> Result<(), AcceptedPlanError> {
+    let fail = |message: String, start_byte: usize, end_byte: usize| AcceptedPlanError {
+        path: "translation plan".to_string(),
+        error: JavaIrError {
+            message,
+            start_byte,
+            end_byte,
+        },
+    };
+    // A recorder conflict is the first thing to refuse: the receipt it refused
+    // could not be installed, and continuing would let the declaration fall back
+    // to an implicit Legacy mode with no contract at all.
+    if let Some(conflict) = translation.receipt_conflicts.first() {
+        return Err(fail(
+            conflict.message.clone(),
+            conflict.start_byte,
+            conflict.end_byte,
+        ));
+    }
+    let mut spans = std::collections::BTreeSet::new();
+    for receipt in &translation.call_receipts {
+        if receipt.location.snapshot_hash != translation.source_hash
+            || receipt.selector.snapshot_hash != translation.source_hash
+        {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` belongs to a different source snapshot than the plan",
+                    receipt.callee.name
+                ),
+                receipt.location.start_byte,
+                receipt.location.end_byte,
+            ));
+        }
+        if !spans.insert((receipt.location.start_byte, receipt.location.end_byte)) {
+            return Err(fail(
+                format!(
+                    "call span carries more than one lowering receipt for `{}`",
+                    receipt.callee.name
+                ),
+                receipt.location.start_byte,
+                receipt.location.end_byte,
+            ));
+        }
+        // Selector and receiver are part of the same signed site: a receipt
+        // whose selector or receiver lies outside its own call span cannot be
+        // the contract for that call.
+        let selector_inside = receipt.location.start_byte <= receipt.selector.start_byte
+            && receipt.selector.end_byte <= receipt.location.end_byte;
+        let receiver_inside = receipt.receiver.as_ref().is_none_or(|receiver| {
+            receipt.location.start_byte <= receiver.start_byte
+                && receiver.end_byte <= receipt.location.end_byte
+                && receiver.file == receipt.location.file
+                && receiver.snapshot_hash == translation.source_hash
+        });
+        if !selector_inside || !receiver_inside || receipt.selector.file != receipt.location.file {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` has a selector or receiver outside its own call span",
+                    receipt.callee.name
+                ),
+                receipt.location.start_byte,
+                receipt.location.end_byte,
+            ));
+        }
+        let owned = translation.declarations.iter().any(|decision| {
+            decision.id.start_byte <= receipt.location.start_byte
+                && receipt.location.end_byte <= decision.id.end_byte
+                && decision.id.file == receipt.location.file
+        });
+        if !owned {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` is outside every planned declaration, so no \
+                     declaration contract can consume it",
+                    receipt.callee.name
+                ),
+                receipt.location.start_byte,
+                receipt.location.end_byte,
+            ));
+        }
+        if receipt.callee.owner.is_empty()
+            || receipt.callee.name.is_empty()
+            || !receipt.callee.descriptor.starts_with('(')
+        {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` has no physical callee identity",
+                    receipt.callee.name
+                ),
+                receipt.location.start_byte,
+                receipt.location.end_byte,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The exact source snapshot a plan is accepted against.
+struct SourceEvidence<'a> {
+    source: &'a str,
+    tree: &'a tree_sitter::Tree,
+    annots: crate::transpiler::types::AnnotationSet,
+}
+
+/// Re-validate every recorded receipt against the exact source tree.
+///
+/// This is the half the record-shape invariant cannot see: that the span still
+/// denotes a call, that the selector text is the callee the receipt names, that
+/// the receiver is the expression it proved, and that the argument count and
+/// the physical descriptor agree with the recorded mapping and outcome. Any
+/// disagreement is a controlled pre-write error — never a best-effort file.
+fn ensure_receipts_match_source(
+    translation: &TranslationPlan,
+    source: &str,
+    tree: &tree_sitter::Tree,
+) -> Result<(), AcceptedPlanError> {
+    let fail = |message: String, start_byte: usize, end_byte: usize| AcceptedPlanError {
+        path: "translation plan".to_string(),
+        error: JavaIrError {
+            message,
+            start_byte,
+            end_byte,
+        },
+    };
+    if *blake3::hash(source.as_bytes()).as_bytes() != translation.source_hash {
+        return Err(fail(
+            "the plan was built for different source bytes than the tree it is validated against"
+                .to_string(),
+            0,
+            source.len(),
+        ));
+    }
+    for receipt in &translation.call_receipts {
+        let start = receipt.location.start_byte;
+        let end = receipt.location.end_byte;
+        let Some(call) = node_at(tree.root_node(), start, end) else {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` does not denote any node in the planned source",
+                    receipt.callee.name
+                ),
+                start,
+                end,
+            ));
+        };
+        if !matches!(call.kind(), "call_expression" | "method_invocation") {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` denotes `{}`, not a call",
+                    receipt.callee.name,
+                    call.kind()
+                ),
+                start,
+                end,
+            ));
+        }
+        let Some(callee) = crate::semantics::call_callee_node(call) else {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` denotes a call without a callee",
+                    receipt.callee.name
+                ),
+                start,
+                end,
+            ));
+        };
+        let selector = source
+            .get(callee.start_byte()..callee.end_byte())
+            .unwrap_or("");
+        if selector.trim() != receipt.callee.name
+            || callee.start_byte() != receipt.selector.start_byte
+            || callee.end_byte() != receipt.selector.end_byte
+        {
+            return Err(fail(
+                format!(
+                    "call receipt names `{}` but the source selector is `{}`",
+                    receipt.callee.name,
+                    selector.trim()
+                ),
+                start,
+                end,
+            ));
+        }
+        match &receipt.receiver {
+            Some(receiver) => {
+                let receiver_node =
+                    node_at(tree.root_node(), receiver.start_byte, receiver.end_byte);
+                let text = source
+                    .get(receiver.start_byte..receiver.end_byte)
+                    .unwrap_or("")
+                    .trim();
+                if text.is_empty()
+                    || !matches!(
+                        receiver_node.map(|node| node.kind()),
+                        Some("identifier" | "simple_identifier")
+                    )
+                {
+                    return Err(fail(
+                        format!(
+                            "call receipt for `{}` proved a receiver that is not a simple \
+                             source binding",
+                            receipt.callee.name
+                        ),
+                        start,
+                        end,
+                    ));
+                }
+            }
+            None => {
+                if crate::semantics::explicit_receiver_node(call, callee).is_some() {
+                    return Err(fail(
+                        format!(
+                            "call receipt for `{}` has no receiver although the source call has one",
+                            receipt.callee.name
+                        ),
+                        start,
+                        end,
+                    ));
+                }
+            }
+        }
+        let arguments = direct_argument_count(call);
+        let crate::semantics::ArgumentMapping::Exact(mapped) = receipt.arguments;
+        if arguments != mapped {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` maps {mapped} arguments but the source call passes \
+                     {arguments}",
+                    receipt.callee.name
+                ),
+                start,
+                end,
+            ));
+        }
+        let Some(arity) = crate::semantics::descriptor_arity(&receipt.callee.descriptor) else {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` has an unparseable descriptor `{}`",
+                    receipt.callee.name, receipt.callee.descriptor
+                ),
+                start,
+                end,
+            ));
+        };
+        if arity != mapped {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` maps {mapped} arguments but its descriptor takes \
+                     {arity}",
+                    receipt.callee.name
+                ),
+                start,
+                end,
+            ));
+        }
+        if !crate::semantics::descriptor_result_matches(
+            &receipt.outcome,
+            &receipt.callee.descriptor,
+        ) {
+            return Err(fail(
+                format!(
+                    "call receipt for `{}` records an outcome the descriptor `{}` does not \
+                     produce",
+                    receipt.callee.name, receipt.callee.descriptor
+                ),
+                start,
+                end,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Re-prove every persisted declaration contract from the source tree.
+///
+/// Acceptance cannot trust a plan that merely *looks* consistent: a stale
+/// plan, a changed tree or an emitter that stopped writing one proved slot all
+/// have to fail here, before the first byte reaches disk.
+fn ensure_required_contracts(
+    translation: &TranslationPlan,
+    source: &str,
+    tree: &tree_sitter::Tree,
+    semantic_provider: Option<&dyn SemanticProvider>,
+    annots: crate::transpiler::types::AnnotationSet,
+) -> Result<(), AcceptedPlanError> {
+    let fail = |message: String, start_byte: usize, end_byte: usize| AcceptedPlanError {
+        path: "translation plan".to_string(),
+        error: JavaIrError {
+            message,
+            start_byte,
+            end_byte,
+        },
+    };
+    let bindings = crate::semantics::TypeBindings::build(source, tree.root_node());
+    for decision in &translation.declarations {
+        if decision.final_owner != Some(crate::translation_plan::BackendOwner::Java) {
+            continue;
+        }
+        if decision.contract_retained {
+            return Err(fail(
+                format!(
+                    "declaration `{}` was refused by its lowering contract but is marked \
+                     Java-owned",
+                    decision.symbol_id.name
+                ),
+                decision.id.start_byte,
+                decision.id.end_byte,
+            ));
+        }
+        let Some(contract) = &decision.lowering_contract else {
+            if decision.required_mode {
+                return Err(fail(
+                    format!(
+                        "declaration `{}` is in Required mode with no persisted ABI contract",
+                        decision.symbol_id.name
+                    ),
+                    decision.id.start_byte,
+                    decision.id.end_byte,
+                ));
+            }
+            continue;
+        };
+        let provider = semantic_provider.ok_or_else(|| {
+            fail(
+                format!(
+                    "declaration `{}` has a persisted ABI contract that cannot be re-proved \
+                     without a semantic provider",
+                    decision.symbol_id.name
+                ),
+                decision.id.start_byte,
+                decision.id.end_byte,
+            )
+        })?;
+        let Some(unit) = node_at(
+            tree.root_node(),
+            decision.id.start_byte,
+            decision.id.end_byte,
+        ) else {
+            return Err(fail(
+                format!(
+                    "declaration `{}` has no source node at its planned span",
+                    decision.symbol_id.name
+                ),
+                decision.id.start_byte,
+                decision.id.end_byte,
+            ));
+        };
+        let abi = crate::semantics::declaration_abi(
+            source,
+            unit,
+            &bindings,
+            provider,
+            annots,
+            &translation.call_receipts,
+        );
+        let Some(replayed) = abi.contract() else {
+            return Err(fail(
+                format!(
+                    "declaration `{}` no longer proves its persisted ABI contract (a slot or \
+                     operation is now unproved)",
+                    decision.symbol_id.name
+                ),
+                decision.id.start_byte,
+                decision.id.end_byte,
+            ));
+        };
+        if replayed.fingerprints() != contract.fingerprints() {
+            return Err(fail(
+                format!(
+                    "declaration `{}` renders a different Java ABI than the plan proved",
+                    decision.symbol_id.name
+                ),
+                decision.id.start_byte,
+                decision.id.end_byte,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The deepest node whose span is exactly `start..end`.
+///
+/// Several nodes can share one span (`values.sorted()` is both a `value_argument`
+/// and its inner `call_expression`), so the search keeps descending and prefers
+/// the innermost exact match.
+fn node_at(root: tree_sitter::Node<'_>, start: usize, end: usize) -> Option<tree_sitter::Node<'_>> {
+    let mut best = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() == start && node.end_byte() == end {
+            best = Some(node);
+        }
+        if node.start_byte() <= start && end <= node.end_byte() {
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+    }
+    best
+}
+
+/// Positional argument count of a call, without named arguments or lambdas
+/// (those forms are refused by the receipt builder, so a mismatched count here
+/// is a real disagreement).
+fn direct_argument_count(call: tree_sitter::Node<'_>) -> usize {
+    let mut count = 0;
+    let mut cursor = call.walk();
+    for child in call.named_children(&mut cursor) {
+        if matches!(child.kind(), "value_arguments" | "arguments") {
+            let mut inner = child.walk();
+            count += child
+                .named_children(&mut inner)
+                .filter(|argument| argument.kind() == "value_argument")
+                .count();
+        }
+    }
+    count
+}
+
 impl std::fmt::Display for AcceptedPlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -51,11 +481,93 @@ pub struct AcceptedTranslationPlan {
 }
 
 impl AcceptedTranslationPlan {
+    /// Whether this plan carries any lowering-contract evidence at all.
+    fn has_contract_evidence(translation: &TranslationPlan) -> bool {
+        !translation.call_receipts.is_empty()
+            || translation.declarations.iter().any(|decision| {
+                decision.required_mode
+                    || decision.lowering_contract.is_some()
+                    || decision.contract_retained
+            })
+    }
+
+    /// Accept a plan that carries **no** lowering-contract evidence.
+    ///
+    /// A receipt-bearing or Required-mode plan must be accepted through
+    /// [`Self::accept_with_source`]: its receipts and ABI contracts have to be
+    /// re-proved against the exact source tree before any write, and this
+    /// entry point deliberately has nothing to prove them against.
     pub fn accept(
-        mut translation: TranslationPlan,
+        translation: TranslationPlan,
         candidates: Vec<PreparedJavaFile>,
         semantic_provider: Option<&dyn SemanticProvider>,
     ) -> Result<Self, AcceptedPlanError> {
+        // A recorder conflict is refused first: it is the evidence that a
+        // receipt could not be installed, and it does not depend on the tree.
+        ensure_call_receipt_invariants(&translation)?;
+        if Self::has_contract_evidence(&translation) {
+            return Err(AcceptedPlanError {
+                path: "translation plan".to_string(),
+                error: JavaIrError {
+                    message: "a plan carrying declaration lowering contracts must be accepted \
+                              against its exact source tree"
+                        .to_string(),
+                    start_byte: 0,
+                    end_byte: 0,
+                },
+            });
+        }
+        Self::accept_inner(translation, candidates, semantic_provider, None)
+    }
+
+    /// Accept a plan against the exact source snapshot it was planned from.
+    ///
+    /// This is the production pre-write gate. Java syntax checking below is
+    /// only syntax; it cannot tell whether the plan and the emitted text agree
+    /// about a call. These invariants can: they re-read the source tree and
+    /// re-prove every receipt and every Required declaration's persisted ABI
+    /// contract before a single byte reaches disk.
+    pub fn accept_with_source(
+        translation: TranslationPlan,
+        candidates: Vec<PreparedJavaFile>,
+        semantic_provider: Option<&dyn SemanticProvider>,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        annots: crate::transpiler::types::AnnotationSet,
+    ) -> Result<Self, AcceptedPlanError> {
+        Self::accept_inner(
+            translation,
+            candidates,
+            semantic_provider,
+            Some(SourceEvidence {
+                source,
+                tree,
+                annots,
+            }),
+        )
+    }
+
+    fn accept_inner(
+        mut translation: TranslationPlan,
+        candidates: Vec<PreparedJavaFile>,
+        semantic_provider: Option<&dyn SemanticProvider>,
+        evidence: Option<SourceEvidence<'_>>,
+    ) -> Result<Self, AcceptedPlanError> {
+        ensure_call_receipt_invariants(&translation)?;
+        // Record shape is not production agreement. Re-read the exact source
+        // snapshot the plan was built from and prove that every receipt still
+        // denotes its call, and that every Required declaration's persisted ABI
+        // contract still holds for its source node.
+        if let Some(evidence) = evidence {
+            ensure_receipts_match_source(&translation, evidence.source, evidence.tree)?;
+            ensure_required_contracts(
+                &translation,
+                evidence.source,
+                evidence.tree,
+                semantic_provider,
+                evidence.annots,
+            )?;
+        }
         let facade_targets = candidates
             .iter()
             .flat_map(|candidate| {
@@ -1326,4 +1838,476 @@ fn last_reference_identifier(node: &JavaSyntaxNode, skip_arguments: bool) -> Opt
     let mut found = None;
     collect(node, &mut found, skip_arguments);
     found
+}
+
+#[cfg(test)]
+mod receipt_invariant_tests {
+    use super::*;
+    use crate::semantics::{
+        ArgumentMapping, Behavior, CallReceipt, CalleeIdentity, CheckedEffects, Dispatch,
+        JavaOutcome, JavaRepresentation, Nullability, ReceiptEvidence, SourceLocation,
+    };
+    use crate::translation_plan::{
+        BackendOwner, DeclarationDecision, DeclarationId, DeclarationKind, TranslationPlan,
+    };
+    use std::path::PathBuf;
+
+    const HASH: [u8; 32] = [3u8; 32];
+
+    fn location(start: usize, end: usize, hash: [u8; 32]) -> SourceLocation {
+        SourceLocation {
+            file: PathBuf::from("Fixture.kt"),
+            snapshot_hash: hash,
+            start_byte: start,
+            end_byte: end,
+        }
+    }
+
+    fn receipt(hash: [u8; 32]) -> CallReceipt {
+        CallReceipt {
+            location: location(20, 40, hash),
+            selector: location(27, 33, hash),
+            receiver: Some(location(20, 26, hash)),
+            callee: CalleeIdentity {
+                owner: "java.util.stream.Stream".into(),
+                name: "sorted".into(),
+                descriptor: "()Ljava/util/stream/Stream;".into(),
+            },
+            dispatch: Dispatch::Instance,
+            arguments: ArgumentMapping::Exact(0),
+            outcome: JavaOutcome::Value(JavaRepresentation::erased_reference(
+                "java.util.stream.Stream",
+                Nullability::Unknown,
+            )),
+            effects: CheckedEffects::None,
+            behavior: Behavior::Exact,
+            evidence: ReceiptEvidence::PhysicalMember,
+        }
+    }
+
+    fn plan(declarations: Vec<DeclarationDecision>) -> TranslationPlan {
+        TranslationPlan {
+            source_hash: HASH,
+            declarations,
+            ..TranslationPlan::default()
+        }
+    }
+
+    fn declaration(start: usize, end: usize) -> DeclarationDecision {
+        DeclarationDecision {
+            id: DeclarationId {
+                file: PathBuf::from("Fixture.kt"),
+                source_hash: HASH,
+                start_byte: start,
+                end_byte: end,
+            },
+            symbol_id: SymbolId {
+                module: "fixture".into(),
+                package: "probe".into(),
+                file: PathBuf::from("Fixture.kt"),
+                owner_path: Vec::new(),
+                kind: "function".into(),
+                name: "sorted".into(),
+                receiver: None,
+                parameters: Vec::new(),
+            },
+            qualified_name: None,
+            kind: DeclarationKind::Function,
+            candidate_owner: BackendOwner::Java,
+            retention_reasons: Vec::new(),
+            preparation_outcome: None,
+            final_owner: None,
+            required_mode: false,
+            lowering_contract: None,
+            contract_retained: false,
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Source-tree acceptance: record shape is not production agreement.
+    // ---------------------------------------------------------------------
+
+    use crate::transpiler::types::AnnotationSet;
+
+    fn kotlin_tree(source: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    fn find_call<'tree>(root: tree_sitter::Node<'tree>) -> tree_sitter::Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression" {
+                return node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("fixture has no call");
+    }
+
+    const CALL_SOURCE: &str = "package p\n\nfun link(s: String) {\n    s.hashCode()\n}\n";
+
+    /// A real plan + tree for `CALL_SOURCE`, with one synthetic receipt bound
+    /// to the real call span.
+    fn call_plan() -> (TranslationPlan, tree_sitter::Tree) {
+        let tree = kotlin_tree(CALL_SOURCE);
+        let file = PathBuf::from("Fixture.kt");
+        let mut plan = crate::translation_plan::analyze(CALL_SOURCE, tree.root_node(), &file);
+        let call = find_call(tree.root_node());
+        let callee = crate::semantics::call_callee_node(call).unwrap();
+        let hash = plan.source_hash;
+        let receipt = CallReceipt {
+            location: SourceLocation {
+                file: file.clone(),
+                snapshot_hash: hash,
+                start_byte: call.start_byte(),
+                end_byte: call.end_byte(),
+            },
+            selector: SourceLocation {
+                file: file.clone(),
+                snapshot_hash: hash,
+                start_byte: callee.start_byte(),
+                end_byte: callee.end_byte(),
+            },
+            receiver: Some(SourceLocation {
+                file,
+                snapshot_hash: hash,
+                start_byte: callee.start_byte() - 2,
+                end_byte: callee.start_byte() - 1,
+            }),
+            callee: CalleeIdentity {
+                owner: "java.lang.Object".into(),
+                name: "hashCode".into(),
+                descriptor: "()I".into(),
+            },
+            dispatch: Dispatch::Instance,
+            arguments: ArgumentMapping::Exact(0),
+            outcome: JavaOutcome::Value(JavaRepresentation::primitive("int")),
+            effects: CheckedEffects::None,
+            behavior: Behavior::Exact,
+            evidence: ReceiptEvidence::PhysicalMember,
+        };
+        plan.record_call_receipt(receipt)
+            .expect("the production recorder installs one receipt per span");
+        (plan, tree)
+    }
+
+    fn source_failure(plan: TranslationPlan, tree: &tree_sitter::Tree) -> String {
+        AcceptedTranslationPlan::accept_with_source(
+            plan,
+            Vec::new(),
+            None,
+            CALL_SOURCE,
+            tree,
+            AnnotationSet::None,
+        )
+        .expect_err("validation must refuse")
+        .error
+        .message
+    }
+
+    #[test]
+    fn a_valid_receipt_is_accepted_against_its_source_tree() {
+        let (plan, tree) = call_plan();
+        AcceptedTranslationPlan::accept_with_source(
+            plan,
+            Vec::new(),
+            None,
+            CALL_SOURCE,
+            &tree,
+            AnnotationSet::None,
+        )
+        .expect("the receipt denotes its call");
+    }
+
+    #[test]
+    fn a_receipt_whose_span_is_not_a_call_is_refused() {
+        let (mut plan, tree) = call_plan();
+        // A block that *contains* the selector and receiver, but is not a call.
+        let literal = {
+            let mut stack = vec![tree.root_node()];
+            let mut found = None;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "block" {
+                    found = Some(node);
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            found.unwrap()
+        };
+        let receipt = &mut plan.call_receipts[0];
+        receipt.location.start_byte = literal.start_byte();
+        receipt.location.end_byte = literal.end_byte();
+        receipt.selector.start_byte = literal.start_byte();
+        receipt.selector.end_byte = literal.end_byte();
+        let message = source_failure(plan, &tree);
+        assert!(message.contains("not a call"), "{message}");
+    }
+
+    #[test]
+    fn a_receipt_naming_another_selector_is_refused() {
+        let (mut plan, tree) = call_plan();
+        plan.call_receipts[0].callee.name = "toString".into();
+        let message = source_failure(plan, &tree);
+        assert!(
+            message.contains("source selector"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn a_receipt_with_a_wrong_argument_mapping_is_refused() {
+        let (mut plan, tree) = call_plan();
+        plan.call_receipts[0].arguments = ArgumentMapping::Exact(1);
+        let message = source_failure(plan, &tree);
+        assert!(
+            message.contains("maps 1 arguments"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn a_receipt_whose_descriptor_takes_another_arity_is_refused() {
+        let (mut plan, tree) = call_plan();
+        plan.call_receipts[0].callee.descriptor = "(I)I".into();
+        let message = source_failure(plan, &tree);
+        assert!(
+            message.contains("descriptor takes 1"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn a_receipt_whose_outcome_contradicts_its_descriptor_is_refused() {
+        let (mut plan, tree) = call_plan();
+        plan.call_receipts[0].outcome = JavaOutcome::Void;
+        let message = source_failure(plan, &tree);
+        assert!(
+            message.contains("outcome the descriptor"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn a_stale_source_plan_is_refused() {
+        let (plan, tree) = call_plan();
+        let other = "package p\n\nfun link(s: String) {\n    s.hashCode() // edited\n}\n";
+        let error = AcceptedTranslationPlan::accept_with_source(
+            plan,
+            Vec::new(),
+            None,
+            other,
+            &tree,
+            AnnotationSet::None,
+        )
+        .expect_err("a plan for other bytes must not validate");
+        assert!(
+            error.error.message.contains("different source bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_required_java_declaration_without_a_contract_is_refused() {
+        let (mut plan, tree) = call_plan();
+        plan.declarations[0].final_owner = Some(BackendOwner::Java);
+        plan.declarations[0].required_mode = true;
+        let message = source_failure(plan, &tree);
+        assert!(message.contains("no persisted ABI contract"), "{message}");
+    }
+
+    #[test]
+    fn a_contract_retained_java_declaration_is_refused() {
+        let (mut plan, tree) = call_plan();
+        plan.declarations[0].final_owner = Some(BackendOwner::Java);
+        plan.declarations[0].contract_retained = true;
+        let message = source_failure(plan, &tree);
+        assert!(
+            message.contains("refused by its lowering contract"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_persisted_contract_that_no_longer_renders_its_slot_is_refused() {
+        let (mut plan, tree) = call_plan();
+        // Build the real contract, then change one rendered slot.
+        let unit = {
+            let mut stack = vec![tree.root_node()];
+            let mut found = None;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "function_declaration" {
+                    found = Some(node);
+                    break;
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            found.unwrap()
+        };
+        let bindings = crate::semantics::TypeBindings::build(CALL_SOURCE, tree.root_node());
+        let provider = crate::semantics::SyntaxSemanticProvider::new([(
+            PathBuf::from("Fixture.kt"),
+            CALL_SOURCE.to_string(),
+        )]);
+        let abi = crate::semantics::declaration_abi(
+            CALL_SOURCE,
+            unit,
+            &bindings,
+            &provider,
+            AnnotationSet::None,
+            &plan.call_receipts,
+        );
+        let mut contract = abi.contract().expect("the fixture proves");
+        contract.slots[0].emitted = "Object".into();
+        plan.declarations[0].final_owner = Some(BackendOwner::Java);
+        plan.declarations[0].required_mode = true;
+        plan.declarations[0].lowering_contract = Some(contract);
+        let message = AcceptedTranslationPlan::accept_with_source(
+            plan,
+            Vec::new(),
+            Some(&provider as &dyn SemanticProvider),
+            CALL_SOURCE,
+            &tree,
+            AnnotationSet::None,
+        )
+        .expect_err("a changed slot must refuse")
+        .error
+        .message;
+        assert!(
+            message.contains("renders a different Java ABI"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_plan_with_contract_evidence_cannot_use_the_source_less_gate() {
+        let (plan, _tree) = call_plan();
+        let error = AcceptedTranslationPlan::accept(plan, Vec::new(), None)
+            .expect_err("a receipt-bearing plan needs its source tree");
+        assert!(
+            error
+                .error
+                .message
+                .contains("against its exact source tree"),
+            "{error}"
+        );
+    }
+
+    /// Legacy plans (no receipt) must pass untouched: this is the helper-off /
+    /// old-jar floor.
+    #[test]
+    fn a_plan_without_receipts_passes() {
+        assert!(ensure_call_receipt_invariants(&plan(vec![declaration(0, 60)])).is_ok());
+    }
+
+    #[test]
+    fn a_receipt_inside_its_declaration_passes() {
+        let mut plan = plan(vec![declaration(0, 60)]);
+        plan.call_receipts.push(receipt(HASH));
+        assert!(ensure_call_receipt_invariants(&plan).is_ok());
+    }
+
+    /// A receipt no declaration owns could never be consumed by a declaration
+    /// contract: refuse before anything is written.
+    #[test]
+    fn a_receipt_outside_every_declaration_is_refused() {
+        let mut plan = plan(vec![declaration(0, 10)]);
+        plan.call_receipts.push(receipt(HASH));
+        let error = ensure_call_receipt_invariants(&plan).expect_err("must refuse");
+        assert!(
+            error
+                .error
+                .message
+                .contains("outside every planned declaration"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_receipt_from_another_snapshot_is_refused() {
+        let mut plan = plan(vec![declaration(0, 60)]);
+        plan.call_receipts.push(receipt([9u8; 32]));
+        let error = ensure_call_receipt_invariants(&plan).expect_err("must refuse");
+        assert!(
+            error.error.message.contains("different source snapshot"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn two_receipts_for_one_call_span_are_refused() {
+        let mut plan = plan(vec![declaration(0, 60)]);
+        plan.call_receipts.push(receipt(HASH));
+        plan.call_receipts.push(receipt(HASH));
+        let error = ensure_call_receipt_invariants(&plan).expect_err("must refuse");
+        assert!(
+            error
+                .error
+                .message
+                .contains("more than one lowering receipt"),
+            "{error}"
+        );
+    }
+
+    /// `record_call_receipt` is the only writer during planning. A second
+    /// receipt for the same span is not a safe ambiguity to resolve by "first
+    /// wins": it is a recorded conflict that the pre-write invariant refuses,
+    /// and no second contract is installed.
+    #[test]
+    fn recording_the_same_span_twice_is_a_refused_conflict() {
+        let mut plan = plan(vec![declaration(0, 60)]);
+        assert!(plan.record_call_receipt(receipt(HASH)).is_ok());
+        let conflict = plan
+            .record_call_receipt(receipt(HASH))
+            .expect_err("a duplicate span must be refused, not silently dropped");
+        assert!(
+            conflict.message.contains("more than one lowering receipt"),
+            "{conflict:?}"
+        );
+        assert_eq!(
+            plan.call_receipts.len(),
+            1,
+            "the conflict must not install a second contract"
+        );
+        let refused = AcceptedTranslationPlan::accept(plan, Vec::new(), None)
+            .expect_err("a recorded conflict must reach the pre-write gate");
+        assert!(
+            refused
+                .error
+                .message
+                .contains("more than one lowering receipt"),
+            "{refused}"
+        );
+    }
+
+    /// A receipt whose snapshot does not match the plan is a conflict, not a
+    /// dropped observation: dropping it would quietly return the declaration to
+    /// Legacy mode with no receipt and no refusal.
+    #[test]
+    fn recording_a_receipt_for_another_snapshot_is_a_refused_conflict() {
+        let mut plan = plan(vec![declaration(0, 60)]);
+        let conflict = plan
+            .record_call_receipt(receipt([9u8; 32]))
+            .expect_err("a foreign snapshot must be refused, not silently dropped");
+        assert!(
+            conflict.message.contains("different source snapshot"),
+            "{conflict:?}"
+        );
+        assert!(
+            plan.call_receipts.is_empty(),
+            "a stale contract must never be recorded"
+        );
+        let refused = AcceptedTranslationPlan::accept(plan, Vec::new(), None)
+            .expect_err("a recorded conflict must reach the pre-write gate");
+        assert!(
+            refused.error.message.contains("different source snapshot"),
+            "{refused}"
+        );
+    }
 }

@@ -1,9 +1,10 @@
 //! Shared type-name and annotation helpers.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AnnotationSet {
     Jetbrains,
     Jspecify,
+    #[default]
     None,
 }
 

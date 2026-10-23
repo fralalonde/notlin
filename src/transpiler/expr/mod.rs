@@ -266,9 +266,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             "infix_expression" => self.infix_expr(node),
             "binary_expression" => self.binary(node),
             "parenthesized_expression" | "parenthesized" => {
-                let inner = node
-                    .children(&mut node.walk())
-                    .find(|c| c.is_named())
+                let inner = self
+                    .unit
+                    .expression_children(node)
+                    .first()
+                    .copied()
                     .map(|c| self.transpile(c))
                     .unwrap_or_default();
                 format!("({})", inner)

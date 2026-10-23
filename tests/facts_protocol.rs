@@ -92,6 +92,7 @@ fn decode_accepts_a_members_line_and_carries_unknown_as_none() {
                 result_type: "java.math.BigDecimal".to_string(),
                 parameter_nullability: vec!["unknown".to_string()],
                 result_nullability: "unknown".to_string(),
+                checked_exceptions: None,
             }]),
         }
     );
@@ -121,4 +122,92 @@ fn response_round_trips_through_the_envelope() {
     };
     let line = serde_json::to_string(&response).unwrap();
     assert_eq!(decode_response(&line), Some(response));
+}
+
+/// An old helper line has no `checked_exceptions` field at all. The field is
+/// additive with `#[serde(default)]`, and absence must stay *Unknown* rather
+/// than becoming "declares no checked exception".
+#[test]
+fn decode_of_an_old_shaped_member_row_leaves_checked_exceptions_unknown() {
+    let response = decode_response(
+        "{\"version\":1,\"id\":7,\"answer\":{\"Members\":{\"owner\":\"java.time.Duration\",\"members\":[{\
+         \"name\":\"toString\",\"static_member\":false,\"parameter_types\":[],\
+         \"result_type\":\"java.lang.String\",\"parameter_nullability\":[],\
+         \"result_nullability\":\"unknown\"}]}}}",
+    )
+    .expect("old-shape line still decodes");
+    let Answer::Members { members, .. } = response.answer else {
+        panic!("expected Members");
+    };
+    let members = members.expect("old-shape owner is known");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].checked_exceptions, None);
+}
+
+/// An explicit `null` is the helper's Unknown, not an empty list.
+#[test]
+fn decode_of_a_null_checked_exceptions_field_is_unknown() {
+    let response = decode_response(
+        "{\"version\":1,\"id\":8,\"answer\":{\"Members\":{\"owner\":\"java.util.stream.Stream\",\"members\":[{\
+         \"name\":\"sorted\",\"static_member\":false,\"parameter_types\":[],\
+         \"result_type\":\"java.util.stream.Stream\",\"parameter_nullability\":[],\
+         \"result_nullability\":\"unknown\",\"checked_exceptions\":null}]}}}",
+    )
+    .expect("null field decodes");
+    let Answer::Members { members, .. } = response.answer else {
+        panic!("expected Members");
+    };
+    assert_eq!(members.expect("known owner")[0].checked_exceptions, None);
+}
+
+/// `Some([])` is the only "proved none" shape; a non-empty list is real
+/// evidence of a checked throws clause.
+#[test]
+fn decode_distinguishes_proved_none_from_declared_checked_throws() {
+    let line = |throws: &str| {
+        format!(
+            "{{\"version\":1,\"id\":9,\"answer\":{{\"Members\":{{\"owner\":\"java.util.stream.Stream\",\"members\":[{{\
+             \"name\":\"sorted\",\"static_member\":false,\"parameter_types\":[],\
+             \"result_type\":\"java.util.stream.Stream\",\"parameter_nullability\":[],\
+             \"result_nullability\":\"unknown\",\"checked_exceptions\":{throws}}}]}}}}}}"
+        )
+    };
+    let members = |throws: &str| {
+        let response = decode_response(&line(throws)).expect("valid line");
+        let Answer::Members { members, .. } = response.answer else {
+            panic!("expected Members");
+        };
+        members.expect("known owner")
+    };
+    assert_eq!(members("[]")[0].checked_exceptions, Some(vec![]));
+    assert_eq!(
+        members("[\"java.io.IOException\"]")[0].checked_exceptions,
+        Some(vec!["java.io.IOException".to_string()])
+    );
+}
+
+/// Serializing an old-shaped (Unknown) row must not invent a new `null` field:
+/// the response bytes stay the old bytes, which keeps the wire floor intact.
+#[test]
+fn serializing_unknown_checked_exceptions_omits_the_field() {
+    let member = MemberFacts {
+        name: "toString".to_string(),
+        static_member: false,
+        parameter_types: vec![],
+        result_type: "java.lang.String".to_string(),
+        parameter_nullability: vec![],
+        result_nullability: "unknown".to_string(),
+        checked_exceptions: None,
+    };
+    let line = serde_json::to_string(&member).unwrap();
+    assert!(!line.contains("checked_exceptions"), "{line}");
+    let round_trip: MemberFacts = serde_json::from_str(&line).unwrap();
+    assert_eq!(round_trip.checked_exceptions, None);
+
+    let known = MemberFacts {
+        checked_exceptions: Some(vec![]),
+        ..member
+    };
+    let line = serde_json::to_string(&known).unwrap();
+    assert!(line.contains("\"checked_exceptions\":[]"), "{line}");
 }

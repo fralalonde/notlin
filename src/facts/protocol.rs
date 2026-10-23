@@ -140,6 +140,19 @@ pub struct MemberFacts {
     /// when nothing establishes it.
     pub parameter_nullability: Vec<String>,
     pub result_nullability: String,
+    /// Checked exception binary names the physical declaration declares.
+    ///
+    /// Tri-state, and the distinction is load-bearing:
+    /// * field absent (old helper/jar, old fixture) ⇒ `None` = Unknown;
+    /// * `null` in the line ⇒ `None` = Unknown;
+    /// * `Some([])` ⇒ proved none.
+    ///
+    /// A consumer that needs "throws no checked exception" must accept only
+    /// `Some([])`; `None` is never an empty list and must never be
+    /// `unwrap_or_default()`-ed. Serialization skips the field when it is
+    /// `None`, so an old-shaped response keeps its exact old bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_exceptions: Option<Vec<String>>,
 }
 
 /// Envelope so one line carries id + payload for future multiplexing.
