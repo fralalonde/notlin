@@ -56,7 +56,7 @@ pub use todo::TodoLowering;
 // Declaration-wide lowering contracts (§4.5). The data types are part of the
 // plan surface (`TranslationPlan::call_receipts`), so every consumer —
 // planning, type inference, emission — reads the same recorded object.
-pub use lowering_contract::{AbiProof, RequiredContract, SlotProof};
+pub use lowering_contract::{AbiProof, RequiredContract, RequiredObligations, SlotProof};
 pub use lowering_contract::{
     ArgumentMapping, Behavior, CallReceipt, CalleeIdentity, CheckedEffects, Dispatch, JavaOutcome,
     JavaRepresentation, Nullability, ReceiptEvidence, ReprKind,
@@ -4803,8 +4803,12 @@ pub fn plan_required_calls(
     crate::semantics::record_receipts(&sites, plan);
     // Declaration-wide contract, last: it needs the whole walk's inventory and
     // the recorded receipts, and its verdicts land as preflight blockers
-    // exactly like the audit's.
-    let required = declarations_requiring_coverage(&sites, plan.declarations.len());
+    // exactly like the audit's. The Required-mode answer is computed once and
+    // shared with `plan_contracts`, so the carried obligations of a virtual
+    // re-plan (a snapshot the helper never answered for) cannot make the two
+    // seams disagree about which declarations still owe a proof.
+    let required =
+        declarations_requiring_coverage(&sites, &plan.declarations, &plan.carried_required);
     let mut operations: Vec<OperationRefusal> = Vec::new();
     for (index, unit) in unit_nodes.iter().enumerate() {
         if !required.get(index).copied().unwrap_or(false) {
@@ -4870,7 +4874,7 @@ pub fn plan_required_calls(
             });
         }
     }
-    plan_contracts(&sites, &operations, plan);
+    plan_contracts(&sites, &operations, &required, plan);
 }
 
 /// Prove (and cache) the declared return types of one co-emitted unit.

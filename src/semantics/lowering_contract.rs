@@ -43,7 +43,10 @@
 //! * [`UseContext`] — where the call's value goes. Slice 1 admits a proved
 //!   value only where its payload cannot be observed: a discarded statement, an
 //!   exit through a *bound* nullable `java.lang.Object` ABI, or an exactly
-//!   matching JVM primitive. An opaque parameterized payload
+//!   matching JVM primitive. Slice 2 narrows one more, structurally: a declared
+//!   `String?` whose binding is the non-generic `java.lang.String` and whose
+//!   receipt's physical descriptor result is `Ljava/lang/String;`. An opaque
+//!   parameterized payload
 //!   (`Stream.sorted()` erasing to `java.util.stream.Stream`) is *not*
 //!   interchangeable with a `Stream<Int>` exit just because erasures match; a
 //!   primitive is not a reference and Java `void` is not Kotlin
@@ -65,6 +68,13 @@
 
 use super::*;
 use serde::{Deserialize, Serialize};
+
+/// The one reference type a nullable exit may name structurally.
+///
+/// `java.lang.String` is final and non-generic, so its erased descriptor and
+/// its complete representation are the same fact. Every other reference stays
+/// a source-ABI question this slice does not answer.
+pub(crate) const STRING_REFERENCE: &str = "java.lang.String";
 
 /// A Java type as the emitter must write it. Never a K2 `TypeRef`: a source
 /// type is evidence about the Kotlin program, this is evidence about the
@@ -221,7 +231,7 @@ pub struct CallReceipt {
     pub evidence: ReceiptEvidence,
 }
 
-/// Where the call's value goes. Only three contexts can be admitted without
+/// Where the call's value goes. Only these contexts can be admitted without
 /// observing an erased payload, and each is proved structurally from the
 /// source tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +244,16 @@ pub enum UseContext {
     /// The whole value is returned through a proven nullable
     /// `java.lang.Object` ABI, which cannot observe the payload either.
     NullableObjectExit,
+    /// The whole value is returned through a declaration type structurally
+    /// bound to the *non-generic* `java.lang.String`, and the receipt's own
+    /// physical descriptor result is `Ljava/lang/String;`.
+    ///
+    /// This is deliberately not "any nullable reference": erasure equality
+    /// cannot distinguish `Stream<Int>?` from `Stream<String>?`, so a
+    /// generalized nullable-reference exit would admit a payload nobody
+    /// proved. `java.lang.String` is final and carries no type arguments, so
+    /// the erased representation *is* the complete representation.
+    NullableStringExit,
     /// The whole value is returned through a declared JVM primitive, and the
     /// receipt's own representation is that same primitive. Both sides are
     /// physical primitives: no payload and no nullability question exists, so
@@ -250,6 +270,7 @@ impl UseContext {
         match self {
             UseContext::Discarded => "discarded",
             UseContext::NullableObjectExit => "nullable-object exit",
+            UseContext::NullableStringExit => "nullable-String exit",
             UseContext::PrimitiveExit(primitive) => primitive.as_str(),
             UseContext::Observing(label) => label,
         }
@@ -268,6 +289,10 @@ pub enum Refusal {
     /// A value whose representation is complete, observed by an operation this
     /// slice has no builder for. Not a payload gap — a coverage gap.
     ObservedValue { use_context: String },
+    /// The declared exit and the receipt's physical representation are
+    /// different Java types. A source spelling is not evidence: the receipt's
+    /// descriptor result is what the emitted Java method actually returns.
+    WrongRepresentation { use_context: String, actual: String },
     /// A `void` result (or a primitive) in a value position.
     ValuePosition {
         use_context: String,
@@ -294,6 +319,14 @@ impl Refusal {
                 "call `{name}` is observed in {use_context}, and no lowering contract signs that \
                  consumer yet"
             ),
+            Refusal::WrongRepresentation {
+                use_context,
+                actual,
+            } => format!(
+                "call `{name}` yields `{actual}` in {use_context}, but the declared exit is \
+                 `java.lang.String`; the receipt's physical descriptor result is what the \
+                 emitted Java method returns"
+            ),
             Refusal::ValuePosition {
                 use_context,
                 detail,
@@ -315,6 +348,115 @@ pub struct SiteRecord {
     pub effects: Option<CheckedEffects>,
 }
 
+/// The one receipt-outcome × use-context admission rule.
+///
+/// Every seam that decides "may this signed call be consumed here?" calls this
+/// function: the declaration-wide [`SiteRecord`] inventory and the closed
+/// operation walk's [`check_call`]. They used to hold separate whitelists, so a
+/// context could be added to one and not the other; the match below is
+/// exhaustive over [`UseContext`] (no wildcard arm), which makes a new exit a
+/// compile error here instead of a half-added behaviour.
+///
+/// This rule answers only the *value* question. Where the value sits is a
+/// separate structural question ([`permits_position`]): a discarded statement
+/// and a whole-result exit are not interchangeable even when the same outcome
+/// is admissible in both.
+pub(crate) fn admit_use(outcome: &JavaOutcome, context: &UseContext) -> Result<(), Refusal> {
+    match outcome {
+        JavaOutcome::Void => match context {
+            // A discarded `void` call is an ordinary Java statement.
+            UseContext::Discarded => Ok(()),
+            other => Err(Refusal::ValuePosition {
+                use_context: other.label().to_string(),
+                detail: "the callee returns Java `void`, which is not a Kotlin `Unit` value",
+            }),
+        },
+        JavaOutcome::Value(value) => match context {
+            // A discarded value is never observed, so any representation —
+            // including an erased parameterized one — is safe there.
+            UseContext::Discarded => Ok(()),
+            UseContext::NullableObjectExit => {
+                if value.is_reference() {
+                    Ok(())
+                } else {
+                    Err(Refusal::ValuePosition {
+                        use_context: context.label().to_string(),
+                        detail: "a JVM primitive is not a reference and needs a boxing receipt",
+                    })
+                }
+            }
+            UseContext::NullableStringExit => {
+                // The declaration side is already structurally bound to the
+                // non-generic `java.lang.String`; this side is the receipt's
+                // physical representation. Both must be the same final,
+                // non-generic class, so erasure equality is complete identity
+                // here specifically — never for a reference in general.
+                if matches!(value.kind, ReprKind::ErasedReference)
+                    && value.erased == STRING_REFERENCE
+                {
+                    Ok(())
+                } else if matches!(value.kind, ReprKind::Primitive) {
+                    Err(Refusal::ValuePosition {
+                        use_context: context.label().to_string(),
+                        detail: "a JVM primitive is not a reference and has no nullable \
+                                 `java.lang.String` representation",
+                    })
+                } else {
+                    Err(Refusal::WrongRepresentation {
+                        use_context: context.label().to_string(),
+                        actual: value.erased.clone(),
+                    })
+                }
+            }
+            UseContext::PrimitiveExit(declared) => match &value.kind {
+                ReprKind::Primitive if value.erased == *declared => Ok(()),
+                ReprKind::Primitive => Err(Refusal::ValuePosition {
+                    use_context: context.label().to_string(),
+                    detail: "the receipt's primitive differs from the declared one",
+                }),
+                _ => Err(Refusal::ObservedPayload {
+                    use_context: "primitive exit".to_string(),
+                    erased: value.erased.clone(),
+                }),
+            },
+            // Any other observed use stays retained until the observing
+            // operation is itself contracted. Even a complete payload is not
+            // enough on its own: no builder signs an observed use, so this is
+            // a coverage boundary, not only a payload one.
+            UseContext::Observing(label) => {
+                if value.payload_complete() {
+                    Err(Refusal::ObservedValue {
+                        use_context: label.to_string(),
+                    })
+                } else {
+                    Err(Refusal::ObservedPayload {
+                        use_context: label.to_string(),
+                        erased: value.erased.clone(),
+                    })
+                }
+            }
+        },
+    }
+}
+
+/// Where an admitted value may sit.
+///
+/// Deliberately separate from [`admit_use`]: a value admissible at a statement
+/// position is not admissible as a whole result, so unifying the *outcome*
+/// rule must not unify the *position* rule. A Java `void` result can therefore
+/// never become a Kotlin `Unit` value through a shared whitelist.
+pub(crate) fn permits_position(context: &UseContext, position: Position) -> bool {
+    match position {
+        Position::Statement => matches!(context, UseContext::Discarded),
+        Position::WholeResult => matches!(
+            context,
+            UseContext::NullableObjectExit
+                | UseContext::NullableStringExit
+                | UseContext::PrimitiveExit(_)
+        ),
+    }
+}
+
 impl SiteRecord {
     /// The refusal this site contributes to a declaration that requires
     /// coverage, or `None` when the site is signed and admissible.
@@ -322,63 +464,33 @@ impl SiteRecord {
         let Some(receipt) = &self.receipt else {
             return Some(Refusal::MissingReceipt);
         };
-        match (&receipt.outcome, &self.use_context) {
-            // A discarded value is never observed, so any representation —
-            // including an erased parameterized one — is safe there.
-            (JavaOutcome::Void, UseContext::Discarded) => None,
-            (JavaOutcome::Value(_), UseContext::Discarded) => None,
-            (JavaOutcome::Void, context) => Some(Refusal::ValuePosition {
-                use_context: context.label().to_string(),
-                detail: "the callee returns Java `void`, which is not a Kotlin `Unit` value",
-            }),
-            (JavaOutcome::Value(value), UseContext::NullableObjectExit) => {
-                if !value.is_reference() {
-                    return Some(Refusal::ValuePosition {
-                        use_context: self.use_context.label().to_string(),
-                        detail: "a JVM primitive is not a reference and needs a boxing receipt",
-                    });
-                }
-                None
-            }
-            (JavaOutcome::Value(value), UseContext::PrimitiveExit(declared)) => match &value.kind {
-                ReprKind::Primitive if value.erased == *declared => None,
-                ReprKind::Primitive => Some(Refusal::ValuePosition {
-                    use_context: self.use_context.label().to_string(),
-                    detail: "the receipt's primitive differs from the declared one",
-                }),
-                _ => Some(Refusal::ObservedPayload {
-                    use_context: "primitive exit".to_string(),
-                    erased: value.erased.clone(),
-                }),
-            },
-            // Any other observed use stays retained until the observing
-            // operation is itself contracted. Even a complete payload is not
-            // enough on its own: slice 1 has no builder that signs an observed
-            // use, so this is a coverage boundary, not just a payload one.
-            (JavaOutcome::Value(value), UseContext::Observing(context)) => {
-                if value.payload_complete() {
-                    Some(Refusal::ObservedValue {
-                        use_context: context.to_string(),
-                    })
-                } else {
-                    Some(Refusal::ObservedPayload {
-                        use_context: context.to_string(),
-                        erased: value.erased.clone(),
-                    })
-                }
-            }
-        }
+        admit_use(&receipt.outcome, &self.use_context).err()
     }
 }
 
 /// Which declarations must cover their whole executable inventory.
 ///
 /// Required mode is activated by the *existence* of a signed receipt in the
-/// declaration's span. That fact is computed once here and consumed by both the
-/// refusal pass and the operation inventory, so "which declarations are in
-/// Required mode" cannot drift between the two seams.
-pub(crate) fn declarations_requiring_coverage(sites: &[SiteRecord], count: usize) -> Vec<bool> {
-    let mut required = vec![false; count];
+/// declaration's span, or by a [`RequiredObligations`] entry carried from the
+/// snapshot that did sign receipts (a virtual re-plan, see
+/// [`crate::translation_plan::TranslationPlan::carried_required`]). That fact is
+/// computed once here and consumed by both the refusal pass and the operation
+/// inventory, so "which declarations are in Required mode" cannot drift between
+/// the two seams.
+pub(crate) fn declarations_requiring_coverage(
+    sites: &[SiteRecord],
+    declarations: &[crate::translation_plan::DeclarationDecision],
+    carried: &BTreeSet<SymbolId>,
+) -> Vec<bool> {
+    let mut required = vec![false; declarations.len()];
+    for (index, decision) in declarations.iter().enumerate() {
+        // A carried obligation is the same Required mode, one snapshot later:
+        // the declaration had signed receipts on a snapshot the helper could
+        // answer for, and this one cannot be answered for at all.
+        if carried.contains(&decision.symbol_id) {
+            required[index] = true;
+        }
+    }
     for site in sites {
         if site.receipt.is_some()
             && let Some(flag) = required.get_mut(site.declaration)
@@ -427,18 +539,80 @@ pub(crate) fn record_receipts(
 pub(crate) fn plan_contracts(
     sites: &[SiteRecord],
     operations: &[OperationRefusal],
+    required: &[bool],
     plan: &mut crate::translation_plan::TranslationPlan,
 ) {
     use crate::translation_plan::PreparationBlockerKind;
 
-    let required = declarations_requiring_coverage(sites, plan.declarations.len());
     for (index, required) in required.iter().enumerate() {
         if let Some(decision) = plan.declarations.get_mut(index) {
             decision.required_mode = *required;
         }
     }
+    // Which declarations this snapshot actually re-established. A declaration
+    // that is Required only because its obligation was carried has none: the
+    // helper cannot answer for a virtual snapshot, so every site of it is
+    // unsigned. That is one fact about the snapshot, not one checked-exception
+    // question per call, so it is reported once per declaration.
+    let mut signed = vec![false; plan.declarations.len()];
+    for site in sites {
+        if site.receipt.is_some()
+            && let Some(flag) = signed.get_mut(site.declaration)
+        {
+            *flag = true;
+        }
+    }
+    let carried = plan.carried_required.clone();
+    let unproved_carried = plan
+        .declarations
+        .iter()
+        .enumerate()
+        .filter(|(index, decision)| {
+            required.get(*index).copied().unwrap_or(false)
+                && !signed.get(*index).copied().unwrap_or(false)
+                && carried.contains(&decision.symbol_id)
+        })
+        .map(|(index, decision)| {
+            (
+                index,
+                decision.symbol_id.name.clone(),
+                decision.symbol_id.file.clone(),
+                decision.id.start_byte,
+                decision.id.end_byte,
+            )
+        })
+        .collect::<Vec<_>>();
+    for (index, name, file, start_byte, end_byte) in unproved_carried {
+        let location = SourceLocation {
+            file,
+            snapshot_hash: plan.source_hash,
+            start_byte,
+            end_byte,
+        };
+        retain_contract(
+            plan,
+            index,
+            format!(
+                "declaration `{name}` was proved Required by signed receiver facts on an earlier \
+                 snapshot of this file; this re-planned snapshot is not the text the helper \
+                 answered for, so its receipts cannot be re-established and it stays Kotlin \
+                 instead of reverting to the legacy path"
+            ),
+            location,
+        );
+    }
     for site in sites {
         if !required.get(site.declaration).copied().unwrap_or(false) {
+            continue;
+        }
+        // Carried-and-unsigned declarations are already refused once, with the
+        // reason that explains why no receipt exists at all.
+        if !signed.get(site.declaration).copied().unwrap_or(false)
+            && plan
+                .declarations
+                .get(site.declaration)
+                .is_some_and(|decision| carried.contains(&decision.symbol_id))
+        {
             continue;
         }
         let (kind, message) = match site.refusal() {
@@ -600,6 +774,12 @@ pub enum AbiProof {
     Primitive(String),
     /// Kotlin `Any?` — `java.lang.Object` with no intrinsic null check.
     NullableObject,
+    /// Kotlin `String?` whose spelling is structurally bound to the
+    /// non-generic `java.lang.String` (no import alias, file declaration, type
+    /// parameter, workspace typealias or type argument). Distinct from
+    /// [`AbiProof::Reference`] on purpose: that variant erases type arguments,
+    /// so admitting every nullable reference would admit `Stream<Int>?` too.
+    NullableString,
     /// A reference whose emitted Java spelling is bound by evidence.
     Reference(String),
     /// Not proved; the string names the missing evidence.
@@ -807,11 +987,18 @@ impl SlotProof {
         }
     }
 
-    /// The comparable identity of this slot: role, exact rendered text, span.
-    pub fn fingerprint(&self) -> (String, String, usize, usize) {
+    /// The comparable identity of this slot: role, exact rendered text, the
+    /// ABI classification that admitted it, and its span.
+    ///
+    /// The proof is part of the identity on purpose: a plan that proved
+    /// `String?` as a nullable String ABI and a replay that proves it as a
+    /// plain reference (or the reverse) are different contracts even when the
+    /// rendered text is identical, and acceptance must refuse the delta.
+    pub fn fingerprint(&self) -> (String, String, AbiProof, usize, usize) {
         (
             self.role.clone(),
             self.emitted.clone(),
+            self.proof.clone(),
             self.start_byte,
             self.end_byte,
         )
@@ -832,8 +1019,48 @@ pub struct RequiredContract {
 }
 
 impl RequiredContract {
-    pub fn fingerprints(&self) -> Vec<(String, String, usize, usize)> {
+    pub fn fingerprints(&self) -> Vec<(String, String, AbiProof, usize, usize)> {
         self.slots.iter().map(SlotProof::fingerprint).collect()
+    }
+}
+
+/// The Required-mode obligations one file established on one snapshot.
+///
+/// This is the cross-snapshot certificate the workspace fixpoint needs. A
+/// speculative round plans a *rewritten* text (`migrate::propose_speculative_migration`)
+/// that the helper never saw, so [`crate::facts::runtime::FactsRuntime::call_site_at`]
+/// refuses to answer and every receipt of that round is gone. Losing a receipt
+/// is not evidence that the declaration is Legacy: it is evidence that this
+/// snapshot cannot answer. Carrying the obligation (an identity set plus the
+/// hash of the snapshot that signed it) keeps Required mode across the window
+/// without ever reusing a receipt under a different hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredObligations {
+    /// blake3 of the snapshot whose signed receipts established these
+    /// obligations. Only a snapshot with the *same* bytes may re-establish
+    /// them itself; anything else inherits the obligation instead.
+    pub proved_hash: [u8; 32],
+    /// Stable declaration identities (`SymbolId` carries no offsets and no
+    /// snapshot hash, so it survives a re-plan of the same declaration header).
+    pub declarations: BTreeSet<SymbolId>,
+}
+
+impl RequiredObligations {
+    pub fn new(proved_hash: [u8; 32]) -> Self {
+        Self {
+            proved_hash,
+            declarations: BTreeSet::new(),
+        }
+    }
+
+    /// The identities a snapshot with `source_hash` may not silently lose.
+    ///
+    /// `None` means this snapshot is the very text the receipts were signed
+    /// on, so it re-proves them itself and carries nothing. A hash mismatch is
+    /// exactly the case where the helper refuses to answer: the obligation
+    /// travels, the receipt does not.
+    pub fn carried(&self, source_hash: &[u8; 32]) -> Option<&BTreeSet<SymbolId>> {
+        (self.proved_hash != *source_hash).then_some(&self.declarations)
     }
 }
 
@@ -893,10 +1120,19 @@ impl DeclarationAbi {
 /// Where a value sits: either a whole `return`/expression-body result, or a
 /// statement whose value is discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Position {
+pub(crate) enum Position {
     Statement,
     WholeResult,
 }
+
+/// The signed receipts of one file, keyed by the call span the plan and the
+/// emitter use.
+///
+/// The operation walk reads the *receipt* here, not just its span: admission is
+/// decided from the receipt's own outcome by the same [`admit_use`] rule the
+/// declaration inventory uses. A duplicate span cannot silently win — the plan
+/// recorder refuses duplicate-span receipts before any write.
+type ReceiptIndex<'a> = BTreeMap<(usize, usize), &'a CallReceipt>;
 
 /// The proof context for one file: the source bytes, the file's name bindings,
 /// the semantic provider and the annotation set the emitter will use.
@@ -950,21 +1186,26 @@ pub(crate) fn declaration_abi<P: SemanticProvider + ?Sized>(
         provider,
         annots,
     };
-    let receipt_spans: BTreeSet<(usize, usize)> = receipts
+    let receipt_index: ReceiptIndex<'_> = receipts
         .iter()
-        .map(|receipt| (receipt.location.start_byte, receipt.location.end_byte))
+        .map(|receipt| {
+            (
+                (receipt.location.start_byte, receipt.location.end_byte),
+                receipt,
+            )
+        })
         .collect();
     let mut abi = DeclarationAbi {
         unit_kind: unit.kind().to_string(),
         ..DeclarationAbi::default()
     };
     match unit.kind() {
-        "function_declaration" => prove_function(&ctx, unit, &receipt_spans, &mut abi),
+        "function_declaration" => prove_function(&ctx, unit, &receipt_index, &mut abi),
         // A class is proved only in the closed shape `prove_class` enumerates.
         // An interface's default methods additionally inherit variance/
         // covariant-getter ABI rewrites that this slice does not prove, so an
         // interface unit is refused outright rather than half-proved.
-        "class_declaration" => prove_class(&ctx, unit, &receipt_spans, &mut abi),
+        "class_declaration" => prove_class(&ctx, unit, &receipt_index, &mut abi),
         "interface_declaration" => abi.refuse(
             "an interface declaration's default-method and variance ABI is not proved by this \
              slice"
@@ -1054,7 +1295,7 @@ fn declared_return_proof<P: SemanticProvider + ?Sized>(
 fn prove_function<P: SemanticProvider + ?Sized>(
     ctx: &TypeCtx<'_, P>,
     function: tree_sitter::Node<'_>,
-    receipts: &BTreeSet<(usize, usize)>,
+    receipts: &ReceiptIndex<'_>,
     abi: &mut DeclarationAbi,
 ) {
     if let Some(modifiers) = child_kind(function, "modifiers") {
@@ -1189,7 +1430,7 @@ fn prove_parameter<P: SemanticProvider + ?Sized>(
 fn prove_class<P: SemanticProvider + ?Sized>(
     ctx: &TypeCtx<'_, P>,
     class: tree_sitter::Node<'_>,
-    receipts: &BTreeSet<(usize, usize)>,
+    receipts: &ReceiptIndex<'_>,
     abi: &mut DeclarationAbi,
 ) {
     // This grammar uses `class_declaration` for interfaces too. Only an
@@ -1350,6 +1591,22 @@ fn prove_type<P: SemanticProvider + ?Sized>(
                     proof: AbiProof::NullableObject,
                     emitted: proven.emitted,
                 }),
+                // `String?` is the one nullable reference this slice may
+                // admit, and only when the *whole* inner type is argument-free.
+                // The proof below is reachable only through the binding guards
+                // in `prove_simple_name`/`prove_user_type`, so an alias,
+                // shadow, type parameter or generic spelling never arrives
+                // here as `java.lang.String`. The structural check is the
+                // second, independent bound: `String<Int>?` (not valid Kotlin,
+                // but parseable) must not borrow the builtin's erasure.
+                AbiProof::Reference(java)
+                    if java == STRING_REFERENCE && !has_type_arguments(inner) =>
+                {
+                    Ok(ProvenType {
+                        proof: AbiProof::NullableString,
+                        emitted: proven.emitted,
+                    })
+                }
                 other => Ok(ProvenType {
                     proof: other,
                     emitted: proven.emitted,
@@ -1650,6 +1907,23 @@ fn one_named_child<'tree>(
     }
 }
 
+/// Whether a type node or any of its descendants carries type arguments.
+///
+/// Used to keep a nullable exit's declaration type non-generic structurally,
+/// not by reading the rendered text (a rendered `String` says nothing about a
+/// source `String<…>` shape).
+fn has_type_arguments(node: tree_sitter::Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "type_arguments" {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
 /// A workspace-level binding this file's own tree cannot see: a typealias in
 /// the same package, a typealias imported from elsewhere, or a same-package
 /// type declaration in another file.
@@ -1741,7 +2015,7 @@ fn code_children<'tree>(
 fn scan_body<P: SemanticProvider + ?Sized>(
     ctx: &TypeCtx<'_, P>,
     body: tree_sitter::Node<'_>,
-    receipts: &BTreeSet<(usize, usize)>,
+    receipts: &ReceiptIndex<'_>,
     abi: &mut DeclarationAbi,
 ) {
     for child in code_children(body) {
@@ -1766,7 +2040,7 @@ fn scan_body<P: SemanticProvider + ?Sized>(
 fn scan_statement<P: SemanticProvider + ?Sized>(
     ctx: &TypeCtx<'_, P>,
     statement: tree_sitter::Node<'_>,
-    receipts: &BTreeSet<(usize, usize)>,
+    receipts: &ReceiptIndex<'_>,
     abi: &mut DeclarationAbi,
 ) {
     match kind_policy(statement.kind()) {
@@ -1786,7 +2060,7 @@ fn scan_statement<P: SemanticProvider + ?Sized>(
 fn scan_value<P: SemanticProvider + ?Sized>(
     ctx: &TypeCtx<'_, P>,
     value: tree_sitter::Node<'_>,
-    receipts: &BTreeSet<(usize, usize)>,
+    receipts: &ReceiptIndex<'_>,
     abi: &mut DeclarationAbi,
     position: Position,
 ) {
@@ -1811,7 +2085,7 @@ fn scan_value<P: SemanticProvider + ?Sized>(
 fn check_value<P: SemanticProvider + ?Sized>(
     ctx: &TypeCtx<'_, P>,
     value: tree_sitter::Node<'_>,
-    receipts: &BTreeSet<(usize, usize)>,
+    receipts: &ReceiptIndex<'_>,
     abi: &mut DeclarationAbi,
 ) {
     scan_value(ctx, value, receipts, abi, Position::WholeResult);
@@ -1820,7 +2094,7 @@ fn check_value<P: SemanticProvider + ?Sized>(
 fn check_call<P: SemanticProvider + ?Sized>(
     ctx: &TypeCtx<'_, P>,
     call: tree_sitter::Node<'_>,
-    receipts: &BTreeSet<(usize, usize)>,
+    receipts: &ReceiptIndex<'_>,
     abi: &mut DeclarationAbi,
     position: Position,
 ) {
@@ -1831,7 +2105,7 @@ fn check_call<P: SemanticProvider + ?Sized>(
         .unwrap_or("")
         .trim()
         .to_string();
-    if !receipts.contains(&(call.start_byte(), call.end_byte())) {
+    let Some(receipt) = receipts.get(&(call.start_byte(), call.end_byte())) else {
         abi.refuse(
             format!(
                 "call `{name}` has no lowering contract; a declaration requiring Java lowering \
@@ -1840,21 +2114,27 @@ fn check_call<P: SemanticProvider + ?Sized>(
             call,
         );
         return;
-    }
-    let context = classify_use(ctx.source, call, &abi.returns);
-    let admitted = match position {
-        Position::Statement => matches!(context, UseContext::Discarded),
-        Position::WholeResult => matches!(
-            context,
-            UseContext::NullableObjectExit | UseContext::PrimitiveExit(_)
-        ),
     };
-    if !admitted {
+    let context = classify_use(ctx.source, call, &abi.returns);
+    // One admission rule for both seams: the receipt's own outcome against the
+    // structurally classified use context. The separate position proof below
+    // answers "may a value sit here at all", so unifying the outcome rule
+    // cannot make a discard context a return value or a Java `void` a Kotlin
+    // `Unit` value.
+    if let Err(refusal) = admit_use(&receipt.outcome, &context) {
+        abi.refuse(refusal.message(&name), call);
+        return;
+    }
+    if !permits_position(&context, position) {
         abi.refuse(
             format!(
-                "call `{name}` is used as {} but the proved lowering contract only admits a \
-                 discarded statement or a whole nullable-`Object`/primitive exit",
-                context.label()
+                "call `{name}` is used as {} in {} position, but a proved value may only be a \
+                 discarded statement or a whole value exit (a `void` result is never a value)",
+                context.label(),
+                match position {
+                    Position::Statement => "statement",
+                    Position::WholeResult => "whole-result",
+                }
             ),
             call,
         );
@@ -2132,6 +2412,7 @@ fn returns_void(function: tree_sitter::Node<'_>, returns: &ReturnAbi) -> bool {
 fn exit_context(function: tree_sitter::Node<'_>, returns: &ReturnAbi) -> UseContext {
     match returns.get(&(function.start_byte(), function.end_byte())) {
         Some(AbiProof::NullableObject) => UseContext::NullableObjectExit,
+        Some(AbiProof::NullableString) => UseContext::NullableStringExit,
         Some(AbiProof::Primitive(primitive)) => UseContext::PrimitiveExit(primitive.clone()),
         _ => UseContext::Observing("return through a declared type"),
     }
@@ -2385,6 +2666,350 @@ mod tests {
             site(primitive, UseContext::PrimitiveExit("long".to_string())).refusal(),
             Some(Refusal::ValuePosition { .. })
         ));
+    }
+
+    fn string_outcome() -> JavaOutcome {
+        JavaOutcome::Value(JavaRepresentation::erased_reference(
+            STRING_REFERENCE,
+            Nullability::Unknown,
+        ))
+    }
+
+    fn erased(name: &str) -> JavaOutcome {
+        JavaOutcome::Value(JavaRepresentation::erased_reference(
+            name,
+            Nullability::Unknown,
+        ))
+    }
+
+    fn array_outcome() -> JavaOutcome {
+        JavaOutcome::Value(JavaRepresentation {
+            erased: "java.lang.String[]".into(),
+            kind: ReprKind::Array(Box::new(JavaRepresentation::erased_reference(
+                STRING_REFERENCE,
+                Nullability::NonNull,
+            ))),
+            nullable: Nullability::Unknown,
+        })
+    }
+
+    fn parameterized_outcome() -> JavaOutcome {
+        JavaOutcome::Value(JavaRepresentation {
+            erased: "java.util.stream.Stream".into(),
+            kind: ReprKind::ParameterizedReference(vec![JavaRepresentation::erased_reference(
+                STRING_REFERENCE,
+                Nullability::NonNull,
+            )]),
+            nullable: Nullability::Unknown,
+        })
+    }
+
+    /// Every use context this module can classify, with a payload so the
+    /// matrix below is a real cross product rather than a label list.
+    fn every_context() -> Vec<UseContext> {
+        vec![
+            UseContext::Discarded,
+            UseContext::NullableObjectExit,
+            UseContext::NullableStringExit,
+            UseContext::PrimitiveExit("int".to_string()),
+            UseContext::PrimitiveExit("long".to_string()),
+            UseContext::Observing("initializer"),
+            UseContext::Observing("return through a declared type"),
+        ]
+    }
+
+    /// The admission matrix, exhaustively: no outcome/context pair may be left
+    /// undecided, and the nullable String exit admits exactly the physical
+    /// String representation.
+    #[test]
+    fn the_shared_admission_rule_covers_every_outcome_and_context() {
+        let mut admitted = std::collections::BTreeSet::new();
+        for (outcome, name) in [
+            (JavaOutcome::Void, "void"),
+            (
+                JavaOutcome::Value(JavaRepresentation::primitive("int")),
+                "int",
+            ),
+            (array_outcome(), "array"),
+            (erased("java.util.stream.Stream"), "erased stream"),
+            (parameterized_outcome(), "parameterized stream"),
+            (string_outcome(), "String"),
+        ] {
+            for context in every_context() {
+                let verdict = admit_use(&outcome, &context);
+                let key = (name, context.label().to_string());
+                if verdict.is_ok() {
+                    admitted.insert(key);
+                } else {
+                    // A refusal must name the gap; `Ok`/`Err` is the whole
+                    // contract, so an empty message would be a silent drop.
+                    let refusal = verdict.unwrap_err();
+                    assert!(
+                        !refusal.message("probe").is_empty(),
+                        "a refusal with no message is not evidence"
+                    );
+                }
+            }
+        }
+        let expected: std::collections::BTreeSet<(&str, String)> = [
+            ("void", "discarded"),
+            ("int", "discarded"),
+            ("array", "discarded"),
+            ("erased stream", "discarded"),
+            ("parameterized stream", "discarded"),
+            ("String", "discarded"),
+            ("array", "nullable-object exit"),
+            ("erased stream", "nullable-object exit"),
+            ("parameterized stream", "nullable-object exit"),
+            ("String", "nullable-object exit"),
+            ("String", "nullable-String exit"),
+            ("int", "int"),
+        ]
+        .into_iter()
+        .map(|(outcome, context)| (outcome, context.to_string()))
+        .collect();
+        assert_eq!(admitted, expected, "the admission matrix changed");
+    }
+
+    /// The nullable String exit is exactly one representation, never a family.
+    #[test]
+    fn the_nullable_string_exit_admits_only_a_physical_string() {
+        for refused in [
+            JavaOutcome::Void,
+            JavaOutcome::Value(JavaRepresentation::primitive("int")),
+            array_outcome(),
+            erased("java.lang.Object"),
+            erased("java.lang.CharSequence"),
+            erased("java.util.stream.Stream"),
+            parameterized_outcome(),
+        ] {
+            assert!(
+                admit_use(&refused, &UseContext::NullableStringExit).is_err(),
+                "{refused:?} must not satisfy a nullable String exit"
+            );
+        }
+        assert_eq!(
+            admit_use(&string_outcome(), &UseContext::NullableStringExit),
+            Ok(())
+        );
+    }
+
+    /// Position is a separate proof: unifying admission must not let a discard
+    /// context become a return value, or a `void` statement become a value.
+    #[test]
+    fn position_admission_is_not_the_outcome_admission() {
+        for context in every_context() {
+            let statement = permits_position(&context, Position::Statement);
+            let whole_result = permits_position(&context, Position::WholeResult);
+            match &context {
+                UseContext::Discarded => {
+                    assert!(statement, "a discarded value is a Java statement");
+                    assert!(!whole_result, "a return cannot discard its value");
+                }
+                UseContext::NullableObjectExit
+                | UseContext::NullableStringExit
+                | UseContext::PrimitiveExit(_) => {
+                    assert!(whole_result, "{context:?} is a whole-value exit");
+                    assert!(!statement, "{context:?} is not a discardable statement");
+                }
+                UseContext::Observing(label) => {
+                    assert!(!statement && !whole_result, "{label} is admitted nowhere");
+                }
+            }
+        }
+        // A void call is admissible only as a statement, so no position can
+        // turn it into a Kotlin `Unit` value.
+        assert_eq!(
+            admit_use(&JavaOutcome::Void, &UseContext::Discarded),
+            Ok(())
+        );
+        assert!(!permits_position(
+            &UseContext::Discarded,
+            Position::WholeResult
+        ));
+    }
+
+    /// The declaration slot proof is structural: the builtin spelling alone is
+    /// not enough, and a generic reference never becomes a nullable String.
+    #[test]
+    fn a_nullable_string_slot_is_structurally_bound() {
+        fn return_proofs(source: &str) -> Vec<AbiProof> {
+            abi(source)
+                .slots
+                .iter()
+                .filter(|slot| slot.role == "return type")
+                .map(|slot| slot.proof.clone())
+                .collect()
+        }
+
+        assert_eq!(
+            return_proofs(
+                "package p\n\nimport java.io.File\n\nfun nullableName(f: File): String? = f.getName()\n"
+            ),
+            vec![AbiProof::NullableString]
+        );
+        // A non-null `String` is a plain reference, not the nullable exit.
+        assert_eq!(
+            return_proofs(
+                "package p\n\nimport java.io.File\n\nfun strictName(f: File): String = f.getName()\n"
+            ),
+            vec![AbiProof::Reference(STRING_REFERENCE.to_string())]
+        );
+        // A nullable parameterized reference keeps its erased-reference proof.
+        assert_eq!(
+            return_proofs(
+                "package p\n\nimport java.util.stream.Stream\n\nfun s(v: Stream<Int>): Stream<Int>? = v.sorted()\n"
+            ),
+            vec![AbiProof::Reference("java.util.stream.Stream".to_string())]
+        );
+        // Bindings that displace the builtin never prove the exit at all.
+        for (label, source) in [
+            (
+                "typealias",
+                "package p\n\nimport java.io.File\n\ntypealias String = Any\n\nfun n(f: File): String? = f.getName()\n",
+            ),
+            (
+                "import alias",
+                "package p\n\nimport java.io.File\nimport java.util.stream.Stream as String\n\nfun n(f: File): String? = f.getName()\n",
+            ),
+            (
+                "file declaration",
+                "package p\n\nimport java.io.File\n\nclass String\n\nfun n(f: File): String? = f.getName()\n",
+            ),
+            (
+                "type parameter",
+                "package p\n\nimport java.io.File\n\nfun <String> n(f: File): String? = f.getName()\n",
+            ),
+        ] {
+            let proofs = return_proofs(source);
+            assert!(
+                proofs.iter().all(|proof| !matches!(
+                    proof,
+                    AbiProof::NullableString | AbiProof::Reference(_)
+                )),
+                "{label}: a bound `String` spelling must not prove the builtin: {proofs:?}"
+            );
+        }
+    }
+
+    /// Build the receipt the operation walk would consume for the fixture's
+    /// first call, with an arbitrary physical outcome.
+    fn call_receipt(source: &str, outcome: JavaOutcome) -> CallReceipt {
+        let tree = parse(source);
+        let mut stack = vec![tree.root_node()];
+        let mut call = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression" && call.is_none() {
+                call = Some(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let call = call.expect("fixture has a call");
+        let mut receipt = receipt(outcome);
+        receipt.location.start_byte = call.start_byte();
+        receipt.location.end_byte = call.end_byte();
+        receipt
+    }
+
+    /// The declaration-wide inventory and the closed operation walk must reach
+    /// the *same* verdict. They consume one `admit_use` rule now; this test
+    /// drives both seams from the same fabricated receipt so an exit added to
+    /// one side only cannot pass.
+    #[test]
+    fn both_seams_agree_on_every_admitted_and_refused_exit() {
+        fn agreement(source: &str, outcome: JavaOutcome) -> (bool, bool) {
+            let tree = parse(source);
+            let root = tree.root_node();
+            let unit = root
+                .named_children(&mut root.walk())
+                .find(|node| node.kind() == "function_declaration")
+                .expect("fixture has a top-level function");
+            let bindings = TypeBindings::build(source, root);
+            let provider = fixture_provider(source);
+            let receipt = call_receipt(source, outcome.clone());
+            let returns = declaration_returns(
+                source,
+                unit,
+                &bindings,
+                &provider,
+                crate::transpiler::types::AnnotationSet::None,
+            );
+            let mut stack = vec![tree.root_node()];
+            let mut call = None;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "call_expression" && call.is_none() {
+                    call = Some(node);
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            let context = classify_use(source, call.unwrap(), &returns);
+            let site = SiteRecord {
+                declaration: 0,
+                name: "member".into(),
+                location: receipt.location.clone(),
+                receipt: Some(receipt.clone()),
+                use_context: context,
+                effects: None,
+            };
+            let abi = declaration_abi(
+                source,
+                unit,
+                &bindings,
+                &provider,
+                crate::transpiler::types::AnnotationSet::None,
+                std::slice::from_ref(&receipt),
+            );
+            (site.refusal().is_none(), abi.contract().is_some())
+        }
+
+        let stream_discard = "package p\n\nimport java.util.stream.Stream\n\nfun link(v: Stream<Int>) {\n    v.sorted()\n}\n";
+        let object_exit = "package p\n\nimport java.util.stream.Stream\n\nfun opaque(v: Stream<Int>): Any? = v.sorted()\n";
+        let string_exit = "package p\n\nimport java.io.File\n\nfun nullableName(f: File): String? = f.getName()\n";
+        let strict_exit =
+            "package p\n\nimport java.io.File\n\nfun strictName(f: File): String = f.getName()\n";
+        let stream_exit = "package p\n\nimport java.util.stream.Stream\n\nfun nullableSorted(v: Stream<Int>): Stream<Int>? = v.sorted()\n";
+
+        for (label, source, outcome, admitted) in [
+            (
+                "discarded stream",
+                stream_discard,
+                erased("java.util.stream.Stream"),
+                true,
+            ),
+            (
+                "nullable object",
+                object_exit,
+                erased("java.util.stream.Stream"),
+                true,
+            ),
+            ("nullable string", string_exit, string_outcome(), true),
+            ("non-null string", strict_exit, string_outcome(), false),
+            (
+                "nullable string/Object",
+                string_exit,
+                erased("java.lang.Object"),
+                false,
+            ),
+            ("nullable string/array", string_exit, array_outcome(), false),
+            (
+                "nullable Stream exit",
+                stream_exit,
+                erased("java.util.stream.Stream"),
+                false,
+            ),
+        ] {
+            let (site_admits, walk_admits) = agreement(source, outcome);
+            assert_eq!(
+                site_admits, admitted,
+                "{label}: the declaration inventory verdict changed"
+            );
+            assert_eq!(
+                walk_admits, admitted,
+                "{label}: the operation walk disagrees with the inventory"
+            );
+        }
     }
 
     #[test]

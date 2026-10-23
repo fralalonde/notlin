@@ -184,6 +184,10 @@ pub struct WorkspaceScope<'a> {
     pub top_level_property_callsite_retention:
         Option<&'a crate::top_level_property_callsite::RetentionMap>,
     pub indexed_path: Option<&'a Path>,
+    /// Required-mode obligations inherited from the snapshot that signed them.
+    /// Only the workspace fixpoint sets this, and only for a file whose current
+    /// text is not the snapshot the receipts were proved on.
+    pub carried_required: Option<&'a std::collections::BTreeSet<crate::semantics::SymbolId>>,
 }
 
 /// Explicit planning result. Preflight ownership is computed before lowering;
@@ -254,7 +258,14 @@ pub(crate) fn prepare_static_plan_facts(
         identity_path: identity_path.to_path_buf(),
         source_hash: *blake3::hash(source.as_bytes()).as_bytes(),
         allow_approximations: cli.allow_approximations,
-        plan: build_static_plan(source, tree, identity_path, cli, provider),
+        plan: build_static_plan(
+            source,
+            tree,
+            identity_path,
+            cli,
+            provider,
+            scope.carried_required,
+        ),
     }
 }
 
@@ -377,7 +388,14 @@ fn lower_with_plan(
         assert_eq!(static_facts.allow_approximations, cli.allow_approximations);
         static_facts.plan.clone()
     } else {
-        build_static_plan(source, tree, identity_path, cli, semantic_provider)
+        build_static_plan(
+            source,
+            tree,
+            identity_path,
+            cli,
+            semantic_provider,
+            scope.carried_required,
+        )
     };
     let retained_with_forced = scope
         .forced_retained
@@ -878,8 +896,10 @@ fn build_static_plan(
     identity_path: &Path,
     cli: &Cli,
     provider: &dyn crate::semantics::SemanticProvider,
+    carried_required: Option<&std::collections::BTreeSet<crate::semantics::SymbolId>>,
 ) -> crate::translation_plan::TranslationPlan {
     let mut plan = crate::translation_plan::analyze(source, tree.root_node(), identity_path);
+    plan.carried_required = carried_required.cloned().unwrap_or_default();
     plan.annotations = match cli.annotations {
         Annotations::Jetbrains => types::AnnotationSet::Jetbrains,
         Annotations::Jspecify => types::AnnotationSet::Jspecify,

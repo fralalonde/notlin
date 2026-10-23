@@ -223,6 +223,19 @@ pub struct TranslationPlan {
     /// type's annotation prefix.
     #[serde(skip)]
     pub annotations: crate::transpiler::types::AnnotationSet,
+    /// Required-mode obligations this snapshot inherits from an earlier
+    /// snapshot of the same file.
+    ///
+    /// A virtual re-plan is not the text on disk, so the helper cannot answer
+    /// for it and no receipt can be re-established. These identities were
+    /// proved Required on a snapshot that *did* carry receipts; carrying the
+    /// obligation — never the receipt — keeps a declaration from silently
+    /// reverting to Legacy and being emitted by an older path that never
+    /// proved its calls. Filled in by the workspace fixpoint from
+    /// [`crate::semantics::RequiredObligations`], empty for every on-disk
+    /// snapshot, and never persisted.
+    #[serde(skip)]
+    pub carried_required: std::collections::BTreeSet<SymbolId>,
     /// Receipts the recorder could not install, kept as authoritative evidence.
     ///
     /// A duplicate span or a foreign snapshot is not a safe ambiguity to
@@ -792,6 +805,7 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         container_calls: Vec::new(),
         call_receipts: Vec::new(),
         annotations: crate::transpiler::types::AnnotationSet::default(),
+        carried_required: std::collections::BTreeSet::new(),
         receipt_conflicts: Vec::new(),
         eager_collection_calls: Vec::new(),
         eager_collection_helpers: Vec::new(),

@@ -1341,3 +1341,478 @@ fn full_helper_retains_string_templates_in_a_required_declaration() {
         .unwrap_or_else(|error| panic!("{label}: retained Kotlin must compile: {error}"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bound nullable `java.lang.String` exit: real null / evaluation / ABI proof
+// ---------------------------------------------------------------------------
+//
+// `f.getName()` on a `java.io.File` subclass that returns `null` is the oracle
+// that separates the two exits:
+//
+// * `String?` — Kotlin emits no null check, so `null` propagates and the
+//   override runs exactly once;
+// * `String`  — Kotlin emits `Intrinsics.checkNotNullExpressionValue`, so the
+//   same null throws `NullPointerException` after exactly one invocation. That
+//   declaration must stay Kotlin: this slice has no intrinsic-check lowering.
+//
+// The migrated Java must reproduce the nullable exit: same single invocation,
+// same `null`, same `java.lang.String` descriptor, and no
+// `requireNonNull`/`checkNotNull`/`toString` coercion.
+//
+// The two declarations are migrated from *separate* roots on purpose. A file
+// that mixes a translated declaration with a retained one is re-planned
+// without receipts in a later pass, and in that pass the older platform
+// member path emits `f.getName()` for the retained declaration — a
+// pre-existing declaration-coverage gap that predates this slice (the accepted
+// comparator binary reproduces it). Pinning it here as a mixed fixture would
+// test that gap instead of this contract, so each fixture is one declaration.
+
+const NULLABLE_NAME_SOURCE: &str = r#"package probe
+
+import java.io.File
+
+fun nullableName(f: File): String? = f.getName()
+"#;
+
+const STRICT_NAME_SOURCE: &str = r#"package probe
+
+import java.io.File
+
+fun strictName(f: File): String = f.getName()
+"#;
+
+const NEVER_NAME: &str = r#"package probe;
+
+public final class NeverName extends java.io.File {
+    private int calls;
+
+    public NeverName() {
+        super("ordinal");
+    }
+
+    @Override
+    public String getName() {
+        calls++;
+        return null;
+    }
+
+    public int calls() {
+        return calls;
+    }
+}
+"#;
+
+/// `facade` names the same function in the retained Kotlin
+/// (`probe.NullableNameKt`) and in the migrated Java (`probe.NullableName`), so
+/// the printed bytes are a direct differential.
+fn nullable_name_main(class_name: &str, facade: &str) -> String {
+    format!(
+        r#"package probe;
+
+public final class {class_name} {{
+    public static void main(String[] args) {{
+        NeverName nullReturning = new NeverName();
+        Object value = {facade}.nullableName(nullReturning);
+        System.out.println("nullable=" + value + ":calls=" + nullReturning.calls());
+        System.out.println(
+            "control=" + {facade}.nullableName(new java.io.File("keep.txt")));
+    }}
+}}
+"#
+    )
+}
+
+fn strict_name_main(class_name: &str, facade: &str) -> String {
+    format!(
+        r#"package probe;
+
+public final class {class_name} {{
+    public static void main(String[] args) {{
+        NeverName nullReturning = new NeverName();
+        try {{
+            System.out.println(
+                "strict=" + {facade}.strictName(nullReturning)
+                    + ":calls=" + nullReturning.calls());
+        }} catch (NullPointerException error) {{
+            System.out.println("strict=NPE:calls=" + nullReturning.calls());
+        }}
+    }}
+}}
+"#
+    )
+}
+
+fn java_tool(name: &str) -> std::ffi::OsString {
+    PathBuf::from(java_of("NOTLIN_JAVA"))
+        .with_file_name(name)
+        .into_os_string()
+}
+
+fn javap(classes: &Path, class_name: &str) -> String {
+    let output = Command::new(java_tool("javap"))
+        .arg("-cp")
+        .arg(classes)
+        .arg(class_name)
+        .output()
+        .expect("javap must run");
+    assert!(
+        output.status.success(),
+        "javap {class_name} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+#[ignore = "requires NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB and the slim/full helper jars"]
+fn full_helper_emits_the_bound_nullable_string_exit_with_real_null_semantics() {
+    let stdlib = PathBuf::from(java_of("NOTLIN_KOTLIN_STDLIB"));
+    let slim = PathBuf::from(std::env::var_os("NOTLIN_JVM_FACTS_JAR").expect("slim helper jar"));
+    let full =
+        PathBuf::from(std::env::var_os("NOTLIN_JVM_FACTS_FULL_JAR").expect("full helper jar"));
+    let scratch = Scratch::new();
+
+    // 1. Original Kotlin: the runtime reference for null propagation, single
+    //    evaluation and the intrinsic null check of the non-null exit.
+    let original = scratch.0.join("original");
+    fs::create_dir_all(&original).unwrap();
+    fs::write(original.join("NullableName.kt"), NULLABLE_NAME_SOURCE).unwrap();
+    fs::write(original.join("StrictName.kt"), STRICT_NAME_SOURCE).unwrap();
+    fs::write(original.join("NeverName.java"), NEVER_NAME).unwrap();
+    fs::write(
+        original.join("NullableMain.java"),
+        nullable_name_main("NullableMain", "probe.NullableNameKt"),
+    )
+    .unwrap();
+    fs::write(
+        original.join("StrictMain.java"),
+        strict_name_main("StrictMain", "probe.StrictNameKt"),
+    )
+    .unwrap();
+    // The nullable oracle and the strict oracle are separate processes so each
+    // printed stream is directly comparable with its migrated counterpart.
+    let nullable_reference = validate_jvm_sources(&config(
+        &original,
+        scratch.0.join("original-nullable-classes"),
+        &stdlib,
+        Some("probe.NullableMain"),
+    ))
+    .expect("the original nullable Kotlin must compile and run");
+    let nullable_expected = nullable_reference
+        .commands
+        .last()
+        .unwrap()
+        .stdout
+        .trim()
+        .to_owned();
+    assert_eq!(
+        nullable_expected, "nullable=null:calls=1\ncontrol=keep.txt",
+        "the nullable oracle fixture itself changed"
+    );
+    let reference_abi = javap(
+        &scratch.0.join("original-nullable-classes"),
+        "probe.NullableNameKt",
+    );
+    assert!(
+        reference_abi.contains("java.lang.String nullableName(java.io.File)"),
+        "the original nullable exit must be a java.lang.String descriptor:\n{reference_abi}"
+    );
+
+    // 2. The non-null destination: real Kotlin throws on the same null. This is
+    //    the recorded original behaviour, not an invented NPE.
+    let strict_reference = validate_jvm_sources(&config(
+        &original,
+        scratch.0.join("original-strict-classes"),
+        &stdlib,
+        Some("probe.StrictMain"),
+    ))
+    .expect("the original strict Kotlin must compile and run");
+    assert_eq!(
+        strict_reference.commands.last().unwrap().stdout.trim(),
+        "strict=NPE:calls=1",
+        "the non-null exit's original intrinsic check changed"
+    );
+
+    // 3. Helper off and the slim helper keep the nullable declaration Kotlin.
+    for (mode, jar) in [("off", None), ("slim", Some(slim.as_path()))] {
+        let tree = scratch.0.join(format!("retained-{mode}"));
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("NullableName.kt"), NULLABLE_NAME_SOURCE).unwrap();
+        fs::write(tree.join("NeverName.java"), NEVER_NAME).unwrap();
+        fs::write(
+            tree.join("NullableMain.java"),
+            nullable_name_main("NullableMain", "probe.NullableNameKt"),
+        )
+        .unwrap();
+        let _ = migrate(&tree, jar, false);
+        assert!(
+            !tree.join("NullableName.java").exists(),
+            "{mode}: no nullable String exit without a physical receipt"
+        );
+        let report = validate_jvm_sources(&config(
+            &tree,
+            scratch.0.join(format!("retained-{mode}-classes")),
+            &stdlib,
+            Some("probe.NullableMain"),
+        ))
+        .unwrap_or_else(|error| panic!("{mode}: retained Kotlin must compile and run: {error}"));
+        assert_eq!(
+            report.commands.last().unwrap().stdout.trim(),
+            nullable_expected,
+            "{mode}"
+        );
+    }
+
+    // 4. The full helper signs the nullable exit and emits the same virtual
+    //    call.
+    let tree = scratch.0.join("migrated-nullable");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(tree.join("NullableName.kt"), NULLABLE_NAME_SOURCE).unwrap();
+    let (stdout, stderr) = migrate(&tree, Some(full.as_path()), false);
+    let java = fs::read_to_string(tree.join("NullableName.java")).unwrap_or_else(|error| {
+        panic!("the proved nullable String exit must translate: {error}\n{stdout}\n{stderr}")
+    });
+    assert!(
+        java.contains("return f.getName();"),
+        "the exit must be the same virtual call, not a coercion:\n{java}"
+    );
+    assert!(
+        !java.contains("requireNonNull")
+            && !java.contains("checkNotNull")
+            && !java.contains("toString()"),
+        "the nullable exit must not observe null or the payload:\n{java}"
+    );
+    assert!(
+        !tree.join("NullableName.kt").exists(),
+        "the fully translated unit must leave the Kotlin file"
+    );
+    fs::write(tree.join("NeverName.java"), NEVER_NAME).unwrap();
+    fs::write(
+        tree.join("MigratedMain.java"),
+        nullable_name_main("MigratedMain", "probe.NullableName"),
+    )
+    .unwrap();
+    let report = validate_jvm_sources(&config(
+        &tree,
+        scratch.0.join("migrated-nullable-classes"),
+        &stdlib,
+        Some("probe.MigratedMain"),
+    ))
+    .unwrap_or_else(|error| panic!("migrated Java must compile and run: {error}"));
+    assert_eq!(
+        report.commands.last().unwrap().stdout.trim(),
+        nullable_expected,
+        "the migrated nullable exit must propagate null after a single invocation"
+    );
+    let migrated_abi = javap(
+        &scratch.0.join("migrated-nullable-classes"),
+        "probe.NullableName",
+    );
+    assert!(
+        migrated_abi.contains("java.lang.String nullableName(java.io.File)"),
+        "the migrated exit must keep the source ABI descriptor:\n{migrated_abi}"
+    );
+
+    // 5. The non-null sibling stays Kotlin, so its intrinsic check is still
+    //    the original one.
+    let strict = scratch.0.join("retained-strict");
+    fs::create_dir_all(&strict).unwrap();
+    fs::write(strict.join("StrictName.kt"), STRICT_NAME_SOURCE).unwrap();
+    fs::write(strict.join("NeverName.java"), NEVER_NAME).unwrap();
+    fs::write(
+        strict.join("StrictMain.java"),
+        strict_name_main("StrictMain", "probe.StrictNameKt"),
+    )
+    .unwrap();
+    let _ = migrate(&strict, Some(full.as_path()), false);
+    assert!(
+        !strict.join("StrictName.java").exists(),
+        "a non-null `String` destination has no proved intrinsic check"
+    );
+    let report = validate_jvm_sources(&config(
+        &strict,
+        scratch.0.join("retained-strict-classes"),
+        &stdlib,
+        Some("probe.StrictMain"),
+    ))
+    .unwrap_or_else(|error| panic!("retained strict Kotlin must compile and run: {error}"));
+    assert_eq!(
+        report.commands.last().unwrap().stdout.trim(),
+        "strict=NPE:calls=1",
+        "retaining the non-null declaration keeps its original behaviour"
+    );
+}
+
+/// One physical file with a provable exit and a sibling that has no proved Java
+/// form. Unlike the one-declaration-per-root fixtures above, this is the shape a
+/// real workspace has, and it is the shape that exposed the re-plan bug: pass 1
+/// translates `nullableName`, and pass 2 re-plans the rewritten file, whose
+/// bytes the helper never answered for.
+///
+/// The migrated tree therefore owns *two* facades — the generated
+/// `probe.Mixed.nullableName` and the retained `probe.MixedKt.strictName` — and
+/// both must behave exactly like the all-Kotlin original:
+///
+/// ```text
+/// nullable=null:calls=1     # no intrinsic check on the nullable exit
+/// strict=NPE:calls=1        # the retained declaration keeps its null check
+/// ```
+///
+/// The old bug printed `strict=null:calls=1`: the strict declaration was emitted
+/// by the platform member path after its receipts disappeared, so Kotlin's
+/// intrinsic null check was silently dropped. This test is the end-to-end
+/// counterexample, against the real JDK and the real helper.
+const MIXED_NAME_SOURCE: &str = r#"package probe
+
+import java.io.File
+
+fun nullableName(f: File): String? = f.getName()
+
+fun strictName(f: File): String = f.getName()
+"#;
+
+/// `nullableFacade`/`strictFacade` are the classes that actually own each
+/// declaration: identical in the original (`probe.MixedKt`), split after
+/// migration.
+fn mixed_name_main(class_name: &str, nullable_facade: &str, strict_facade: &str) -> String {
+    format!(
+        r#"package probe;
+
+public final class {class_name} {{
+    public static void main(String[] args) {{
+        NeverName nullable = new NeverName();
+        System.out.println(
+            "nullable=" + {nullable_facade}.nullableName(nullable)
+                + ":calls=" + nullable.calls());
+        NeverName strict = new NeverName();
+        try {{
+            System.out.println(
+                "strict=" + {strict_facade}.strictName(strict)
+                    + ":calls=" + strict.calls());
+        }} catch (NullPointerException error) {{
+            System.out.println("strict=NPE:calls=" + strict.calls());
+        }}
+    }}
+}}
+"#
+    )
+}
+
+#[test]
+#[ignore = "requires NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB and the slim/full helper jars"]
+fn a_mixed_top_level_file_keeps_its_strict_sibling_kotlin() {
+    let stdlib = PathBuf::from(java_of("NOTLIN_KOTLIN_STDLIB"));
+    let full =
+        PathBuf::from(std::env::var_os("NOTLIN_JVM_FACTS_FULL_JAR").expect("full helper jar"));
+    let scratch = Scratch::new();
+
+    // 1. The original program: one file, both declarations, recorded behaviour.
+    let original = scratch.0.join("original");
+    fs::create_dir_all(&original).unwrap();
+    fs::write(original.join("Mixed.kt"), MIXED_NAME_SOURCE).unwrap();
+    fs::write(original.join("NeverName.java"), NEVER_NAME).unwrap();
+    fs::write(
+        original.join("OriginalMain.java"),
+        mixed_name_main("OriginalMain", "probe.MixedKt", "probe.MixedKt"),
+    )
+    .unwrap();
+    let reference = validate_jvm_sources(&config(
+        &original,
+        scratch.0.join("original-classes"),
+        &stdlib,
+        Some("probe.OriginalMain"),
+    ))
+    .expect("the original mixed Kotlin must compile and run");
+    let expected = reference.commands.last().unwrap().stdout.trim().to_owned();
+    assert_eq!(
+        expected, "nullable=null:calls=1\nstrict=NPE:calls=1",
+        "the original mixed fixture itself changed"
+    );
+
+    // 2. The full helper: only the proved declaration moves to Java, and the
+    //    retained sibling keeps its Kotlin facade and its null check.
+    let tree = scratch.0.join("migrated");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(tree.join("Mixed.kt"), MIXED_NAME_SOURCE).unwrap();
+    fs::write(tree.join("NeverName.java"), NEVER_NAME).unwrap();
+    let (stdout, stderr) = migrate(&tree, Some(full.as_path()), false);
+    let java = fs::read_to_string(tree.join("Mixed.java")).unwrap_or_else(|error| {
+        panic!("the proved nullable exit must still translate: {error}\n{stdout}\n{stderr}")
+    });
+    assert!(
+        java.contains("return f.getName();") && !java.contains("strictName"),
+        "the sibling must not ride the translation:\n{java}"
+    );
+    let kotlin =
+        fs::read_to_string(tree.join("Mixed.kt")).expect("the strict sibling must stay Kotlin");
+    assert!(
+        kotlin.contains("fun strictName(f: File): String = f.getName()")
+            && !kotlin.contains("fun nullableName"),
+        "the retained file must hold exactly the strict declaration:\n{kotlin}"
+    );
+    assert!(
+        kotlin.contains("earlier snapshot"),
+        "the retention must name the carried obligation:\n{kotlin}"
+    );
+    fs::write(
+        tree.join("MixedMain.java"),
+        mixed_name_main("MixedMain", "probe.Mixed", "probe.MixedKt"),
+    )
+    .unwrap();
+    let report = validate_jvm_sources(&config(
+        &tree,
+        scratch.0.join("migrated-classes"),
+        &stdlib,
+        Some("probe.MixedMain"),
+    ))
+    .unwrap_or_else(|error| panic!("the migrated mixed tree must compile and run: {error}"));
+    assert_eq!(
+        report.commands.last().unwrap().stdout.trim(),
+        expected,
+        "the migrated tree must reproduce the original bytes: same null propagation, same \
+         single evaluation, and the retained declaration's intrinsic null check"
+    );
+
+    // 3. Physical ABI: the generated class holds the nullable exit and nothing
+    //    else; the retained Kotlin keeps the strict one.
+    let migrated_abi = javap(&scratch.0.join("migrated-classes"), "probe.Mixed");
+    assert!(
+        migrated_abi.contains("java.lang.String nullableName(java.io.File)")
+            && !migrated_abi.contains("strictName"),
+        "the generated class must expose only the proved declaration:\n{migrated_abi}"
+    );
+    let retained_abi = javap(&scratch.0.join("migrated-classes"), "probe.MixedKt");
+    assert!(
+        retained_abi.contains("java.lang.String strictName(java.io.File)"),
+        "the retained declaration must keep its Kotlin facade:\n{retained_abi}"
+    );
+
+    // 4. Helper off: no facts, no obligation, the whole file stays Kotlin and
+    //    behaves like the original.
+    let off = scratch.0.join("retained-off");
+    fs::create_dir_all(&off).unwrap();
+    fs::write(off.join("Mixed.kt"), MIXED_NAME_SOURCE).unwrap();
+    fs::write(off.join("NeverName.java"), NEVER_NAME).unwrap();
+    let _ = migrate(&off, None, false);
+    assert!(
+        !off.join("Mixed.java").exists(),
+        "helper off must not invent a translation"
+    );
+    fs::write(
+        off.join("OffMain.java"),
+        mixed_name_main("OffMain", "probe.MixedKt", "probe.MixedKt"),
+    )
+    .unwrap();
+    let off_report = validate_jvm_sources(&config(
+        &off,
+        scratch.0.join("retained-off-classes"),
+        &stdlib,
+        Some("probe.OffMain"),
+    ))
+    .expect("the helper-off tree must compile and run");
+    assert_eq!(
+        off_report.commands.last().unwrap().stdout.trim(),
+        expected,
+        "without a helper the file is untouched Kotlin"
+    );
+}

@@ -1664,3 +1664,659 @@ fn the_production_cli_emits_a_bound_nullable_object_exit() {
         "the exit must return the proved call verbatim:\n{java}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bound nullable `java.lang.String` exits
+// ---------------------------------------------------------------------------
+//
+// A zero-argument physical member receipt can now exit through a declaration
+// whose return type is structurally bound to the non-generic
+// `java.lang.String`. The admission is *physical*: the receipt's descriptor
+// result must be `Ljava/lang/String;`, so every alias, shadow or contradictory
+// fact keeps the declaration in Kotlin.
+
+const FILE_MEMBERS: &str = include_str!("fixtures/classpath_facts/file_members.json");
+
+/// The production positive: `f: File` is a uniquely imported JDK declaration,
+/// `String?` is the unshadowed builtin, and `getName()` is the proved receipt.
+const NULLABLE_STRING_SOURCE: &str = r#"package probe
+
+import java.io.File
+
+fun nullableName(f: File): String? = f.getName()
+"#;
+
+fn file_sites(source: &str) -> String {
+    site_line(
+        selector_offset(source, "getName"),
+        "java.io.File",
+        "getName",
+        "java.lang.String",
+        false,
+        "()Ljava/lang/String;",
+        "getName()",
+    )
+}
+
+#[test]
+fn the_production_cli_emits_a_bound_nullable_string_exit() {
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("NullableName.kt"), NULLABLE_STRING_SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &file_sites(NULLABLE_STRING_SOURCE),
+        "java.io.File",
+        FILE_MEMBERS,
+        "NullableName",
+    );
+    let java = outcome
+        .emitted
+        .expect("a bound `String?` exit over a physical String receipt is proved");
+    assert!(
+        java.contains("String nullableName(File f)"),
+        "the exit must emit the physically proved java.lang.String spelling:\n{java}"
+    );
+    assert!(
+        java.contains("return f.getName();"),
+        "the exit must return the proved call verbatim, with no coercion:\n{java}"
+    );
+    assert!(
+        !java.contains("requireNonNull")
+            && !java.contains("checkNotNull")
+            && !java.contains("toString()"),
+        "a nullable exit observes neither the payload nor null, so no check/coercion may appear:\n{java}"
+    );
+}
+
+/// A block-bodied `return` is the same whole-result position, not a statement.
+#[test]
+fn the_production_cli_emits_a_bound_nullable_string_return_statement() {
+    const SOURCE: &str = r#"package probe
+
+import java.io.File
+
+fun nullableName(f: File): String? {
+    return f.getName()
+}
+"#;
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("NullableReturn.kt"), SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &file_sites(SOURCE),
+        "java.io.File",
+        FILE_MEMBERS,
+        "NullableReturn",
+    );
+    let java = outcome
+        .emitted
+        .expect("a returned `String?` exit is the same whole-result position");
+    assert!(
+        java.contains("return f.getName();"),
+        "the return statement must carry the proved call verbatim:\n{java}"
+    );
+}
+
+/// The non-null destination keeps today's behaviour: Kotlin inserts an
+/// intrinsic null check there that this contract does not model, so the
+/// declaration is retained rather than emitted without it.
+#[test]
+fn the_production_cli_retains_a_non_null_string_destination() {
+    const SOURCE: &str = r#"package probe
+
+import java.io.File
+
+fun strictName(f: File): String = f.getName()
+"#;
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("StrictName.kt"), SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &file_sites(SOURCE),
+        "java.io.File",
+        FILE_MEMBERS,
+        "StrictName",
+    );
+    assert!(
+        outcome.emitted.is_none(),
+        "a non-null `String` exit carries an intrinsic null check this slice does not prove: {:?}",
+        outcome.emitted
+    );
+    assert!(
+        outcome
+            .retained
+            .as_deref()
+            .is_some_and(|kotlin| kotlin.contains("f.getName()")),
+        "the declaration must survive in Kotlin: {:?}",
+        outcome.retained
+    );
+}
+
+/// A `typealias String = Any` is valid Kotlin whose physical exit is
+/// `java.lang.Object`, not `java.lang.String`. The existing binding guard must
+/// keep it retained: a spelling-only `String` match would admit it.
+#[test]
+fn the_production_cli_retains_a_nullable_exit_whose_string_spelling_is_an_alias() {
+    const SOURCE: &str = r#"package probe
+
+import java.io.File
+
+typealias String = Any
+
+fun nullableName(f: File): String? = f.getName()
+"#;
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("TypeAliasName.kt"), SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &file_sites(SOURCE),
+        "java.io.File",
+        FILE_MEMBERS,
+        "TypeAliasName",
+    );
+    assert!(
+        outcome.emitted.is_none(),
+        "the aliased `String?` is the Object ABI: {:?}",
+        outcome.emitted
+    );
+    let retained = outcome.retained.unwrap_or_default();
+    assert!(
+        retained.contains("typealias String") && retained.contains("f.getName()"),
+        "the declaration must survive in Kotlin:\n{retained}"
+    );
+    assert!(
+        retained.contains("bound by a typealias"),
+        "the refusal must name the binding, not the spelling:\n{retained}"
+    );
+}
+
+/// The same binding question one level up: `typealias String = CharSequence` is
+/// valid Kotlin too, and its physical exit is `java.lang.CharSequence`.
+#[test]
+fn the_production_cli_retains_a_nullable_exit_aliased_to_char_sequence() {
+    const SOURCE: &str = r#"package probe
+
+import java.io.File
+
+typealias String = CharSequence
+
+fun nullableName(f: File): String? = f.getName()
+"#;
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("CharSequenceName.kt"), SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &file_sites(SOURCE),
+        "java.io.File",
+        FILE_MEMBERS,
+        "CharSequenceName",
+    );
+    assert!(
+        outcome.emitted.is_none(),
+        "the aliased `String?` is the CharSequence ABI: {:?}",
+        outcome.emitted
+    );
+    assert!(
+        outcome
+            .retained
+            .as_deref()
+            .is_some_and(|kotlin| kotlin.contains("typealias String = CharSequence")),
+        "the declaration must survive in Kotlin: {:?}",
+        outcome.retained
+    );
+}
+
+/// Erasure equality is still not evidence: a nullable `Stream<Int>?` exit keeps
+/// the exact erased descriptor its receipt declares and must still retain.
+#[test]
+fn the_production_cli_still_retains_a_nullable_parameterized_stream_exit() {
+    const SOURCE: &str = r#"package probe
+
+import java.util.stream.Stream
+
+fun nullableSorted(values: Stream<Int>): Stream<Int>? = values.sorted()
+"#;
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("NullableStream.kt"), SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &stream_sites(SOURCE),
+        "java.util.stream.Stream",
+        STREAM_MEMBERS,
+        "NullableStream",
+    );
+    assert!(
+        outcome.emitted.is_none(),
+        "a nullable parameterized reference is not a nullable String exit: {:?}",
+        outcome.emitted
+    );
+    assert!(
+        outcome
+            .retained
+            .as_deref()
+            .is_some_and(|kotlin| kotlin.contains("values.sorted()")),
+        "the declaration must survive in Kotlin: {:?}",
+        outcome.retained
+    );
+}
+
+/// Deliberately *contradictory* scripted evidence, not a native fact: the real
+/// `File.getName()` returns `java.lang.String`, this helper claims
+/// `java.lang.Object`. The declared `String?` exit must be refused on the
+/// receipt's own representation, so a source spelling can never stand in for
+/// the physical descriptor.
+#[test]
+fn a_contradictory_object_result_cannot_stand_in_for_the_string_exit() {
+    let contradictory = site_line(
+        selector_offset(NULLABLE_STRING_SOURCE, "getName"),
+        "java.io.File",
+        "getName",
+        "java.lang.Object",
+        false,
+        "()Ljava/lang/Object;",
+        "getName()",
+    );
+    const OBJECT_MEMBERS: &str = r#"[
+  {"name":"getName","static_member":false,"parameter_types":[],"result_type":"java.lang.Object","parameter_nullability":[],"result_nullability":"unknown","checked_exceptions":[]}
+]
+"#;
+    let scratch = Scratch::new();
+    fs::write(
+        scratch.0.join("ContradictoryName.kt"),
+        NULLABLE_STRING_SOURCE,
+    )
+    .unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &contradictory,
+        "java.io.File",
+        OBJECT_MEMBERS,
+        "ContradictoryName",
+    );
+    assert!(
+        outcome.emitted.is_none(),
+        "the receipt's Object representation does not satisfy a String exit: {:?}",
+        outcome.emitted
+    );
+    assert!(
+        outcome
+            .retained
+            .as_deref()
+            .is_some_and(|kotlin| kotlin.contains("f.getName()")),
+        "the declaration must survive in Kotlin: {:?}",
+        outcome.retained
+    );
+}
+
+/// An initializer observes the value even when the destination is `String?`:
+/// the new exit must not leak into alias/argument positions.
+#[test]
+fn a_nullable_string_binding_of_the_receipt_still_retains() {
+    const SOURCE: &str = r#"package probe
+
+import java.io.File
+
+fun nullableName(f: File): String? {
+    val name: String? = f.getName()
+    return name
+}
+"#;
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("BoundName.kt"), SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &file_sites(SOURCE),
+        "java.io.File",
+        FILE_MEMBERS,
+        "BoundName",
+    );
+    assert!(
+        outcome.emitted.is_none(),
+        "an initializer is an observing context: {:?}",
+        outcome.emitted
+    );
+    assert!(
+        outcome
+            .retained
+            .as_deref()
+            .is_some_and(|kotlin| kotlin.contains("val name: String? = f.getName()")),
+        "the declaration must survive in Kotlin: {:?}",
+        outcome.retained
+    );
+}
+
+/// Helper-off keeps the floor: the nullable String exit is not a spelling
+/// fallback.
+#[test]
+fn a_nullable_string_exit_without_the_helper_stays_kotlin() {
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("NullableName.kt"), NULLABLE_STRING_SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "off",
+        &file_sites(NULLABLE_STRING_SOURCE),
+        "java.io.File",
+        FILE_MEMBERS,
+        "NullableName",
+    );
+    assert!(outcome.emitted.is_none(), "{:?}", outcome.emitted);
+    assert!(outcome.journal.is_empty(), "helper off must send no query");
+    assert!(
+        outcome
+            .retained
+            .as_deref()
+            .is_some_and(|kotlin| kotlin.contains("fun nullableName")),
+        "the declaration must survive in Kotlin: {:?}",
+        outcome.retained
+    );
+}
+
+/// Byte offset of the `member(...)` selector's `occurrence`th appearance.
+fn selector_offset_at(source: &str, member: &str, occurrence: usize) -> u64 {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let mut found = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression"
+            && let Some(offset) = notlin::semantics::kotlin_call_site_offset(node)
+            && source[offset..].starts_with(&format!("{member}("))
+        {
+            found.push(offset as u64);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    found.sort_unstable();
+    *found
+        .get(occurrence)
+        .unwrap_or_else(|| panic!("no occurrence {occurrence} of `{member}` in fixture"))
+}
+
+/// Every `getName()` site in one physical file, one entry per call.
+fn all_file_sites(source: &str, calls: usize) -> String {
+    let sites = (0..calls)
+        .map(|occurrence| {
+            site_entry(
+                selector_offset_at(source, "getName", occurrence),
+                "java.io.File",
+                "getName",
+                "[]",
+                "java.lang.String",
+                false,
+                "()Ljava/lang/String;",
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", sites.join(","))
+}
+
+/// One physical file with a newly proved declaration and a sibling that has no
+/// proved Java form.
+///
+/// Pass 1 translates `nullableName` and leaves `strictName` in Kotlin. Pass 2
+/// re-plans the *rewritten* file, which the helper never saw, so the strict
+/// declaration's receipts cannot be re-established. Losing a receipt is not
+/// evidence of Legacy mode: the declaration keeps its Required obligation and
+/// stays Kotlin. The old bug was that this pass silently fell back to the
+/// platform member path and emitted `f.getName()` for the non-null destination,
+/// dropping Kotlin's intrinsic null check (`strictName(null)` returned `null`
+/// instead of throwing).
+const MIXED_NAME_SOURCE: &str = r#"package probe
+
+import java.io.File
+
+fun nullableName(f: File): String? = f.getName()
+
+fun strictName(f: File): String = f.getName()
+"#;
+
+#[test]
+fn the_production_cli_keeps_a_strict_sibling_after_a_nullable_translation() {
+    let scratch = Scratch::new();
+    for (label, flags) in [
+        ("strict", &[][..]),
+        ("approximations", &["--allow-approximations"][..]),
+    ] {
+        let root = scratch.0.join(label);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Mixed.kt"), MIXED_NAME_SOURCE).unwrap();
+        let outcome = run_owners(
+            &root,
+            "on",
+            &all_file_sites(MIXED_NAME_SOURCE, 2),
+            &[("java.io.File", FILE_MEMBERS)],
+            flags,
+            "Mixed",
+        );
+        let java = outcome
+            .emitted
+            .expect("the proved nullable exit still translates beside a retained sibling");
+        assert!(
+            java.contains("String nullableName(File f)"),
+            "{label}: the proved declaration must still translate:\n{java}"
+        );
+        assert!(
+            !java.contains("strictName"),
+            "{label}: a non-null `String` destination has no proved intrinsic check and must \
+             not ride the sibling's translation:\n{java}"
+        );
+        let kotlin = outcome
+            .retained
+            .expect("the strict sibling must stay Kotlin");
+        assert!(
+            kotlin.contains("fun strictName(f: File): String = f.getName()"),
+            "{label}: the strict declaration must survive in Kotlin:\n{kotlin}"
+        );
+        assert!(
+            !kotlin.contains("fun nullableName"),
+            "{label}: the translated declaration must leave the Kotlin file:\n{kotlin}"
+        );
+        assert!(
+            kotlin.contains("earlier snapshot"),
+            "{label}: the retention must name the carried obligation, not a generic refusal:\n{kotlin}"
+        );
+    }
+}
+
+/// The same shape with the *pre-existing* discard positive: proving `sorted()`
+/// safe says nothing about the sibling's non-null `String` destination, so the
+/// carrier must not be a nullable-String special case.
+#[test]
+fn the_production_cli_keeps_a_strict_sibling_after_a_discarded_translation() {
+    const SOURCE: &str = r#"package probe
+
+import java.io.File
+import java.util.stream.Stream
+
+fun touch(values: Stream<String>) {
+    values.sorted()
+}
+
+fun strictName(f: File): String = f.getName()
+"#;
+    let sites = format!(
+        "[{},{}]",
+        site_entry(
+            selector_offset_at(SOURCE, "sorted", 0),
+            "java.util.stream.Stream",
+            "sorted",
+            "[]",
+            "java.util.stream.Stream",
+            false,
+            "()Ljava/util/stream/Stream;",
+        ),
+        site_entry(
+            selector_offset_at(SOURCE, "getName", 0),
+            "java.io.File",
+            "getName",
+            "[]",
+            "java.lang.String",
+            false,
+            "()Ljava/lang/String;",
+        )
+    );
+    let scratch = Scratch::new();
+    for (label, flags) in [
+        ("strict", &[][..]),
+        ("approximations", &["--allow-approximations"][..]),
+    ] {
+        let root = scratch.0.join(label);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("MixedStream.kt"), SOURCE).unwrap();
+        let outcome = run_owners(
+            &root,
+            "on",
+            &sites,
+            &[
+                ("java.util.stream.Stream", STREAM_MEMBERS),
+                ("java.io.File", FILE_MEMBERS),
+            ],
+            flags,
+            "MixedStream",
+        );
+        let java = outcome
+            .emitted
+            .expect("the proved discard still translates beside a retained sibling");
+        assert!(
+            java.contains("void touch(") && java.contains("values.sorted()"),
+            "{label}: the proved discard must still translate:\n{java}"
+        );
+        assert!(
+            !java.contains("strictName"),
+            "{label}: the strict sibling has no proved form:\n{java}"
+        );
+        let kotlin = outcome
+            .retained
+            .expect("the strict sibling must stay Kotlin");
+        assert!(
+            kotlin.contains("fun strictName"),
+            "{label}: the strict declaration must survive in Kotlin:\n{kotlin}"
+        );
+    }
+}
+
+/// Old-shaped helper row: the checked-exception field does not exist, so no
+/// receipt is signed anywhere and no declaration ever enters Required mode.
+/// Nothing is declassified by this change — there was no obligation to carry —
+/// so the mixed file keeps today's legacy answer for *each* declaration: both
+/// are lowered by the pre-existing platform path, exactly as the single
+/// declaration row already does (`an_absent_throws_row_leaves_the_legacy_platform_answer_unchanged`).
+///
+/// This is the floor that keeps the fix narrow: the carrier must never
+/// manufacture an obligation out of absent evidence, and it must not turn
+/// "retain a lost obligation" into "retain every file with a strict sibling".
+#[test]
+fn an_old_shaped_row_carries_no_obligation_in_a_mixed_file() {
+    const OLD_SHAPE_MEMBERS: &str = r#"[
+  {"name":"getName","static_member":false,"parameter_types":[],"result_type":"java.lang.String","parameter_nullability":[],"result_nullability":"unknown"}
+]
+"#;
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("Mixed.kt"), MIXED_NAME_SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &all_file_sites(MIXED_NAME_SOURCE, 2),
+        "java.io.File",
+        OLD_SHAPE_MEMBERS,
+        "Mixed",
+    );
+    assert!(
+        outcome.journal.contains("ClassMembers"),
+        "the helper must have been asked: {}",
+        outcome.journal
+    );
+    let java = outcome
+        .emitted
+        .expect("no receipt exists, so the legacy platform path decides both declarations");
+    assert!(
+        java.contains("return f.getName();"),
+        "the legacy answer is the same verbatim member call:\n{java}"
+    );
+    assert!(
+        outcome.retained.is_none(),
+        "no receipt was signed, so no obligation exists to carry and nothing is withheld: {:?}",
+        outcome.retained
+    );
+}
+
+/// Helper off: the same mixed file keeps every declaration, because no facts
+/// exist for either of them. The carrier never invents an obligation.
+#[test]
+fn the_mixed_file_without_a_helper_stays_entirely_kotlin() {
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("Mixed.kt"), MIXED_NAME_SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "off",
+        &all_file_sites(MIXED_NAME_SOURCE, 2),
+        "java.io.File",
+        FILE_MEMBERS,
+        "Mixed",
+    );
+    assert!(outcome.emitted.is_none(), "{:?}", outcome.emitted);
+    assert!(outcome.journal.is_empty(), "helper off must send no query");
+    let kotlin = outcome.retained.expect("the file must stay Kotlin");
+    assert!(kotlin.contains("fun nullableName") && kotlin.contains("fun strictName"));
+    assert!(
+        !kotlin.contains("earlier snapshot"),
+        "no receipt was ever signed, so there is no carried obligation:\n{kotlin}"
+    );
+}
+
+/// Old-shaped helper row: the checked-exception field does not exist, so the
+/// member is Unknown and **no receipt is signed**. The declaration therefore
+/// drops out of Required mode entirely and today's answer is whatever the older
+/// platform-member path already did — it emits the call. That is the unchanged
+/// floor, not a contract gain:
+///
+/// * the accepted comparator binary emits the same Java for this scripted row
+///   (verified out-of-tree against the frozen `2b193ed` executable), so this
+///   slice neither widens nor narrows it;
+/// * the run is asserted to have reached the helper, so the observation is a
+///   verdict on absent evidence rather than a silent no-op.
+///
+/// A *proved-none* row is the different case, and it is where this slice's
+/// contract applies (see `the_production_cli_emits_a_bound_nullable_string_exit`
+/// and `the_production_cli_retains_a_non_null_string_destination`).
+#[test]
+fn an_absent_throws_row_leaves_the_legacy_platform_answer_unchanged() {
+    const OLD_SHAPE_MEMBERS: &str = r#"[
+  {"name":"getName","static_member":false,"parameter_types":[],"result_type":"java.lang.String","parameter_nullability":[],"result_nullability":"unknown"}
+]
+"#;
+    let scratch = Scratch::new();
+    fs::write(scratch.0.join("NullableName.kt"), NULLABLE_STRING_SOURCE).unwrap();
+    let outcome = run(
+        &scratch.0,
+        "on",
+        &file_sites(NULLABLE_STRING_SOURCE),
+        "java.io.File",
+        OLD_SHAPE_MEMBERS,
+        "NullableName",
+    );
+    let java = outcome
+        .emitted
+        .expect("the pre-existing platform path answers this row unchanged");
+    assert!(
+        java.contains("return f.getName();"),
+        "the legacy answer is the same verbatim member call:\n{java}"
+    );
+    assert!(
+        outcome.journal.contains("ClassMembers"),
+        "the helper must have been asked: {}",
+        outcome.journal
+    );
+}

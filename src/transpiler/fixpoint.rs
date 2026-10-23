@@ -10,7 +10,7 @@ use crate::transpiler::{PlannedTranslation, WorkspaceScope, parse_tree, plan_wit
 use crate::workspace::SourceIndex;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Per-file fixpoint result: exactly what `run()` needs to write once.
@@ -58,6 +58,25 @@ fn worker_stack_bytes() -> usize {
         .saturating_mul(1024 * 1024)
 }
 
+/// The Required-mode obligations `file` may not lose on this snapshot.
+///
+/// A snapshot with the bytes the receipts were signed on re-establishes them
+/// itself, so nothing is carried. Anything else — the rewritten text of a
+/// speculative round — cannot be answered for by the helper at all, and the
+/// declaration keeps its obligation instead of reverting to Legacy. `None`
+/// keeps every other file's planning byte-identical, which is what preserves
+/// the helper-off/dead/old-jar floor.
+fn carried_required<'a>(
+    required_carry: &'a BTreeMap<PathBuf, crate::semantics::RequiredObligations>,
+    file: &Path,
+    source: &str,
+) -> Option<&'a BTreeSet<crate::semantics::SymbolId>> {
+    required_carry
+        .get(file)
+        .and_then(|obligations| obligations.carried(&crate::facts::classpath::source_hash(source)))
+        .filter(|declarations| !declarations.is_empty())
+}
+
 fn planner_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -81,6 +100,7 @@ struct SilentPlanner<'a> {
         Vec<crate::function_callsite::CallsiteRepairDiagnostic>,
     >,
     top_level_property_callsite_retention: &'a crate::top_level_property_callsite::RetentionMap,
+    required_carry: &'a BTreeMap<PathBuf, crate::semantics::RequiredObligations>,
     files: &'a [(PathBuf, String)],
     trees: &'a [tree_sitter::Tree],
     workspace_files: &'a [Option<PathBuf>],
@@ -106,6 +126,7 @@ impl SilentPlanner<'_> {
         let probe = super::retention_queries::Probe::start();
         let started = std::time::Instant::now();
         log::debug!("planning {}", crate::paths::display(file));
+        let carried = carried_required(self.required_carry, file, source);
         let scope = WorkspaceScope {
             index: Some(self.index),
             roots: self.translation_roots,
@@ -115,6 +136,7 @@ impl SilentPlanner<'_> {
             semantic_provider: Some(self.semantic_provider),
             function_callsite_retention: Some(self.function_callsite_retention),
             top_level_property_callsite_retention: Some(self.top_level_property_callsite_retention),
+            carried_required: carried,
         };
         let planned = if let Some(static_facts) = self.static_facts {
             super::plan_with_static_facts_hint(
@@ -235,6 +257,7 @@ pub fn plan_workspace_state(
         max_passes,
         emit_diagnostics,
         &HashSet::new(),
+        &BTreeMap::new(),
     )
 }
 
@@ -247,6 +270,35 @@ pub fn plan_workspace_warm(
     emit_diagnostics: bool,
     seed: &HashSet<crate::semantics::SymbolId>,
 ) -> Result<WorkspacePlan, String> {
+    plan_workspace_warm_carrying(
+        files,
+        cli,
+        index,
+        translation_roots,
+        max_passes,
+        emit_diagnostics,
+        seed,
+        &BTreeMap::new(),
+    )
+}
+
+/// Warm planning that also carries the Required-mode obligations of earlier
+/// snapshots.
+///
+/// `required_carry` is per file and is consulted only when the file's current
+/// text is not the snapshot whose receipts proved those declarations. Every
+/// other caller passes an empty map, so general warm planning is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_workspace_warm_carrying(
+    files: &[(PathBuf, String)],
+    cli: &Cli,
+    index: &SourceIndex,
+    translation_roots: &[PathBuf],
+    max_passes: usize,
+    emit_diagnostics: bool,
+    seed: &HashSet<crate::semantics::SymbolId>,
+    required_carry: &BTreeMap<PathBuf, crate::semantics::RequiredObligations>,
+) -> Result<WorkspacePlan, String> {
     plan_workspace_cold(
         files,
         cli,
@@ -255,9 +307,11 @@ pub fn plan_workspace_warm(
         max_passes,
         emit_diagnostics,
         seed,
+        required_carry,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_workspace_cold(
     files: &[(PathBuf, String)],
     cli: &Cli,
@@ -266,6 +320,7 @@ fn plan_workspace_cold(
     max_passes: usize,
     emit_diagnostics: bool,
     seed: &HashSet<crate::semantics::SymbolId>,
+    required_carry: &BTreeMap<PathBuf, crate::semantics::RequiredObligations>,
 ) -> Result<WorkspacePlan, String> {
     plan_workspace_cold_mode(
         files,
@@ -275,6 +330,7 @@ fn plan_workspace_cold(
         max_passes,
         emit_diagnostics,
         seed,
+        required_carry,
         BTreeMap::new(),
         true,
         true,
@@ -292,6 +348,7 @@ fn plan_workspace_cold_mode(
     max_passes: usize,
     emit_diagnostics: bool,
     seed: &HashSet<crate::semantics::SymbolId>,
+    required_carry: &BTreeMap<PathBuf, crate::semantics::RequiredObligations>,
     mut forced_retained: BTreeMap<crate::semantics::SymbolId, usize>,
     incremental: bool,
     cache_static_facts: bool,
@@ -396,6 +453,7 @@ fn plan_workspace_cold_mode(
                             roots: translation_roots,
                             semantic_provider: Some(&semantic_provider),
                             indexed_path: workspace_files[file_index].as_deref(),
+                            carried_required: carried_required(required_carry, file, source),
                             ..WorkspaceScope::default()
                         },
                     )
@@ -414,6 +472,7 @@ fn plan_workspace_cold_mode(
         semantic_provider: &semantic_provider,
         function_callsite_retention: &function_callsite_retention,
         top_level_property_callsite_retention: &top_level_property_callsite_retention,
+        required_carry,
         files,
         trees: &trees,
         workspace_files: &workspace_files,
@@ -501,6 +560,7 @@ fn plan_workspace_cold_mode(
                         top_level_property_callsite_retention: Some(
                             &top_level_property_callsite_retention,
                         ),
+                        carried_required: carried_required(required_carry, file, source),
                     };
                     let planned = if let Some(static_facts) =
                         static_facts.as_ref().map(|facts| &facts[file_index])
@@ -827,6 +887,7 @@ mod cache_tests {
             8,
             false,
             &HashSet::new(),
+            &BTreeMap::new(),
             forced_set,
             true,
             true,
@@ -913,6 +974,7 @@ mod cache_tests {
             64,
             false,
             &HashSet::new(),
+            &BTreeMap::new(),
             BTreeMap::new(),
             true,
             true,
@@ -926,6 +988,7 @@ mod cache_tests {
             64,
             false,
             &HashSet::new(),
+            &BTreeMap::new(),
             BTreeMap::new(),
             false,
             true,
@@ -939,6 +1002,7 @@ mod cache_tests {
             64,
             false,
             &HashSet::new(),
+            &BTreeMap::new(),
             BTreeMap::new(),
             true,
             false,
@@ -991,6 +1055,7 @@ mod cache_tests {
                     16,
                     false,
                     &HashSet::new(),
+                    &BTreeMap::new(),
                     BTreeMap::new(),
                     true,
                     true,
@@ -1005,6 +1070,7 @@ mod cache_tests {
                     16,
                     false,
                     &HashSet::new(),
+                    &BTreeMap::new(),
                     BTreeMap::new(),
                     true,
                     false,
@@ -1063,6 +1129,7 @@ mod cache_tests {
             16,
             false,
             &HashSet::new(),
+            &BTreeMap::new(),
             BTreeMap::new(),
             true,
             true,
@@ -1082,6 +1149,7 @@ mod cache_tests {
             16,
             false,
             &HashSet::new(),
+            &BTreeMap::new(),
             BTreeMap::new(),
             true,
             true,
