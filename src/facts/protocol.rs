@@ -1,6 +1,17 @@
 //! Versioned newline-delimited JSON protocol between notlin and the JVM
 //! facts helper. One request per line, one response per line. Requests are
-//! answered independently; an unanswered/invalid line fails closed (Unknown).
+//! answered independently.
+//!
+//! Two kinds of "nothing" are kept apart, because the client cannot wait for a
+//! line that will never come:
+//!
+//! * **An answer** — always means what it says. `CallSites` with an empty batch
+//!   is "looked, saw no calls".
+//! * **An explicit absence** — [`Answer::NoEvidence`]: the helper was asked and
+//!   has nothing for this one request. The helper stays healthy.
+//!
+//! An *unanswered* or invalid line is a fault, not a fact: the run fails that
+//! request closed and (for a fault, not an absence) stops trusting the helper.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -62,6 +73,24 @@ pub enum Answer {
     },
     Pong {
         version: u32,
+    },
+    /// Explicit, *per-request* absence of evidence: the helper was asked, is
+    /// healthy, and has nothing to say about this one request (it did not index
+    /// that file, cannot read it, or failed to analyse it).
+    ///
+    /// This is deliberately not silence and not an empty batch. Silence is
+    /// indistinguishable from a stalled helper — the client blocks on
+    /// `read_line` — and an empty [`Answer::CallSites`] claims "looked, saw no
+    /// calls", which is a different fact. Callers map this answer to `Unknown`
+    /// for that request only; the helper stays trusted for every other query,
+    /// and the same question may be asked again later.
+    NoEvidence {
+        /// The query discriminator that produced no evidence. Diagnostic and
+        /// stable (`ResolveCalls`); never parsed for control flow.
+        query: String,
+        /// Why the helper had nothing, for logs. Diagnostic only: the truth
+        /// value is "no evidence", whatever the text says.
+        reason: String,
     },
 }
 

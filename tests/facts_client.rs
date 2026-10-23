@@ -73,30 +73,42 @@ fn ping_round_trips_and_repeats_hit_the_cache() {
 fn ids_advance_per_query() {
     let root = scratch("ids");
     let count = root.join("received.txt");
-    // Echo the incoming id back by echoing the request unchanged is not valid
-    // JSON for a response, so use a fixed-id fake and accept the failure: the
-    // point here is that the client keeps asking instead of caching a failure.
-    let mut client = FactsClient::start_with_command(fake_helper(&count, PONG_ID_0)).unwrap();
+    // Echo the incoming id: every request gets *its* answer, so this test is
+    // about the id sequence rather than about how a desync is handled.
+    let script = r#"while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$COUNT_FILE"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  printf '{"version":1,"id":%s,"answer":{"Pong":{"version":1}}}\n' "$id"
+done"#;
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script).env("COUNT_FILE", &count);
+    let mut client = FactsClient::start_with_command(command).unwrap();
     assert!(client.query(Query::Ping).is_some());
+    // Uncached: the per-query memo would otherwise collapse the repeats.
     assert!(
         client
-            .query(Query::ClassMembers {
+            .query_uncached(Query::ClassMembers {
                 owner: "java.util.UUID".into()
             })
-            .is_none()
+            .is_some()
     );
     assert!(
         client
-            .query(Query::ClassMembers {
+            .query_uncached(Query::ClassMembers {
                 owner: "java.util.UUID".into()
             })
-            .is_none()
+            .is_some()
     );
     let lines = received_lines(&count);
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert_eq!(
         lines[1],
         "{\"version\":1,\"id\":1,\"query\":{\"ClassMembers\":{\"owner\":\"java.util.UUID\"}}}"
+    );
+    assert_eq!(
+        lines[2],
+        "{\"version\":1,\"id\":2,\"query\":{\"ClassMembers\":{\"owner\":\"java.util.UUID\"}}}",
+        "every request gets a fresh id, cached or not"
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -111,6 +123,15 @@ fn mismatched_ids_are_rejected_without_panicking() {
     ))
     .unwrap();
     assert!(client.query(Query::Ping).is_none());
+    // An answer to a request we never made means answers and requests can no
+    // longer be matched up: the client retires instead of reading the next line
+    // as the next answer. Nothing more is written.
+    assert!(!client.ping());
+    assert_eq!(
+        received_lines(&count).len(),
+        1,
+        "a desynchronized client must not keep asking"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

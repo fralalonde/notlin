@@ -9,15 +9,18 @@
 //!
 //! Failure policy is unchanged from Phase 0: a helper that cannot start, dies,
 //! or answers garbage yields `None`, which callers map to `Unknown`. Only
-//! `--jvm-facts=on` turns a startup failure into a run error.
+//! `--jvm-facts=on` turns a startup failure into a run error. A helper that
+//! *answers* "no evidence" for one request is not a failure: that answer is
+//! per-request, leaves the helper trusted, and never retires the run.
 
-use super::classpath::{self, CallSiteFacts, ClasspathFacts};
+use super::classpath::{self, CallSiteFacts, CallSiteLookup, ClasspathFacts};
 use super::client::FactsClient;
 use super::protocol::{Answer, CallSite, MemberFacts, Query};
 use crate::cli::JvmFactsMode;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 pub struct FactsRuntime {
     /// `None` once the helper is known dead, so later queries fail fast.
@@ -32,6 +35,18 @@ impl FactsRuntime {
     /// Production jars use `start` so disabled Kotlin queries remain disabled.
     pub fn with_command(command: std::process::Command) -> Result<Arc<Self>, String> {
         Ok(Self::from_client(FactsClient::start_with_command(command)?))
+    }
+
+    /// Test seam: a custom helper with an explicit response deadline, so a hang
+    /// regression costs milliseconds instead of the production deadline. The
+    /// deadline is never unbounded.
+    pub fn with_command_and_timeout(
+        command: std::process::Command,
+        response_timeout: Duration,
+    ) -> Result<Arc<Self>, String> {
+        Ok(Self::from_client(
+            FactsClient::start_with_command_and_timeout(command, response_timeout)?,
+        ))
     }
 
     fn from_client(client: FactsClient) -> Arc<Self> {
@@ -64,6 +79,10 @@ impl FactsRuntime {
     /// One memoized exchange, or `None` when the helper cannot be trusted for
     /// this run. The first I/O failure marks it dead: a killed helper must not
     /// cost a failed write at every later call site.
+    ///
+    /// [`Answer::NoEvidence`] is a *successful* exchange: the helper answered
+    /// that it has nothing for this request, which says nothing about the next
+    /// one. It is returned as an answer, so it never retires the run.
     pub fn query(&self, query: Query) -> Option<Answer> {
         self.exchange(query, false)
     }
@@ -111,6 +130,10 @@ impl FactsRuntime {
     /// file the helper cannot read, or a batch that failed to decode. Callers
     /// map that to `Unknown`; it is never an error, and an empty batch is a
     /// real answer ("no calls visible"), not `None`.
+    ///
+    /// An explicit per-request absence ([`Answer::NoEvidence`]) is also `None`
+    /// here, but it is not remembered: the same file may be asked about again,
+    /// because the helper — unlike a dead one — may be able to answer later.
     ///
     /// The helper is asked about the *canonical* path so the bytes it opens are
     /// the bytes hashed here. As with any hashing scheme there is a window
@@ -165,20 +188,31 @@ impl FactsRuntime {
     ///
     /// Uncached on the client as well: the run's memo keyed on content hash is
     /// the only memo this answer may come from, so a new revision always asks.
-    fn load_call_sites(&self, canonical: &Path) -> Option<Vec<CallSite>> {
+    fn load_call_sites(&self, canonical: &Path) -> CallSiteLookup {
         match self.query_uncached(Query::ResolveCalls {
             file: canonical.to_path_buf(),
         }) {
-            Some(Answer::CallSites { file, sites }) if same_file(&file, canonical) => Some(sites),
+            Some(Answer::CallSites { file, sites }) if same_file(&file, canonical) => {
+                CallSiteLookup::Sites(sites)
+            }
             Some(Answer::CallSites { file, .. }) => {
                 log::debug!(
                     "helper answered call sites for {} instead of {}; ignoring",
                     file.display(),
                     canonical.display()
                 );
-                None
+                CallSiteLookup::Unavailable
             }
-            _ => None,
+            Some(Answer::NoEvidence { query, reason }) => {
+                // Answered, healthy, nothing to say about this one request.
+                // Not memoized: a per-request absence may not repeat.
+                log::debug!(
+                    "helper had no evidence for {query} on {}: {reason}",
+                    canonical.display()
+                );
+                CallSiteLookup::Absent
+            }
+            _ => CallSiteLookup::Unavailable,
         }
     }
 }

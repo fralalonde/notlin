@@ -181,3 +181,29 @@ fn an_empty_sites_batch_is_a_real_answer_not_an_unknown() {
         })
     );
 }
+
+#[test]
+fn a_per_request_absence_is_a_typed_answer_not_an_empty_batch() {
+    // Byte-exact line `Facts.noEvidenceAnswer` writes for a ResolveCalls the
+    // helper cannot satisfy: an answer, so the waiting client is released, and
+    // not a `CallSites` batch, which would claim "looked, saw no calls".
+    const LINE: &str = "{\"version\":1,\"id\":7,\"answer\":{\"NoEvidence\":{\"query\":\"ResolveCalls\",\"reason\":\"file is not indexed by this session\"}}}";
+    let answer = Answer::NoEvidence {
+        query: "ResolveCalls".to_string(),
+        reason: "file is not indexed by this session".to_string(),
+    };
+    let response = decode_response(LINE).expect("absence line");
+    assert_eq!(response.version, PROTOCOL_VERSION);
+    assert_eq!(response.id, 7);
+    assert_eq!(response.answer, answer);
+    assert_eq!(
+        serde_json::to_string(&Response {
+            version: PROTOCOL_VERSION,
+            id: 7,
+            answer,
+        })
+        .unwrap(),
+        LINE,
+        "both ends must share one shape for the absence answer"
+    );
+}

@@ -39,11 +39,33 @@ pub fn file_hash(file: &Path) -> Option<[u8; 32]> {
 /// One file's last batch, together with the disk bytes it was produced from.
 struct CallSiteMemo {
     source_hash: [u8; 32],
-    /// `None` records a helper that could not establish anything for these
-    /// bytes. Negative answers are memoized on purpose: the planner treats
-    /// them as `Unknown` either way, and a dead helper must not be re-asked at
-    /// every call site (the fail-closed rule in `runtime.rs`).
+    /// `None` records that this run *cannot* get an answer for these bytes (no
+    /// helper, a dead helper, an unreadable or contradictory answer). Negative
+    /// answers of that kind are memoized on purpose: the planner treats them as
+    /// `Unknown` either way, and a dead helper must not be re-asked at every
+    /// call site (the fail-closed rule in `runtime.rs`). A per-request absence
+    /// is not stored at all — see [`CallSiteLookup::Absent`].
     sites: Option<Arc<Vec<CallSite>>>,
+}
+
+/// What one attempt to get a file's batch produced.
+///
+/// The two negative shapes are kept apart because they age differently: a
+/// helper that answered "no evidence for *this* request" is still healthy and
+/// the question may be answerable later, while a dead channel never becomes
+/// answerable in this run.
+pub enum CallSiteLookup {
+    /// A real batch for the hashed bytes; may legitimately be empty ("this file
+    /// calls nothing we can see").
+    Sites(Vec<CallSite>),
+    /// The helper answered, explicitly, that it has no evidence for this
+    /// request. Not memoized: the reason can be transient, and the cost of
+    /// re-asking is one exchange rather than a permanent wrong negative.
+    Absent,
+    /// This run cannot ask (no helper, dead helper, unreadable file, or an
+    /// answer that does not describe these bytes). Memoized so a dead helper is
+    /// not re-asked once per call site.
+    Unavailable,
 }
 
 /// Memoized call-site batches for the whole run, keyed by canonical path.
@@ -70,7 +92,7 @@ impl CallSiteFacts {
         &self,
         file: &Path,
         source_hash: [u8; 32],
-        load: impl FnOnce() -> Option<Vec<CallSite>>,
+        load: impl FnOnce() -> CallSiteLookup,
     ) -> Option<Arc<Vec<CallSite>>> {
         {
             let files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
@@ -83,16 +105,37 @@ impl CallSiteFacts {
                 return memo.sites.clone();
             }
         }
-        let loaded = load().map(Arc::new);
-        let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
-        files.insert(
-            file.to_path_buf(),
-            CallSiteMemo {
-                source_hash,
-                sites: loaded.clone(),
-            },
-        );
-        loaded
+        match load() {
+            CallSiteLookup::Sites(sites) => {
+                let loaded = Arc::new(sites);
+                let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+                files.insert(
+                    file.to_path_buf(),
+                    CallSiteMemo {
+                        source_hash,
+                        sites: Some(loaded.clone()),
+                    },
+                );
+                Some(loaded)
+            }
+            CallSiteLookup::Absent => {
+                // Deliberately not memoized: the helper may be able to answer
+                // the same question later, and a per-request absence is not a
+                // property of these bytes.
+                None
+            }
+            CallSiteLookup::Unavailable => {
+                let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+                files.insert(
+                    file.to_path_buf(),
+                    CallSiteMemo {
+                        source_hash,
+                        sites: None,
+                    },
+                );
+                None
+            }
+        }
     }
 }
 

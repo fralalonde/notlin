@@ -241,6 +241,38 @@ public final class Facts {
         return line.toString();
     }
 
+    /**
+     * Serializes the per-request <em>absence</em> answer for one request id.
+     *
+     * <p>The helper was asked and is healthy, but has nothing to say about this
+     * one request (it did not index that file, cannot read it, or failed to
+     * analyse it). That is a fact the parent must be able to receive: the Rust
+     * side waits for exactly one line per request, so silence is
+     * indistinguishable from a stalled helper and blocks the run on its own
+     * stdout pipe. It is also not an empty batch, which would claim "looked,
+     * saw no calls".
+     *
+     * <p>Wire shape (pinned by the Rust {@code Answer::NoEvidence} variant and
+     * its byte-exact tests):
+     * <pre>
+     * {"version":1,"id":N,"answer":{"NoEvidence":{"query":"ResolveCalls","reason":"..."}}}
+     * </pre>
+     *
+     * <p>{@code reason} is diagnostic only; the Rust side never parses it, and
+     * it deliberately carries no paths.
+     */
+    public static String noEvidenceAnswer(long id, String query, String reason) {
+        StringBuilder line = new StringBuilder(128);
+        line.append("{\"version\":").append(PROTOCOL_VERSION)
+                .append(",\"id\":").append(id)
+                .append(",\"answer\":{\"NoEvidence\":{\"query\":");
+        appendString(line, query);
+        line.append(",\"reason\":");
+        appendString(line, reason);
+        line.append("}}}");
+        return line.toString();
+    }
+
     private Member row(Class<?> declaring, String name, int modifiers, Class<?>[] parameters,
             Class<?> result, Annotation[][] parameterAnnotations, AnnotatedElement element) {
         String[] fromClassFile = classFiles == null ? null

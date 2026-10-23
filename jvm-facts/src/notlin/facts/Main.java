@@ -16,8 +16,14 @@ import java.nio.charset.StandardCharsets;
  * below is a deliberately rigid string scanner instead of a JSON library: no
  * third-party dependency may enter the helper. Anything that does not match the
  * version-1 shape is dropped without an answer and the loop keeps serving, so a
- * malformed line can never take the process down (the Rust side maps a missing
- * answer to {@code Unknown}).
+ * malformed line can never take the process down.
+ *
+ * <p>A request this helper <em>understands but cannot answer</em> is different
+ * from a malformed one: it gets an explicit
+ * {@link Facts#noEvidenceAnswer absence answer}. The parent waits for exactly
+ * one line per request, so staying silent for a query the helper does not
+ * implement (a {@code ResolveCalls} sent to the slim jar) would block the run
+ * forever rather than read as {@code Unknown}.
  *
  * <p>Requests:
  * <pre>
@@ -54,8 +60,11 @@ public final class Main {
     }
 
     /**
-     * Answers one request line, or returns {@code null} when the line carries no
-     * answerable query (malformed, unknown discriminator, unsupported version).
+     * Answers one request line, or returns {@code null} for a line that cannot
+     * be answered at all (malformed, or an unsupported protocol version, where
+     * the id it carries is not trustworthy either). A well-formed query this
+     * helper does not implement is answered with
+     * {@link Facts#noEvidenceAnswer}.
      */
     static String handle(String line, Facts facts) {
         Cursor cursor = new Cursor(line);
@@ -86,7 +95,14 @@ public final class Main {
                 cursor.end();
                 return facts.membersAnswer(id, owner);
             }
-            default -> throw new IllegalArgumentException("unknown query discriminator \"" + discriminator + "\"");
+            default -> {
+                // Another helper build's query (or a future one this jar does
+                // not implement): no evidence for *this* request, and the loop
+                // keeps serving Track A. Answering beats silence, which the
+                // parent can only read as a stalled helper.
+                return Facts.noEvidenceAnswer(id, discriminator,
+                        "this helper does not implement the query");
+            }
         }
         cursor.expect('}');
         cursor.expect('}');

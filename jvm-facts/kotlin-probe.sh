@@ -38,12 +38,12 @@ echo
 echo "[2] Ping"
 printf '{"version":1,"id":1,"query":{"Ping":null}}\n' | "$JAVA" -jar "$slim" 2>/dev/null | sed 's/^/    slim: /'
 printf '{"version":1,"id":1,"query":{"Ping":null}}\n' | "$JAVA" -jar "$full" 2>/dev/null | sed 's/^/    full: /'
-echo "    ResolveCalls without --kotlin must not be answered:"
+echo "    ResolveCalls without --kotlin is declined per request (NoEvidence, never silence):"
 printf '{"version":1,"id":2,"query":{"ResolveCalls":{"file":"/tmp/nope.kt"}}}\n' \
   | "$JAVA" -jar "$full" 2>&1 >/dev/null | sed 's/^/    stderr: /'
 printf '{"version":1,"id":2,"query":{"ResolveCalls":{"file":"/tmp/nope.kt"}}}\n' \
   | "$JAVA" -jar "$full" 2>/dev/null | sed 's/^/    stdout: /'
-echo "    (no stdout line above = fail closed)"
+echo "    (a NoEvidence line above = declined, not a stalled helper)"
 
 echo
 echo "[3] ResolveCalls on the spike fixture (expect 3 Established, offsets 406/496/582)"
