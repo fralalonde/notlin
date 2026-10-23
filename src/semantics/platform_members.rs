@@ -919,3 +919,601 @@ fn argument_kind<P: SemanticProvider + ?Sized>(
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::facts::protocol::MemberFacts;
+    use std::collections::BTreeSet;
+
+    /// One expanded bootstrap case: a table row plus one concrete choice from
+    /// each parameter's proven alternative set.
+    struct Case {
+        row: usize,
+        owner: &'static str,
+        name: &'static str,
+        dispatch: Dispatch,
+        parameters: Vec<&'static str>,
+        result: &'static str,
+    }
+
+    /// One proven case and the native member rows that satisfied it.
+    #[derive(Debug)]
+    struct CaseEvidence {
+        row: usize,
+        owner: &'static str,
+        name: &'static str,
+        dispatch: &'static str,
+        parameters: Vec<&'static str>,
+        result: &'static str,
+        matches: usize,
+    }
+
+    fn dispatch_label(dispatch: Dispatch) -> &'static str {
+        match dispatch {
+            Dispatch::Constructor => "Constructor",
+            Dispatch::Static => "Static",
+            Dispatch::Instance => "Instance",
+        }
+    }
+
+    /// Every case the bootstrap table declares, in table order.
+    ///
+    /// The empty parameter list is one case, not zero: a no-argument row is
+    /// exactly where a skipped product would hide.
+    fn expanded_cases() -> Vec<Case> {
+        let mut cases = Vec::new();
+        for (row, signature) in SIGNATURES.iter().enumerate() {
+            let mut product: Vec<Vec<&'static str>> = vec![Vec::new()];
+            for alternatives in signature.parameters {
+                assert!(
+                    !alternatives.is_empty(),
+                    "{}::{} declares an empty alternative set; its cases would silently vanish",
+                    signature.owner,
+                    signature.name
+                );
+                product = product
+                    .into_iter()
+                    .flat_map(|prefix| {
+                        alternatives.iter().map(move |alternative| {
+                            let mut extended = prefix.clone();
+                            extended.push(*alternative);
+                            extended
+                        })
+                    })
+                    .collect();
+            }
+            for parameters in product {
+                cases.push(Case {
+                    row,
+                    owner: signature.owner,
+                    name: signature.name,
+                    dispatch: signature.dispatch,
+                    parameters,
+                    result: signature.result,
+                });
+            }
+        }
+        cases
+    }
+
+    /// The resolver's own classification of a fact row (`member_rows`):
+    /// `<init>` is a constructor whatever `static_member` says, then static,
+    /// else instance. The gate has to agree with the resolver it is proving.
+    fn fact_dispatch(member: &MemberFacts) -> Dispatch {
+        if member.name == "<init>" {
+            Dispatch::Constructor
+        } else if member.static_member {
+            Dispatch::Static
+        } else {
+            Dispatch::Instance
+        }
+    }
+
+    /// The semantic result the resolver derives from a fact row, spelled the
+    /// way `member_rows` derives it: a constructor row answers the constructed
+    /// owner, every other row answers its classified wire result.
+    fn semantic_result(owner: &str, member: &MemberFacts) -> String {
+        if member.name == "<init>" {
+            owner.to_string()
+        } else {
+            classifier(&member.result_type)
+        }
+    }
+
+    /// Identity, dispatch and physical parameter agreement — conformance
+    /// without the result half.
+    fn shape_matches(case: &Case, member: &MemberFacts) -> bool {
+        member.name == case.name
+            && fact_dispatch(member) == case.dispatch
+            && member.parameter_types.len() == case.parameters.len()
+            && member
+                .parameter_types
+                .iter()
+                .zip(&case.parameters)
+                .all(|(physical, expected)| classifier(physical) == *expected)
+    }
+
+    /// Whether one native member row satisfies this declared case.
+    ///
+    /// Normalization is the resolver's own [`classifier`] mapping, so this is
+    /// applicability conformance — not a claim about generics, nullability,
+    /// checked exceptions or the Java ABI.
+    fn conforms(case: &Case, member: &MemberFacts) -> bool {
+        if !shape_matches(case, member) {
+            return false;
+        }
+        // Constructor rows are pinned on both halves: the helper's wire contract
+        // (`<init>` reports `<void>`) and the resolver's mapping (the row result
+        // is the constructed owner). A helper that reported the owner as the
+        // wire result would otherwise pass through the production mapping.
+        if case.dispatch == Dispatch::Constructor {
+            return matches!(member.result_type.as_str(), "<void>" | "void")
+                && case.result == case.owner
+                && semantic_result(case.owner, member) == case.result;
+        }
+        semantic_result(case.owner, member) == case.result
+    }
+
+    /// A fixture built through the wire shape of `MemberFacts`, so the controls
+    /// cannot drift from fields the helper actually reports.
+    fn fact(name: &str, static_member: bool, parameters: &[&str], result: &str) -> MemberFacts {
+        let parameters = parameters
+            .iter()
+            .map(|parameter| format!("\"{parameter}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"name":"{name}","static_member":{static_member},"parameter_types":[{parameters}],"result_type":"{result}","parameter_nullability":[],"result_nullability":"unknown"}}"#
+        );
+        serde_json::from_str(&json).expect("fixture must deserialize as MemberFacts")
+    }
+
+    fn case_of(cases: &[Case], owner: &str, name: &str, parameters: &[&str]) -> usize {
+        cases
+            .iter()
+            .position(|case| {
+                case.owner == owner && case.name == name && case.parameters == parameters
+            })
+            .unwrap_or_else(|| panic!("no declared case {owner}::{name}{parameters:?}"))
+    }
+
+    /// Conformance of one owner's declared cases against native member facts.
+    ///
+    /// Missing or empty facts are **gate failures**, never skips: the bootstrap
+    /// row for a covered owner stays unproven, and a silent pass would turn an
+    /// unloadable class or a dead helper into a green regression. The table is
+    /// not consulted here, so absent evidence cannot be answered from the rows
+    /// the gate is supposed to be testing.
+    fn evaluate_owner(
+        owner: &str,
+        cases: &[Case],
+        facts: Option<&[MemberFacts]>,
+    ) -> Result<Vec<CaseEvidence>, String> {
+        let facts = facts.ok_or_else(|| {
+            format!(
+                "{owner}: native ClassMembers evidence is missing (helper unavailable, query failed, or class not loadable)"
+            )
+        })?;
+        if facts.is_empty() {
+            return Err(format!(
+                "{owner}: native ClassMembers answer declares no members; nothing proves the bootstrap rows"
+            ));
+        }
+        let mut evidence = Vec::new();
+        for case in cases.iter().filter(|case| case.owner == owner) {
+            // The resolver chooses applicability before reading the result.
+            // A contradictory result must not hide an otherwise ambiguous row.
+            let matching = facts
+                .iter()
+                .filter(|member| shape_matches(case, member))
+                .collect::<Vec<_>>();
+            let matches = matching.len();
+            if matches == 0 {
+                return Err(format!(
+                    "{owner}::{} {:?} -> {}: no native member conforms",
+                    case.name,
+                    case.parameters,
+                    dispatch_label(case.dispatch),
+                ));
+            }
+            if matches > 1 {
+                return Err(format!(
+                    "{owner}::{} {:?} -> {}: {matches} native members conform, so the resolver would answer NotApplicable",
+                    case.name,
+                    case.parameters,
+                    dispatch_label(case.dispatch),
+                ));
+            }
+            if !conforms(case, matching[0]) {
+                return Err(format!(
+                    "{owner}::{} {:?}: unique native shape has a contradictory result",
+                    case.name, case.parameters,
+                ));
+            }
+            evidence.push(CaseEvidence {
+                row: case.row,
+                owner: case.owner,
+                name: case.name,
+                dispatch: dispatch_label(case.dispatch),
+                parameters: case.parameters.clone(),
+                result: case.result,
+                matches,
+            });
+        }
+        if evidence.is_empty() {
+            return Err(format!("{owner}: no bootstrap cases to prove"));
+        }
+        Ok(evidence)
+    }
+
+    #[test]
+    fn bootstrap_table_shape_is_21_rows_27_cases_7_owners() {
+        let cases = expanded_cases();
+        assert_eq!(SIGNATURES.len(), 21, "declared bootstrap rows");
+        assert_eq!(cases.len(), 27, "expanded parameter cases");
+        let owners = SIGNATURES
+            .iter()
+            .map(|signature| signature.owner)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(owners.len(), 7, "declared owners");
+
+        // Every row, and every alternative within it, contributes cases.
+        let visited = cases.iter().map(|case| case.row).collect::<BTreeSet<_>>();
+        assert_eq!(
+            visited,
+            (0..SIGNATURES.len()).collect::<BTreeSet<_>>(),
+            "every row must be visited"
+        );
+        for (row, signature) in SIGNATURES.iter().enumerate() {
+            let declared: usize = signature
+                .parameters
+                .iter()
+                .map(|alternatives| alternatives.len())
+                .product();
+            let expanded = cases.iter().filter(|case| case.row == row).count();
+            assert_eq!(
+                expanded, declared,
+                "{}::{} lost or invented cases",
+                signature.owner, signature.name
+            );
+        }
+
+        // No duplicate case: a repeated declaration would fake ambiguity in the
+        // resolver and make the uniqueness answer meaningless.
+        let unique = cases
+            .iter()
+            .map(|case| {
+                (
+                    case.owner,
+                    case.name,
+                    dispatch_label(case.dispatch),
+                    case.parameters.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), cases.len(), "duplicate declared case");
+
+        for signature in SIGNATURES {
+            assert!(!signature.owner.is_empty() && !signature.name.is_empty());
+            assert!(
+                !signature.result.is_empty(),
+                "{}::{} has no result",
+                signature.owner,
+                signature.name
+            );
+            match signature.dispatch {
+                Dispatch::Constructor => {
+                    assert_eq!(signature.name, "<init>", "constructor rows must be <init>");
+                    assert_eq!(
+                        signature.result, signature.owner,
+                        "a constructor row returns the constructed owner, never the wire <void>"
+                    );
+                }
+                Dispatch::Static | Dispatch::Instance => assert_ne!(
+                    signature.name, "<init>",
+                    "only Dispatch::Constructor may declare <init>"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn constructor_rows_map_wire_void_to_the_constructed_owner() {
+        let cases = expanded_cases();
+        let constructors = cases
+            .iter()
+            .filter(|case| case.dispatch == Dispatch::Constructor)
+            .collect::<Vec<_>>();
+        assert_eq!(constructors.len(), 9, "constructor cases across 4 owners");
+        for case in constructors {
+            assert_eq!(case.result, case.owner);
+            // The wire reports `<init>` with a void result; the resolver maps it
+            // to the constructed owner. Both halves are pinned here.
+            assert!(
+                conforms(case, &fact("<init>", false, &case.parameters, "<void>")),
+                "{}: <init> with wire <void> must conform",
+                case.owner
+            );
+            assert!(
+                !conforms(case, &fact("<init>", false, &case.parameters, case.owner)),
+                "{}: a constructor wire result equal to the owner is not the helper's contract",
+                case.owner
+            );
+            assert!(
+                !conforms(
+                    case,
+                    &fact("<init>", false, &case.parameters, "kotlin.Unit")
+                ),
+                "{}: kotlin.Unit is a scalar classifier, not the constructor result",
+                case.owner
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_spellings_conform_only_through_the_resolver_classifier() {
+        // BigDecimal(int) is declared once; the JVM primitive and its boxed
+        // alternative are both what `classifier` already maps to kotlin.Int.
+        assert_eq!(classifier("int"), "kotlin.Int");
+        assert_eq!(classifier("java.lang.Integer"), "kotlin.Int");
+        assert_eq!(classifier("java.lang.String"), "java.lang.String");
+        let cases = expanded_cases();
+        let case = &cases[case_of(&cases, DECIMAL, "<init>", &["kotlin.Int"])];
+        assert!(conforms(case, &fact("<init>", false, &["int"], "<void>")));
+        assert!(conforms(
+            case,
+            &fact("<init>", false, &["java.lang.Integer"], "<void>")
+        ));
+        assert!(!conforms(case, &fact("<init>", false, &["long"], "<void>")));
+        assert!(!conforms(
+            case,
+            &fact("<init>", false, &["java.lang.Long"], "<void>")
+        ));
+    }
+
+    #[test]
+    fn contradictory_member_rows_are_rejected() {
+        let cases = expanded_cases();
+
+        let add = &cases[case_of(&cases, DECIMAL, "add", &[DECIMAL])];
+        assert!(
+            conforms(add, &fact("add", false, &[DECIMAL], DECIMAL)),
+            "positive control: the exact native row must conform"
+        );
+        // Wrong physical result.
+        assert!(!conforms(add, &fact("add", false, &[DECIMAL], STRING)));
+        assert!(!conforms(
+            add,
+            &fact("add", false, &[DECIMAL], "kotlin.Int")
+        ));
+        // Wrong dispatch.
+        assert!(!conforms(add, &fact("add", true, &[DECIMAL], DECIMAL)));
+        // Wrong parameters, same arity and different arity.
+        assert!(!conforms(
+            add,
+            &fact("add", false, &["kotlin.Long"], DECIMAL)
+        ));
+        assert!(!conforms(
+            add,
+            &fact("add", false, &[DECIMAL, DECIMAL], DECIMAL)
+        ));
+        // Wrong name.
+        assert!(!conforms(
+            add,
+            &fact("subtract", false, &[DECIMAL], DECIMAL)
+        ));
+
+        let now = &cases[case_of(&cases, "java.time.Instant", "now", &[])];
+        assert!(conforms(now, &fact("now", true, &[], "java.time.Instant")));
+        assert!(
+            !conforms(now, &fact("now", false, &[], "java.time.Instant")),
+            "an instance row cannot satisfy a static case"
+        );
+        assert!(!conforms(now, &fact("now", true, &[], "kotlin.Unit")));
+
+        let builder = &cases[case_of(&cases, BUILDER, "<init>", &[])];
+        assert!(conforms(builder, &fact("<init>", false, &[], "<void>")));
+        assert!(!conforms(
+            builder,
+            &fact("<init>", false, &[STRING], "<void>")
+        ));
+        assert!(
+            !conforms(builder, &fact("toString", false, &[], BUILDER)),
+            "a non-<init> member cannot satisfy a constructor case"
+        );
+    }
+
+    #[test]
+    fn a_matching_result_cannot_hide_an_ambiguous_native_shape() {
+        let cases = expanded_cases()
+            .into_iter()
+            .filter(|case| case.owner == BUILDER && case.name == "toString")
+            .collect::<Vec<_>>();
+        assert_eq!(cases.len(), 1);
+        let correct = fact("toString", false, &[], STRING);
+        assert!(evaluate_owner(BUILDER, &cases, Some(std::slice::from_ref(&correct))).is_ok());
+        // Deliberately contradictory wire evidence: applicability cannot use
+        // the desired result to choose between otherwise identical members.
+        let contradictory = fact("toString", false, &[], BUILDER);
+        let error = evaluate_owner(BUILDER, &cases, Some(&[correct, contradictory]))
+            .expect_err("the resolver rejects both shapes before choosing a result");
+        assert!(error.contains("NotApplicable"), "{error}");
+    }
+
+    #[test]
+    fn native_gate_fails_closed_on_missing_unknown_or_ambiguous_evidence() {
+        let cases = expanded_cases();
+        let builder_facts = vec![
+            fact("<init>", false, &[], "<void>"),
+            fact("append", false, &["int"], BUILDER),
+            fact("append", false, &["long"], BUILDER),
+            fact("append", false, &["double"], BUILDER),
+            fact("append", false, &[STRING], BUILDER),
+            fact("toString", false, &[], STRING),
+        ];
+
+        // The table has StringBuilder rows, yet absent native evidence fails:
+        // the gate must never answer its own query from the rows under test.
+        let missing = evaluate_owner(BUILDER, &cases, None).unwrap_err();
+        assert!(missing.contains("missing"), "{missing}");
+        let empty = evaluate_owner(BUILDER, &cases, Some(&[])).unwrap_err();
+        assert!(empty.contains("no members"), "{empty}");
+
+        // Facts for a different owner are not evidence for this one.
+        let foreign = vec![fact("now", true, &[], "java.time.Instant")];
+        assert!(evaluate_owner(BUILDER, &cases, Some(&foreign)).is_err());
+
+        let established = evaluate_owner(BUILDER, &cases, Some(&builder_facts)).unwrap();
+        assert_eq!(established.len(), 6);
+        assert!(established.iter().all(|case| case.matches == 1));
+
+        // Duplicate conforming rows make the resolver answer NotApplicable, so
+        // the gate must fail rather than pick one.
+        let mut ambiguous = builder_facts.clone();
+        ambiguous.push(fact("toString", false, &[], STRING));
+        let error = evaluate_owner(BUILDER, &cases, Some(&ambiguous)).unwrap_err();
+        assert!(error.contains("NotApplicable"), "{error}");
+
+        // A contradictory result for a declared case is a failure, not a skip.
+        let mut wrong_result = builder_facts.clone();
+        wrong_result[1] = fact("append", false, &["int"], STRING);
+        assert!(evaluate_owner(BUILDER, &cases, Some(&wrong_result)).is_err());
+
+        // An owner with no declared case cannot be "proven" by asking it.
+        assert!(evaluate_owner("java.util.UUID", &cases[..0], Some(&builder_facts)).is_err());
+    }
+
+    fn required_env(name: &str, hint: &str) -> std::ffi::OsString {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| panic!("{name} must be set: {hint}"))
+    }
+
+    fn require_jdk_25(java: &Path) {
+        let output = std::process::Command::new(java)
+            .arg("-version")
+            .output()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "NOTLIN_JAVA ({}) must be executable: {error}",
+                    java.display()
+                )
+            });
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains("version \"25."),
+            "native conformance is pinned to JDK 25; NOTLIN_JAVA reported: {text}"
+        );
+    }
+
+    /// Every bootstrap row, and every alternative within it, must be a member
+    /// the real JDK25 helper reports — with the constructor `<void>` mapping and
+    /// with unique resolver applicability.
+    ///
+    /// Ignored by default: it needs `NOTLIN_JAVA` (the JDK 25 java binary) and
+    /// `NOTLIN_JVM_FACTS_JAR` (the slim helper jar). It panics when they are
+    /// absent rather than returning green, and it is meant to be run explicitly:
+    ///
+    /// ```text
+    /// NOTLIN_JAVA=.../25.0.4-tem/bin/java \
+    /// NOTLIN_JVM_FACTS_JAR=.../notlin-jvm-facts.jar \
+    ///   cargo test --lib -- --ignored --nocapture platform_members
+    /// ```
+    #[test]
+    #[ignore = "native: needs NOTLIN_JAVA (JDK25) and NOTLIN_JVM_FACTS_JAR (slim helper jar)"]
+    fn bootstrap_rows_conform_to_real_jdk25_class_members() {
+        let java = std::path::PathBuf::from(required_env(
+            "NOTLIN_JAVA",
+            "the JDK 25 java binary the helper must run on",
+        ));
+        let jar = std::path::PathBuf::from(required_env(
+            "NOTLIN_JVM_FACTS_JAR",
+            "the built slim notlin-jvm-facts.jar",
+        ));
+        require_jdk_25(&java);
+        assert!(jar.is_file(), "helper jar missing: {}", jar.display());
+        let runtime = crate::facts::runtime::FactsRuntime::start(&jar)
+            .expect("the slim helper jar must start under NOTLIN_JAVA");
+
+        let cases = expanded_cases();
+        let owners = SIGNATURES
+            .iter()
+            .map(|signature| signature.owner)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(owners.len(), 7);
+
+        let mut evidence = Vec::new();
+        for owner in &owners {
+            let facts = runtime.member_facts(owner);
+            let slice = facts.as_ref().map(|facts| facts.as_slice());
+            let mut owner_evidence =
+                evaluate_owner(owner, &cases, slice).unwrap_or_else(|error| panic!("{error}"));
+            // The native answer must be richer than the bootstrap table;
+            // otherwise the evidence could be an echo of the rows it proves.
+            let facts = facts.expect("checked by evaluate_owner");
+            assert!(
+                facts.iter().any(|member| !cases
+                    .iter()
+                    .filter(|case| case.owner == *owner)
+                    .any(|case| shape_matches(case, member))),
+                "{owner}: native members are indistinguishable from the bootstrap table"
+            );
+            evidence.append(&mut owner_evidence);
+        }
+
+        assert_eq!(evidence.len(), 27, "expanded cases proved");
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|case| case.row)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            21,
+            "distinct rows proved"
+        );
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|case| case.owner)
+                .collect::<BTreeSet<_>>(),
+            owners,
+            "owners visited"
+        );
+        assert!(
+            evidence.iter().all(|case| case.matches == 1),
+            "every case must have exactly one native match"
+        );
+
+        // A class the helper cannot load answers null, which the gate treats as
+        // missing evidence. Without this a silently broken helper could look
+        // like "nothing to check".
+        let absent = runtime.member_facts("java.lang.NotlinFallbackConformanceAbsent");
+        assert!(
+            absent.is_none(),
+            "the helper must answer null for an unloadable class"
+        );
+
+        for case in &evidence {
+            eprintln!(
+                "conforms {owner}::{name} {dispatch} {parameters:?} -> {result} ({matches} native row)",
+                owner = case.owner,
+                name = case.name,
+                dispatch = case.dispatch,
+                parameters = case.parameters,
+                result = case.result,
+                matches = case.matches,
+            );
+        }
+        eprintln!(
+            "native conformance: {} rows, {} cases, {} owners, all unique",
+            21,
+            evidence.len(),
+            owners.len()
+        );
+    }
+}
