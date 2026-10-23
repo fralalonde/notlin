@@ -154,6 +154,14 @@ macro_rules! signature {
 
 // Parameter alternatives describe the currently proven overload subset, not
 // arbitrary Java assignability. Unknown, nullable and generic values fail closed.
+//
+// The `Dispatch::Constructor` rows below are the **jar-less FALLBACK** for the
+// four bounded owner families: they are consulted only when the run's fact
+// source has no usable answer for that owner
+// (`platform_constructors::fallback_constructor_table`). An owner covered by
+// classpath facts is answered from its real `<init>` rows, and "no applicable
+// constructor" there is final. Do not extend these rows with overloads the JDK
+// has but no test proves: the sourced path is what makes them work.
 const SIGNATURES: &[Signature] = &[
     signature!(
         DECIMAL,
@@ -448,6 +456,66 @@ fn establish_from_classpath<P: SemanticProvider + ?Sized>(
     }
 }
 
+/// Whether a classpath fact source covers an owner for constructor
+/// applicability, and what it answered.
+///
+/// Same exclusivity rule as [`ClasspathAnswer`] for members: an owner the source
+/// covers is the whole truth for that owner, so *no applicable constructor* is a
+/// final negative rather than a reason to consult the fallback table.
+pub(super) enum ConstructorAnswer {
+    /// The source has facts for the owner and exactly one constructor matches.
+    Established(&'static str),
+    /// The source has facts for the owner and none matches (or several do).
+    NotApplicable,
+    /// The source has no usable facts for the owner: keep the table floor.
+    Unavailable,
+}
+
+/// Constructor applicability read through the same classpath signature model as
+/// instance and static calls.
+///
+/// `owner` is a canonical JVM binary name the caller has already proven from the
+/// call's spelling, imports and shadowing evidence; this function performs no
+/// name matching of its own, so it cannot widen the set of owners a caller
+/// recognizes. Everything below is the shared resolver: `<init>` rows from the
+/// fact source ([`classpath_rows`]), exact proven argument types, exact arity
+/// and unique applicability.
+///
+/// Usable facts are decided **per owner**, not per process: a dead helper, an
+/// all-null answer and a type the classpath cannot load all mean "no facts for
+/// this owner", and each keeps the caller's pre-helper behavior unchanged.
+pub(super) fn constructor_applicable<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    owner: &str,
+    provider: &P,
+) -> ConstructorAnswer {
+    let Some(facts) = provider.classpath_member_facts(owner) else {
+        return ConstructorAnswer::Unavailable;
+    };
+    let rows = member_rows(&facts, owner, "<init>", Dispatch::Constructor);
+    match applicable(
+        source,
+        file,
+        call,
+        Target {
+            owner,
+            name: "<init>",
+            dispatch: Dispatch::Constructor,
+        },
+        SignatureSource::Classpath(&rows),
+        provider,
+    ) {
+        Some(result) => ConstructorAnswer::Established(result),
+        // A covered owner with no applicable constructor is final. Falling back
+        // to the table here would answer from stale guessed rows exactly when
+        // the fact source is authoritative — and fake ambiguity or fake
+        // applicability depending on which side is narrower.
+        None => ConstructorAnswer::NotApplicable,
+    }
+}
+
 /// Rows for one `owner`/`name`/`dispatch`, or `None` when the source has no
 /// facts for that owner at all. An empty `Some` is a real answer: the owner is
 /// known and does not declare that member.
@@ -458,7 +526,27 @@ fn classpath_rows<P: SemanticProvider + ?Sized>(
     dispatch: Dispatch,
 ) -> Option<Vec<ClasspathRow>> {
     let facts = provider.classpath_member_facts(owner)?;
-    let rows = facts
+    Some(member_rows(&facts, owner, name, dispatch))
+}
+
+/// [`classpath_rows`] over an answer the caller already holds, so a caller that
+/// has just checked availability does not ask twice or re-check for a `None`
+/// that cannot happen.
+///
+/// Constructor rows need one semantic mapping: the helper reports a constructor
+/// with `<init>` and the JVM `void` result (`result_type: "<void>"`), because a
+/// constructor call produces no value at the call instruction. A constructor
+/// *expression* still has the constructed class as its Kotlin/JVM type, so the
+/// row's result is the owner here. This is a mapping, not a disagreement with
+/// the wire, and it is why nothing downstream should expect a constructor row's
+/// wire `result_type` to equal the owner.
+fn member_rows(
+    facts: &[crate::facts::protocol::MemberFacts],
+    owner: &str,
+    name: &str,
+    dispatch: Dispatch,
+) -> Vec<ClasspathRow> {
+    facts
         .iter()
         .filter_map(|member| {
             let member_dispatch = if member.name == "<init>" {
@@ -492,8 +580,7 @@ fn classpath_rows<P: SemanticProvider + ?Sized>(
                 result: intern(&result),
             })
         })
-        .collect();
-    Some(rows)
+        .collect()
 }
 
 /// JVM classifier name as the resolver's argument types spell it.
