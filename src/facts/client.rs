@@ -16,6 +16,7 @@ pub struct FactsClient {
     reader: BufReader<ChildStdout>,
     next_id: u64,
     cache: HashMap<Query, super::protocol::Answer>,
+    kotlin_queries: bool,
 }
 
 impl FactsClient {
@@ -37,7 +38,8 @@ impl FactsClient {
 
     /// Start the helper jar with the java binary chosen by the environment.
     pub fn start(jar: &Path) -> Result<Self, String> {
-        Self::start_with_command(Self::jar_command(jar))
+        let (command, kotlin_queries) = Self::jar_command_with_mode(jar);
+        Self::start_configured_command(command, kotlin_queries)
     }
 
     /// The `java -jar <helper>` command, before it is spawned. Exposed so the
@@ -56,10 +58,16 @@ impl FactsClient {
     ///   the slim one and never answers `ResolveCalls`. The flag is *not* passed
     ///   to the slim jar (it has no such code) and *not* passed to a full jar
     ///   with no sources — the helper treats that combination as a startup
-    ///   failure, and a missing answer is already the fail-closed path the Rust
-    ///   side wants (`Unknown`, never a guess). See
-    ///   [`super::runtime::pass_kotlin_flag`].
+    ///   failure. In Track A mode the client skips `ResolveCalls` locally:
+    ///   absent evidence becomes `Unknown`, never a guess or a blocking read.
+    ///   See [`super::runtime::pass_kotlin_flag`].
     pub fn jar_command(jar: &Path) -> Command {
+        Self::jar_command_with_mode(jar).0
+    }
+
+    /// Keep the capability decision with the command it configures; neither a
+    /// second environment read nor a flag-looking jar filename can change it.
+    fn jar_command_with_mode(jar: &Path) -> (Command, bool) {
         let mut command = Command::new(Self::java_program());
         command.arg("-jar").arg(jar);
         if let Some(sources) = super::runtime::kotlin_sources_env() {
@@ -68,15 +76,24 @@ impl FactsClient {
         if let Some(classpath) = super::runtime::classpath_env() {
             command.env("NOTLIN_CLASSPATH", classpath);
         }
-        if super::runtime::pass_kotlin_flag(jar) {
+        let kotlin_queries = super::runtime::pass_kotlin_flag(jar);
+        if kotlin_queries {
             command.arg("--kotlin");
         }
-        command
+        (command, kotlin_queries)
     }
 
-    /// Test seam: spawn any program that speaks the line protocol. No argument
-    /// is passed implicitly, so callers own the full command line.
-    pub fn start_with_command(mut command: Command) -> Result<Self, String> {
+    /// Test seam: spawn a custom helper implementing all query families.
+    /// No argument is passed implicitly; production jar launches use `start`
+    /// so their configured capabilities are recorded as well.
+    pub fn start_with_command(command: Command) -> Result<Self, String> {
+        Self::start_configured_command(command, true)
+    }
+
+    fn start_configured_command(
+        mut command: Command,
+        kotlin_queries: bool,
+    ) -> Result<Self, String> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -97,6 +114,7 @@ impl FactsClient {
             reader: BufReader::new(stdout),
             next_id: 0,
             cache: HashMap::new(),
+            kotlin_queries,
         })
     }
 
@@ -112,6 +130,16 @@ impl FactsClient {
         Some(answer)
     }
 
+    /// Unsupported queries are absence of evidence, not a dead helper. Check
+    /// before allocating an ID or writing: a Track A helper sends no response
+    /// to ResolveCalls and would otherwise leave the reader blocked forever.
+    pub(super) fn supports_query(&self, query: &Query) -> bool {
+        match query {
+            Query::ResolveCalls { .. } => self.kotlin_queries,
+            Query::ClassMembers { .. } | Query::Ping => true,
+        }
+    }
+
     /// Uncached exchange, for questions whose answer depends on state the wire
     /// does not carry. `ResolveCalls` names a file, and the file's contents can
     /// change between two identical queries: the per-query cache would answer
@@ -119,6 +147,9 @@ impl FactsClient {
     /// that memoize on their own content hash (`facts::runtime::call_sites`)
     /// must therefore reach the helper on every new hash.
     pub fn query_uncached(&mut self, query: Query) -> Option<super::protocol::Answer> {
+        if !self.supports_query(&query) {
+            return None;
+        }
         let id = self.next_id;
         self.next_id += 1;
         let line = encode_request(id, query);

@@ -28,21 +28,24 @@ pub struct FactsRuntime {
 }
 
 impl FactsRuntime {
-    /// Start any program that speaks the line protocol (test seam, also used by
-    /// the jar path with a `java -jar` command).
+    /// Start a custom helper implementing all query families (test seam).
+    /// Production jars use `start` so disabled Kotlin queries remain disabled.
     pub fn with_command(command: std::process::Command) -> Result<Arc<Self>, String> {
-        let client = FactsClient::start_with_command(command)?;
-        Ok(Arc::new(Self {
+        Ok(Self::from_client(FactsClient::start_with_command(command)?))
+    }
+
+    fn from_client(client: FactsClient) -> Arc<Self> {
+        Arc::new(Self {
             client: Mutex::new(Some(client)),
             member_facts: ClasspathFacts::new(),
             call_site_facts: CallSiteFacts::new(),
             dead: AtomicBool::new(false),
-        }))
+        })
     }
 
     /// Start the helper jar with the java binary chosen by the environment.
     pub fn start(jar: &std::path::Path) -> Result<Arc<Self>, String> {
-        Self::with_command(FactsClient::jar_command(jar))
+        Ok(Self::from_client(FactsClient::start(jar)?))
     }
 
     /// Memoized `Members` answer for one owner. `None` means the helper
@@ -80,6 +83,11 @@ impl FactsRuntime {
         }
         let mut held = self.client.lock().unwrap_or_else(PoisonError::into_inner);
         let client = held.as_mut()?;
+        // No response is expected for a disabled query family. Do not write it,
+        // and do not confuse missing capability with a dead Track A helper.
+        if !client.supports_query(&query) {
+            return None;
+        }
         let answer = if uncached {
             client.query_uncached(query)
         } else {
@@ -333,10 +341,9 @@ pub fn specifies_full_jar(jar: &Path, override_value: Option<&std::ffi::OsStr>) 
 /// treats `--kotlin` without `NOTLIN_KOTLIN_SOURCES` as a startup failure
 /// (exit 2) because a session with no module can never answer anything, and
 /// that would take Track A down with it. Without the flag the full jar still
-/// serves `Ping`/`ClassMembers` and simply never answers `ResolveCalls`; the
-/// Rust side reads a missing answer as `Unknown`, which is the same
-/// fail-closed path the slim jar takes. So the slim jar needs no flag and gets
-/// none, and a full jar with no sources runs as a Track A helper.
+/// serves `Ping`/`ClassMembers`. The client records this launch mode and skips
+/// `ResolveCalls` locally, returning no fact without disabling Track A.
+/// A full jar with no sources therefore runs as a Track A helper.
 pub(super) fn pass_kotlin_flag(jar: &Path) -> bool {
     if !is_full_jar(jar) {
         return false;
