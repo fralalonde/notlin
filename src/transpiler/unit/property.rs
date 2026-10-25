@@ -7,6 +7,20 @@ use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    /// The proved Java type for a constant field, or `None`.
+    ///
+    /// Emission never re-derives a proved field type: it writes exactly what the
+    /// plan proved, records that it consumed the proof (a proof the emitter
+    /// skipped fails the run before any write), and requests the single-type
+    /// import that makes the emitted name mean that type in generated Java.
+    fn proved_field_type(&mut self, decl: tree_sitter::Node) -> Option<String> {
+        let span = (decl.start_byte(), decl.end_byte());
+        let proved = self.field_type_proofs.get(&span)?.clone();
+        self.consumed_field_type_proofs.insert(span);
+        self.proved_field_imports.insert(proved.binding_import);
+        Some(proved.emitted_type)
+    }
+
     /// Private default properties are field reads in
     /// their own methods. A public getX()/setX() beside that storage is a real
     /// method, not a replacement for a generated constructor-property accessor.
@@ -237,9 +251,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .and_then(|v| kt::child(v, "identifier"))
             .map(|n| self.text(n).to_string())
             .unwrap_or_else(|| "prop".to_string());
-        let ty = vd
-            .and_then(|v| kt::child(v, "user_type").or_else(|| kt::child(v, "nullable_type")))
-            .map(|t| kt::java_type_ann(t, self.source, self.annots));
+        let ty = self.proved_field_type(decl).or_else(|| {
+            vd.and_then(|v| kt::child(v, "user_type").or_else(|| kt::child(v, "nullable_type")))
+                .map(|t| kt::java_type_ann(t, self.source, self.annots))
+        });
         let visibility = self.visibility_of(decl);
 
         // Destructuring class property `val (a, b) = expr`: field + accessor

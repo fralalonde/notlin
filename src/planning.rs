@@ -422,6 +422,78 @@ fn ensure_required_contracts(
     Ok(())
 }
 
+/// Re-prove every persisted constant-field type proof before the write.
+///
+/// Applicability and emission share this object, so acceptance is where the
+/// disagreement would otherwise reach disk: the proved field type must still
+/// follow from the accepted source tree, and the accepted candidate must
+/// actually write that type *and* the single-type import that binds its name.
+/// A helper-free run carries no such proof and is untouched.
+fn ensure_constant_field_proofs(
+    translation: &TranslationPlan,
+    source: &str,
+    tree: &tree_sitter::Tree,
+    candidates: &[PreparedJavaFile],
+) -> Result<(), AcceptedPlanError> {
+    let fail = |message: String, start_byte: usize, end_byte: usize| AcceptedPlanError {
+        path: "translation plan".to_string(),
+        error: JavaIrError {
+            message,
+            start_byte,
+            end_byte,
+        },
+    };
+    for proof in &translation.property_imports {
+        let Some(field) = &proof.field else {
+            continue;
+        };
+        if !crate::top_level_property_callsite::reprove_field_type(source, tree.root_node(), field)
+        {
+            return Err(fail(
+                format!(
+                    "declaration `{}` no longer proves the Java field type its import proof \
+                     recorded",
+                    proof.target.name
+                ),
+                field.start_byte,
+                field.end_byte,
+            ));
+        }
+        // Only a Java-owned declaration has an emission obligation; a retained
+        // constant keeps its Kotlin text and writes no field.
+        let owned = translation.declarations.iter().any(|decision| {
+            decision.final_owner == Some(crate::translation_plan::BackendOwner::Java)
+                && decision.id.start_byte <= field.start_byte
+                && field.end_byte <= decision.id.end_byte
+        });
+        if !owned {
+            continue;
+        }
+        let field_text = format!("static final {} {} ", field.emitted_type, proof.target.name);
+        let import_text = format!("import {};", field.binding_import);
+        let written = candidates.iter().any(|candidate| {
+            std::path::Path::new(&candidate.path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                == Some(field.facade.as_str())
+                && candidate.source.contains(&field_text)
+                && candidate.source.contains(&import_text)
+        });
+        if !written {
+            return Err(fail(
+                format!(
+                    "declaration `{}` was proved to emit `{}` bound by `{}`, but the prepared Java \
+                     does not write both",
+                    proof.target.name, field.emitted_type, field.binding_import
+                ),
+                field.start_byte,
+                field.end_byte,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The deepest node whose span is exactly `start..end`.
 ///
 /// Several nodes can share one span (`values.sorted()` is both a `value_argument`
@@ -484,6 +556,10 @@ impl AcceptedTranslationPlan {
     /// Whether this plan carries any lowering-contract evidence at all.
     fn has_contract_evidence(translation: &TranslationPlan) -> bool {
         !translation.call_receipts.is_empty()
+            || translation
+                .property_imports
+                .iter()
+                .any(|proof| proof.field.is_some())
             || translation.declarations.iter().any(|decision| {
                 decision.required_mode
                     || decision.lowering_contract.is_some()
@@ -566,6 +642,12 @@ impl AcceptedTranslationPlan {
                 evidence.tree,
                 semantic_provider,
                 evidence.annots,
+            )?;
+            ensure_constant_field_proofs(
+                &translation,
+                evidence.source,
+                evidence.tree,
+                &candidates,
             )?;
         }
         let facade_targets = candidates

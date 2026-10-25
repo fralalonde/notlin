@@ -63,6 +63,22 @@ pub struct Unit<'src, 'tree> {
     /// that has no receipt keeps today's Legacy path.
     pub(crate) call_receipts:
         std::collections::HashMap<(usize, usize), crate::semantics::CallReceipt>,
+    /// Proved constant-field emission contracts for this snapshot, copied from
+    /// the plan's property-import proofs and keyed by declaration span. The
+    /// field emitter writes the type from here instead of re-deriving it from a
+    /// source spelling that a wildcard import leaves ambiguous.
+    pub(crate) field_type_proofs: std::collections::BTreeMap<
+        (usize, usize),
+        crate::top_level_property_callsite::FieldEmissionProof,
+    >,
+    /// Field proofs this emission actually consumed. An unproved field whose
+    /// plan asked for a bound type would otherwise fall back to the ambiguous
+    /// spelling silently, so `lower_with_plan` fails closed on a leftover.
+    pub(crate) consumed_field_type_proofs: std::collections::BTreeSet<(usize, usize)>,
+    /// Single-type imports the proved field types require in this file's
+    /// generated Java. Empty for every file without such a proof, so the
+    /// helper-free/Legacy import block is byte-identical.
+    pub(crate) proved_field_imports: std::collections::BTreeSet<String>,
     /// Receipt spans this emission actually consumed. `lower_with_plan`
     /// compares it against the receipts inside translated declarations, so a
     /// receipt that planning required but emission never read is a pre-write
@@ -507,6 +523,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             exact_overload_calls: std::collections::HashMap::new(),
             reified_class_calls: std::collections::HashMap::new(),
             call_receipts: std::collections::HashMap::new(),
+            field_type_proofs: std::collections::BTreeMap::new(),
+            consumed_field_type_proofs: std::collections::BTreeSet::new(),
+            proved_field_imports: std::collections::BTreeSet::new(),
             consumed_receipts: std::collections::BTreeSet::new(),
             required_declaration_spans: Vec::new(),
             constructor_delegations: std::collections::HashMap::new(),
@@ -1341,6 +1360,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             })
             .collect();
         self.consumed_receipts.clear();
+        // Field type proofs are snapshot-bound for the same reason receipts
+        // are: the facts describe one declaration on one text. A proof taken
+        // for a different snapshot of this file is not an emission input.
+        self.field_type_proofs = plan
+            .property_imports
+            .iter()
+            .filter_map(|proof| proof.field.as_ref())
+            .filter(|field| field.source_hash == self.source_hash)
+            .map(|field| ((field.start_byte, field.end_byte), field.clone()))
+            .collect();
+        self.consumed_field_type_proofs.clear();
+        self.proved_field_imports.clear();
         self.required_declaration_spans = plan
             .declarations
             .iter()

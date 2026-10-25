@@ -103,6 +103,17 @@ impl FactsProvider {
 }
 
 impl SemanticProvider for FactsProvider {
+    fn source_property_reference(
+        &self,
+        file: &Path,
+        byte_offset: u64,
+        source_hash: &[u8; 32],
+    ) -> Option<crate::facts::protocol::SourcePropertyReference> {
+        self.runtime
+            .as_ref()?
+            .source_property_reference_at(file, byte_offset, source_hash)
+    }
+
     fn has_classpath_facts(&self) -> bool {
         self.runtime.is_some()
     }

@@ -103,7 +103,7 @@ fn the_golden_callsites_line_decodes_to_the_pinned_shape() {
     let response = decode_response(GOLDEN).expect("golden call sites line");
     assert_eq!(response.version, PROTOCOL_VERSION);
     assert_eq!(response.id, 0);
-    let Answer::CallSites { file, sites } = response.answer else {
+    let Answer::CallSites { file, sites, .. } = response.answer else {
         panic!("golden line must carry CallSites");
     };
     assert_eq!(file, PathBuf::from("/srv/mod/Sample.kt"));
@@ -121,6 +121,7 @@ fn call_sites_reserialize_to_the_same_golden_line() {
         answer: Answer::CallSites {
             file: PathBuf::from("/srv/mod/Sample.kt"),
             sites: vec![established_site(), ambiguous_site(), unknown_site()],
+            references: None,
         },
     };
     assert_eq!(serde_json::to_string(&response).unwrap(), GOLDEN.trim());
@@ -178,6 +179,7 @@ fn an_empty_sites_batch_is_a_real_answer_not_an_unknown() {
         Some(Answer::CallSites {
             file: PathBuf::from("A.kt"),
             sites: Vec::new(),
+            references: None,
         })
     );
 }

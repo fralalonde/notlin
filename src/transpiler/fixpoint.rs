@@ -689,6 +689,36 @@ pub fn qualify_retention_markers(plans: &mut [FilePlan]) {
 }
 
 pub fn qualify_retention_markers_at(plans: &mut [FilePlan]) {
+    // New source-binding consumers may require import edits while remaining
+    // Kotlin. Their diagnostic markers must not displace a leading shebang.
+    // Keep the Legacy diagnostic path unchanged for unproved/helper-off files.
+    let binding_consumers = plans
+        .iter()
+        .flat_map(|plan| &plan.translation.property_imports)
+        .map(|proof| proof.consumer.file.clone())
+        .collect::<HashSet<_>>();
+    // Required obligations persist after the import edit's source snapshot
+    // disappears; keep diagnostic hygiene through those later rounds too.
+    for plan in plans.iter_mut().filter(|plan| {
+        binding_consumers.contains(&plan.file)
+            || plan
+                .translation
+                .declarations
+                .iter()
+                .any(|decision| decision.required_mode)
+    }) {
+        if plan.source.starts_with("#!") {
+            let after_shebang = plan
+                .source
+                .find('\n')
+                .map_or(plan.source.len(), |at| at + 1);
+            for (offset, _) in &mut plan.coverage.blockers {
+                if *offset < after_shebang {
+                    *offset = after_shebang;
+                }
+            }
+        }
+    }
     let sites = crate::diagnostics::retention_sites();
     let qualified_names = sites
         .iter()

@@ -476,6 +476,12 @@ fn lower_with_plan(
         .top_level_property_callsite_retention
         .or(local_property_callsite_retention.as_ref())
         .expect("top-level property callsite facts are available");
+    plan.property_imports = property_callsite_retention
+        .binding_imports
+        .iter()
+        .filter(|proof| proof.target.file == identity_path)
+        .cloned()
+        .collect();
     for decision in &mut plan.declarations {
         let Some(diagnostics) = property_callsite_retention.get(&decision.symbol_id) else {
             continue;
@@ -493,6 +499,12 @@ fn lower_with_plan(
             decision.retention_reasons.push(reason);
         }
         decision.candidate_owner = crate::translation_plan::BackendOwner::Kotlin;
+        if property_callsite_retention
+            .consumers
+            .contains(&decision.symbol_id)
+        {
+            decision.required_mode = true;
+        }
     }
     let getter_started = profile_enabled().then(Instant::now);
     let default_provider_retention = scope.index.and_then(|index| {
@@ -710,6 +722,34 @@ fn lower_with_plan(
                 preparation_failure = Some(format!(
                     "declaration lowering contract was not consumed by emission for {}; the \
                      planned receipt and the emitted Java disagree, so no output is written",
+                    unconsumed.join(", ")
+                ));
+            }
+        }
+        // The same consumption invariant for proved field types: a plan that
+        // proved how a field's Java type is spelled and then emitted the
+        // ambiguous source spelling instead is a silent ABI change, so it fails
+        // before any write rather than falling back to the old bytes.
+        if preparation_failure.is_none() {
+            let unconsumed = plan
+                .property_imports
+                .iter()
+                .filter_map(|proof| proof.field.as_ref())
+                .filter(|field| {
+                    field.source_hash == unit.source_hash
+                        && unit.coverage.translated_spans.iter().any(|(start, end)| {
+                            *start <= field.start_byte && field.end_byte <= *end
+                        })
+                        && !unit
+                            .consumed_field_type_proofs
+                            .contains(&(field.start_byte, field.end_byte))
+                })
+                .map(|field| format!("{}..{}", field.start_byte, field.end_byte))
+                .collect::<Vec<_>>();
+            if !unconsumed.is_empty() {
+                preparation_failure = Some(format!(
+                    "a proved field type was not consumed by emission at {}; the planned Java \
+                     type and the emitted declaration disagree, so no output is written",
                     unconsumed.join(", ")
                 ));
             }

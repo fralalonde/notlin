@@ -1242,6 +1242,162 @@ pub(crate) fn declaration_abi<P: SemanticProvider + ?Sized>(
     abi
 }
 
+/// The canonical Java spelling this slice may emit for a wildcard-ambiguous
+/// `String` declaration slot, and the single-type import that binds it.
+///
+/// Both halves are one contract: the *type* comes from the native declaration
+/// descriptor (a source spelling cannot say which `String` a wildcard import
+/// leaves in scope for a Java reader), and the *name* is bound by a single-type
+/// import, which — unlike `java.lang`'s implicit binding — shadows both a
+/// same-package type and any type-import-on-demand declaration. The emitted
+/// name therefore means exactly `java.lang.String` in generated Java, which is
+/// why nothing here depends on the wildcard's package contents.
+pub(crate) struct CanonicalFieldType {
+    /// The exact descriptor the declaration fact must carry.
+    pub(crate) descriptor: &'static str,
+    pub(crate) emitted: &'static str,
+    pub(crate) binding_import: &'static str,
+}
+
+const STRING_DESCRIPTOR: &str = "Ljava/lang/String;";
+const STRING_SIMPLE_NAME: &str = "String";
+const STRING_BINARY_NAME: &str = "java.lang.String";
+
+/// Prove a `const val … : String` declaration slot whose source spelling is
+/// ambiguous, from native declaration facts plus a name-binding import.
+///
+/// The structural half is independent of the facts: the slot must be a bare,
+/// non-generic, non-nullable `String` spelling, so a fact about a different
+/// shape cannot be borrowed for this one. The fact half is tri-state and
+/// exact: an absent descriptor/nullability (old helper) proves nothing.
+pub(crate) fn canonical_string_field_type(
+    source: &str,
+    ty: tree_sitter::Node<'_>,
+    facade: &str,
+    descriptor: Option<&str>,
+    nullable: Option<bool>,
+) -> Option<CanonicalFieldType> {
+    if !is_bare_string_spelling(source, ty)
+        || descriptor != Some(STRING_DESCRIPTOR)
+        || nullable != Some(false)
+    {
+        return None;
+    }
+    field_type_binding(source, ty, facade).then_some(CanonicalFieldType {
+        descriptor: STRING_DESCRIPTOR,
+        emitted: STRING_SIMPLE_NAME,
+        binding_import: STRING_BINARY_NAME,
+    })
+}
+
+/// Whether the emitted simple name can be bound in the generated compilation
+/// unit without capturing something else.
+///
+/// Everything Java can put in front of a simple type name is enumerated here:
+/// a type declared in the same compilation unit (a member type of the emitting
+/// class shadows an import outright), a second single-type import of the same
+/// simple name (a duplicate binding), and the facade class name itself. A
+/// wildcard import is *not* a hazard for the bound name — a single-type import
+/// shadows every type-import-on-demand declaration — which is exactly why this
+/// path binds the name instead of emitting the source spelling.
+fn field_type_binding(source: &str, ty: tree_sitter::Node<'_>, facade: &str) -> bool {
+    if facade.rsplit('.').next() == Some(STRING_SIMPLE_NAME) {
+        return false;
+    }
+    let mut root = ty;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "object_declaration"
+                | "enum_class_declaration"
+        ) && node_name(node, source).as_deref() == Some(STRING_SIMPLE_NAME)
+        {
+            return false;
+        }
+        // A typealias of this name would make the emitted spelling depend on
+        // alias lowering instead of on this binding; that is a different proof.
+        if node.kind() == "type_alias"
+            && node_name(node, source).as_deref() == Some(STRING_SIMPLE_NAME)
+        {
+            return false;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let mut cursor = root.walk();
+    for header in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "import")
+    {
+        let Some(header) = java_member_calls::import_header(source, header) else {
+            return false;
+        };
+        if header.wildcard {
+            continue;
+        }
+        let binds_string = match header.alias.as_deref() {
+            Some(alias) => alias == STRING_SIMPLE_NAME,
+            None => header.path.rsplit('.').next() == Some(STRING_SIMPLE_NAME),
+        };
+        if binds_string && header.path != STRING_BINARY_NAME {
+            return false;
+        }
+    }
+    true
+}
+
+/// Exactly one identifier child spelling `String`, with no type arguments, no
+/// qualification and no type-use modifiers.
+fn is_bare_string_spelling(source: &str, ty: tree_sitter::Node<'_>) -> bool {
+    if ty.kind() != "user_type" {
+        return false;
+    }
+    let mut names = Vec::new();
+    for child in ty.children(&mut ty.walk()) {
+        match child.kind() {
+            kind if kind.ends_with("comment") => {}
+            "identifier" | "simple_identifier" => names.push(
+                child
+                    .utf8_text(source.as_bytes())
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('`')
+                    .to_owned(),
+            ),
+            _ => return false,
+        }
+    }
+    matches!(names.as_slice(), [name] if name == STRING_SIMPLE_NAME)
+}
+
+/// Reuse the shared bound ABI-slot proof for a source constant declaration.
+/// This does not sign its consumers or their executable operations.
+pub(crate) fn is_canonical_string_slot<P: SemanticProvider + ?Sized>(
+    source: &str,
+    ty: tree_sitter::Node<'_>,
+    provider: &P,
+) -> bool {
+    let mut root = ty;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let bindings = TypeBindings::build(source, root);
+    let ctx = TypeCtx {
+        source,
+        bindings: &bindings,
+        provider,
+        annots: crate::transpiler::types::AnnotationSet::None,
+    };
+    matches!(prove_slot(&ctx, SlotKind::Parameter, ty).proof,
+        AbiProof::Reference(ref owner) if owner == STRING_REFERENCE)
+}
+
 /// The declared return classification of every function in one unit.
 ///
 /// This half does not depend on receipts, so the call-site walk can classify a

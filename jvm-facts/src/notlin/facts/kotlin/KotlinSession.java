@@ -198,7 +198,7 @@ public final class KotlinSession {
      * loop) must answer every request, because the Rust client blocks on one
      * line per request and cannot tell silence from a stalled helper. A
      * non-answer is never a partial batch either — that would read as "every
-     * call site in this file".
+     * call site and every source-property read in this file".
      */
     public String callSitesAnswer(long id, String requestedPath) {
         String real = realPath(requestedPath);
@@ -215,18 +215,20 @@ public final class KotlinSession {
             return Facts.noEvidenceAnswer(id, "ResolveCalls", "cannot read the requested file");
         }
         long started = System.nanoTime();
-        List<CallSites.Site> sites;
+        CallSites.Batch batch;
         try {
-            sites = CallSites.extractAll(session, file, raw);
+            batch = CallSites.extractAll(session, file, raw);
         } catch (RuntimeException | LinkageError failure) {
             // Fail closed: an exception mid-file must not produce a partial batch
-            // the Rust side could mistake for "every call site in this file".
+            // the Rust side could mistake for "every call site and every property
+            // read in this file".
             warn("ResolveCalls failed for " + real + ": " + failure);
             return Facts.noEvidenceAnswer(id, "ResolveCalls", "call-site extraction failed");
         }
         long elapsed = (System.nanoTime() - started) / 1_000_000L;
-        log("ResolveCalls " + Paths.get(real).getFileName() + " sites=" + sites.size() + " in " + elapsed + " ms");
-        return CallSites.toAnswerLine(id, requestedPath, sites);
+        log("ResolveCalls " + Paths.get(real).getFileName() + " sites=" + batch.sites().size()
+                + " references=" + batch.references().size() + " in " + elapsed + " ms");
+        return CallSites.toAnswerLine(id, requestedPath, batch);
     }
 
     /**

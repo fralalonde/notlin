@@ -13,7 +13,33 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
-pub type RetentionMap = BTreeMap<SymbolId, Vec<CallsiteRepairDiagnostic>>;
+mod source_bindings;
+pub(crate) use source_bindings::reprove_field_type;
+pub use source_bindings::{FieldEmissionProof, PropertyImportProof};
+
+#[derive(Default)]
+pub struct RetentionMap {
+    retained: BTreeMap<SymbolId, Vec<CallsiteRepairDiagnostic>>,
+    pub(crate) binding_imports: Vec<PropertyImportProof>,
+    binding_consumers: BTreeMap<SymbolId, std::collections::BTreeSet<SymbolId>>,
+    pub(crate) consumers: std::collections::BTreeSet<SymbolId>,
+}
+impl std::ops::Deref for RetentionMap {
+    type Target = BTreeMap<SymbolId, Vec<CallsiteRepairDiagnostic>>;
+    fn deref(&self) -> &Self::Target {
+        &self.retained
+    }
+}
+impl std::ops::DerefMut for RetentionMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.retained
+    }
+}
+impl RetentionMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct PropertyCallsiteReport {
@@ -149,6 +175,10 @@ pub(crate) fn properties_requiring_kotlin_retention_in_selection(
         safe_targets.extend(property_safety_map(source, &file, &file_targets));
     }
     let target_index = TargetIndex::new(&targets);
+    // Apply these only to newly fact-backed moves. A missing binding/import
+    // proof must not disappear merely because the Legacy read classifier
+    // cannot see through an argument/receiver context.
+    let mut unsigned_uses = Vec::new();
 
     for (path, source) in sources {
         if path
@@ -176,6 +206,14 @@ pub(crate) fn properties_requiring_kotlin_retention_in_selection(
         let Some(tree) = parse(source) else { continue };
         let package = package(source, tree.root_node());
         let imports = imports(source, tree.root_node());
+        let bindings = source_bindings::BindingContext {
+            source,
+            file: path,
+            root: tree.root_node(),
+            provider,
+            safe_targets: &safe_targets,
+            editable: editable.contains(path),
+        };
         if !editable.contains(path) {
             for import in imports.iter().filter(|import| !import.wildcard) {
                 let candidates = target_index.qualified(&import.package, &import.name);
@@ -206,8 +244,21 @@ pub(crate) fn properties_requiring_kotlin_retention_in_selection(
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
             if matches!(node.kind(), "string_literal" | "multiline_string_literal") {
-                for name in short_template_names(node.utf8_text(source.as_bytes()).unwrap_or("")) {
+                for (start, end, name) in
+                    short_template_names(node.utf8_text(source.as_bytes()).unwrap_or(""))
+                {
                     let candidates = target_index.visible(&name, &package, &imports);
+                    if candidates.len() == 1
+                        && bindings.record(
+                            node,
+                            (node.start_byte() + start, node.start_byte() + end),
+                            &name,
+                            candidates[0],
+                            &mut result,
+                        )
+                    {
+                        continue;
+                    }
                     pin(
                         &mut result,
                         &candidates,
@@ -226,6 +277,34 @@ pub(crate) fn properties_requiring_kotlin_retention_in_selection(
                 } else {
                     target_index.visible(spelling, &package, &imports)
                 };
+                // K2 proves this exact read. Do not classify it through an
+                // enclosing receiver chain: a bare argument can sit inside a
+                // navigation expression without being that chain's receiver.
+                // Keep the legacy syntactic classifier below unchanged.
+                if candidates.len() == 1
+                    && qualified.is_none()
+                    && bindings.record(
+                        node,
+                        (node.start_byte(), node.end_byte()),
+                        spelling,
+                        candidates[0],
+                        &mut result,
+                    )
+                {
+                    continue;
+                }
+                if qualified.is_none() {
+                    for target in &candidates {
+                        let owner = source_bindings::top_level_owner(node)
+                            .map(|owner| crate::semantics::symbol_id_for_node(source, owner, path));
+                        unsigned_uses.push((
+                            target.id.clone(),
+                            path.clone(),
+                            node.start_byte(),
+                            owner,
+                        ));
+                    }
+                }
                 if !candidates.is_empty() {
                     let mut unsafe_use = false;
                     if let Some((qualifier, whole)) = qualified {
@@ -331,6 +410,41 @@ pub(crate) fn properties_requiring_kotlin_retention_in_selection(
             stack.extend(node.named_children(&mut cursor));
         }
     }
+    let fact_backed = result
+        .binding_imports
+        .iter()
+        .map(|proof| proof.target.clone())
+        .collect::<HashSet<_>>();
+    for (target, file, offset, owner) in unsigned_uses {
+        if fact_backed.contains(&target) {
+            result.retained.entry(target).or_default().push(diag(
+                &file,
+                offset,
+                "P010",
+                "a potentially dependent read has no complete source-binding/import proof".into(),
+            ));
+            if let Some(owner) = owner {
+                result.consumers.insert(owner.clone());
+                result.retained.entry(owner).or_default().push(diag(
+                    &file,
+                    offset,
+                    "P009",
+                    "unsigned consumer of a source-bound property remains Kotlin".into(),
+                ));
+            }
+        }
+    }
+    // A property binding proves no operation in its consumers. These obligations
+    // survive even when another use forces the target itself to stay Kotlin.
+    for owners in result.binding_consumers.clone().into_values() {
+        for owner in owners {
+            result.consumers.insert(owner.clone());
+            result.retained.entry(owner.clone()).or_default().push(diag(
+                &owner.file, 0, "P009",
+                "source-bound static property consumer remains Kotlin until its own lowering contract is proved".into(),
+            ));
+        }
+    }
     for diagnostics in result.values_mut() {
         diagnostics.sort_by(|a, b| a.file.cmp(&b.file).then(a.start_byte.cmp(&b.start_byte)));
         diagnostics.dedup();
@@ -381,6 +495,19 @@ pub fn repair_emitted_property_references(
     }
     let target_index = TargetIndex::new(&targets);
     let mut edits_by_file = BTreeMap::<PathBuf, Vec<PendingEdit>>::new();
+    let replaced_imports = match source_bindings::collect_bound_imports(
+        original,
+        plans,
+        &targets,
+        residual,
+        &mut edits_by_file,
+    ) {
+        Ok(replaced) => replaced,
+        Err(diagnostic) => {
+            report.diagnostics.push(diagnostic);
+            return report;
+        }
+    };
 
     for (path, source) in residual.iter() {
         let Some(tree) = parse(source) else { continue };
@@ -391,6 +518,9 @@ pub fn repair_emitted_property_references(
 
         // Imports are redirected to Java static fields; aliases remain intact.
         for import in imports.iter().filter(|i| !i.wildcard) {
+            if replaced_imports.contains(&(path.clone(), import.start, import.end)) {
+                continue;
+            }
             let matches = targets
                 .iter()
                 .filter(|t| t.id.package == import.package && t.id.name == import.name)
@@ -489,7 +619,7 @@ pub fn repair_emitted_property_references(
             stack.extend(node.named_children(&mut cursor));
         }
         if !edits.is_empty() {
-            edits_by_file.insert(path.clone(), edits);
+            edits_by_file.entry(path.clone()).or_default().extend(edits);
         }
     }
 
@@ -507,7 +637,13 @@ pub fn repair_emitted_property_references(
                 &path,
                 0,
                 "P004",
-                "overlapping property call-site edits were rejected".into(),
+                format!(
+                    "overlapping property call-site edits were rejected: {:?}",
+                    pending
+                        .iter()
+                        .map(|e| (e.edit.location.start_byte, e.edit.location.end_byte))
+                        .collect::<Vec<_>>()
+                ),
             ));
             continue;
         }
@@ -749,22 +885,22 @@ fn package(source: &str, root: Node) -> String {
         .unwrap_or_default()
 }
 
-fn short_template_names(source: &str) -> Vec<String> {
+fn short_template_names(source: &str) -> Vec<(usize, usize, String)> {
+    let bytes = source.as_bytes();
     let mut names = Vec::new();
-    let mut chars = source.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '$' {
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'$' {
+            at += 1;
             continue;
         }
-        let mut name = String::new();
-        while chars
-            .peek()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-        {
-            name.push(chars.next().unwrap());
+        at += 1;
+        let start = at;
+        while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+            at += 1;
         }
-        if !name.is_empty() {
-            names.push(name);
+        if at > start {
+            names.push((start, at, source[start..at].to_owned()));
         }
     }
     names
@@ -874,7 +1010,10 @@ fn in_import(n: Node) -> bool {
         if x.kind() == "import" {
             return true;
         }
-        if !matches!(x.kind(), "navigation_expression" | "navigation_suffix") {
+        if !matches!(
+            x.kind(),
+            "navigation_expression" | "navigation_suffix" | "qualified_identifier"
+        ) {
             break;
         }
         p = x.parent()

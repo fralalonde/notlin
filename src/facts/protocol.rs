@@ -70,6 +70,9 @@ pub enum Answer {
     CallSites {
         file: PathBuf,
         sites: Vec<CallSite>,
+        /// Absent in old helpers; never interpreted as binding evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        references: Option<Vec<SourcePropertyReference>>,
     },
     Pong {
         version: u32,
@@ -92,6 +95,33 @@ pub enum Answer {
         /// value is "no evidence", whatever the text says.
         reason: String,
     },
+}
+
+/// An exact source-backed top-level property binding, not a spelling guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourcePropertyReference {
+    pub byte_offset: u64,
+    pub end_byte: u64,
+    pub text: String,
+    pub target_file: PathBuf,
+    pub target_start_byte: u64,
+    pub target_end_byte: u64,
+    pub target_name: String,
+    pub target_package: String,
+    /// The JVM descriptor of the property's *declared* type as the Analysis API
+    /// resolved it, with no call-site substitutions (`Ljava/lang/String;`).
+    ///
+    /// This is declaration evidence, not an expression result: it says which
+    /// physical Java type the declaration's own type spelling denotes, which a
+    /// source spelling cannot say once a wildcard import is in scope. Absent
+    /// means Unknown (old helper), never "some type".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_jvm_descriptor: Option<String>,
+    /// Whether that declared type is nullable, as resolved. Tri-state for the
+    /// same reason: absent/null is Unknown, and a consumer that needs "not
+    /// nullable" must accept only `Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_nullable: Option<bool>,
 }
 
 /// How far the helper got with one call site. Serialized spellings

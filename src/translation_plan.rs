@@ -218,6 +218,9 @@ pub struct TranslationPlan {
     /// receiver form, arguments and per-call type).
     #[serde(default)]
     pub call_receipts: Vec<crate::semantics::CallReceipt>,
+    /// Exact source-property bindings consumed as Kotlin static-field imports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub property_imports: Vec<crate::top_level_property_callsite::PropertyImportProof>,
     /// The annotation set emission will use for this run. Slot proofs render the
     /// exact text with it, so planning and emission cannot disagree about a
     /// type's annotation prefix.
@@ -804,6 +807,7 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         reference_string_calls: Vec::new(),
         container_calls: Vec::new(),
         call_receipts: Vec::new(),
+        property_imports: Vec::new(),
         annotations: crate::transpiler::types::AnnotationSet::default(),
         carried_required: std::collections::BTreeSet::new(),
         receipt_conflicts: Vec::new(),

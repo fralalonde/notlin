@@ -738,6 +738,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
         }
+        // A proved constant-field type is bound by a single-type import: the
+        // source spelling it replaces was ambiguous under a wildcard import,
+        // and a single-type import shadows type-import-on-demand declarations.
+        // Nothing is added for a file whose plan proved no such field, so the
+        // helper-free import block stays byte-identical.
+        for want in &self.proved_field_imports {
+            if imports.iter().any(|existing| existing == want) {
+                continue;
+            }
+            block.push_str(&format!("import {};\n", want));
+        }
         // Under --lombok the emitted @Data/@AllArgsConstructor need their
         // imports; user-declared lombok imports (Lombok-flagged source) may
         // already provide some — add only what's missing, exactly once.

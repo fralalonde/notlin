@@ -15,7 +15,13 @@
 
 use super::classpath::{self, CallSiteFacts, CallSiteLookup, ClasspathFacts};
 use super::client::FactsClient;
-use super::protocol::{Answer, CallSite, MemberFacts, Query};
+use super::protocol::{Answer, CallSite, MemberFacts, Query, SourcePropertyReference};
+use std::collections::HashMap;
+
+struct ReferenceMemo {
+    source_hash: [u8; 32],
+    references: Option<Vec<SourcePropertyReference>>,
+}
 use crate::cli::JvmFactsMode;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +33,7 @@ pub struct FactsRuntime {
     client: Mutex<Option<FactsClient>>,
     member_facts: ClasspathFacts,
     call_site_facts: CallSiteFacts,
+    reference_facts: Mutex<HashMap<PathBuf, ReferenceMemo>>,
     dead: AtomicBool,
 }
 
@@ -54,6 +61,7 @@ impl FactsRuntime {
             client: Mutex::new(Some(client)),
             member_facts: ClasspathFacts::new(),
             call_site_facts: CallSiteFacts::new(),
+            reference_facts: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
         })
     }
@@ -142,7 +150,7 @@ impl FactsRuntime {
     pub fn call_sites(&self, file: &Path) -> Option<Arc<Vec<CallSite>>> {
         let (canonical, hash) = disk_snapshot(file)?;
         self.call_site_facts
-            .sites_at(&canonical, hash, || self.load_call_sites(&canonical))
+            .sites_at(&canonical, hash, || self.load_call_sites(&canonical, hash))
     }
 
     /// One call site at `byte_offset`, but only if the caller can prove it is
@@ -175,11 +183,53 @@ impl FactsRuntime {
         }
         let sites = self
             .call_site_facts
-            .sites_at(&canonical, hash, || self.load_call_sites(&canonical))?;
+            .sites_at(&canonical, hash, || self.load_call_sites(&canonical, hash))?;
         sites
             .iter()
             .find(|site| site.byte_offset == byte_offset)
             .cloned()
+    }
+
+    /// One source-property binding from the same content-addressed batch as
+    /// calls. Old helpers, stale snapshots and duplicate spans prove nothing.
+    pub fn source_property_reference_at(
+        &self,
+        file: &Path,
+        byte_offset: u64,
+        expected_source_hash: &[u8; 32],
+    ) -> Option<SourcePropertyReference> {
+        let (canonical, hash) = disk_snapshot(file)?;
+        if hash != *expected_source_hash {
+            return None;
+        }
+        self.call_site_facts
+            .sites_at(&canonical, hash, || self.load_call_sites(&canonical, hash))?;
+        let held = self
+            .reference_facts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let memo = held
+            .get(&canonical)
+            .filter(|memo| memo.source_hash == hash)?;
+        let mut matches = memo
+            .references
+            .as_ref()?
+            .iter()
+            .filter(|r| r.byte_offset == byte_offset);
+        let found = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        let bytes = std::fs::read(&canonical).ok()?;
+        let start = usize::try_from(found.byte_offset).ok()?;
+        let end = usize::try_from(found.end_byte).ok()?;
+        if source_hash_bytes(&bytes) != hash
+            || start >= end
+            || bytes.get(start..end) != Some(found.text.as_bytes())
+        {
+            return None;
+        }
+        Some(found.clone())
     }
 
     /// The batch exchange itself. An answer that names another file is not
@@ -188,11 +238,25 @@ impl FactsRuntime {
     ///
     /// Uncached on the client as well: the run's memo keyed on content hash is
     /// the only memo this answer may come from, so a new revision always asks.
-    fn load_call_sites(&self, canonical: &Path) -> CallSiteLookup {
+    fn load_call_sites(&self, canonical: &Path, hash: [u8; 32]) -> CallSiteLookup {
         match self.query_uncached(Query::ResolveCalls {
             file: canonical.to_path_buf(),
         }) {
-            Some(Answer::CallSites { file, sites }) if same_file(&file, canonical) => {
+            Some(Answer::CallSites {
+                file,
+                sites,
+                references,
+            }) if same_file(&file, canonical) => {
+                self.reference_facts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(
+                        canonical.to_path_buf(),
+                        ReferenceMemo {
+                            source_hash: hash,
+                            references,
+                        },
+                    );
                 CallSiteLookup::Sites(sites)
             }
             Some(Answer::CallSites { file, .. }) => {
@@ -220,6 +284,10 @@ impl FactsRuntime {
 /// Canonical path plus the hash of its bytes right now. Both halves are
 /// required: the memo key is the canonical path, and the hash is what makes a
 /// cached batch trustworthy for the revision being planned.
+fn source_hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
 fn disk_snapshot(file: &Path) -> Option<(PathBuf, [u8; 32])> {
     let canonical = std::fs::canonicalize(file).ok()?;
     let hash = classpath::file_hash(&canonical)?;

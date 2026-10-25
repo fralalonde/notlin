@@ -67,6 +67,7 @@ pub(crate) use lowering_contract::{
     descriptor_result_matches, plan_contracts, record_receipts, representation_from_row,
     retain_contract, unconsumed_receipts,
 };
+pub(crate) use lowering_contract::{canonical_string_field_type, is_canonical_string_slot};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SymbolId {
@@ -2120,6 +2121,17 @@ pub trait SemanticProvider: Send + Sync {
     ) -> Option<crate::facts::protocol::CallSite> {
         None
     }
+    /// Exact Kotlin source property binding for these source bytes.
+    /// Absence cannot establish independence or a movable field.
+    fn source_property_reference(
+        &self,
+        _file: &Path,
+        _byte_offset: u64,
+        _source_hash: &[u8; 32],
+    ) -> Option<crate::facts::protocol::SourcePropertyReference> {
+        None
+    }
+
     fn kotlin_constructor_metadata_dependency(
         &self,
         _owner: &SymbolId,
@@ -7189,7 +7201,7 @@ fn unwrap_single_string_literal<'tree>(
     }
 }
 
-fn safe_java_string_literal(raw: &str) -> bool {
+pub(crate) fn safe_java_string_literal(raw: &str) -> bool {
     if !raw.starts_with('"')
         || !raw.ends_with('"')
         || raw.starts_with("\"\"\"")
