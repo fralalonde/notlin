@@ -310,10 +310,10 @@ pub(crate) fn recovered_annotation_class_name(
         .map(str::to_owned)
 }
 
-/// Recover an annotated interface only when the prefix parse establishes the
-/// same top-level declaration boundaries. Both planning and emission use this
-/// syntax evidence; an opaque or malformed boundary still remains Kotlin.
-pub(crate) fn recover_annotated_interface_tree(
+/// Recover an annotated interface or annotation class only when the prefix
+/// parse establishes the same name, kind and top-level declaration boundaries.
+/// Planning and emission share this syntax evidence; malformed boundaries retain.
+pub(crate) fn recover_annotated_type_tree(
     source: &str,
     wrapper: tree_sitter::Node<'_>,
 ) -> Option<tree_sitter::Tree> {
@@ -326,26 +326,93 @@ pub(crate) fn recover_annotated_interface_tree(
         .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
         .ok()?;
     let tree = parser.parse(prefix, None)?;
-    recovered_annotated_interface_decl(source, wrapper, tree.root_node())?;
+    if recovered_annotated_type_decl(source, wrapper, tree.root_node()).is_some() {
+        return Some(tree);
+    }
+    // A bodyless annotation remains an infix expression even at EOF in the
+    // pinned grammar. An explicit empty constructor disambiguates the same
+    // parameterless annotation declaration. Remove only that synthetic suffix
+    // from the tree coordinates before either consumer observes the tree.
+    let name = recovered_annotation_class_name_node(wrapper, source)?;
+    if name.end_byte() != wrapper.end_byte() {
+        return None;
+    }
+    let suffix = " constructor()";
+    let augmented = format!("{prefix}{suffix}");
+    let mut tree = parser.parse(&augmented, None)?;
+    let declaration =
+        matched_annotated_type_decl(source, wrapper, tree.root_node(), augmented.len())?;
+    let constructor = declaration
+        .named_children(&mut declaration.walk())
+        .find(|child| child.kind() == "primary_constructor")?;
+    if constructor.start_byte() != prefix.len() + 1
+        || constructor.utf8_text(augmented.as_bytes()).ok() != Some("constructor()")
+    {
+        return None;
+    }
+    let end = wrapper.end_position();
+    tree.edit(&tree_sitter::InputEdit {
+        start_byte: prefix.len(),
+        old_end_byte: augmented.len(),
+        new_end_byte: prefix.len(),
+        start_position: end,
+        old_end_position: tree_sitter::Point {
+            row: end.row,
+            column: end.column + suffix.len(),
+        },
+        new_end_position: end,
+    });
+    recovered_annotated_type_decl(source, wrapper, tree.root_node())?;
     Some(tree)
 }
 
-pub(crate) fn recovered_annotated_interface_decl<'tree>(
+pub(crate) fn recovered_annotated_type_decl<'tree>(
     source: &str,
     wrapper: tree_sitter::Node<'_>,
     root: tree_sitter::Node<'tree>,
 ) -> Option<tree_sitter::Node<'tree>> {
-    let name = recovered_interface_name(wrapper, source)?;
+    matched_annotated_type_decl(source, wrapper, root, wrapper.end_byte())
+}
+
+fn matched_annotated_type_decl<'tree>(
+    source: &str,
+    wrapper: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'tree>,
+    expected_end: usize,
+) -> Option<tree_sitter::Node<'tree>> {
+    let (name, annotation) = match (
+        recovered_interface_name(wrapper, source),
+        recovered_annotation_class_name(wrapper, source),
+    ) {
+        (Some(name), None) => (name, false),
+        (None, Some(name)) => (name, true),
+        _ => return None,
+    };
     let mut cursor = root.walk();
     let mut declarations = root.named_children(&mut cursor).filter(|candidate| {
         candidate.kind() == "class_declaration"
             && !candidate.has_error()
             && !candidate.is_missing()
             && candidate.start_byte() == wrapper.start_byte()
-            && candidate.end_byte() == wrapper.end_byte()
-            && candidate
-                .children(&mut candidate.walk())
-                .any(|child| child.kind() == "interface")
+            && candidate.end_byte() == expected_end
+            && if annotation {
+                candidate
+                    .named_children(&mut candidate.walk())
+                    .find(|child| child.kind() == "modifiers")
+                    .is_some_and(|modifiers| {
+                        modifiers
+                            .named_children(&mut modifiers.walk())
+                            .any(|modifier| {
+                                modifier.kind() == "class_modifier"
+                                    && modifier.utf8_text(source.as_bytes()).ok()
+                                        == Some("annotation")
+                            })
+                    })
+            } else {
+                candidate
+                    .children(&mut candidate.walk())
+                    .any(|child| child.kind() == "interface")
+            }
             && candidate
                 .child_by_field_name("name")
                 .and_then(|node| node.utf8_text(source.as_bytes()).ok())

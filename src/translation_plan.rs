@@ -823,12 +823,13 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         if !is_ownership_boundary(node, source) {
             continue;
         }
-        let opaque_interface = is_opaque_annotated_interface(node, source);
-        let recovery_tree = opaque_interface
-            .then(|| crate::semantics::recover_annotated_interface_tree(source, node))
+        let opaque_type = is_opaque_annotated_interface(node, source)
+            || crate::semantics::recovered_annotation_class_name_node(node, source).is_some();
+        let recovery_tree = opaque_type
+            .then(|| crate::semantics::recover_annotated_type_tree(source, node))
             .flatten();
         let recovered_node = recovery_tree.as_ref().and_then(|tree| {
-            crate::semantics::recovered_annotated_interface_decl(source, node, tree.root_node())
+            crate::semantics::recovered_annotated_type_decl(source, node, tree.root_node())
         });
         let syntax_node = recovered_node.unwrap_or(node);
         let mut reasons = Vec::new();
@@ -838,9 +839,7 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
                 end_byte: node.end_byte(),
             });
         }
-        if (opaque_interface && recovered_node.is_none())
-            || crate::semantics::recovered_annotation_class_name_node(node, source).is_some()
-        {
+        if opaque_type && recovered_node.is_none() {
             reasons.push(RetentionReason::OpaqueBoundary {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),

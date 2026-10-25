@@ -1626,14 +1626,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         None
                     };
                     let recovered_tree = recovery_name.as_ref().and_then(|_| {
-                        crate::semantics::recover_annotated_interface_tree(
-                            self.source,
-                            original_decl,
-                        )
+                        crate::semantics::recover_annotated_type_tree(self.source, original_decl)
                     });
                     let recovered_decl = recovery_name.as_ref().and_then(|_| {
                         recovered_tree.as_ref().and_then(|tree| {
-                            crate::semantics::recovered_annotated_interface_decl(
+                            crate::semantics::recovered_annotated_type_decl(
                                 self.source,
                                 original_decl,
                                 tree.root_node(),
