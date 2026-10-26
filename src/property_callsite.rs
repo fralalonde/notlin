@@ -7,6 +7,7 @@
 //! types, and ambiguous contracts remain unchanged. A [`SourceIndex`] built
 //! with speculative overlays works the same as a disk-backed index.
 
+use crate::receiver_binding::{Binding, Evidence, Lookup, Resolution, Scope};
 use crate::smart_cast;
 use crate::transpiler::kt;
 use crate::workspace::{Declaration, Member, SourceFile, SourceIndex, SourceLanguage};
@@ -458,7 +459,7 @@ pub(crate) fn private_storage_accesses_supported(
                     .parent()
                     .is_some_and(|parent| parent.kind() == "callable_reference"));
         if bare || navigation || short_template {
-            if !navigation && scoped_binding_at(&context, node, &member.name).is_some() {
+            if !navigation && scoped_binding_at(&context, node, &member.name).is_bound() {
                 pending.extend(node.named_children(&mut node.walk()));
                 continue;
             }
@@ -504,7 +505,7 @@ fn private_storage_access_scope_supported(node: Node<'_>, owner: Node<'_>, sourc
             "lambda_literal" | "callable_reference" | "class_declaration"
             | "object_declaration" | "object_literal" => return false,
             "function_declaration" => {
-                if function_has_extension_receiver(parent) {
+                if crate::receiver_binding::extension_receiver_scope(parent) {
                     return false;
                 }
             }
@@ -534,26 +535,15 @@ fn private_storage_access_scope_supported(node: Node<'_>, owner: Node<'_>, sourc
     false
 }
 
-fn function_has_extension_receiver(function: Node<'_>) -> bool {
-    let Some(name) = function.child_by_field_name("name") else {
-        return true;
-    };
-    function.named_children(&mut function.walk()).any(|child| {
-        child.end_byte() <= name.start_byte()
-            && matches!(
-                child.kind(),
-                "user_type" | "nullable_type" | "function_type" | "parenthesized_type"
-            )
-    })
-}
-
 /// Without resolved lambda/extension receiver facts, a bare name or `this`
 /// may refer to a nearer receiver. Leave Kotlin to resolve those accesses.
 fn has_unknown_implicit_receiver_scope(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
         match parent.kind() {
             "lambda_literal" | "object_literal" => return true,
-            "function_declaration" if function_has_extension_receiver(parent) => return true,
+            "function_declaration" if crate::receiver_binding::extension_receiver_scope(parent) => {
+                return true;
+            }
             "class_declaration" | "object_declaration" => return false,
             _ => {}
         }
@@ -829,7 +819,7 @@ fn rewrite_implicit_this_accesses(
                     .into_iter()
                     .flatten()
                 {
-                    if scoped_binding_at(context, *node, &contract.property).is_some()
+                    if scoped_binding_at(context, *node, &contract.property).is_bound()
                         || has_unknown_implicit_receiver_scope(*node)
                     {
                         continue;
@@ -848,7 +838,7 @@ fn rewrite_implicit_this_accesses(
                         .into_iter()
                         .flatten()
                     {
-                        if scoped_binding_at(context, *assignment, &contract.property).is_some()
+                        if scoped_binding_at(context, *assignment, &contract.property).is_bound()
                             || has_unknown_implicit_receiver_scope(*assignment)
                         {
                             continue;
@@ -983,7 +973,7 @@ fn rewrite_short_string_templates(
     let source = context.source;
     let mut changed = 0;
     for node in string_literals {
-        if scoped_binding_at(context, *node, &contract.property).is_some()
+        if scoped_binding_at(context, *node, &contract.property).is_bound()
             || has_unknown_implicit_receiver_scope(*node)
         {
             continue;
@@ -1151,6 +1141,17 @@ impl<'a> RewriteContext<'a> {
             .into_iter()
             .flatten()
             .copied()
+    }
+}
+
+/// The caller's receiver inference, offered to the shared binding proof.
+struct LambdaReceiverTypes<'a, 'b> {
+    context: &'a RewriteContext<'b>,
+}
+
+impl crate::receiver_binding::ReceiverTypes for LambdaReceiverTypes<'_, '_> {
+    fn lookup(&self, node: Node<'_>) -> Lookup {
+        scoped_binding_at(self.context, node, kt::text(node, self.context.source))
     }
 }
 
@@ -1427,32 +1428,20 @@ fn method_return_type(
         .or_else(|| Some(resolved.to_string()))
 }
 
-fn receiver_type_at(context: &RewriteContext<'_>, node: Node, name: &str) -> Option<String> {
-    match scoped_binding_at(context, node, name) {
-        Some(Some(ty)) => return Some(ty),
-        Some(None) => return None,
-        None => {}
-    }
-    enclosing_member_receiver_type(
-        context.index,
-        context.source_file,
-        context.source,
-        node,
-        name,
-    )
-    .or_else(|| context.bindings.get(name).cloned())
-}
-
-/// `Some(None)` means a nearer untyped declaration shadows the name, so an
-/// outer class property or the file-wide binding table must not be used.
-fn scoped_binding_at(
-    context: &RewriteContext<'_>,
-    node: Node,
-    name: &str,
-) -> Option<Option<String>> {
+/// The one receiver inference: lexical binders, then the enclosing member, then
+/// the file-wide table.
+///
+/// `Unknown` never degrades into a wider hint. An untyped nearer declaration, an
+/// opaque implicit receiver and an open ancestor all stop here, so an outer
+/// class property or a global type hint cannot answer in their place. A typed
+/// lexical local or parameter stays authoritative for a direct receiver read
+/// even across an opaque implicit receiver, but it records
+/// `opaque_receiver`, which is what the stdlib call proof consumes.
+fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -> Lookup {
     let source = context.source;
+    let mut opaque = false;
     let mut current = node;
-    while let Some(parent) = current.parent() {
+    'walk: while let Some(parent) = current.parent() {
         match parent.kind() {
             "block" => {
                 let binding = parent
@@ -1461,10 +1450,16 @@ fn scoped_binding_at(
                     .filter_map(|child| declared_binding_named(child, name, source))
                     .last();
                 if let Some((_, ty)) = binding {
-                    return Some(ty);
+                    return resolved(ty, opaque);
                 }
             }
             "function_declaration" | "secondary_constructor" => {
+                // An extension receiver is an implicit receiver in its own
+                // right: a bare name resolves there before the enclosing class,
+                // so no outer class member or file-wide hint answers for it.
+                if crate::receiver_binding::extension_receiver_scope(parent) {
+                    opaque = true;
+                }
                 if let Some(parameters) = parent.child_by_field_name("parameters").or_else(|| {
                     parent
                         .named_children(&mut parent.walk())
@@ -1472,7 +1467,7 @@ fn scoped_binding_at(
                 }) {
                     for parameter in parameters.named_children(&mut parameters.walk()) {
                         if let Some((_, ty)) = declared_binding_named(parameter, name, source) {
-                            return Some(ty);
+                            return resolved(ty, opaque);
                         }
                     }
                 }
@@ -1481,29 +1476,80 @@ fn scoped_binding_at(
                 if parent.kind() == "setter" {
                     for parameter in parent.named_children(&mut parent.walk()) {
                         if let Some((_, ty)) = declared_binding_named(parameter, name, source) {
-                            return Some(ty);
+                            return resolved(ty, opaque);
                         }
                     }
                 }
             }
             "lambda_literal" => {
+                // A lambda body's statements are direct children of the lambda,
+                // so a local declared before the reference shadows the value the
+                // call binds.
                 let binding = parent
                     .named_children(&mut parent.walk())
                     .filter(|child| child.end_byte() < node.start_byte())
                     .filter_map(|child| declared_binding_named(child, name, source))
                     .last();
                 if let Some((_, ty)) = binding {
-                    return Some(ty);
+                    return resolved(ty, opaque);
                 }
-                for child in parent.named_children(&mut parent.walk()) {
-                    if child.kind() == "lambda_parameters" {
-                        for parameter in child.named_children(&mut child.walk()) {
-                            if let Some((_, ty)) = declared_binding_named(parameter, name, source) {
-                                return Some(ty);
-                            }
+                // The lambda's own binders are the shared proof's answer. A
+                // name it does not bind still depends on how the block treats
+                // bare identifiers, and that answer comes from the same
+                // canonical call proof — not from a list of value-scope names.
+                let input = crate::receiver_binding::binding(
+                    context.index,
+                    context.source_file,
+                    source,
+                    parent,
+                    name,
+                    &LambdaReceiverTypes { context },
+                );
+                match input.binding {
+                    Binding::Unbound => {
+                        if matches!(
+                            crate::receiver_binding::scope(
+                                context.index,
+                                context.source_file,
+                                source,
+                                parent,
+                                &LambdaReceiverTypes { context },
+                            ),
+                            Scope::Opaque
+                        ) {
+                            opaque = true;
                         }
                     }
+                    Binding::Unknown => return Lookup::unknown(opaque),
+                    // A declared lambda parameter type is canonical evidence.
+                    Binding::Bound(ty) => return Lookup::bound(ty, opaque),
+                    Binding::Value(receiver) => {
+                        // The call binds the name, so the value's own binding is
+                        // the only answer, and only canonical evidence carries
+                        // over. A legacy loop or table hint would remint an
+                        // unproved type as proof, so it stays Unknown instead of
+                        // falling through to an outer hint.
+                        let lookup =
+                            scoped_binding_at(context, receiver, kt::text(receiver, source));
+                        let opaque = opaque || lookup.opaque_receiver;
+                        return match lookup.canonical_ty() {
+                            Some(ty) => Lookup::bound(ty.to_string(), opaque).lexical(),
+                            None => Lookup::unknown(opaque).lexical(),
+                        };
+                    }
                 }
+            }
+            // An extension property receiver is the same implicit receiver as
+            // an extension function's.
+            "property_declaration" => {
+                if crate::receiver_binding::extension_receiver_scope(parent) {
+                    opaque = true;
+                }
+            }
+            // An anonymous object installs its own `this`, so no bare name is
+            // closed until a lexical binder or the enclosing declaration answers.
+            "object_literal" | "anonymous_object" => {
+                opaque |= crate::receiver_binding::implicit_receiver(parent);
             }
             "for_statement" => {
                 // The loop variable is not in scope in its own iterable.
@@ -1525,7 +1571,9 @@ fn scoped_binding_at(
                     continue;
                 };
                 if declared == name {
-                    return Some(for_loop_element_type(context, parent));
+                    // The variable's identity is lexical; the element type is
+                    // the legacy sequence-spelling inference, not proof.
+                    return legacy_resolved(for_loop_element_type(context, parent), opaque);
                 }
             }
             "catch_block" => {
@@ -1533,26 +1581,70 @@ fn scoped_binding_at(
                     .named_children(&mut parent.walk())
                     .any(|child| child.kind() == "identifier" && kt::text(child, source) == name)
                 {
-                    return Some(None);
+                    return Lookup::unknown(opaque);
                 }
             }
             "when_expression" if current.kind() != "when_subject" => {
                 if let Some(subject) = kt::child(parent, "when_subject") {
                     for child in subject.named_children(&mut subject.walk()) {
                         if declared_binding_named(child, name, source).is_some() {
-                            return Some(None);
+                            return Lookup::unknown(opaque);
                         }
                     }
                 }
             }
             "class_declaration" | "object_declaration" => {
-                return primary_initializer_binding(parent, node, name, source);
+                if let Some(ty) = primary_initializer_binding(parent, node, name, source) {
+                    return resolved(ty, opaque);
+                }
+                // Everything above this boundary is the enclosing member's own
+                // scope; resolve it once, outside the lexical walk.
+                break 'walk;
             }
             _ => {}
         }
         current = parent;
     }
-    None
+    if opaque {
+        return Lookup::opaque_unknown();
+    }
+    match enclosing_member_resolution(context, node, name) {
+        // A declared or inherited member answered: canonical evidence, carried
+        // through rather than reminted from the type string.
+        resolution @ Resolution::Bound { .. } => Lookup::implicit(resolution),
+        Resolution::Unknown => Lookup::implicit(Resolution::Unknown),
+        // The file-wide table is the legacy hint: an unrelated declaration's
+        // constructor may own this name here, so its type is preserved for a
+        // direct read but never proves a binding or a lambda input.
+        Resolution::Unbound => context
+            .bindings
+            .get(name)
+            .map_or_else(Lookup::unbound, |ty| Lookup::implicit_legacy(ty.clone())),
+    }
+}
+
+/// A nearer declaration answered: `Bound` when it declares a type, `Unknown`
+/// when it declares the name without one.
+fn resolved(ty: Option<String>, opaque: bool) -> Lookup {
+    match ty {
+        Some(ty) => Lookup::bound(ty, opaque),
+        None => Lookup::unknown(opaque),
+    }
+}
+
+/// The legacy inference answered rather than a declaration: `is_bound()` still
+/// holds for the binder, but the type is not canonical evidence.
+fn legacy_resolved(ty: Option<String>, opaque: bool) -> Lookup {
+    match ty {
+        Some(ty) => Lookup::legacy_bound(ty, opaque),
+        None => Lookup::unknown(opaque),
+    }
+}
+
+fn receiver_type_at(context: &RewriteContext<'_>, node: Node, name: &str) -> Option<String> {
+    scoped_binding_at(context, node, name)
+        .ty()
+        .map(str::to_owned)
 }
 
 fn primary_initializer_binding(
@@ -1906,37 +1998,58 @@ fn enclosing_declaration_type(
     )
 }
 
-/// Resolve a receiver that is an implicit-this property of the containing
-/// declaration. Only an explicit property type is useful here; inferred types
-/// and ambiguous/shadowed simple names remain unchanged.
-fn enclosing_member_receiver_type(
-    index: &SourceIndex,
-    source_file: &SourceFile,
-    source: &str,
-    node: Node,
-    receiver: &str,
-) -> Option<String> {
-    let mut current = Some(node);
-    let enclosing = loop {
-        let candidate = current?;
-        if matches!(
-            candidate.kind(),
-            "class_declaration" | "enum_class_declaration" | "object_declaration"
-        ) {
-            break candidate;
-        }
-        current = candidate.parent();
-    };
-    let name = enclosing.child_by_field_name("name")?;
-    let name = kt::text(name, source);
-    let mut declarations = source_file
+/// Resolve a name that is an implicit-this property of the containing
+/// declaration.
+///
+/// A direct member of the enclosing declaration owns the name and its declared
+/// type, so no inherited candidate can dominate it. An inherited answer needs
+/// the whole traversed hierarchy to be closed: a supertype outside the index
+/// (other than a canonical methodless JVM marker) can own the name, so the
+/// result is `Unknown` rather than an absence. `Unbound` means the name is not
+/// a member at all and only a file-wide binding could still own it.
+fn class_declaration_named<'a>(
+    context: &'a RewriteContext<'_>,
+    class: Node<'_>,
+) -> Option<&'a Declaration> {
+    let name = kt::text(class.child_by_field_name("name")?, context.source);
+    let mut declarations = context
+        .source_file
         .declarations
         .iter()
         .filter(|declaration| declaration.name == name);
     let declaration = declarations.next()?;
-    if declarations.next().is_some() {
-        return None;
+    declarations.next().is_none().then_some(declaration)
+}
+
+fn enclosing_member_resolution(
+    context: &RewriteContext<'_>,
+    node: Node<'_>,
+    receiver: &str,
+) -> Resolution {
+    let index = context.index;
+    let source_file = context.source_file;
+    // No enclosing declaration at all: only a file-wide binding is left. An
+    // enclosing class that the file declaration list cannot identify (an inner
+    // or local class) is not the same thing: its own members, including ones
+    // inherited from a compiled ancestor, are unknown, never absent.
+    let mut current = Some(node);
+    let mut enclosing = None;
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "class_declaration" | "enum_class_declaration" | "object_declaration"
+        ) {
+            enclosing = Some(candidate);
+            break;
+        }
+        current = candidate.parent();
     }
+    let Some(enclosing) = enclosing else {
+        return Resolution::Unbound;
+    };
+    let Some(declaration) = class_declaration_named(context, enclosing) else {
+        return Resolution::Unknown;
+    };
 
     let direct_members = declaration
         .members
@@ -1950,16 +2063,20 @@ fn enclosing_member_receiver_type(
     if !direct_members.is_empty() {
         let mut resolved_type = None::<(&Declaration, String)>;
         for member in direct_members {
-            let ty = member.type_name.as_deref()?;
+            let Some(ty) = member.type_name.as_deref() else {
+                return Resolution::Unknown;
+            };
             let context = index
                 .declaration_source_file(declaration)
                 .unwrap_or(source_file);
-            let resolved = index.resolve_type(context, ty)?;
+            let Some(resolved) = index.resolve_type(context, ty) else {
+                return Resolution::Unknown;
+            };
             if resolved_type
                 .as_ref()
                 .is_some_and(|(prior, _)| !std::ptr::eq(*prior, resolved))
             {
-                return None;
+                return Resolution::Unknown;
             }
             let qualified = resolved
                 .package
@@ -1968,12 +2085,16 @@ fn enclosing_member_receiver_type(
                 .unwrap_or_else(|| resolved.name.clone());
             resolved_type.get_or_insert((resolved, qualified));
         }
-        return resolved_type.map(|(_, ty)| ty);
+        return resolved_type.map_or(Resolution::Unknown, |(_, ty)| Resolution::Bound {
+            ty,
+            evidence: Evidence::Canonical,
+        });
     }
 
     let mut pending = vec![declaration];
     let mut visited = HashSet::new();
     let mut inherited_types = Vec::new();
+    let mut open = false;
     while let Some(current) = pending.pop() {
         if !visited.insert(current as *const Declaration as usize) {
             continue;
@@ -1983,11 +2104,15 @@ fn enclosing_member_receiver_type(
                 && member.name == receiver
                 && !member.is_static
         }) {
-            let ty = member.type_name.as_deref()?;
+            let Some(ty) = member.type_name.as_deref() else {
+                return Resolution::Unknown;
+            };
             let context = index
                 .declaration_source_file(current)
                 .unwrap_or(source_file);
-            let resolved = index.resolve_type(context, ty)?;
+            let Some(resolved) = index.resolve_type(context, ty) else {
+                return Resolution::Unknown;
+            };
             let qualified = resolved
                 .package
                 .as_deref()
@@ -1998,19 +2123,35 @@ fn enclosing_member_receiver_type(
         let context = index
             .declaration_source_file(current)
             .unwrap_or(source_file);
-        pending.extend(
-            current
-                .supertypes
-                .iter()
-                .filter_map(|supertype| index.resolve_type(context, supertype)),
-        );
+        for supertype in &current.supertypes {
+            match index.resolve_type(context, supertype) {
+                Some(resolved) => pending.push(resolved),
+                // Not an ancestor without members: only the canonical
+                // methodless markers close a branch.
+                None if index.canonical_methodless_external_marker(context, supertype) => {}
+                None => open = true,
+            }
+        }
     }
-    let first = inherited_types.first()?;
+    let Some(first) = inherited_types.first() else {
+        return if open {
+            Resolution::Unknown
+        } else {
+            Resolution::Unbound
+        };
+    };
+    if open {
+        // A dropped unknown ancestor could own the name with another type.
+        return Resolution::Unknown;
+    }
     if inherited_types
         .iter()
         .all(|candidate| std::ptr::eq(candidate.0, first.0))
     {
-        return Some(first.1.clone());
+        return Resolution::Bound {
+            ty: first.1.clone(),
+            evidence: Evidence::Canonical,
+        };
     }
     // Read-only properties may refine their inherited return type. Require
     // an indexed subtype of every competing type, rather than relying on
@@ -2019,17 +2160,24 @@ fn enclosing_member_receiver_type(
         .iter()
         .any(|candidate| candidate.2 || candidate.3)
     {
-        return None;
+        return Resolution::Unknown;
     }
     let mut most_specific = inherited_types.iter().filter(|candidate| {
         inherited_types
             .iter()
             .all(|other| inherits_exactly(index, source_file, candidate.0, other.0))
     });
-    let selected = most_specific.next()?;
-    most_specific
-        .all(|other| std::ptr::eq(other.0, selected.0))
-        .then(|| selected.1.clone())
+    let Some(selected) = most_specific.next() else {
+        return Resolution::Unknown;
+    };
+    if most_specific.all(|other| std::ptr::eq(other.0, selected.0)) {
+        Resolution::Bound {
+            ty: selected.1.clone(),
+            evidence: Evidence::Canonical,
+        }
+    } else {
+        Resolution::Unknown
+    }
 }
 
 fn inherits_exactly(

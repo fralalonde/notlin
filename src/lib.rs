@@ -22,6 +22,7 @@ pub mod paths;
 pub mod planning;
 pub mod property_abi;
 pub mod property_callsite;
+mod receiver_binding;
 pub mod retention_docs;
 pub mod semantics;
 pub mod smart_cast;

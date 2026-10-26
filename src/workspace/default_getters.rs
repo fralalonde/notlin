@@ -1217,6 +1217,47 @@ fn imported_marker_alias(index: &SourceIndex, file: &SourceFile, base: &str) -> 
 }
 
 impl SourceIndex {
+    /// Proves a supertype spelling denotes one of the canonical JVM marker
+    /// interfaces that declare no methods at all, so an ancestor outside the
+    /// workspace index cannot own a callable member name.
+    ///
+    /// Only the methodless markers qualify. `Comparable` is deliberately
+    /// excluded even though `known_external_without_getters` accepts it: it
+    /// declares `compareTo`, so "no getter" is not "no members", and an
+    /// unresolved `Comparable` ancestor is not a closed hierarchy. The spelling
+    /// still goes through the shared canonical identity resolver, so aliases,
+    /// source collisions and duplicate imports stay unproved.
+    pub(crate) fn canonical_methodless_external_marker(
+        &self,
+        file: &SourceFile,
+        type_name: &str,
+    ) -> bool {
+        let source_type = type_name.trim().trim_end_matches("()").trim();
+        let (base, arguments) = super::split_generic(source_type);
+        // The markers take no type arguments: a parameterised spelling is a
+        // different contract and stays unknown.
+        if arguments.is_some() {
+            return false;
+        }
+        let marker_name = matches!(
+            base.rsplit('.').next().map(|name| name.trim_matches('`')),
+            Some("Serializable" | "Cloneable" | "RandomAccess")
+        );
+        let imported_alias = imported_marker_alias(self, file, base);
+        if !marker_name && imported_alias.is_none() {
+            return false;
+        }
+        let identity = super::canonical_getter_named_identity(self, file, base).or(imported_alias);
+        matches!(
+            identity.as_deref(),
+            Some(
+                "external:java.io.Serializable"
+                    | "external:java.lang.Cloneable"
+                    | "external:java.util.RandomAccess"
+            )
+        )
+    }
+
     pub(crate) fn inferred_simple_property_type(
         &self,
         owner: &Declaration,
@@ -3114,6 +3155,64 @@ mod tests {
             assert!(
                 !known_external_without_getters(&index, file, "PlatformComparable<String>"),
                 "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn methodless_marker_proof_excludes_comparable_and_unproved_bindings() {
+        for (source, type_name, expected) in [
+            (
+                "package sample\nimport java.io.Serializable\ninterface Model : Serializable",
+                "Serializable",
+                true,
+            ),
+            (
+                "package sample\nimport java.lang.Cloneable as PlatformCloneable\ninterface Model : PlatformCloneable",
+                "PlatformCloneable",
+                true,
+            ),
+            (
+                "package sample\ninterface Model : java.util.RandomAccess",
+                "java.util.RandomAccess",
+                true,
+            ),
+            // `Comparable` declares `compareTo`: no getter is not no members.
+            (
+                "package sample\nimport java.lang.Comparable as PlatformComparable\ninterface Model : PlatformComparable",
+                "PlatformComparable",
+                false,
+            ),
+            (
+                "package sample\ninterface Model : Comparable<String>",
+                "Comparable<String>",
+                false,
+            ),
+            // A source classifier of the same name shadows the JDK marker.
+            (
+                "package sample\nimport java.lang.Comparable as PlatformComparable\ninterface PlatformComparable<T> {}",
+                "PlatformComparable",
+                false,
+            ),
+            (
+                "package java.lang\nimport java.lang.Cloneable as PlatformCloneable\ninterface Cloneable {}",
+                "PlatformCloneable",
+                false,
+            ),
+            // Two bindings are ambiguous, exactly like Kotlin's own conflict.
+            (
+                "package sample\nimport java.lang.Cloneable as PlatformCloneable\nimport external.contract.Cloneable as PlatformCloneable",
+                "PlatformCloneable",
+                false,
+            ),
+            ("package sample\n", "Serializable", false),
+        ] {
+            let (_root, path, index) = index_for(source);
+            let file = index.source_file(&path).expect("indexed test source");
+            assert_eq!(
+                index.canonical_methodless_external_marker(file, type_name),
+                expected,
+                "{source} / {type_name}"
             );
         }
     }

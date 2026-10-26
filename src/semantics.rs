@@ -23,7 +23,7 @@ mod generated_getter_tests;
 mod inherited_calls;
 mod inherited_properties;
 mod jackson_defaults;
-mod java_member_calls;
+pub(crate) mod java_member_calls;
 mod java_property_reads;
 mod lowering_contract;
 mod object_calls;
