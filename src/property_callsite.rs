@@ -1447,10 +1447,12 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
                 let binding = parent
                     .named_children(&mut parent.walk())
                     .filter(|child| child.end_byte() < node.start_byte())
-                    .filter_map(|child| declared_binding_named(child, name, source))
+                    .filter_map(|child| {
+                        declared_binding_named(child, name, source).map(|(_, ty)| (child, ty))
+                    })
                     .last();
-                if let Some((_, ty)) = binding {
-                    return resolved(ty, opaque);
+                if let Some((declaration, ty)) = binding {
+                    return resolved(context, declaration, ty, opaque);
                 }
             }
             "function_declaration" | "secondary_constructor" => {
@@ -1467,7 +1469,7 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
                 }) {
                     for parameter in parameters.named_children(&mut parameters.walk()) {
                         if let Some((_, ty)) = declared_binding_named(parameter, name, source) {
-                            return resolved(ty, opaque);
+                            return resolved(context, parameter, ty, opaque);
                         }
                     }
                 }
@@ -1476,7 +1478,7 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
                 if parent.kind() == "setter" {
                     for parameter in parent.named_children(&mut parent.walk()) {
                         if let Some((_, ty)) = declared_binding_named(parameter, name, source) {
-                            return resolved(ty, opaque);
+                            return resolved(context, parameter, ty, opaque);
                         }
                     }
                 }
@@ -1488,10 +1490,12 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
                 let binding = parent
                     .named_children(&mut parent.walk())
                     .filter(|child| child.end_byte() < node.start_byte())
-                    .filter_map(|child| declared_binding_named(child, name, source))
+                    .filter_map(|child| {
+                        declared_binding_named(child, name, source).map(|(_, ty)| (child, ty))
+                    })
                     .last();
-                if let Some((_, ty)) = binding {
-                    return resolved(ty, opaque);
+                if let Some((declaration, ty)) = binding {
+                    return resolved(context, declaration, ty, opaque);
                 }
                 // The lambda's own binders are the shared proof's answer. A
                 // name it does not bind still depends on how the block treats
@@ -1521,8 +1525,12 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
                         }
                     }
                     Binding::Unknown => return Lookup::unknown(opaque),
-                    // A declared lambda parameter type is canonical evidence.
-                    Binding::Bound(ty) => return Lookup::bound(ty, opaque),
+                    // A declared lambda parameter type is canonical evidence
+                    // only when this file provably binds the name; the proof
+                    // must not be reminted from the spelling by a wider lookup.
+                    Binding::Bound(ty) => {
+                        return declared_type_evidence(context, ty, opaque);
+                    }
                     Binding::Value(receiver) => {
                         // The call binds the name, so the value's own binding is
                         // the only answer, and only canonical evidence carries
@@ -1595,7 +1603,7 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
             }
             "class_declaration" | "object_declaration" => {
                 if let Some(ty) = primary_initializer_binding(parent, node, name, source) {
-                    return resolved(ty, opaque);
+                    return resolved(context, parent, ty, opaque);
                 }
                 // Everything above this boundary is the enclosing member's own
                 // scope; resolve it once, outside the lexical walk.
@@ -1625,9 +1633,34 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
 
 /// A nearer declaration answered: `Bound` when it declares a type, `Unknown`
 /// when it declares the name without one.
-fn resolved(ty: Option<String>, opaque: bool) -> Lookup {
+fn resolved(
+    context: &RewriteContext<'_>,
+    origin: Node<'_>,
+    ty: Option<String>,
+    opaque: bool,
+) -> Lookup {
     match ty {
-        Some(ty) => Lookup::bound(ty, opaque),
+        Some(ty)
+            if crate::receiver_binding::file_scoped_type_reference(origin, &ty, context.source) =>
+        {
+            declared_type_evidence(context, ty, opaque)
+        }
+        Some(ty) => Lookup::legacy_bound(ty, opaque),
+        None => Lookup::unknown(opaque),
+    }
+}
+
+/// Canonical evidence for a declared type spelling: the file must provably bind
+/// the name. A spelling whose only candidate is a classifier in another package
+/// (`Int` against a phantom `phantom.Int`) or an unresolved alias has no
+/// identity here, so the value's type stays `Unknown` rather than being reminted
+/// from the string by the index's convenience fallback.
+fn declared_type_evidence(context: &RewriteContext<'_>, ty: String, opaque: bool) -> Lookup {
+    // Carry the selected classifier's qualified spelling, not the written
+    // spelling: an import alias may denote a different declaration than a
+    // same-named classifier that a later convenience lookup would find.
+    match crate::workspace::canonical_type_binding(context.index, context.source_file, &ty) {
+        Some(binding) => Lookup::bound(binding.qualified, opaque),
         None => Lookup::unknown(opaque),
     }
 }
@@ -1711,9 +1744,12 @@ fn declared_binding(node: Node, source: &str) -> Option<(String, Option<String>)
         match child.kind() {
             "identifier" if name.is_none() => name = Some(kt::text(child, source).to_string()),
             "user_type" | "nullable_type" if ty.is_none() => {
-                let simple = crate::smart_cast::simple_type(kt::text(child, source));
-                if !simple.is_empty() {
-                    ty = Some(simple);
+                let declared = kt::text(child, source)
+                    .trim()
+                    .trim_end_matches('?')
+                    .to_string();
+                if !declared.is_empty() {
+                    ty = Some(declared);
                 }
             }
             _ => {}
@@ -2066,10 +2102,20 @@ fn enclosing_member_resolution(
             let Some(ty) = member.type_name.as_deref() else {
                 return Resolution::Unknown;
             };
+            if !crate::receiver_binding::file_scoped_member_type(index, declaration, ty) {
+                return Resolution::Bound {
+                    ty: ty.to_owned(),
+                    evidence: Evidence::Legacy,
+                };
+            }
             let context = index
                 .declaration_source_file(declaration)
                 .unwrap_or(source_file);
-            let Some(resolved) = index.resolve_type(context, ty) else {
+            // A member's declared type is canonical evidence only when this
+            // file provably binds the spelling; the index's unique-simple-name
+            // global fallback would name a classifier from an unrelated package.
+            let Some(resolved) = crate::workspace::proven_type_declaration(index, context, ty)
+            else {
                 return Resolution::Unknown;
             };
             if resolved_type
@@ -2107,10 +2153,17 @@ fn enclosing_member_resolution(
             let Some(ty) = member.type_name.as_deref() else {
                 return Resolution::Unknown;
             };
+            if !crate::receiver_binding::file_scoped_member_type(index, current, ty) {
+                return Resolution::Bound {
+                    ty: ty.to_owned(),
+                    evidence: Evidence::Legacy,
+                };
+            }
             let context = index
                 .declaration_source_file(current)
                 .unwrap_or(source_file);
-            let Some(resolved) = index.resolve_type(context, ty) else {
+            let Some(resolved) = crate::workspace::proven_type_declaration(index, context, ty)
+            else {
                 return Resolution::Unknown;
             };
             let qualified = resolved

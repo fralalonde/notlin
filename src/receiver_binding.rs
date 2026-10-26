@@ -191,6 +191,110 @@ impl Lookup {
     }
 }
 
+/// Whether a declared type reference can be resolved in the file namespace.
+/// Lexical type parameters and local/nested classifiers bind before that
+/// namespace; a same-named indexed classifier is not their meaning. Bounds are
+/// deliberately not guessed here. The caller must still resolve the nominal
+/// candidate through the index before using it as receiver evidence.
+pub(crate) fn file_scoped_type_reference(origin: Node<'_>, ty: &str, source: &str) -> bool {
+    let head = ty
+        .trim()
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('?');
+    let root = head.split('.').next().unwrap_or("").trim_matches('`');
+    if root.is_empty() {
+        return false;
+    }
+    let mut current = Some(origin);
+    while let Some(scope) = current {
+        if let Some(parameters) = kt::child(scope, "type_parameters") {
+            for parameter in parameters.named_children(&mut parameters.walk()) {
+                if parameter.kind() != "type_parameter" {
+                    continue;
+                }
+                let Some(name) = parameter.child_by_field_name("name").or_else(|| {
+                    parameter
+                        .named_children(&mut parameter.walk())
+                        .find(|child| child.kind() == "identifier")
+                }) else {
+                    return false;
+                };
+                if kt::text(name, source).trim_matches('`') == root {
+                    return false;
+                }
+            }
+        }
+        if matches!(scope.kind(), "block" | "lambda_literal" | "class_body") {
+            for declaration in scope.named_children(&mut scope.walk()) {
+                if !matches!(
+                    declaration.kind(),
+                    "class_declaration" | "object_declaration" | "type_alias"
+                ) {
+                    continue;
+                }
+                if scope.kind() != "class_body" && declaration.start_byte() >= origin.start_byte() {
+                    continue;
+                }
+                if declaration
+                    .child_by_field_name("name")
+                    .is_some_and(|name| kt::text(name, source).trim_matches('`') == root)
+                {
+                    return false;
+                }
+            }
+        }
+        current = scope.parent();
+    }
+    true
+}
+
+/// Indexed member types are resolved in their declaring owner's lexical type
+/// scope, never in a consumer method's scope or a same-named file classifier.
+///
+/// `Declaration.type_params` only carries the owner's OWN parameters, so a
+/// member typed by an enclosing class's parameter (an `inner class`) or by the
+/// enclosing generic function's parameter (a local class) would otherwise pass
+/// and its spelling would bind to whatever classifier carries that name. The
+/// owner's exact syntax node is recovered from the indexed source text — the
+/// same speculative overlay the index holds, never disk — and its full ancestor
+/// chain decides. A missing source file, an ambiguous duplicate declaration
+/// name, or a node that cannot be matched to the owner's cached symbol is not a
+/// proof: the answer is `false`, so the caller emits no canonical evidence.
+pub(crate) fn file_scoped_member_type(index: &SourceIndex, owner: &Declaration, ty: &str) -> bool {
+    let Some(file) = index.declaration_source_file(owner) else {
+        return false;
+    };
+    let source = file.source_text();
+    let symbol = crate::semantics::workspace_symbol(index, owner);
+    if symbol.kind.starts_with("ambiguous:") || symbol.name.starts_with('<') {
+        return false;
+    }
+    let expected = symbol.stable_key();
+    let tree = crate::transpiler::parse_tree(source);
+    let mut declaring = None;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if crate::semantics::declaration_node_kind(node.kind())
+            && crate::semantics::symbol_id_for_node(source, node, &file.path).stable_key()
+                == expected
+        {
+            // A second node with the owner's exact identity means the source
+            // does not say which declaration this member belongs to.
+            if declaring.is_some() {
+                return false;
+            }
+            declaring = Some(node);
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    let Some(declaring) = declaring else {
+        return false;
+    };
+    file_scoped_type_reference(declaring, ty, source)
+}
+
 /// The caller's canonical receiver inference, reused by every proof here.
 pub(crate) trait ReceiverTypes {
     fn lookup(&self, node: Node<'_>) -> Lookup;
@@ -287,10 +391,18 @@ pub(crate) fn binding<'t>(
         return unknown;
     }
     match matched {
-        ParameterType::Typed(ty) => LambdaInput {
-            span,
-            binding: Binding::Bound(ty),
-        },
+        ParameterType::Typed(ty) if file_scoped_type_reference(lambda, &ty, source) => {
+            // A written declared type is canonical only through the same
+            // import-aware binding consumers use; carry its qualified class.
+            match crate::workspace::canonical_type_binding(index, file, &ty) {
+                Some(binding) => LambdaInput {
+                    span,
+                    binding: Binding::Bound(binding.qualified),
+                },
+                None => unknown,
+            }
+        }
+        ParameterType::Typed(_) => unknown,
         ParameterType::Nullable => unknown,
         ParameterType::Untyped => match value_binding(index, file, source, lambda, receiver_type) {
             Some(receiver) => LambdaInput {
@@ -391,9 +503,9 @@ fn parameter_binding(node: Node<'_>, source: &str) -> Option<(String, ParameterT
                 name = Some(kt::text(child, source).trim_matches('`').to_string());
             }
             "user_type" if ty.is_none() => {
-                let simple = crate::smart_cast::simple_type(kt::text(child, source));
-                if !simple.is_empty() {
-                    ty = Some(simple);
+                let declared = kt::text(child, source).trim().to_string();
+                if !declared.is_empty() {
+                    ty = Some(declared);
                 }
             }
             "nullable_type" => nullable = true,

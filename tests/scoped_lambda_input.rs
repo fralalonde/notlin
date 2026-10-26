@@ -86,6 +86,236 @@ fn c4() -> Vec<(&'static str, &'static str)> {
         .collect::<Vec<_>>()
 }
 
+#[test]
+fn generic_parameter_is_not_a_same_named_workspace_classifier() {
+    let scratch = Scratch::new("generic-type-binding");
+    let mut files = c4();
+    files[5] = (
+        "Relay.kt",
+        "package bridgeprobe\nclass Relay(val source: Other) : Keyed {\n override val key: Key get() = probe(source)\n private fun <T : Other> probe(value: T): Key = value.let { it.key }\n suspend fun stay() {}\n}\n",
+    );
+    files.extend([
+        ("Other.java", "package bridgeprobe; public final class Other {public final Key key; public Other(Key key){this.key=key;} }\n"),
+        ("Nominal.kt", "package bridgeprobe\nabstract class T : DerivedInfo\n"),
+    ]);
+    let root = scratch.write("work", &files);
+    let migrated = migrate(&root);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    assert!(root.join("Keyed.java").exists());
+    assert!(read(&root, "DerivedInfo.kt").contains("fun getKey("));
+    let relay = read(&root, "Relay.kt");
+    assert!(
+        relay.contains("value.let { it.key }"),
+        "a type parameter must not select the nominal T: {relay}"
+    );
+    assert!(!relay.contains("it.getKey()"), "{relay}");
+}
+
+#[test]
+fn imported_alias_shadows_same_package_classifier() {
+    let scratch = Scratch::new("import-alias-type-binding");
+    let mut files = c4();
+    files[5] = (
+        "Relay.kt",
+        "package bridgeprobe\nimport bridgeprobe.Other as T\nclass Relay(val source: bridgeprobe.Other) : Keyed {\n override val key: Key get() = probe(source)\n private fun probe(value: T): Key = value.let { it.key }\n suspend fun stay() {}\n}\n",
+    );
+    files.extend([
+        ("Other.java", "package bridgeprobe; public final class Other {public final Key key; public Other(Key key){this.key=key;} }\n"),
+        ("Nominal.kt", "package bridgeprobe\nabstract class T : DerivedInfo\n"),
+    ]);
+    let root = scratch.write("work", &files);
+    let migrated = migrate(&root);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    assert!(root.join("Keyed.java").exists());
+    let relay = read(&root, "Relay.kt");
+    assert!(
+        relay.contains("value.let { it.key }"),
+        "an imported alias must not select the package classifier: {relay}"
+    );
+    assert!(!relay.contains("it.getKey()"), "{relay}");
+}
+
+#[test]
+fn tab_after_import_keyword_preserves_type_binding() {
+    let scratch = Scratch::new("import-tab-type-binding");
+    let mut files = c4();
+    files[5] = (
+        "Relay.kt",
+        "package bridgeprobe\nimport\tbridgeprobe.Other as T\nclass Relay(val source: bridgeprobe.Other) : Keyed {\n override val key: Key get() = probe(source)\n private fun probe(value: T): Key = value.let { it.key }\n suspend fun stay() {}\n}\n",
+    );
+    files.extend([
+        ("Other.java", "package bridgeprobe; public final class Other {public final Key key; public Other(Key key){this.key=key;} }\n"),
+        ("Nominal.kt", "package bridgeprobe\nabstract class T : DerivedInfo\n"),
+    ]);
+    let root = scratch.write("work", &files);
+    let migrated = migrate(&root);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    assert!(root.join("Keyed.java").exists());
+    let relay = read(&root, "Relay.kt");
+    assert!(
+        relay.contains("value.let { it.key }"),
+        "an imported alias must not select the package classifier: {relay}"
+    );
+    assert!(!relay.contains("it.getKey()"), "{relay}");
+}
+
+#[test]
+fn member_type_uses_its_generic_declaration_scope() {
+    let scratch = Scratch::new("generic-member-type-binding");
+    let mut files = c4();
+    files[5] = (
+        "Relay.kt",
+        "package bridgeprobe\nclass Relay<T : Other>(val value: T) : Keyed {\n override val key: Key get() = value.let { it.key }\n suspend fun stay() {}\n}\n",
+    );
+    files.extend([
+        ("Other.java", "package bridgeprobe; public final class Other {public final Key key; public Other(Key key){this.key=key;} }\n"),
+        ("Nominal.kt", "package bridgeprobe\nabstract class T : DerivedInfo\n"),
+    ]);
+    let root = scratch.write("work", &files);
+    let migrated = migrate(&root);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    assert!(root.join("Keyed.java").exists());
+    let relay = read(&root, "Relay.kt");
+    assert!(
+        relay.contains("value.let { it.key }"),
+        "a member's T is its owner's parameter, not a nominal class: {relay}"
+    );
+    assert!(!relay.contains("it.getKey()"), "{relay}");
+}
+
+#[test]
+fn qualified_member_type_is_independent_of_consumer_type_parameters() {
+    let scratch = Scratch::new("nominal-member-declaration-scope");
+    let mut files = c4();
+    files[5] = (
+        "Relay.kt",
+        "package bridgeprobe\nclass Relay(val value: bridgeprobe.T) : Keyed {\n override val key: Key get() = read<Other>()\n private fun <T : Other> read(): Key = value.let { it.key }\n suspend fun stay() {}\n}\n",
+    );
+    files.extend([
+        ("Other.java", "package bridgeprobe; public final class Other {public final Key key; public Other(Key key){this.key=key;} }\n"),
+        ("Nominal.kt", "package bridgeprobe\nabstract class T : DerivedInfo\n"),
+    ]);
+    let root = scratch.write("work", &files);
+    let migrated = migrate(&root);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    assert!(root.join("Keyed.java").exists());
+    let relay = read(&root, "Relay.kt");
+    assert!(
+        relay.contains("value.let { it.getKey() }"),
+        "the member's qualified nominal T is independent of method T: {relay}"
+    );
+}
+
+#[test]
+fn inner_class_member_type_uses_the_outer_class_scope() {
+    let scratch = Scratch::new("inner-class-member-binding");
+    let mut files = c4();
+    files[5] = (
+        "Relay.kt",
+        "package bridgeprobe\nclass Outer<T : Other> {\n inner class Inner(val value: T) {\n  fun read(): Key = value.let { it.key }\n  suspend fun keep() {}\n }\n suspend fun keep() {}\n}\n",
+    );
+    files.extend([
+        ("Other.java", "package bridgeprobe; public final class Other {public final Key key; public Other(Key key){this.key=key;} }\n"),
+        ("Nominal.kt", "package bridgeprobe\nabstract class T : DerivedInfo\n"),
+    ]);
+    let root = scratch.write("work", &files);
+    let migrated = migrate(&root);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    assert!(root.join("Keyed.java").exists());
+    let relay = read(&root, "Relay.kt");
+    assert!(
+        relay.contains("value.let { it.key }"),
+        "an inner member's T is its OUTER class's parameter, not a nominal class: {relay}"
+    );
+    assert!(!relay.contains("it.getKey()"), "{relay}");
+}
+
+#[test]
+fn local_class_member_type_uses_the_enclosing_function_scope() {
+    let scratch = Scratch::new("local-class-member-binding");
+    let mut files = c4();
+    files[5] = (
+        "Relay.kt",
+        "package bridgeprobe\nclass Relay(val seed: Other) : Keyed {\n override val key: Key get() = probe(seed)\n suspend fun keep() {}\n}\nfun <T : Other> probe(value: T): Key {\n class Local(val source: T) {\n  fun read(): Key = source.let { it.key }\n  suspend fun keep() {}\n }\n return Local(value).read()\n}\n",
+    );
+    files.extend([
+        ("Other.java", "package bridgeprobe; public final class Other {public final Key key; public Other(Key key){this.key=key;} }\n"),
+        ("Nominal.kt", "package bridgeprobe\nabstract class T : DerivedInfo\n"),
+    ]);
+    let root = scratch.write("work", &files);
+    let migrated = migrate(&root);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    assert!(root.join("Keyed.java").exists());
+    let relay = read(&root, "Relay.kt");
+    assert!(
+        relay.contains("source.let { it.key }"),
+        "a local class member's T is the enclosing function's parameter: {relay}"
+    );
+    assert!(!relay.contains("it.getKey()"), "{relay}");
+}
+
+#[test]
+fn unimported_same_named_nominal_does_not_capture_a_builtin_receiver() {
+    let scratch = Scratch::new("unimported-nominal-builtin");
+    let mut files = c4();
+    files[5] = (
+        "Relay.kt",
+        "package bridgeprobe\nclass Relay(val source: Int) : Keyed {\n override val key: Key get() = probe(source)\n private fun probe(value: Int): Key = value.let { it.key }\n suspend fun keep() {}\n}\n",
+    );
+    files.extend([
+        (
+            "Extensions.kt",
+            "package bridgeprobe\nval Int.key: Key get() = Key(\"alternate\")\n",
+        ),
+        (
+            "Phantom.kt",
+            "package phantom\nabstract class Int : bridgeprobe.DerivedInfo\n",
+        ),
+    ]);
+    let root = scratch.write("work", &files);
+    let migrated = migrate(&root);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    assert!(root.join("Keyed.java").exists());
+    let relay = read(&root, "Relay.kt");
+    assert!(
+        relay.contains("value.let { it.key }"),
+        "a non-imported phantom Int is not the receiver's type: {relay}"
+    );
+    assert!(!relay.contains("it.getKey()"), "{relay}");
+}
+
 fn migrate(root: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_notlin"))
         .args(["--root", root.to_str().unwrap(), "--in-place", "--lombok"])
@@ -117,6 +347,40 @@ fn snapshot(root: &Path) -> Vec<(String, String)> {
 /// getter on that branch while `Info`/`DerivedInfo` stay Kotlin and carry the
 /// promoted `fun getKey()`. The retained consumer must call that method through
 /// the value `let` binds to `it`.
+#[test]
+fn commented_import_does_not_bind_a_classifier() {
+    let scratch = Scratch::new("unimported-nominal-builtin");
+    let mut files = c4();
+    files[5] = (
+        "Relay.kt",
+        "package bridgeprobe\n/*\nimport phantom.Int\n*/\nclass Relay(val source: Int) : Keyed {\n override val key: Key get() = probe(source)\n private fun probe(value: Int): Key = value.let { it.key }\n suspend fun keep() {}\n}\n",
+    );
+    files.extend([
+        (
+            "Extensions.kt",
+            "package bridgeprobe\nval Int.key: Key get() = Key(\"alternate\")\n",
+        ),
+        (
+            "Phantom.kt",
+            "package phantom\nabstract class Int : bridgeprobe.DerivedInfo\n",
+        ),
+    ]);
+    let root = scratch.write("work", &files);
+    let migrated = migrate(&root);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    assert!(root.join("Keyed.java").exists());
+    let relay = read(&root, "Relay.kt");
+    assert!(
+        relay.contains("value.let { it.key }"),
+        "a non-imported phantom Int is not the receiver's type: {relay}"
+    );
+    assert!(!relay.contains("it.getKey()"), "{relay}");
+}
+
 #[test]
 fn retained_parallel_interface_getter_read_uses_bound_lambda_input() {
     let scratch = Scratch::new("c4");
