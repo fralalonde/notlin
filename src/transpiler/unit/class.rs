@@ -422,6 +422,187 @@ fn forwarding_return_is_subtype(
     false
 }
 
+/// One companion constant group: the enum member name, its DECLARED Java type
+/// (`Set<Owner>` / `Collection<Owner>`) and the entries in source order.
+struct EnumGroup {
+    name: String,
+    declared: String,
+    element: String,
+    entries: Vec<String>,
+}
+
+fn is_collection_base(base: &str) -> bool {
+    matches!(
+        base,
+        "Set"
+            | "kotlin.collections.Set"
+            | "java.util.Set"
+            | "Collection"
+            | "kotlin.collections.Collection"
+            | "java.util.Collection"
+    )
+}
+
+/// `Base<A, B>` -> (`Base`, [`A`, `B`]); `Base` -> (`Base`, []). Only the
+/// top-level argument list is split, so nested generics stay one argument.
+fn split_generic(text: &str) -> Option<(String, Vec<String>)> {
+    let text = text.trim().trim_end_matches('?');
+    let Some((base, rest)) = text.split_once('<') else {
+        return Some((text.trim().to_string(), Vec::new()));
+    };
+    let inner = rest.strip_suffix('>')?;
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for ch in inner.chars() {
+        match ch {
+            '<' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '>' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                args.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        args.push(current.trim().to_string());
+    }
+    Some((base.trim().to_string(), args))
+}
+
+fn collect_kind<'t>(node: tree_sitter::Node<'t>, kind: &str, out: &mut Vec<tree_sitter::Node<'t>>) {
+    if node.kind() == kind {
+        out.push(node);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_kind(child, kind, out);
+    }
+}
+
+fn count_kind(node: tree_sitter::Node, kind: &str) -> usize {
+    let mut found = Vec::new();
+    collect_kind(node, kind, &mut found);
+    found.len()
+}
+
+fn java_enum_companion_reference(source: &str, owner: &str, getter: &str) -> bool {
+    if !source.contains(owner) || !source.contains("Companion") {
+        return false;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .is_err()
+    {
+        return true;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return true;
+    };
+    fn visit(node: tree_sitter::Node<'_>, source: &str, owner: &str, getter: &str) -> bool {
+        if matches!(
+            node.kind(),
+            "field_access" | "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            fn names<'a>(node: tree_sitter::Node<'_>, source: &'a str, out: &mut Vec<&'a str>) {
+                if matches!(node.kind(), "identifier" | "type_identifier") {
+                    out.push(&source[node.byte_range()]);
+                    return;
+                }
+                let mut c = node.walk();
+                for child in node.named_children(&mut c) {
+                    names(child, source, out);
+                }
+            }
+            let mut identifiers = Vec::new();
+            names(node, source, &mut identifiers);
+            if identifiers
+                .windows(2)
+                .any(|pair| pair == [owner, "Companion"])
+            {
+                let supported_getter = node.parent().is_some_and(|call| {
+                    call.kind() == "method_invocation"
+                        && call
+                            .child_by_field_name("name")
+                            .is_some_and(|name| &source[name.byte_range()] == getter)
+                        && call
+                            .child_by_field_name("arguments")
+                            .is_some_and(|args| args.named_child_count() == 0)
+                });
+                if !supported_getter {
+                    return true;
+                }
+            }
+        }
+        let mut c = node.walk();
+        node.named_children(&mut c)
+            .any(|child| visit(child, source, owner, getter))
+    }
+    visit(tree.root_node(), source, owner, getter)
+}
+
+fn enum_group_consumer_requires_companion(source: &str, owner: &str) -> bool {
+    if !source.contains(owner) {
+        return false;
+    }
+    let tree = crate::transpiler::parse_tree(source);
+    fn visit(node: tree_sitter::Node<'_>, source: &str, owner: &str) -> bool {
+        let text = |n: tree_sitter::Node<'_>| &source[n.byte_range()];
+        if node.kind() == "class_declaration"
+            && kt::child(node, "identifier").is_some_and(|name| text(name) == owner)
+            && text(node).contains("enum class")
+        {
+            return false;
+        }
+        if node.kind() == "identifier" && text(node).trim_matches('`') == owner {
+            let mut current = node.parent();
+            while let Some(parent) = current {
+                match parent.kind() {
+                    "import" => {
+                        return crate::semantics::java_member_calls::import_header(source, parent)
+                            .is_none_or(|header| {
+                                header.alias.is_some() || !header.path.ends_with(owner)
+                            });
+                    }
+                    "type_alias" => return true,
+                    "user_type" => {
+                        return text(parent)
+                            .split('.')
+                            .any(|part| part.trim() == "Companion");
+                    }
+                    "navigation_expression" => {
+                        return text(parent)
+                            .split('.')
+                            .any(|part| part.trim() == "Companion");
+                    }
+                    "class_literal" => return false,
+                    "callable_reference" if text(parent).contains("::class") => return false,
+                    "property_declaration"
+                    | "function_declaration"
+                    | "call_expression"
+                    | "value_argument" => return true,
+                    _ => {}
+                }
+                current = parent.parent();
+            }
+            return true;
+        }
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .any(|child| visit(child, source, owner))
+    }
+    visit(tree.root_node(), source, owner)
+}
+
 /// One companion fn captured for the nested `Companion` bridge.
 struct BridgeSig {
     signature: String,
@@ -1713,6 +1894,23 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     pub(crate) fn transpile_type_decl(&mut self, decl: tree_sitter::Node, out: &mut JavaOut) {
+        if self.workspace.is_some_and(|workspace| {
+            workspace.kotlin_files().any(|file| {
+                file.declarations.iter().any(|candidate| {
+                    candidate.kind == crate::workspace::DeclarationKind::Enum
+                        && enum_group_consumer_requires_companion(
+                            self.text(decl),
+                            candidate.name.as_str(),
+                        )
+                })
+            })
+        }) {
+            self.diag_untranslatable(
+                decl,
+                "enum companion object is used as a value; retain its consumer in Kotlin",
+            );
+            return;
+        }
         self.check_builtin_annotation_contracts(decl);
         // `KClass<T>` type references lower to Java `Class<T>` (kt.rs /
         // types.rs interop mapping). That ABI change is only compatible
@@ -4917,6 +5115,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     self.transpile_type_decl(m, out);
                     out.blank();
                 }
+                // Only the proven #5 group shape leaves Kotlin; every other
+                // enum companion stays retained (as it was before this slice),
+                // because companion-object reachability is not proven here.
+                "companion_object" => {
+                    if self.enum_companion_group(m, name).is_some() {
+                        self.transpile_companion(m, name, out);
+                        out.blank();
+                    } else {
+                        self.diag_untranslatable(
+                            m,
+                            "enum companion object shape is not the proven constant group",
+                        );
+                    }
+                }
                 "line_comment" | "block_comment" | ";" | "{" | "}" => {}
                 _ => {
                     if m.is_named() {
@@ -4930,6 +5142,189 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
         self.pending_field_types.clear();
         out.close();
+    }
+
+    /// The declared type of a companion constant group, as the Java type Kotlin
+    /// exposes. Same-file `typealias` chains are expanded because Kotlin erases
+    /// them; the DECLARED type is returned, never a type narrowed from the
+    /// initializer (`Collection<Kind>` must not become `Set<Kind>`).
+    fn declared_collection_type(&self, declared: &str, owner: &str) -> Option<(String, String)> {
+        let (base, args) = split_generic(declared)?;
+        let (base, args) = if is_collection_base(&base) {
+            (base, args)
+        } else {
+            let alias = self
+                .source
+                .lines()
+                .find_map(|line| {
+                    let rest = line.trim().strip_prefix("typealias ")?;
+                    let (head, target) = rest.split_once('=')?;
+                    let alias_name = head.trim().split(['<', ' ']).next()?;
+                    (alias_name == base).then(|| target.trim().to_string())
+                })
+                .or_else(|| {
+                    // A same-package alias in another source file is just as
+                    // erased; the workspace snapshot is the only place its
+                    // target is recorded.
+                    let workspace = self.workspace?;
+                    let file = self
+                        .workspace_file
+                        .clone()
+                        .unwrap_or_else(|| self.file.to_path_buf());
+                    workspace
+                        .type_aliases_for(&file)
+                        .into_iter()
+                        .find(|(name, _)| name == &base)
+                        .map(|(_, target)| target)
+                })?;
+            let (target_base, target_params) = split_generic(&alias)?;
+            if target_params.len() != args.len() || !is_collection_base(&target_base) {
+                return None;
+            }
+            (target_base, args)
+        };
+        if args.len() != 1 || args[0].trim() != owner {
+            return None;
+        }
+        let element = args[0].trim().to_string();
+        let java_base = match base.as_str() {
+            "Set" | "kotlin.collections.Set" | "java.util.Set" => "java.util.Set",
+            "Collection" | "kotlin.collections.Collection" | "java.util.Collection" => {
+                "java.util.Collection"
+            }
+            _ => return None,
+        };
+        Some((format!("{java_base}<{element}>"), element))
+    }
+
+    /// The one `companion object { val GROUP: Set<Owner> = setOf(ENTRY, ...) }`
+    /// shape this backend proves: a literal, parameterless, member-free enum
+    /// plus one non-empty factory call over its own entries. Any deviation --
+    /// constructor parameters, per-entry bodies/arguments, another companion
+    /// member, annotations, accessors, spreads, named arguments, a foreign or
+    /// nullable declared type -- returns `None` so the caller keeps the
+    /// conservative existing behavior instead of guessing.
+    fn enum_companion_group(&self, companion: tree_sitter::Node, owner: &str) -> Option<EnumGroup> {
+        if enum_group_consumer_requires_companion(self.source, owner)
+            || self.workspace.is_some_and(|workspace| {
+                workspace
+                    .kotlin_files()
+                    .any(|file| enum_group_consumer_requires_companion(file.source_text(), owner))
+            })
+        {
+            return None;
+        }
+        let enum_body = kt::parent_of(companion)?;
+        if !matches!(enum_body.kind(), "enum_class_body" | "class_body") {
+            return None;
+        }
+        if kt::parent_of(enum_body)
+            .is_some_and(|decl| kt::child(decl, "primary_constructor").is_some())
+        {
+            return None;
+        }
+        for kind in [
+            "function_declaration",
+            "class_declaration",
+            "object_declaration",
+            "secondary_constructor",
+            "anonymous_initializer",
+        ] {
+            if count_kind(enum_body, kind) > 0 {
+                return None;
+            }
+        }
+        let mut entry_nodes = Vec::new();
+        collect_kind(enum_body, "enum_entry", &mut entry_nodes);
+        if entry_nodes.is_empty() {
+            return None;
+        }
+        let mut entries: Vec<String> = Vec::new();
+        for node in entry_nodes {
+            let mut name = None;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "identifier" => name = Some(self.text(child).to_string()),
+                    "line_comment" | "block_comment" | "modifiers" | "," | ";" => {}
+                    _ => return None,
+                }
+            }
+            entries.push(name?);
+        }
+        let companion_body = kt::child(companion, "class_body")?;
+        for kind in [
+            "function_declaration",
+            "object_declaration",
+            "class_declaration",
+            "anonymous_initializer",
+            "secondary_constructor",
+        ] {
+            if count_kind(companion_body, kind) > 0 {
+                return None;
+            }
+        }
+        let mut properties = Vec::new();
+        collect_kind(companion_body, "property_declaration", &mut properties);
+        if properties.len() != 1 {
+            return None;
+        }
+        let property = properties[0];
+        if !self.text(property).trim_start().starts_with("val ")
+            || kt::child(property, "getter").is_some()
+            || kt::child(property, "setter").is_some()
+            || kt::child(property, "property_delegate").is_some()
+        {
+            return None;
+        }
+        let mut identifiers = Vec::new();
+        collect_kind(property, "identifier", &mut identifiers);
+        let name = self.text(*identifiers.first()?).to_string();
+        let mut type_nodes = Vec::new();
+        collect_kind(property, "user_type", &mut type_nodes);
+        let (declared, element) =
+            self.declared_collection_type(self.text(*type_nodes.first()?), owner)?;
+        let mut calls = Vec::new();
+        collect_kind(property, "call_expression", &mut calls);
+        let init = *calls.first()?;
+        let callee = init.named_child(0)?;
+        if self.text(callee) != "setOf"
+            || self
+                .semantic_provider
+                .is_some_and(|provider| !provider.symbols_named("setOf").is_empty())
+        {
+            return None;
+        }
+        if count_kind(init, "type_arguments") > 0 {
+            return None;
+        }
+        let mut argument_nodes = Vec::new();
+        collect_kind(init, "value_argument", &mut argument_nodes);
+        if argument_nodes.is_empty() {
+            return None;
+        }
+        let mut listed: Vec<String> = Vec::new();
+        for argument in argument_nodes {
+            let spelling = self.text(argument).trim().to_string();
+            if !entries.contains(&spelling) {
+                return None;
+            }
+            listed.push(spelling);
+        }
+        let getter = format!("get{}", capitalize(&name));
+        if self.workspace.is_some_and(|workspace| {
+            workspace
+                .java_files()
+                .any(|file| java_enum_companion_reference(file.source_text(), owner, &getter))
+        }) {
+            return None;
+        }
+        Some(EnumGroup {
+            name,
+            declared,
+            element,
+            entries: listed,
+        })
     }
 
     /// `companion object { ... }` -> static members of the enclosing class.
@@ -4959,6 +5354,47 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 companion,
                 "named companion object has no Java counterpart (callers use Outer.CompanionName.member; cannot be redirected to Outer statics)",
             );
+            return;
+        }
+        // The one #5 shape this backend proves: a literal enum plus a companion
+        // `val GROUP: Set<Owner> = setOf(ENTRY, ...)`. Emit the Kotlin `setOf`
+        // semantics as a shared, ordered, mutable instance behind a static field
+        // whose type is the DECLARED type (aliases expanded, never narrowed from
+        // the initializer). Every other companion shape keeps the existing path.
+        if let Some(group) = self.enum_companion_group(companion, owner) {
+            let cap = capitalize(&group.name);
+            let initializer = if group.entries.len() == 1 {
+                format!("java.util.Set.<{}>of({})", group.element, group.entries[0])
+            } else {
+                format!(
+                    "new java.util.LinkedHashSet<{}>(java.util.Arrays.<{}>asList({}))",
+                    group.element,
+                    group.element,
+                    group.entries.join(", ")
+                )
+            };
+            out.line(format!(
+                "public static final {} {} = {};",
+                group.declared, group.name, initializer
+            ));
+            out.blank();
+            out.open(format!("public static {} get{}()", group.declared, cap));
+            out.line(format!("return {};", group.name));
+            out.close();
+            out.blank();
+            // Java source callers may still use Enum.Companion.getGROUP().
+            // Keep that namespace as static forwarding methods, not a fake
+            // companion singleton or a replacement for first-class object uses.
+            out.open("public static final class Companion");
+            out.line("private Companion() {}");
+            out.open(format!("public static {} get{}()", group.declared, cap));
+            out.line(format!("return {};", group.name));
+            out.close();
+            out.close();
+            out.blank();
+            self.companion_members
+                .insert(group.name.clone(), format!("get{}()", cap));
+            self.static_member_types.insert(group.name, group.declared);
             return;
         }
         let Some(body) = kt::child(companion, "class_body") else {
