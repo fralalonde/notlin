@@ -25,7 +25,8 @@ pub(crate) mod profile;
 // 26: constructor-property visibility is indexed for inherited setter proofs.
 // 28: value-class identity excludes unboxed getters from reference covariance.
 // 29: method-generic and inline-bound header facts reuse the indexing parse.
-const CACHE_VERSION: u32 = 30;
+// 31: setter_name_renamed indexes @JvmName presence on properties.
+const CACHE_VERSION: u32 = 31;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -160,6 +161,12 @@ pub struct Member {
     /// bridgeable in all-open/JPA classes, while a custom accessor is virtual.
     #[serde(default)]
     pub has_custom_accessor: bool,
+    /// The Java setter name is not the JavaBean default because the property
+    /// carries `@set:JvmName`. Declaration-site annotations (serialization,
+    /// tooling) do NOT rename accessors and must not carry this flag. Only a
+    /// proven ordinary `setX` name is safe for caller-side write rewrites.
+    #[serde(default)]
+    pub setter_name_renamed: bool,
     /// An explicitly typed, annotation-free readonly getter with no initializer,
     /// delegate or backing-field access. It can retain its JVM method body
     /// without introducing a storage property when a Java contract owns it.
@@ -6051,6 +6058,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 has_unsupported_property_shape: false,
                 is_constructor_property: false,
                 has_custom_accessor: false,
+                setter_name_renamed: false,
                 has_plain_computed_getter: false,
                 has_inline_getter: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
@@ -6121,6 +6129,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                         .any(|child| child.kind() == "property_delegate"),
                 is_constructor_property: true,
                 has_custom_accessor: false,
+                setter_name_renamed: parameter_text.contains("JvmName"),
                 has_plain_computed_getter: false,
                 has_inline_getter: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
@@ -6547,6 +6556,18 @@ fn member_from_node(
             && node
                 .named_children(&mut node.walk())
                 .any(|child| matches!(child.kind(), "getter" | "setter")),
+        // Conservative: any mention of JvmName (on the property, an accessor,
+        // or a `@set:`/`@get:` target) may change the Java accessor name, and
+        // cheap text cannot prove which. Consumers must not assume a setter
+        // name on a property that carries it.
+
+        // Conservative: any mention of JvmName (on the property, an accessor,
+        // or a `@set:`/`@get:` target) may change the Java accessor name, and
+        // cheap text cannot prove which. Consumers must not assume a setter
+        // name on a property that carries it.
+        setter_name_renamed: kind == MemberKind::Property
+            && language == SourceLanguage::Kotlin
+            && member_text.contains("JvmName"),
         has_plain_computed_getter: kind == MemberKind::Property
             && language == SourceLanguage::Kotlin
             && plain_computed_property_getter(node, source).is_some(),
@@ -7707,6 +7728,8 @@ fn canonical_getter_type(
     Some(CanonicalGetterType::Named(identity, arguments))
 }
 
+// Legacy getter ABI inference stays byte-compatible with the accepted path.
+// New receiver evidence uses canonical_type_binding below, never this adapter.
 fn canonical_getter_named_identity(
     index: &SourceIndex,
     file: &SourceFile,
@@ -7828,6 +7851,169 @@ fn canonical_getter_named_identity(
     Some(builtin.to_owned())
 }
 
+/// How a written type name is bound by this file's structural imports.
+enum WrittenImport {
+    /// No import header binds the name.
+    NotApplicable,
+    /// One import binds it; the value is the fully qualified written target.
+    Bound(String),
+    /// An import mentions the root but its header is not proof, or two headers
+    /// bind the same name. The spelling has no canonical meaning.
+    Unknown,
+}
+
+/// Read the binding for `written` from the source tree's `import_header`s.
+///
+/// The indexed `file.imports` strings are only a cheap prefilter: an alias is
+/// proven by the parsed header path, never by splitting the string on ` as `.
+fn structural_import_binding(file: &SourceFile, written: &str) -> WrittenImport {
+    let (root, rest) = written
+        .split_once('.')
+        .map_or((written, None), |(root, rest)| (root, Some(rest)));
+    let root = root.trim_matches('`');
+    if root.is_empty() {
+        return WrittenImport::NotApplicable;
+    }
+    // `file.imports` is a Legacy line-reader projection. Absence there is not
+    // evidence of absence in Kotlin syntax (e.g. a tab after `import`).
+    // Classifier binding must always consult the structural header reader.
+    let source = file.source_text();
+    let tree = crate::transpiler::parse_tree(source);
+    let mut nodes = vec![tree.root_node()];
+    let mut target = None;
+    while let Some(node) = nodes.pop() {
+        if node.kind() != "import" {
+            nodes.extend(node.named_children(&mut node.walk()));
+            continue;
+        }
+        let Some(header) = crate::semantics::java_member_calls::import_header(source, node) else {
+            if kt_text_contains(node, source, root) {
+                return WrittenImport::Unknown;
+            }
+            continue;
+        };
+        if header.wildcard {
+            continue;
+        }
+        let binds = match header.alias.as_deref() {
+            Some(alias) => alias == root,
+            None => header.path.rsplit('.').next() == Some(root),
+        };
+        if !binds {
+            continue;
+        }
+        let qualified = match rest {
+            Some(rest) => format!("{}.{rest}", header.path),
+            None => header.path,
+        };
+        if target.as_ref().is_some_and(|prior| prior != &qualified) {
+            return WrittenImport::Unknown;
+        }
+        target = Some(qualified);
+    }
+    target.map_or(WrittenImport::NotApplicable, WrittenImport::Bound)
+}
+
+fn kt_text_contains(node: tree_sitter::Node<'_>, source: &str, needle: &str) -> bool {
+    node.utf8_text(source.as_bytes())
+        .is_ok_and(|text| text.contains(needle))
+}
+
+/// A written type name's canonical source binding, selected by stable identity.
+/// Consumers carry the fully qualified spelling and the already matched
+/// declaration, rather than resolving the original spelling again.
+pub(crate) struct CanonicalTypeBinding<'a> {
+    pub(crate) qualified: String,
+    pub(crate) declaration: Option<&'a Declaration>,
+}
+
+/// Bind a written type spelling once, through structural import/alias
+/// precedence, and carry the selected classifier's qualified name. `None` means
+/// the spelling has no proven binding here; the index's unique-simple-name
+/// convenience lookup is never consulted.
+pub(crate) fn canonical_type_binding<'a>(
+    index: &'a SourceIndex,
+    file: &SourceFile,
+    ty: &str,
+) -> Option<CanonicalTypeBinding<'a>> {
+    let head = type_head(ty)?;
+    if !head
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.'))
+    {
+        return None;
+    }
+    let first = head.split('.').next()?;
+    // A source typealias is not a physical classifier. Its expansion, including
+    // nullability and arguments, needs a separate proof, not a name guess.
+    if file.type_aliases.contains_key(first) {
+        return None;
+    }
+    let qualified = match structural_import_binding(file, &head) {
+        WrittenImport::Bound(qualified) => qualified,
+        WrittenImport::Unknown => return None,
+        WrittenImport::NotApplicable if head.contains('.') => {
+            // A local package-root classifier can capture an apparent package.
+            if index.declarations_named(first).any(|d| {
+                d.package == file.package
+                    && crate::semantics::workspace_symbol(index, d)
+                        .owner_path
+                        .is_empty()
+            }) {
+                return None;
+            }
+            head
+        }
+        WrittenImport::NotApplicable => file
+            .package
+            .as_ref()
+            .map_or_else(|| head.clone(), |package| format!("{package}.{head}")),
+    };
+    let declaration = {
+        let simple = qualified.rsplit('.').next()?;
+        let mut candidates = index.declarations_named(simple).filter(|declaration| {
+            let symbol = crate::semantics::workspace_symbol(index, declaration);
+            !symbol.kind.starts_with("ambiguous:")
+                && !symbol.name.starts_with('<')
+                && declaration_qualified(index, declaration) == qualified
+        });
+        let declaration = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        declaration
+    };
+    // Only an exact indexed classifier is evidence for this producer. Builtins,
+    // external types, wildcard-only names and aliases remain unproved rather
+    // than consulting Legacy imports or the global simple-name fallback.
+    Some(CanonicalTypeBinding {
+        qualified,
+        declaration: Some(declaration),
+    })
+}
+
+fn type_head(ty: &str) -> Option<String> {
+    let head = ty
+        .trim()
+        .trim_end_matches('?')
+        .split('<')
+        .next()?
+        .split('(')
+        .next()?
+        .trim()
+        .trim_matches('`');
+    (!head.is_empty()).then(|| head.to_owned())
+}
+
+fn declaration_qualified(index: &SourceIndex, declaration: &Declaration) -> String {
+    let symbol = crate::semantics::workspace_symbol(index, declaration);
+    std::iter::once(symbol.package.as_str())
+        .chain(symbol.owner_path.iter().map(String::as_str))
+        .chain(std::iter::once(symbol.name.as_str()))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
 fn canonical_getter_external_identity(qualified: &str) -> String {
     match qualified {
         "java.lang.String" | "kotlin.String" => "kotlin.String".to_owned(),
@@ -7841,7 +8027,7 @@ fn canonical_getter_external_identity(qualified: &str) -> String {
     }
 }
 
-fn resolve_unique_getter_type<'a>(
+pub(crate) fn resolve_unique_getter_type<'a>(
     index: &'a SourceIndex,
     file: &SourceFile,
     type_name: &str,
@@ -7864,6 +8050,18 @@ fn resolve_unique_getter_type<'a>(
     } else {
         None
     }
+}
+
+/// The source declaration a written type name provably denotes from `file`, or
+/// `None` when the spelling has no visible binding there. `resolve_type` ends in
+/// a unique-simple-name GLOBAL fallback — a convenience lookup, not a binding —
+/// so canonical receiver evidence must not be minted from it.
+pub(crate) fn proven_type_declaration<'a>(
+    index: &'a SourceIndex,
+    file: &SourceFile,
+    type_name: &str,
+) -> Option<&'a Declaration> {
+    canonical_type_binding(index, file, type_name)?.declaration
 }
 
 /// Prefer a candidate type whose bare name is an indexed enum declaration.

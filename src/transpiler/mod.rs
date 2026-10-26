@@ -184,6 +184,10 @@ pub struct WorkspaceScope<'a> {
     pub top_level_property_callsite_retention:
         Option<&'a crate::top_level_property_callsite::RetentionMap>,
     pub indexed_path: Option<&'a Path>,
+    /// Required-mode obligations inherited from the snapshot that signed them.
+    /// Only the workspace fixpoint sets this, and only for a file whose current
+    /// text is not the snapshot the receipts were proved on.
+    pub carried_required: Option<&'a std::collections::BTreeSet<crate::semantics::SymbolId>>,
 }
 
 /// Explicit planning result. Preflight ownership is computed before lowering;
@@ -254,7 +258,14 @@ pub(crate) fn prepare_static_plan_facts(
         identity_path: identity_path.to_path_buf(),
         source_hash: *blake3::hash(source.as_bytes()).as_bytes(),
         allow_approximations: cli.allow_approximations,
-        plan: build_static_plan(source, tree, identity_path, cli, provider),
+        plan: build_static_plan(
+            source,
+            tree,
+            identity_path,
+            cli,
+            provider,
+            scope.carried_required,
+        ),
     }
 }
 
@@ -377,7 +388,14 @@ fn lower_with_plan(
         assert_eq!(static_facts.allow_approximations, cli.allow_approximations);
         static_facts.plan.clone()
     } else {
-        build_static_plan(source, tree, identity_path, cli, semantic_provider)
+        build_static_plan(
+            source,
+            tree,
+            identity_path,
+            cli,
+            semantic_provider,
+            scope.carried_required,
+        )
     };
     let retained_with_forced = scope
         .forced_retained
@@ -458,6 +476,12 @@ fn lower_with_plan(
         .top_level_property_callsite_retention
         .or(local_property_callsite_retention.as_ref())
         .expect("top-level property callsite facts are available");
+    plan.property_imports = property_callsite_retention
+        .binding_imports
+        .iter()
+        .filter(|proof| proof.target.file == identity_path)
+        .cloned()
+        .collect();
     for decision in &mut plan.declarations {
         let Some(diagnostics) = property_callsite_retention.get(&decision.symbol_id) else {
             continue;
@@ -475,6 +499,12 @@ fn lower_with_plan(
             decision.retention_reasons.push(reason);
         }
         decision.candidate_owner = crate::translation_plan::BackendOwner::Kotlin;
+        if property_callsite_retention
+            .consumers
+            .contains(&decision.symbol_id)
+        {
+            decision.required_mode = true;
+        }
     }
     let getter_started = profile_enabled().then(Instant::now);
     let default_provider_retention = scope.index.and_then(|index| {
@@ -672,6 +702,58 @@ fn lower_with_plan(
         unit.semantic_provider = Some(semantic_provider);
         unit.add_proven_map_aliases(tree.root_node());
         let java_files = unit.run_planned(tree.root_node(), &plan);
+        // Emission-consumption invariant (§4.5, obligation 9).
+        //
+        // Every receipt the plan signed inside a declaration that is being
+        // translated must have been read by the emitter — and every emitted
+        // call the contract admitted must therefore have come from the plan
+        // rather than from a name table. A receipt planning required but
+        // emission never consumed means the two disagree about what the call
+        // is; that is a controlled pre-write failure (no Java is written and
+        // the file is reported), never a best-effort file.
+        let mut preparation_failure = unit.preparation_failure.take();
+        if preparation_failure.is_none() {
+            let unconsumed = crate::semantics::unconsumed_receipts(
+                &plan.call_receipts,
+                &unit.coverage.translated_spans,
+                &unit.consumed_receipts,
+            );
+            if !unconsumed.is_empty() {
+                preparation_failure = Some(format!(
+                    "declaration lowering contract was not consumed by emission for {}; the \
+                     planned receipt and the emitted Java disagree, so no output is written",
+                    unconsumed.join(", ")
+                ));
+            }
+        }
+        // The same consumption invariant for proved field types: a plan that
+        // proved how a field's Java type is spelled and then emitted the
+        // ambiguous source spelling instead is a silent ABI change, so it fails
+        // before any write rather than falling back to the old bytes.
+        if preparation_failure.is_none() {
+            let unconsumed = plan
+                .property_imports
+                .iter()
+                .filter_map(|proof| proof.field.as_ref())
+                .filter(|field| {
+                    field.source_hash == unit.source_hash
+                        && unit.coverage.translated_spans.iter().any(|(start, end)| {
+                            *start <= field.start_byte && field.end_byte <= *end
+                        })
+                        && !unit
+                            .consumed_field_type_proofs
+                            .contains(&(field.start_byte, field.end_byte))
+                })
+                .map(|field| format!("{}..{}", field.start_byte, field.end_byte))
+                .collect::<Vec<_>>();
+            if !unconsumed.is_empty() {
+                preparation_failure = Some(format!(
+                    "a proved field type was not consumed by emission at {}; the planned Java \
+                     type and the emitted declaration disagree, so no output is written",
+                    unconsumed.join(", ")
+                ));
+            }
+        }
         let java_files = java_files
             .into_iter()
             .map(|(path, source)| crate::planning::PreparedJavaFile {
@@ -689,7 +771,7 @@ fn lower_with_plan(
             approx,
             coverage,
             type_facts,
-            unit.preparation_failure,
+            preparation_failure,
         )
     };
     if profile {
@@ -727,10 +809,16 @@ fn lower_with_plan(
     if profile {
         record_profile(&PROFILE_DIAGNOSTICS_NS, started.elapsed());
     }
-    plan.reconcile(source, &coverage)
-        .expect("lowering uses the analyzed source snapshot");
+    // Reconciliation is where the plan learns which declarations the lowerer
+    // actually covered. It must not panic: a contract-refused declaration that
+    // arrives here as translated is a plan/emitter disagreement, and the
+    // honest answer is a controlled pre-write failure.
+    let reconcile_failure = plan.reconcile(source, &coverage).err();
     plan.type_facts.extend(type_facts);
     let acceptance_started = profile_enabled().then(Instant::now);
+    let preparation_failure = preparation_failure.or_else(|| {
+        reconcile_failure.map(|message| format!("declaration lowering contract: {message}"))
+    });
     let acceptance = match preparation_failure {
         Some(message) => Err(crate::planning::AcceptedPlanError {
             path: file.display().to_string(),
@@ -740,10 +828,13 @@ fn lower_with_plan(
                 end_byte: 0,
             },
         }),
-        None => crate::planning::AcceptedTranslationPlan::accept(
+        None => crate::planning::AcceptedTranslationPlan::accept_with_source(
             plan.clone(),
             candidate_java_files,
             Some(semantic_provider),
+            source,
+            tree,
+            annots,
         ),
     };
     let (accepted, emission_failed) = match acceptance {
@@ -845,8 +936,15 @@ fn build_static_plan(
     identity_path: &Path,
     cli: &Cli,
     provider: &dyn crate::semantics::SemanticProvider,
+    carried_required: Option<&std::collections::BTreeSet<crate::semantics::SymbolId>>,
 ) -> crate::translation_plan::TranslationPlan {
     let mut plan = crate::translation_plan::analyze(source, tree.root_node(), identity_path);
+    plan.carried_required = carried_required.cloned().unwrap_or_default();
+    plan.annotations = match cli.annotations {
+        Annotations::Jetbrains => types::AnnotationSet::Jetbrains,
+        Annotations::Jspecify => types::AnnotationSet::Jspecify,
+        Annotations::None => types::AnnotationSet::None,
+    };
     plan.plan_type_losses(source, tree.root_node(), cli.allow_approximations);
     plan.plan_constructor_metadata_losses(identity_path, provider, cli.allow_approximations);
     plan.plan_jackson_default_constructor_losses(identity_path, provider, cli.allow_approximations);

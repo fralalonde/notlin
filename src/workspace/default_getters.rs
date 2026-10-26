@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
+use tree_sitter::Node;
 
 type BridgeOutcome = Result<Vec<CovariantDefaultGetterBridge>, String>;
 
@@ -350,6 +351,31 @@ pub(crate) struct CovariantDefaultGetterBridge {
     /// The exact source FQName of the selected default's reference return.
     pub return_type: String,
     pub return_type_ref: TypeRef,
+    /// The selected default's own body when it was proven to be a chain of
+    /// public zero-argument accessors rooted at implicit `this`. `None` means
+    /// this bridge can only work by inheriting Java method semantics from
+    /// `target`.
+    pub body: Option<ForwardingGetterBody>,
+}
+
+/// One accessor call of a source-forwarding default getter body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForwardingGetterStep {
+    /// Java method name called on the receiver of this step (`getEnvelope`).
+    pub accessor: String,
+}
+
+/// The whole body of a Kotlin default getter proven to be a chain of public
+/// zero-argument accessors rooted at implicit `this`.
+///
+/// Re-creating that chain in a Java child evaluates the same accessors on the
+/// same receivers in the same order, so dynamic dispatch, evaluation order and
+/// getter side effects are preserved without depending on how the retained
+/// Kotlin provider was compiled (`-jvm-default` mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForwardingGetterBody {
+    /// Accessor calls in evaluation order, starting from `this`.
+    pub steps: Vec<ForwardingGetterStep>,
 }
 
 #[derive(Clone)]
@@ -779,6 +805,336 @@ fn source_getter<'a>(
     })
 }
 
+/// Prove that a Kotlin default getter body is exactly a chain of public
+/// zero-argument property accessors rooted at implicit `this`.
+///
+/// This is the narrowest shape a Java child can re-create without knowing how
+/// the retained Kotlin provider was compiled: every step is a virtual accessor
+/// call, so the dispatched methods, their order and their side effects are the
+/// ones the Kotlin default already performs. Everything else stays unproven:
+/// annotations (including accessor renames), non-public or static members,
+/// mutable or nullable steps, safe calls, `!!`, calls, casts, `super`/outer or
+/// labelled receivers, and anything generic.
+fn proven_forwarding_getter_body(
+    index: &SourceIndex,
+    target: &Declaration,
+    member: &Member,
+    expected_return: &super::CanonicalGetterType,
+) -> Option<ForwardingGetterBody> {
+    if target.language != SourceLanguage::Kotlin || !target.type_params.is_empty() {
+        return None;
+    }
+    let file = index.declaration_source_file(target)?;
+    // The proof reads this snapshot's text, so a later edit must invalidate the
+    // cached bridge instead of reusing a body that no longer exists.
+    record_file(&file.path);
+    let symbol = semantics::workspace_symbol(index, target);
+    if symbol.kind.starts_with("ambiguous:") {
+        return None;
+    }
+    let source = file.source_text();
+    let tree = crate::transpiler::parse_tree(source);
+    let declaration = exact_declaration_node(tree.root_node(), source, &file.path, &symbol)?;
+    let member_node = exact_member_node(declaration, source, member)?;
+    if member_has_annotations(member_node) {
+        return None;
+    }
+    let names = accessor_chain(expression_body(member_node, source)?, source)?;
+    let mut owner = target;
+    let mut steps = Vec::with_capacity(names.len());
+    for (position, name) in names.iter().enumerate() {
+        let accessor = property_accessor_name(name);
+        let candidates = owner
+            .members
+            .iter()
+            .filter(|candidate| match candidate.kind {
+                MemberKind::Property => candidate.name == *name,
+                // A property with a block accessor body is indexed as its
+                // physical getter method. Both shapes perform the same JVM
+                // call, so a step is resolvable through either.
+                MemberKind::Method => {
+                    candidate.name == accessor && is_physical_zero_arg_getter(candidate, &accessor)
+                }
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        // Inherited, shadowed or duplicated: the accessor the Kotlin default
+        // resolves is not this declaration's, so refuse to guess.
+        let [property] = candidates.as_slice() else {
+            return None;
+        };
+        let property = *property;
+        if position == 0 && property.name == member.name {
+            // The default would read itself through the bridge.
+            return None;
+        }
+        if step_declaration_has_annotations(index, owner, property) {
+            // An annotation may rename the accessor (`@get:JvmName`) or carry a
+            // framework contract a re-created body would silently drop.
+            return None;
+        }
+        if property.is_static
+            || property.is_mutable
+            || property.is_jvm_field
+            || property.is_nullable
+            || !getter_is_public(property, owner)
+            || !plain_accessor_name(&accessor)
+        {
+            return None;
+        }
+        let declared = getter_return_type(index, owner, property)?;
+        let declared = declared.trim();
+        // Generic and nullable spellings need projection or null handling this
+        // slice cannot prove; decline instead of manufacturing a cast.
+        if declared.is_empty() || declared.ends_with('?') || declared.contains('<') {
+            return None;
+        }
+        let canonical = canonical_return(index, owner, declared, &BTreeMap::new())?;
+        steps.push(ForwardingGetterStep { accessor });
+        if position + 1 == names.len() {
+            if canonical != *expected_return {
+                return None;
+            }
+        } else {
+            owner = source_reference_declaration(index, &canonical)?;
+        }
+    }
+    Some(ForwardingGetterBody { steps })
+}
+
+/// The one class-like syntax node whose exact symbol identity is `symbol`.
+fn exact_declaration_node<'t>(
+    root: Node<'t>,
+    source: &str,
+    file: &Path,
+    symbol: &SymbolId,
+) -> Option<Node<'t>> {
+    let mut pending = vec![root];
+    let mut matches = Vec::new();
+    while let Some(node) = pending.pop() {
+        pending.extend(node.named_children(&mut node.walk()));
+        if !matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "object_declaration"
+                | "enum_declaration"
+        ) {
+            continue;
+        }
+        if semantics::symbol_id_for_node(source, node, file) == *symbol {
+            matches.push(node);
+        }
+    }
+    let [declaration] = matches.as_slice() else {
+        return None;
+    };
+    Some(*declaration)
+}
+
+/// The one member declaration node inside `declaration` that is exactly
+/// `member`. Nested types own their own members and are never searched.
+fn exact_member_node<'t>(declaration: Node<'t>, source: &str, member: &Member) -> Option<Node<'t>> {
+    let body = declaration
+        .named_children(&mut declaration.walk())
+        .find(|child| child.kind() == "class_body")?;
+    let mut pending = vec![body];
+    let mut matches = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.id() != body.id()
+            && matches!(
+                node.kind(),
+                "class_declaration" | "interface_declaration" | "object_declaration"
+            )
+        {
+            continue;
+        }
+        let matching = match (member.kind, node.kind()) {
+            (MemberKind::Property, "property_declaration") => {
+                property_name(node, source) == Some(member.name.as_str())
+            }
+            (MemberKind::Method, "function_declaration") => {
+                member_function_name(node, source) == Some(member.name.as_str())
+                    && function_parameter_count(node) == 0
+            }
+            _ => false,
+        };
+        if matching {
+            matches.push(node);
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    let [node] = matches.as_slice() else {
+        return None;
+    };
+    Some(*node)
+}
+
+fn property_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let declaration = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "variable_declaration")?;
+    let identifier = declaration
+        .named_children(&mut declaration.walk())
+        .find(|child| child.kind() == "identifier")?;
+    identifier.utf8_text(source.as_bytes()).ok()
+}
+
+fn member_function_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    node.child_by_field_name("name")?
+        .utf8_text(source.as_bytes())
+        .ok()
+}
+
+fn function_parameter_count(node: Node<'_>) -> usize {
+    node.named_children(&mut node.walk())
+        .find(|child| child.kind() == "function_value_parameters")
+        .map_or(0, |parameters| {
+            parameters
+                .named_children(&mut parameters.walk())
+                .filter(|child| matches!(child.kind(), "parameter" | "spread_parameter"))
+                .count()
+        })
+}
+
+/// Any annotation on the declaring member keeps the body unproven: accessor
+/// renames (`@get:JvmName`), `@JvmField` storage and framework contracts that
+/// expect the annotated method must not be re-created without it.
+fn member_has_annotations(member: Node<'_>) -> bool {
+    let mut cursor = member.walk();
+    member
+        .children(&mut cursor)
+        .take_while(|child| !matches!(child.kind(), "getter" | "function_body" | "class_body"))
+        .any(|child| {
+            matches!(child.kind(), "annotation" | "annotations")
+                || (child.kind() == "modifiers" && {
+                    let mut modifiers = child.walk();
+                    child
+                        .named_children(&mut modifiers)
+                        .any(|modifier| matches!(modifier.kind(), "annotation" | "annotations"))
+                })
+        })
+}
+
+/// Whether the exact source declaration of one forwarding step carries any
+/// annotation. An unresolvable declaration counts as annotated: the proof
+/// never falls back to a same-named declaration elsewhere.
+fn step_declaration_has_annotations(
+    index: &SourceIndex,
+    owner: &Declaration,
+    property: &Member,
+) -> bool {
+    let Some(file) = index.declaration_source_file(owner) else {
+        return true;
+    };
+    record_file(&file.path);
+    let symbol = semantics::workspace_symbol(index, owner);
+    if symbol.kind.starts_with("ambiguous:") {
+        return true;
+    }
+    let source = file.source_text();
+    let tree = crate::transpiler::parse_tree(source);
+    let Some(declaration) = exact_declaration_node(tree.root_node(), source, &file.path, &symbol)
+    else {
+        return true;
+    };
+    let Some(node) = exact_member_node(declaration, source, property) else {
+        return true;
+    };
+    member_has_annotations(node)
+}
+
+/// The single expression a getter body `= expr` evaluates. Block bodies and
+/// non-value bodies are unproven: they may contain arbitrary statements.
+fn expression_body<'t>(member: Node<'t>, _source: &str) -> Option<Node<'t>> {
+    let holder = if member.kind() == "property_declaration" {
+        member
+            .named_children(&mut member.walk())
+            .find(|child| child.kind() == "getter")?
+    } else {
+        member
+    };
+    let body = holder
+        .named_children(&mut holder.walk())
+        .find(|child| child.kind() == "function_body")?;
+    let mut cursor = body.walk();
+    let mut expressions = body.named_children(&mut cursor);
+    let expression = expressions.next()?;
+    if expressions.next().is_some() || matches!(expression.kind(), "block") {
+        return None;
+    }
+    Some(expression)
+}
+
+/// Flatten `a.b.c`, `this.a.b` into its identifier steps. Anything that is not
+/// plain `.` member access (calls, safe calls, `!!`, casts, labels, `super`,
+/// outer receivers, indexing) is unproven.
+fn accessor_chain(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    match node.kind() {
+        "identifier" => {
+            let name = node.utf8_text(source.as_bytes()).ok()?;
+            plain_identifier(name).then(|| vec![name.to_owned()])
+        }
+        "this_expression" => {
+            let text = node.utf8_text(source.as_bytes()).ok()?;
+            (text.trim() == "this" && node.named_child_count() == 0).then(Vec::new)
+        }
+        "navigation_expression" => {
+            let mut receiver = None;
+            let mut member = None;
+            for index in 0..node.child_count() {
+                let child = node.child(index)?;
+                match child.kind() {
+                    "." => {}
+                    "identifier" if receiver.is_some() && member.is_none() => member = Some(child),
+                    "identifier" | "this_expression" | "navigation_expression"
+                        if receiver.is_none() =>
+                    {
+                        receiver = Some(child);
+                    }
+                    // `?.`, `!!`, call suffixes and every other token shape.
+                    _ => return None,
+                }
+            }
+            let name = member?.utf8_text(source.as_bytes()).ok()?;
+            if !plain_identifier(name) {
+                return None;
+            }
+            let mut chain = accessor_chain(receiver?, source)?;
+            chain.push(name.to_owned());
+            Some(chain)
+        }
+        _ => None,
+    }
+}
+
+fn plain_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first == '_' || first.is_alphabetic())
+        && characters.all(|character| character == '_' || character.is_alphanumeric())
+}
+
+/// A plain JavaBean accessor spelling. Kotlin renames an accessor through
+/// `@get:JvmName`, which the annotation guard already rejects; this keeps a
+/// mangled or non-getter name from reaching the emitter. The spelling must be
+/// Java's ASCII identifier alphabet as well: the Kotlin proof may read a
+/// Unicode property name, but the Java emitter cannot re-create that accessor,
+/// so it has to be declined here rather than asserted at emission time.
+fn plain_accessor_name(accessor: &str) -> bool {
+    let mut characters = accessor.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && accessor
+            .strip_prefix("get")
+            .or_else(|| accessor.strip_prefix("is"))
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(|first| first.is_ascii_uppercase())
+}
+
 fn external_root(name: &str) -> bool {
     matches!(
         name.trim().trim_end_matches("()"),
@@ -861,6 +1217,47 @@ fn imported_marker_alias(index: &SourceIndex, file: &SourceFile, base: &str) -> 
 }
 
 impl SourceIndex {
+    /// Proves a supertype spelling denotes one of the canonical JVM marker
+    /// interfaces that declare no methods at all, so an ancestor outside the
+    /// workspace index cannot own a callable member name.
+    ///
+    /// Only the methodless markers qualify. `Comparable` is deliberately
+    /// excluded even though `known_external_without_getters` accepts it: it
+    /// declares `compareTo`, so "no getter" is not "no members", and an
+    /// unresolved `Comparable` ancestor is not a closed hierarchy. The spelling
+    /// still goes through the shared canonical identity resolver, so aliases,
+    /// source collisions and duplicate imports stay unproved.
+    pub(crate) fn canonical_methodless_external_marker(
+        &self,
+        file: &SourceFile,
+        type_name: &str,
+    ) -> bool {
+        let source_type = type_name.trim().trim_end_matches("()").trim();
+        let (base, arguments) = super::split_generic(source_type);
+        // The markers take no type arguments: a parameterised spelling is a
+        // different contract and stays unknown.
+        if arguments.is_some() {
+            return false;
+        }
+        let marker_name = matches!(
+            base.rsplit('.').next().map(|name| name.trim_matches('`')),
+            Some("Serializable" | "Cloneable" | "RandomAccess")
+        );
+        let imported_alias = imported_marker_alias(self, file, base);
+        if !marker_name && imported_alias.is_none() {
+            return false;
+        }
+        let identity = super::canonical_getter_named_identity(self, file, base).or(imported_alias);
+        matches!(
+            identity.as_deref(),
+            Some(
+                "external:java.io.Serializable"
+                    | "external:java.lang.Cloneable"
+                    | "external:java.util.RandomAccess"
+            )
+        )
+    }
+
     pub(crate) fn inferred_simple_property_type(
         &self,
         owner: &Declaration,
@@ -1238,6 +1635,8 @@ impl SourceIndex {
                     blocked_default = true;
                     continue;
                 }
+                let body =
+                    proven_forwarding_getter_body(self, target, member, &canonical_default_return);
                 defaults.push((
                     direct_type,
                     provider,
@@ -1246,6 +1645,7 @@ impl SourceIndex {
                     return_decl,
                     canonical_default_return,
                     default_erased_return,
+                    body,
                 ));
             }
             if defaults.is_empty() {
@@ -1273,7 +1673,7 @@ impl SourceIndex {
 
             // Collapse repeated routes to one inherited default, then require
             // a single most-specific provider across all direct branches.
-            defaults.sort_by_key(|(_, provider, target, member, _, _, _)| {
+            defaults.sort_by_key(|(_, provider, target, member, _, _, _, _)| {
                 (
                     provider.language != SourceLanguage::Java
                         || target.language != SourceLanguage::Java,
@@ -1291,8 +1691,8 @@ impl SourceIndex {
             let most_specific = defaults
                 .iter()
                 .enumerate()
-                .filter(|(_, (_, _, target, _, _, _, _))| {
-                    !defaults.iter().any(|(_, _, other, _, _, _, _)| {
+                .filter(|(_, (_, _, target, _, _, _, _, _))| {
+                    !defaults.iter().any(|(_, _, other, _, _, _, _, _)| {
                         semantics::workspace_symbol(self, other)
                             != semantics::workspace_symbol(self, target)
                             && super::proven_reference_subtype(
@@ -1322,6 +1722,7 @@ impl SourceIndex {
                 return_decl,
                 default_canonical_return,
                 default_erased_return,
+                body,
             ) = defaults[most_specific[0]].clone();
 
             let mut has_wider_contract = false;
@@ -1407,6 +1808,7 @@ impl SourceIndex {
                 method_name,
                 return_type_ref: TypeRef::parse(&return_type),
                 return_type,
+                body,
             });
         }
         Ok(bridges)
@@ -2755,5 +3157,361 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn methodless_marker_proof_excludes_comparable_and_unproved_bindings() {
+        for (source, type_name, expected) in [
+            (
+                "package sample\nimport java.io.Serializable\ninterface Model : Serializable",
+                "Serializable",
+                true,
+            ),
+            (
+                "package sample\nimport java.lang.Cloneable as PlatformCloneable\ninterface Model : PlatformCloneable",
+                "PlatformCloneable",
+                true,
+            ),
+            (
+                "package sample\ninterface Model : java.util.RandomAccess",
+                "java.util.RandomAccess",
+                true,
+            ),
+            // `Comparable` declares `compareTo`: no getter is not no members.
+            (
+                "package sample\nimport java.lang.Comparable as PlatformComparable\ninterface Model : PlatformComparable",
+                "PlatformComparable",
+                false,
+            ),
+            (
+                "package sample\ninterface Model : Comparable<String>",
+                "Comparable<String>",
+                false,
+            ),
+            // A source classifier of the same name shadows the JDK marker.
+            (
+                "package sample\nimport java.lang.Comparable as PlatformComparable\ninterface PlatformComparable<T> {}",
+                "PlatformComparable",
+                false,
+            ),
+            (
+                "package java.lang\nimport java.lang.Cloneable as PlatformCloneable\ninterface Cloneable {}",
+                "PlatformCloneable",
+                false,
+            ),
+            // Two bindings are ambiguous, exactly like Kotlin's own conflict.
+            (
+                "package sample\nimport java.lang.Cloneable as PlatformCloneable\nimport external.contract.Cloneable as PlatformCloneable",
+                "PlatformCloneable",
+                false,
+            ),
+            ("package sample\n", "Serializable", false),
+        ] {
+            let (_root, path, index) = index_for(source);
+            let file = index.source_file(&path).expect("indexed test source");
+            assert_eq!(
+                index.canonical_methodless_external_marker(file, type_name),
+                expected,
+                "{source} / {type_name}"
+            );
+        }
+    }
+
+    const FORWARDING_PROVIDERS: &str = r#"
+        package sample
+        interface View { val text: String }
+        class Marker(override val text: String) : View
+        class Envelope(private val stored: Marker) {
+            val marker: Marker get() = stored
+        }
+        interface Wide { fun getMarker(): View }
+        interface Provider : Wide {
+            val envelope: Envelope
+            override fun getMarker(): Marker = envelope.marker
+            suspend fun retainedOnly() {}
+        }
+    "#;
+
+    const FORWARDING_CHILD: &str = r#"
+        package sample
+        class Child(private val storage: Envelope) : Provider {
+            override val envelope: Envelope get() = storage
+        }
+    "#;
+
+    #[test]
+    fn forwarding_body_is_proven_for_an_exact_this_rooted_accessor_chain() {
+        let (_root, path, index) = index_for_sources(&[
+            ("Providers.kt", FORWARDING_PROVIDERS),
+            ("Child.kt", FORWARDING_CHILD),
+        ]);
+        let bridges = index
+            .covariant_default_getter_bridges(&path, "Child")
+            .unwrap();
+        assert_eq!(bridges.len(), 1, "{bridges:?}");
+        let body = bridges[0].body.as_ref().expect("forwarding body");
+        let accessors = body
+            .steps
+            .iter()
+            .map(|step| step.accessor.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(accessors, ["getEnvelope", "getMarker"]);
+    }
+
+    #[test]
+    fn forwarding_body_is_proven_across_separate_source_files() {
+        let view = "package sample\n\ninterface MarkerView {\n    val text: String\n}\n";
+        let marker = "package sample\n\nclass Marker(override val text: String) : MarkerView\n";
+        let envelope = "package sample\n\nclass Envelope(private val stored: Marker) {\n    val marker: Marker\n        get() {\n            Reads.markerRead()\n            return stored\n        }\n}\n";
+        let reads = "package sample;\n\npublic final class Reads {\n    private static int markerReads;\n    public static int markerRead() { return ++markerReads; }\n}\n";
+        let wide = "package sample\n\ninterface WideSource {\n    fun getMarker(): MarkerView\n}\n";
+        let provider = "package sample\n\ninterface DefaultSource : WideSource {\n    val envelope: Envelope\n\n    override fun getMarker(): Marker = envelope.marker\n\n    suspend fun retainedMarker() {}\n}\n";
+        let child = "package sample\n\nclass Subject(private val storage: Envelope) : DefaultSource {\n    override val envelope: Envelope\n        get() {\n            Reads.envelopeRead()\n            return storage\n        }\n}\n";
+        let (_root, path, index) = index_for_sources(&[
+            ("MarkerView.kt", view),
+            ("Marker.kt", marker),
+            ("Envelope.kt", envelope),
+            ("Reads.java", reads),
+            ("WideSource.kt", wide),
+            ("DefaultSource.kt", provider),
+            ("Subject.kt", child),
+        ]);
+        let bridges = index
+            .covariant_default_getter_bridges(&path, "Subject")
+            .unwrap();
+        assert_eq!(bridges.len(), 1, "{bridges:?}");
+        let body = bridges[0].body.as_ref().expect("forwarding body");
+        let accessors = body
+            .steps
+            .iter()
+            .map(|step| step.accessor.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(accessors, ["getEnvelope", "getMarker"]);
+    }
+
+    const FORWARDING_CHILD_BODY: &str = "package sample\n\
+         class Child(private val storage: Envelope) : Provider {\n\
+             override val envelope: Envelope get() = storage\n\
+         }\n";
+
+    /// A provider whose selected default getter body is `body`, plus a child
+    /// that inherits it. The child file is always part of the fixture so a
+    /// missing-source error can never stand in for a declined proof.
+    fn forwarding_bridges(providers: &str) -> Result<Vec<CovariantDefaultGetterBridge>, String> {
+        let (_root, path, index) = index_for_sources(&[
+            ("Providers.kt", providers),
+            ("Child.kt", FORWARDING_CHILD_BODY),
+        ]);
+        index.covariant_default_getter_bridges(&path, "Child")
+    }
+
+    fn provider_with(body: &str) -> String {
+        format!(
+            "package sample\n\
+             interface View {{ val text: String }}\n\
+             class Marker(override val text: String) : View\n\
+             class Envelope(private val stored: Marker) {{\n\
+                 val marker: Marker get() = stored\n\
+                 fun pick(): Marker = stored\n\
+             }}\n\
+             interface Wide {{ fun getMarker(): View }}\n\
+             interface Provider : Wide {{\n\
+                 val envelope: Envelope\n\
+                 {body}\n\
+             }}\n"
+        )
+    }
+
+    /// The bridge is still selected, so only the forwarding proof can keep the
+    /// child in Kotlin.
+    fn assert_bridge_without_forwarding_body(providers: &str) {
+        let bridges = forwarding_bridges(providers)
+            .unwrap_or_else(|error| panic!("bridge analysis must still succeed: {error}"));
+        assert!(!bridges.is_empty(), "expected a selected default getter");
+        assert!(
+            bridges.iter().all(|bridge| bridge.body.is_none()),
+            "expected no proven forwarding body: {bridges:?}"
+        );
+    }
+
+    #[test]
+    fn annotated_default_getter_body_stays_unproven() {
+        // Renaming the accessor changes the JVM method the Kotlin default
+        // reads, so the chain cannot be re-created by its property spelling.
+        let renamed = "package sample\n\
+             interface View { val text: String }\n\
+             class Marker(override val text: String) : View\n\
+             class Envelope(private val stored: Marker) {\n\
+                 @get:JvmName(\"named\")\n\
+                 val marker: Marker get() = stored\n\
+             }\n\
+             interface Wide { fun getMarker(): View }\n\
+             interface Provider : Wide {\n\
+                 val envelope: Envelope\n\
+                 override fun getMarker(): Marker = envelope.marker\n\
+             }\n";
+        assert_bridge_without_forwarding_body(renamed);
+
+        // An annotated target default keeps its annotation on the Kotlin
+        // provider; a body re-created without it would silently drop the
+        // contract, so this slice refuses the whole default.
+        let annotated = provider_with(
+            "@Deprecated(\"old\")\n    override fun getMarker(): Marker = envelope.marker",
+        );
+        assert_bridge_without_forwarding_body(&annotated);
+    }
+
+    #[test]
+    fn a_default_that_reads_its_own_getter_stays_unproven() {
+        // The re-created body must never call the bridge it belongs to.
+        let providers = "package sample\n\
+             interface View { val text: String }\n\
+             class Marker(override val text: String) : View\n\
+             interface Wide { fun getMarker(): View }\n\
+             interface Provider : Wide {\n\
+                 override val marker: Marker get() = marker\n\
+             }\n";
+        if let Ok(bridges) = forwarding_bridges(providers) {
+            assert!(
+                bridges.iter().all(|bridge| bridge.body.is_none()),
+                "a self-reading default must stay unproven: {bridges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn calls_casts_labelled_receivers_and_block_bodies_stay_unproven() {
+        for body in [
+            "override fun getMarker(): Marker = envelope.pick()",
+            "override fun getMarker(): Marker = envelope as Marker",
+            "override fun getMarker(): Marker = this@Provider.envelope.marker",
+            "override fun getMarker(): Marker = Outer(this).envelope.marker",
+            "override fun getMarker(): Marker { return envelope.marker }",
+        ] {
+            assert_bridge_without_forwarding_body(&provider_with(body));
+        }
+    }
+
+    #[test]
+    fn non_public_or_mutable_steps_stay_unproven() {
+        for (label, marker) in [
+            ("private", "private val marker: Marker get() = stored"),
+            ("mutable", "var marker: Marker get() = stored"),
+        ] {
+            let providers = format!(
+                "package sample\n\
+                 interface View {{ val text: String }}\n\
+                 class Marker(override val text: String) : View\n\
+                 class Envelope(private val stored: Marker) {{\n\
+                     {marker}\n\
+                 }}\n\
+                 interface Wide {{ fun getMarker(): View }}\n\
+                 interface Provider : Wide {{\n\
+                     val envelope: Envelope\n\
+                     override fun getMarker(): Marker = envelope.marker\n\
+                 }}\n"
+            );
+            // A private step has no readable accessor at all, so the chain is
+            // unresolvable; a mutable step is refused by the proof itself.
+            let bridges =
+                forwarding_bridges(&providers).unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert!(
+                bridges.iter().all(|bridge| bridge.body.is_none()),
+                "{label} step must stay unproven: {bridges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nullable_and_generic_default_returns_stay_unproven() {
+        let nullable = provider_with("override fun getMarker(): Marker? = envelope.marker");
+        assert!(
+            forwarding_bridges(&nullable).is_err(),
+            "a nullable default return needs null handling this slice cannot prove"
+        );
+        // A type-parameter return only erases to its bound. Kotlin's own
+        // reflection reports the bound type in some `-jvm-default` modes, so a
+        // logical subtype proof is not an ABI proof.
+        let generic = "package sample\n\
+             interface View { val text: String }\n\
+             class Marker(override val text: String) : View\n\
+             class Envelope(private val stored: Marker) { val marker: Marker get() = stored }\n\
+             interface Wide { fun getMarker(): View }\n\
+             interface Provider<T : Marker> : Wide {\n\
+                 val envelope: Envelope\n\
+                 override fun getMarker(): T = current\n\
+                 val current: T\n\
+             }\n";
+        let bridges = forwarding_bridges(generic).unwrap();
+        assert!(
+            bridges.iter().all(|bridge| bridge.body.is_none()),
+            "a generic default return must not be proven from a subtype alone: {bridges:?}"
+        );
+    }
+
+    #[test]
+    fn same_named_providers_are_never_confused_across_files() {
+        // A same-named provider in another package forwards through a
+        // different property chain. The proof must follow the child's own
+        // resolution and that provider's exact source identity.
+        let other = "package other\n\
+             interface View { val text: String }\n\
+             class Marker(override val text: String) : View\n\
+             class Envelope(private val stored: Marker) { val marker: Marker get() = stored }\n\
+             interface Wide { fun getMarker(): View }\n\
+             interface Provider : Wide {\n\
+                 val bag: Envelope\n\
+                 override fun getMarker(): Marker = bag.marker\n\
+             }\n";
+        let (_root, path, index) = index_for_sources(&[
+            ("Other.kt", other),
+            (
+                "Providers.kt",
+                &provider_with("override fun getMarker(): Marker = envelope.marker"),
+            ),
+            ("Child.kt", FORWARDING_CHILD_BODY),
+        ]);
+        let bridges = index
+            .covariant_default_getter_bridges(&path, "Child")
+            .unwrap();
+        assert_eq!(bridges.len(), 1, "{bridges:?}");
+        assert_eq!(bridges[0].target.package, "sample");
+        let body = bridges[0].body.as_ref().expect("forwarding body");
+        let accessors = body
+            .steps
+            .iter()
+            .map(|step| step.accessor.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(accessors, ["getEnvelope", "getMarker"]);
+    }
+
+    #[test]
+    fn a_changed_provider_snapshot_invalidates_the_forwarding_body() {
+        let (_root, path, index) = index_for_sources(&[
+            (
+                "Providers.kt",
+                &provider_with("override fun getMarker(): Marker = envelope.marker"),
+            ),
+            ("Child.kt", FORWARDING_CHILD_BODY),
+        ]);
+        let bridges = index
+            .covariant_default_getter_bridges(&path, "Child")
+            .unwrap();
+        assert!(bridges[0].body.is_some());
+        let providers = provider_with("override fun getMarker(): Marker = envelope.pick()");
+        let changed = index
+            .with_overlays(&[super::SourceOverlay::Replace {
+                path: _root.join("Providers.kt"),
+                language: SourceLanguage::Kotlin,
+                source: providers,
+            }])
+            .unwrap();
+        let bridges = changed
+            .covariant_default_getter_bridges(&path, "Child")
+            .unwrap();
+        assert!(
+            bridges.iter().all(|bridge| bridge.body.is_none()),
+            "an edited default body must not keep its previous forwarding proof: {bridges:?}"
+        );
     }
 }

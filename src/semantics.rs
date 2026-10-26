@@ -23,7 +23,9 @@ mod generated_getter_tests;
 mod inherited_calls;
 mod inherited_properties;
 mod jackson_defaults;
+pub(crate) mod java_member_calls;
 mod java_property_reads;
+mod lowering_contract;
 mod object_calls;
 mod overloads;
 mod platform_constructors;
@@ -31,6 +33,7 @@ mod platform_members;
 mod property_getter_equivalence;
 mod reified_calls;
 mod source_calls;
+pub(crate) mod string_case;
 mod todo;
 pub(crate) use class_literals::{
     contains_unlowerable_class_literal, established_default_companion_call,
@@ -46,8 +49,25 @@ pub use inherited_properties::InheritedPropertyAccess;
 pub use object_calls::{ReferenceStringCall, ReferenceStringCallKind, ReferenceStringReceiver};
 pub use overloads::ExactOverloadCall;
 pub(crate) use platform_constructors::established_platform_constructor;
+pub(crate) use platform_members::external_static_field_access;
 pub use reified_calls::ReifiedClassCall;
 pub use todo::TodoLowering;
+
+// Declaration-wide lowering contracts (§4.5). The data types are part of the
+// plan surface (`TranslationPlan::call_receipts`), so every consumer —
+// planning, type inference, emission — reads the same recorded object.
+pub use lowering_contract::{AbiProof, RequiredContract, RequiredObligations, SlotProof};
+pub use lowering_contract::{
+    ArgumentMapping, Behavior, CallReceipt, CalleeIdentity, CheckedEffects, Dispatch, JavaOutcome,
+    JavaRepresentation, Nullability, ReceiptEvidence, ReprKind,
+};
+pub(crate) use lowering_contract::{
+    OperationRefusal, ReturnAbi, SiteRecord, TypeBindings, UseContext, classify_use,
+    declaration_abi, declaration_returns, declarations_requiring_coverage, descriptor_arity,
+    descriptor_result_matches, plan_contracts, record_receipts, representation_from_row,
+    retain_contract, unconsumed_receipts,
+};
+pub(crate) use lowering_contract::{canonical_string_field_type, is_canonical_string_slot};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SymbolId {
@@ -290,10 +310,10 @@ pub(crate) fn recovered_annotation_class_name(
         .map(str::to_owned)
 }
 
-/// Recover an annotated interface only when the prefix parse establishes the
-/// same top-level declaration boundaries. Both planning and emission use this
-/// syntax evidence; an opaque or malformed boundary still remains Kotlin.
-pub(crate) fn recover_annotated_interface_tree(
+/// Recover an annotated interface or annotation class only when the prefix
+/// parse establishes the same name, kind and top-level declaration boundaries.
+/// Planning and emission share this syntax evidence; malformed boundaries retain.
+pub(crate) fn recover_annotated_type_tree(
     source: &str,
     wrapper: tree_sitter::Node<'_>,
 ) -> Option<tree_sitter::Tree> {
@@ -306,26 +326,93 @@ pub(crate) fn recover_annotated_interface_tree(
         .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
         .ok()?;
     let tree = parser.parse(prefix, None)?;
-    recovered_annotated_interface_decl(source, wrapper, tree.root_node())?;
+    if recovered_annotated_type_decl(source, wrapper, tree.root_node()).is_some() {
+        return Some(tree);
+    }
+    // A bodyless annotation remains an infix expression even at EOF in the
+    // pinned grammar. An explicit empty constructor disambiguates the same
+    // parameterless annotation declaration. Remove only that synthetic suffix
+    // from the tree coordinates before either consumer observes the tree.
+    let name = recovered_annotation_class_name_node(wrapper, source)?;
+    if name.end_byte() != wrapper.end_byte() {
+        return None;
+    }
+    let suffix = " constructor()";
+    let augmented = format!("{prefix}{suffix}");
+    let mut tree = parser.parse(&augmented, None)?;
+    let declaration =
+        matched_annotated_type_decl(source, wrapper, tree.root_node(), augmented.len())?;
+    let constructor = declaration
+        .named_children(&mut declaration.walk())
+        .find(|child| child.kind() == "primary_constructor")?;
+    if constructor.start_byte() != prefix.len() + 1
+        || constructor.utf8_text(augmented.as_bytes()).ok() != Some("constructor()")
+    {
+        return None;
+    }
+    let end = wrapper.end_position();
+    tree.edit(&tree_sitter::InputEdit {
+        start_byte: prefix.len(),
+        old_end_byte: augmented.len(),
+        new_end_byte: prefix.len(),
+        start_position: end,
+        old_end_position: tree_sitter::Point {
+            row: end.row,
+            column: end.column + suffix.len(),
+        },
+        new_end_position: end,
+    });
+    recovered_annotated_type_decl(source, wrapper, tree.root_node())?;
     Some(tree)
 }
 
-pub(crate) fn recovered_annotated_interface_decl<'tree>(
+pub(crate) fn recovered_annotated_type_decl<'tree>(
     source: &str,
     wrapper: tree_sitter::Node<'_>,
     root: tree_sitter::Node<'tree>,
 ) -> Option<tree_sitter::Node<'tree>> {
-    let name = recovered_interface_name(wrapper, source)?;
+    matched_annotated_type_decl(source, wrapper, root, wrapper.end_byte())
+}
+
+fn matched_annotated_type_decl<'tree>(
+    source: &str,
+    wrapper: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'tree>,
+    expected_end: usize,
+) -> Option<tree_sitter::Node<'tree>> {
+    let (name, annotation) = match (
+        recovered_interface_name(wrapper, source),
+        recovered_annotation_class_name(wrapper, source),
+    ) {
+        (Some(name), None) => (name, false),
+        (None, Some(name)) => (name, true),
+        _ => return None,
+    };
     let mut cursor = root.walk();
     let mut declarations = root.named_children(&mut cursor).filter(|candidate| {
         candidate.kind() == "class_declaration"
             && !candidate.has_error()
             && !candidate.is_missing()
             && candidate.start_byte() == wrapper.start_byte()
-            && candidate.end_byte() == wrapper.end_byte()
-            && candidate
-                .children(&mut candidate.walk())
-                .any(|child| child.kind() == "interface")
+            && candidate.end_byte() == expected_end
+            && if annotation {
+                candidate
+                    .named_children(&mut candidate.walk())
+                    .find(|child| child.kind() == "modifiers")
+                    .is_some_and(|modifiers| {
+                        modifiers
+                            .named_children(&mut modifiers.walk())
+                            .any(|modifier| {
+                                modifier.kind() == "class_modifier"
+                                    && modifier.utf8_text(source.as_bytes()).ok()
+                                        == Some("annotation")
+                            })
+                    })
+            } else {
+                candidate
+                    .children(&mut candidate.walk())
+                    .any(|child| child.kind() == "interface")
+            }
             && candidate
                 .child_by_field_name("name")
                 .and_then(|node| node.utf8_text(source.as_bytes()).ok())
@@ -2101,6 +2188,17 @@ pub trait SemanticProvider: Send + Sync {
     ) -> Option<crate::facts::protocol::CallSite> {
         None
     }
+    /// Exact Kotlin source property binding for these source bytes.
+    /// Absence cannot establish independence or a movable field.
+    fn source_property_reference(
+        &self,
+        _file: &Path,
+        _byte_offset: u64,
+        _source_hash: &[u8; 32],
+    ) -> Option<crate::facts::protocol::SourcePropertyReference> {
+        None
+    }
+
     fn kotlin_constructor_metadata_dependency(
         &self,
         _owner: &SymbolId,
@@ -4490,8 +4588,34 @@ pub fn plan_required_calls(
     allow_approximations: bool,
     plan: &mut crate::translation_plan::TranslationPlan,
 ) {
+    let annots = plan.annotations;
     let hash = *blake3::hash(source.as_bytes()).as_bytes();
     let owners = DeclarationOwnerIndex::new(plan);
+    // Per-declaration, call-scoped checked-exception audit. A `Prepared`
+    // declaration is a Java method with no `throws`/`catch` model, so one
+    // physically checked callee makes the whole emitted file invalid. Which
+    // call made the declaration eligible is irrelevant: this audit does not
+    // consult the fact's `Established`/platform status to decide *whether* to
+    // look, only this call's own site and physical rows to decide *what* it
+    // found.
+    let mut throws_audit = vec![DeclarationThrowsAudit::default(); plan.declarations.len()];
+    // The co-emitted unit of a Kotlin file is its top-level declaration (a
+    // class carries every member), which is the granularity `plan.declarations`
+    // and the emitter's preflight use. Both halves of the inventory below need
+    // the unit node itself, so it is resolved once from the exact span.
+    let unit_nodes = declaration_unit_nodes(tree.root_node(), plan);
+    // Declared type spellings are resolved through one binding table per file,
+    // shared by every ABI slot and every use-context proof.
+    let bindings = TypeBindings::build(source, tree.root_node());
+    // Return proofs do not depend on receipts, so they are cached while the
+    // call-site walk classifies each value's use context.
+    let mut returns_cache: Vec<Option<ReturnAbi>> =
+        (0..plan.declarations.len()).map(|_| None).collect();
+    // Whole-declaration inventory: every call site this walk sees, with what
+    // the planners could sign for it. `plan_contracts` turns the inventory into
+    // a verdict after the walk, because required mode depends on whether *any*
+    // receipt exists in the declaration.
+    let mut sites: Vec<SiteRecord> = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if matches!(node.kind(), "call_expression" | "method_invocation") {
@@ -4504,6 +4628,90 @@ pub fn plan_required_calls(
                 {
                     let locally_shadowed = is_proven_local_shadow(callee, &name, source);
                     let fact = resolve_required_call(source, file, node, callee, &name, provider);
+                    // Call-scoped physical visibility (§4.4). This runs before
+                    // every older eligibility path below and does not depend
+                    // on any of them: a resolution answer is not emission
+                    // evidence.
+                    if matches!(fact, FactStatus::Established(_)) {
+                        let audit = &mut throws_audit[index];
+                        let location = SourceLocation {
+                            file: file.to_path_buf(),
+                            snapshot_hash: hash,
+                            start_byte: node.start_byte(),
+                            end_byte: node.end_byte(),
+                        };
+                        let effects =
+                            match java_member_calls::checked_throws(source, file, node, provider) {
+                                java_member_calls::CheckedThrows::Checked(exceptions) => {
+                                    audit.checked.get_or_insert_with(|| {
+                                        (name.clone(), exceptions.clone(), location.clone())
+                                    });
+                                    Some(CheckedEffects::Checked(exceptions))
+                                }
+                                java_member_calls::CheckedThrows::Unknown => {
+                                    audit
+                                        .unknown
+                                        .get_or_insert_with(|| (name.clone(), location.clone()));
+                                    Some(CheckedEffects::Unknown)
+                                }
+                                java_member_calls::CheckedThrows::None => {
+                                    Some(CheckedEffects::None)
+                                }
+                                java_member_calls::CheckedThrows::Unidentified => None,
+                            };
+                        // The one receipt builder of this slice. A receipt is
+                        // what activates required mode for the declaration;
+                        // the throws audit above stays the independent
+                        // call-scoped refusal for sites this builder cannot
+                        // sign at all (arguments, static dispatch, unknown
+                        // metadata).
+                        let receipt = java_member_calls::propose(source, file, node, provider);
+                        if receipt.is_some() {
+                            audit.newly_proved = true;
+                        }
+                        let use_context = if receipt.is_some() {
+                            ensure_unit_returns(
+                                &mut returns_cache,
+                                index,
+                                unit_nodes.get(index).copied().flatten(),
+                                source,
+                                &bindings,
+                                provider,
+                                annots,
+                            );
+                            match returns_cache.get(index).and_then(Option::as_ref) {
+                                Some(returns) => classify_use(source, node, returns),
+                                None => UseContext::Observing("value position"),
+                            }
+                        } else {
+                            UseContext::Observing("value position")
+                        };
+                        sites.push(SiteRecord {
+                            declaration: index,
+                            name: name.clone(),
+                            location,
+                            receipt,
+                            use_context,
+                            effects,
+                        });
+                    } else {
+                        // Not established by any fact: still an operation in
+                        // the declaration's emission closure, so the inventory
+                        // must see it.
+                        sites.push(SiteRecord {
+                            declaration: index,
+                            name: name.clone(),
+                            location: SourceLocation {
+                                file: file.to_path_buf(),
+                                snapshot_hash: hash,
+                                start_byte: node.start_byte(),
+                                end_byte: node.end_byte(),
+                            },
+                            receipt: None,
+                            use_context: UseContext::Observing("value position"),
+                            effects: None,
+                        });
+                    }
                     if let FactStatus::Established(target) = &fact
                         && let Some(overload) =
                             overloads::establish(source, file, node, target, provider)
@@ -4624,6 +4832,39 @@ pub fn plan_required_calls(
                                             crate::translation_plan::BackendOwner::Kotlin;
                                     }
                                 }
+                                // A `String` receiver is not evidence that a
+                                // `lowercase`/`uppercase` call is the stdlib
+                                // conversion: the resolved callee has to be
+                                // the shared fact. Anything else — a workspace
+                                // extension, another stdlib function, or a
+                                // shape this lowering does not implement — is
+                                // retained here, because the emitter has no
+                                // Java form for the Kotlin spelling.
+                                if string_case::spelling_claims_string_case(
+                                    source, file, node, callee, &name, provider,
+                                ) && string_case::establish(source, file, node, provider)
+                                    .is_none()
+                                {
+                                    let decision = &mut plan.declarations[index];
+                                    let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
+                                        kind: crate::translation_plan::PreparationBlockerKind::UnresolvedAssumption,
+                                        message: format!(
+                                            "call `{name}` is not the proven String case conversion"
+                                        ),
+                                    };
+                                    if !decision.retention_reasons.contains(&reason) {
+                                        decision.retention_reasons.push(reason);
+                                        decision.candidate_owner =
+                                            crate::translation_plan::BackendOwner::Kotlin;
+                                    }
+                                    plan.diagnostics.push(SemanticDiagnostic {
+                                        code: "S001".into(),
+                                        message: format!(
+                                            "call `{name}` is not the proven String case conversion"
+                                        ),
+                                        location,
+                                    });
+                                }
                             }
                         }
                     }
@@ -4632,6 +4873,219 @@ pub fn plan_required_calls(
         }
         let mut c = node.walk();
         stack.extend(node.named_children(&mut c));
+    }
+    apply_checked_throws_retention(&throws_audit, plan);
+    // Receipts are recorded exactly once, *before* either inventory reads them.
+    // Recording inside `plan_contracts` (after `inventory_operations`) made the
+    // signed-call half of both inventories structurally dead: every call looked
+    // unsigned and the receipt coverage claim was never exercised.
+    crate::semantics::record_receipts(&sites, plan);
+    // Declaration-wide contract, last: it needs the whole walk's inventory and
+    // the recorded receipts, and its verdicts land as preflight blockers
+    // exactly like the audit's. The Required-mode answer is computed once and
+    // shared with `plan_contracts`, so the carried obligations of a virtual
+    // re-plan (a snapshot the helper never answered for) cannot make the two
+    // seams disagree about which declarations still owe a proof.
+    let required =
+        declarations_requiring_coverage(&sites, &plan.declarations, &plan.carried_required);
+    let mut operations: Vec<OperationRefusal> = Vec::new();
+    for (index, unit) in unit_nodes.iter().enumerate() {
+        if !required.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(unit) = unit else {
+            // A Required declaration with no resolved unit node is not proved.
+            let Some(decision) = plan.declarations.get(index) else {
+                continue;
+            };
+            let location = SourceLocation {
+                file: file.to_path_buf(),
+                snapshot_hash: hash,
+                start_byte: decision.id.start_byte,
+                end_byte: decision.id.end_byte,
+            };
+            retain_contract(
+                plan,
+                index,
+                "the declaration's unit node could not be resolved in this snapshot, so its \
+                 lowering contract cannot be proved"
+                    .to_string(),
+                location,
+            );
+            continue;
+        };
+        // One closed walk proves every emitted ABI slot and every executable
+        // operation of the co-emitted unit, reading the receipts recorded
+        // above.
+        let abi = crate::semantics::declaration_abi(
+            source,
+            *unit,
+            &bindings,
+            provider,
+            annots,
+            &plan.call_receipts,
+        );
+        if let Some(decision) = plan.declarations.get_mut(index) {
+            decision.lowering_contract = abi.contract();
+        }
+        for slot in abi.unproved() {
+            operations.push(OperationRefusal {
+                declaration: index,
+                message: slot.message(),
+                location: SourceLocation {
+                    file: file.to_path_buf(),
+                    snapshot_hash: hash,
+                    start_byte: slot.start_byte(),
+                    end_byte: slot.end_byte(),
+                },
+            });
+        }
+        for refusal in abi.refusals() {
+            operations.push(OperationRefusal {
+                declaration: index,
+                message: refusal.message.clone(),
+                location: SourceLocation {
+                    file: file.to_path_buf(),
+                    snapshot_hash: hash,
+                    start_byte: refusal.start_byte,
+                    end_byte: refusal.end_byte,
+                },
+            });
+        }
+    }
+    plan_contracts(&sites, &operations, &required, plan);
+}
+
+/// Prove (and cache) the declared return types of one co-emitted unit.
+///
+/// This half does not read receipts: the call-site walk needs a value's use
+/// context before any receipt is recorded, and a return classification is a
+/// property of the declaration alone.
+#[allow(clippy::too_many_arguments)]
+fn ensure_unit_returns<'tree>(
+    cache: &mut [Option<ReturnAbi>],
+    index: usize,
+    unit: Option<tree_sitter::Node<'tree>>,
+    source: &str,
+    bindings: &TypeBindings,
+    provider: &(impl SemanticProvider + ?Sized),
+    annots: crate::transpiler::types::AnnotationSet,
+) {
+    if cache.get(index).is_some_and(Option::is_some) {
+        return;
+    }
+    let Some(unit) = unit else {
+        return;
+    };
+    let returns = crate::semantics::declaration_returns(source, unit, bindings, provider, annots);
+    if let Some(slot) = cache.get_mut(index) {
+        *slot = Some(returns);
+    }
+}
+
+/// Resolve each planned declaration's exact node in this file's tree.
+fn declaration_unit_nodes<'tree>(
+    root: tree_sitter::Node<'tree>,
+    plan: &crate::translation_plan::TranslationPlan,
+) -> Vec<Option<tree_sitter::Node<'tree>>> {
+    let mut nodes = vec![None; plan.declarations.len()];
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        for (index, decision) in plan.declarations.iter().enumerate() {
+            if nodes[index].is_none()
+                && decision.id.start_byte == node.start_byte()
+                && decision.id.end_byte == node.end_byte()
+            {
+                nodes[index] = Some(node);
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    nodes
+}
+
+/// What one declaration's own call sites proved about checked exceptions.
+///
+/// `newly_proved` records that at least one call in the declaration is
+/// established by the call-scoped member proof, i.e. the declaration's
+/// migration is *newly* unlocked. That is the only state in which an absent
+/// throws metadata field can be treated as a reason to keep today's retention:
+/// with a helper that does not answer the field at all, nothing is newly
+/// proved and the floor is untouched.
+#[derive(Clone, Default)]
+struct DeclarationThrowsAudit {
+    newly_proved: bool,
+    /// First call proved to denote a physical member that declares checked
+    /// exceptions: `(selector, exceptions, location)`.
+    checked: Option<(String, Vec<String>, SourceLocation)>,
+    /// First call whose identified physical member carries no throws metadata
+    /// at all. Unknown is never "proved none".
+    unknown: Option<(String, SourceLocation)>,
+}
+
+/// Retain every declaration that a Java method cannot express.
+///
+/// The emitted Java has no `throws`/`catch` model, so a call to a declaration
+/// that throws a checked exception cannot be written at that site. Retention is
+/// recorded as a `PreparationBlocker`, which the preflight consumes before any
+/// lowering runs, so no older Established/platform/member path can override it
+/// and `--allow-approximations` cannot opt out of it.
+///
+/// Boundary (deliberate, and reported rather than patched around):
+/// * a Kotlin `try`/`catch` around the call is *also* retained — this cycle
+///   does not model handler scope, and over-retention is the honest floor;
+/// * a call whose physical member this slice cannot identify
+///   (`CheckedThrows::Unidentified`: no site, non-JDK owner, contradictory
+///   rows) keeps today's answer. It is not a no-throws verdict, and this
+///   function does not invent one;
+/// * absent metadata keeps today's answer unless the declaration is newly
+///   unlocked by the member proof.
+fn apply_checked_throws_retention(
+    audits: &[DeclarationThrowsAudit],
+    plan: &mut crate::translation_plan::TranslationPlan,
+) {
+    for (index, audit) in audits.iter().enumerate() {
+        let (message, location) = if let Some((name, exceptions, location)) = &audit.checked {
+            let plural = if exceptions.len() == 1 { "" } else { "s" };
+            (
+                format!(
+                    "call `{name}` declares checked exception{plural} {}; the emitted Java method \
+                     has no `throws`/`catch` model",
+                    exceptions.join(", ")
+                ),
+                location.clone(),
+            )
+        } else if audit.newly_proved {
+            let Some((name, location)) = &audit.unknown else {
+                continue;
+            };
+            (
+                format!(
+                    "call `{name}` has no checked-exception evidence; a declaration this proof \
+                     newly unlocks must not assume a callee throws nothing"
+                ),
+                location.clone(),
+            )
+        } else {
+            continue;
+        };
+        let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
+            kind: crate::translation_plan::PreparationBlockerKind::SemanticLoss,
+            message,
+        };
+        if let Some(decision) = plan.declarations.get_mut(index) {
+            if decision.retention_reasons.contains(&reason) {
+                continue;
+            }
+            decision.retention_reasons.push(reason.clone());
+            decision.candidate_owner = crate::translation_plan::BackendOwner::Kotlin;
+        }
+        plan.diagnostics.push(SemanticDiagnostic {
+            code: reason.code().into(),
+            message: reason.message(),
+            location,
+        });
     }
 }
 fn inside_annotation(mut node: tree_sitter::Node) -> bool {
@@ -5254,7 +5708,7 @@ fn declaration_supertypes(source: &str, node: tree_sitter::Node<'_>, file: &Path
     names
 }
 
-fn call_callee_node(call: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+pub(crate) fn call_callee_node(call: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     if let Some(name) = call.child_by_field_name("name") {
         return Some(name);
     }
@@ -6814,7 +7268,7 @@ fn unwrap_single_string_literal<'tree>(
     }
 }
 
-fn safe_java_string_literal(raw: &str) -> bool {
+pub(crate) fn safe_java_string_literal(raw: &str) -> bool {
     if !raw.starts_with('"')
         || !raw.ends_with('"')
         || raw.starts_with("\"\"\"")
@@ -6901,55 +7355,6 @@ pub(crate) fn established_platform_call_return_type<P: SemanticProvider + ?Sized
     platform_members::establish(source, file, call, provider)
 }
 
-/// Shared proof for Kotlin String case conversion calls. The Locale overload
-/// is accepted only when its sole argument has a proven `java.util.Locale`
-/// type, and an indexed workspace extension takes precedence over this fact.
-pub(crate) fn established_standard_string_case_call<P: SemanticProvider + ?Sized>(
-    source: &str,
-    file: &Path,
-    call: tree_sitter::Node<'_>,
-    provider: &P,
-) -> bool {
-    let Some(callee) = call_callee_node(call) else {
-        return false;
-    };
-    let name = callee.utf8_text(source.as_bytes()).unwrap_or("").trim();
-    if !matches!(name, "lowercase" | "uppercase")
-        || provider.symbols_named(name).iter().any(|symbol| {
-            symbol.id.receiver.is_some() && matches!(symbol.id.kind.as_str(), "function" | "method")
-        })
-        || kotlin_import_lines(source).any(|import| {
-            let (path, alias) = import
-                .split_once(" as ")
-                .map_or((import, None), |(path, alias)| {
-                    (path.trim(), Some(alias.trim()))
-                });
-            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or("")) == name
-                && path != format!("kotlin.text.{name}")
-        })
-        || explicit_receiver_node(call, callee).is_none()
-        || !matches!(
-            resolve_required_call(source, file, call, callee, name, provider),
-            FactStatus::Unknown
-        )
-    {
-        return false;
-    }
-    let Some(receiver_type) = explicit_receiver_type(source, call, callee, file, provider) else {
-        return false;
-    };
-    if standard_external_type(source, provider, &receiver_type, false).as_deref()
-        != Some("java.lang.String")
-    {
-        return false;
-    }
-    match call_argument_count(call) {
-        0 => true,
-        1 => known_locale_argument(source, file, call, provider),
-        _ => false,
-    }
-}
-
 pub(crate) fn established_java_callable_member<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
@@ -6963,9 +7368,22 @@ pub(crate) fn established_java_callable_member<P: SemanticProvider + ?Sized>(
         return false;
     }
     let name = callee.utf8_text(source.as_bytes()).unwrap_or("");
-    matches!(resolve_required_call(source, file, call, callee, name, provider),
-        FactStatus::Established(id) if provider.is_java_callable_member(&id))
-        || established_projected_receiver_instance_call(source, call, file, provider)
+    // Source-only, exactly as before 4.4: the declaration-index predicate.
+    //
+    // A helper fact identity carries no declaration answer, so a fact
+    // `Established` call is not an unconditional positive here. Emission of a
+    // helper-proved call must consume the planned `CallReceipt` (see
+    // `Unit::call_receipt`); admitting it from the fact identity instead would
+    // bypass the declaration-wide contract that decided the call may be
+    // emitted at all, which is how a `Stream.sorted()` proof leaked
+    // unproved sibling lowerings into the same declaration.
+    let established = match resolve_required_call(source, file, call, callee, name, provider) {
+        FactStatus::Established(id) if !crate::facts::is_fact_symbol(&id) => {
+            provider.is_java_callable_member(&id)
+        }
+        _ => false,
+    };
+    established || established_projected_receiver_instance_call(source, call, file, provider)
 }
 
 fn known_external_member_call<P: SemanticProvider + ?Sized>(
@@ -6987,6 +7405,17 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
     {
         return true;
     }
+    // The String case conversion is one typed fact (direction and locale
+    // contract from the resolved callee), not a spelling table: an alias such
+    // as `value.fold()` is only this call when the fact says so.
+    if string_case::establish(source, file, call, provider).is_some() {
+        return true;
+    }
+    if matches!(name, "lowercase" | "uppercase") {
+        // The stdlib case conversion either proved itself above or is not this
+        // call. Its spelling is never evidence of its own.
+        return false;
+    }
     let Some(receiver_type) = explicit_receiver_type(source, call, callee, file, provider) else {
         return false;
     };
@@ -7007,9 +7436,6 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
             return matches!(arity, 1 | 2);
         }
         return arity == 1 && known_string_split_argument(source, file, call, provider);
-    }
-    if receiver_type == "java.lang.String" && matches!(name, "lowercase" | "uppercase") {
-        return established_standard_string_case_call(source, file, call, provider);
     }
     if matches!(name, "mapKeys" | "filterValues")
         && matches!(
@@ -7038,11 +7464,7 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
         (receiver_type.as_str(), name, arity),
         ("java.util.UUID", "toString" | "hashCode", 0)
             | ("java.util.UUID", "equals", 1)
-            | (
-                "java.lang.String",
-                "toString" | "hashCode" | "lowercase" | "uppercase" | "trim",
-                0
-            )
+            | ("java.lang.String", "toString" | "hashCode" | "trim", 0)
             | ("java.lang.String", "equals" | "compareTo", 1)
             | (
                 "java.util.Map"
@@ -7395,7 +7817,7 @@ fn explicit_receiver_spelling<'a>(
     receiver.utf8_text(source.as_bytes()).ok().map(str::trim)
 }
 
-fn explicit_receiver_node<'tree>(
+pub(crate) fn explicit_receiver_node<'tree>(
     call: tree_sitter::Node<'tree>,
     callee: tree_sitter::Node<'tree>,
 ) -> Option<tree_sitter::Node<'tree>> {
@@ -7426,7 +7848,23 @@ fn explicit_receiver_is_type_qualifier<P: SemanticProvider + ?Sized>(
     let Some(spelling) = explicit_receiver_spelling(source, call, callee) else {
         return false;
     };
-    if explicit_receiver_node(call, callee).is_some_and(|node| node.kind() == "call_expression") {
+    let Some(receiver) = explicit_receiver_node(call, callee) else {
+        return false;
+    };
+    if receiver.kind() == "call_expression" {
+        return false;
+    }
+    // A dotted receiver may be a value reached through a static field. Its
+    // leading capital only identifies the root, not the entire expression.
+    // Require a classifier fact for the complete path before static dispatch;
+    // instance dispatch can independently prove a field value's type.
+    if receiver.kind() == "navigation_expression"
+        && standard_external_type(source, provider, spelling, false).is_none()
+        && !matches!(
+            provider.resolve_type_in_file(file, &package_name(source), spelling),
+            FactStatus::Established(id) if is_type_symbol(&id)
+        )
+    {
         return false;
     }
     spelling.chars().next().is_some_and(char::is_uppercase)

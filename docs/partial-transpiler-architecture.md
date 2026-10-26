@@ -168,13 +168,52 @@ callable *and* every type involved is real. `Ambiguous` (an error type, or
 candidates it could not choose between) and `Unknown` (no candidates) carry no
 data, so the call keeps today's retention — `S001`/`S002` — unchanged.
 
+**Answering nothing.** The exchange is one line in, one line out, so a request
+the helper cannot satisfy is answered with `Answer::NoEvidence` (per-request:
+asked, healthy, no evidence) instead of silence. Silence would leave the client
+waiting out its response deadline — which cannot tell a slow helper from a dead
+one — and then retire the helper; an empty `CallSites` batch would be a
+different claim ("looked, saw no calls"). A `NoEvidence` answer is `Unknown`
+for that request only: the helper stays trusted for `Ping`, `ClassMembers` and
+the next file, and the batch memo does not store it (a per-request absence may
+not repeat).
+
+**Faults, and where they are decided.** A *fault* — EOF, a write/read error, a
+desynchronized answer, an answer line over the 64 MiB cap or not valid UTF-8,
+or no line within the client's response deadline — retires the helper: the
+client kills *and reaps* it, so a direct `FactsClient` that outlives the fault
+leaves no zombie behind, and every later query fails fast. Malformed *frames*
+are decided one level below retirement, deliberately: a line that does not
+decode fails only the request that was waiting for it (the reader consumed
+exactly one line, so the stream stays aligned and the next exchange starts
+clean), while a line carrying another request's id means answers can no longer
+be matched at all and retires the client immediately. `FactsRuntime` is
+stricter than the client: any failed exchange marks the helper dead for the
+run, so one malformed frame still costs Track B its facts rather than letting
+them quietly degrade.
+
+**Bounded memory.** The reader thread queues at most one answer line and caps
+each line at 64 MiB including its newline. Both bounds are backpressure on the
+child — unbidden lines block the reader and then the helper on its own stdout
+pipe — and crossing either is a fault rather than an allocation or a truncated
+frame. Leading whitespace counts against the cap, because the cap applies to
+the bytes on the wire before the decoder trims them.
+
+**The deadline is fail-closed, not a health check.** 120 s is chosen to clear a
+JVM start plus a K2 session build over a large tree, but the client cannot tell
+a helper that is merely slow from one that has stalled — it only sees that no
+line arrived. Any exchange that exceeds it retires the helper either way. What
+keeps a working helper alive is the answer, not the deadline: `NoEvidence` is a
+fact, so a healthy helper does not depend on the ceiling at all.
+
 **Launch contract.** `notlin` passes the run's Kotlin source roots
 (`configure_kotlin_sources`, canonicalized parent directories of the selected
 inputs) and the validation config's classpath to the helper child as
 `NOTLIN_KOTLIN_SOURCES`/`NOTLIN_CLASSPATH`, and adds `--kotlin` only when the jar
 is the full one *and* sources exist (the helper treats the flag without sources
-as a fatal startup error; without the flag it serves Track A and never answers
-`ResolveCalls`, which is the same fail-closed `Unknown`). `NOTLIN_JAVA` /
+as a fatal startup error; without the flag it serves Track A and answers
+`ResolveCalls` with a per-request `NoEvidence`, which is the same fail-closed
+`Unknown` without the wait). `NOTLIN_JAVA` /
 `JAVA_HOME` choose the JVM: the session needs a HotSpot VM with JFR — an
 OpenJ9/Semeru `JAVA_HOME` fails at the first resolution, and the run then
 degrades to no facts rather than hanging (the helper halts on a fatal request

@@ -4,6 +4,7 @@ import com.intellij.openapi.Disposable;
 import com.intellij.openapi.util.Disposer;
 import kotlin.Unit;
 import kotlin.jvm.functions.Function1;
+import notlin.facts.Facts;
 import org.jetbrains.kotlin.analysis.api.projectStructure.KaSourceModule;
 import org.jetbrains.kotlin.analysis.api.standalone.StandaloneAnalysisAPISession;
 import org.jetbrains.kotlin.analysis.api.standalone.StandaloneAnalysisAPISessionBuilder;
@@ -188,34 +189,46 @@ public final class KotlinSession {
         return built;
     }
 
-    /** Answers one {@code ResolveCalls} batch, or {@code null} when the file is not indexed. */
+    /**
+     * Answers one {@code ResolveCalls} batch.
+     *
+     * <p>Always returns a line. A file this session did not index, a file that
+     * cannot be read, and a batch that fails midway are each an explicit
+     * {@link Facts#noEvidenceAnswer per-request absence}: the caller (the stdio
+     * loop) must answer every request, because the Rust client blocks on one
+     * line per request and cannot tell silence from a stalled helper. A
+     * non-answer is never a partial batch either — that would read as "every
+     * call site and every source-property read in this file".
+     */
     public String callSitesAnswer(long id, String requestedPath) {
         String real = realPath(requestedPath);
         KtFile file = real == null ? null : files.get(real);
         if (file == null) {
             warn("ResolveCalls: file is not indexed by this session: " + requestedPath);
-            return null;
+            return Facts.noEvidenceAnswer(id, "ResolveCalls", "file is not indexed by this session");
         }
         byte[] raw;
         try {
             raw = Files.readAllBytes(Paths.get(real));
         } catch (IOException unreadable) {
             warn("ResolveCalls: cannot read " + real + ": " + unreadable);
-            return null;
+            return Facts.noEvidenceAnswer(id, "ResolveCalls", "cannot read the requested file");
         }
         long started = System.nanoTime();
-        List<CallSites.Site> sites;
+        CallSites.Batch batch;
         try {
-            sites = CallSites.extractAll(session, file, raw);
+            batch = CallSites.extractAll(session, file, raw);
         } catch (RuntimeException | LinkageError failure) {
             // Fail closed: an exception mid-file must not produce a partial batch
-            // the Rust side could mistake for "every call site in this file".
+            // the Rust side could mistake for "every call site and every property
+            // read in this file".
             warn("ResolveCalls failed for " + real + ": " + failure);
-            return null;
+            return Facts.noEvidenceAnswer(id, "ResolveCalls", "call-site extraction failed");
         }
         long elapsed = (System.nanoTime() - started) / 1_000_000L;
-        log("ResolveCalls " + Paths.get(real).getFileName() + " sites=" + sites.size() + " in " + elapsed + " ms");
-        return CallSites.toAnswerLine(id, requestedPath, sites);
+        log("ResolveCalls " + Paths.get(real).getFileName() + " sites=" + batch.sites().size()
+                + " references=" + batch.references().size() + " in " + elapsed + " ms");
+        return CallSites.toAnswerLine(id, requestedPath, batch);
     }
 
     /**

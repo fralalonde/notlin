@@ -1,0 +1,7 @@
+[
+  {"name":"<init>","static_member":false,"parameter_types":[],"result_type":"<void>","parameter_nullability":[],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.lang.String"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.lang.String","java.lang.Throwable"],"result_type":"<void>","parameter_nullability":["unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.lang.Throwable"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"getMessage","static_member":false,"parameter_types":[],"result_type":"java.lang.String","parameter_nullability":[],"result_nullability":"unknown"}
+]

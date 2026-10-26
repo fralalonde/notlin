@@ -580,6 +580,10 @@ fun main() {
         emitted.contains("toUpperCase(java.util.Locale.ROOT)"),
         "{emitted}"
     );
+    // The process-default JDK member is exactly what Kotlin's zero-argument
+    // conversion does not do; it must not appear anywhere in the output.
+    assert!(!emitted.contains(".toLowerCase()"), "{emitted}");
+    assert!(!emitted.contains(".toUpperCase()"), "{emitted}");
     let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
     target_java_17(&mut mixed);
     mixed.kotlin_sources.push(migrated.join("Runner.kt"));
@@ -587,6 +591,120 @@ fun main() {
     mixed.classpath.push(stdlib);
     mixed.run_main_class = Some("boundary.RunnerKt".into());
     let after = validate_jvm_sources(&mixed).expect("translated locale conversion compiles");
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        after.commands.last().unwrap().stdout.trim()
+    );
+}
+
+/// Import aliases rename the stdlib overloads without changing them. The
+/// direction therefore has to come from the resolved callee (`lowercase` /
+/// `uppercase`), never from the selector spelling: emitting `value.fold()` is
+/// invalid Java, and lowering it without the invariant Locale silently changes
+/// the result under a Turkish default locale.
+///
+/// Without Track B the alias selector is unprovable, so the honest answer is
+/// retention (the same S001 floor as a jar-less run); the JVM comparison only
+/// applies when the call-site fact exists.
+#[test]
+#[ignore = "requires JVM tool paths and Kotlin stdlib in NOTLIN_KOTLINC/JAVAC/JAVA/KOTLIN_STDLIB"]
+fn real_toolchain_lowers_aliased_stdlib_case_imports() {
+    let kotlinc = std::env::var_os("NOTLIN_KOTLINC").expect("NOTLIN_KOTLINC");
+    let javac = std::env::var_os("NOTLIN_JAVAC").expect("NOTLIN_JAVAC");
+    let java = std::env::var_os("NOTLIN_JAVA").expect("NOTLIN_JAVA");
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new("aliased string conversion");
+    let original = scratch.0.join("original");
+    let migrated = scratch.0.join("migrated");
+    for root in [&original, &migrated] {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("Aliasing.kt"),
+            r#"package boundary
+import java.util.Locale
+import kotlin.text.lowercase as fold
+import kotlin.text.uppercase as raiseCase
+class Aliasing {
+    fun lower(value: String): String = value.fold()
+    fun upper(value: String): String = value.raiseCase()
+    fun localized(value: String, locale: Locale): String = value.fold(locale)
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Runner.kt"),
+            r#"package boundary
+import java.util.Locale
+fun main() {
+    Locale.setDefault(Locale.forLanguageTag("tr-TR"))
+    val aliasing = Aliasing()
+    val values = listOf(aliasing.lower("TITLE"), aliasing.upper("title"),
+        aliasing.localized("TITLE", Locale.getDefault()))
+    println(values.map { text -> text.map { it.code }.joinToString(",") }.joinToString("|"))
+}
+"#,
+        )
+        .unwrap();
+    }
+    let mut baseline =
+        JvmValidationConfig::new(&kotlinc, &javac, &java, scratch.0.join("original classes"));
+    target_java_17(&mut baseline);
+    baseline.kotlin_sources = vec![original.join("Aliasing.kt"), original.join("Runner.kt")];
+    baseline.classpath.push(stdlib.clone());
+    baseline.run_main_class = Some("boundary.RunnerKt".into());
+    let before = validate_jvm_sources(&baseline).expect("original alias conversion compiles");
+    // `fold()`/`raiseCase()` are the invariant conversions: "TITLE" -> "title"
+    // even under tr-TR, while the explicit Locale keeps the dotted/dotless
+    // difference (ı = 305, İ = 304).
+    assert_eq!(
+        before.commands.last().unwrap().stdout.trim(),
+        "116,105,116,108,101|84,73,84,76,69|116,305,116,108,101"
+    );
+    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .arg("--root")
+        .arg(&migrated)
+        .args(["--annotations", "none", "--in-place", "--lombok"])
+        .arg(migrated.join("Aliasing.kt"))
+        .output()
+        .unwrap();
+    assert!(
+        translation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translation.stderr)
+    );
+    let emitted_path = migrated.join("Aliasing.java");
+    if std::env::var_os("NOTLIN_JVM_FACTS_JAR").is_none() {
+        assert!(
+            !emitted_path.exists(),
+            "an alias selector without a call-site fact has no invocable proof: {}",
+            fs::read_to_string(&emitted_path).unwrap_or_default()
+        );
+        assert!(migrated.join("Aliasing.kt").exists());
+        return;
+    }
+    let emitted = fs::read_to_string(&emitted_path).expect("aliased case conversion translates");
+    assert!(
+        emitted.contains("toLowerCase(java.util.Locale.ROOT)"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("toUpperCase(java.util.Locale.ROOT)"),
+        "{emitted}"
+    );
+    assert!(emitted.contains("toLowerCase(locale)"), "{emitted}");
+    assert!(!emitted.contains(".fold("), "{emitted}");
+    assert!(!emitted.contains(".raiseCase("), "{emitted}");
+    assert!(!emitted.contains(".toLowerCase()"), "{emitted}");
+    assert!(!emitted.contains(".toUpperCase()"), "{emitted}");
+    let mut mixed = JvmValidationConfig::new(kotlinc, javac, java, scratch.0.join("mixed classes"));
+    target_java_17(&mut mixed);
+    mixed.kotlin_sources.push(migrated.join("Runner.kt"));
+    mixed.java_sources.push(emitted_path);
+    mixed.classpath.push(stdlib);
+    mixed.run_main_class = Some("boundary.RunnerKt".into());
+    let after = validate_jvm_sources(&mixed).expect("translated alias conversion compiles");
     assert_eq!(
         before.commands.last().unwrap().stdout.trim(),
         after.commands.last().unwrap().stdout.trim()

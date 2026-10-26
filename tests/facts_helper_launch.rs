@@ -44,8 +44,8 @@ fn no_configured_sources_means_no_kotlin_flag() {
         eprintln!("NOTLIN_KOTLIN_SOURCES is exported; the no-sources half is covered elsewhere");
         return;
     }
-    // The full jar without sources runs as a Track A helper: ResolveCalls then
-    // goes unanswered, which the Rust side reads as Unknown.
+    // The full jar without sources runs as a Track A helper. The client must
+    // skip Kotlin queries instead of waiting for an unsupported response.
     assert!(!args_of("/x/notlin-jvm-facts-full.jar").contains(&"--kotlin".to_string()));
     assert!(!args_of("/x/notlin-jvm-facts.jar").contains(&"--kotlin".to_string()));
 }

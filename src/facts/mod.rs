@@ -41,10 +41,13 @@ pub const FACT_MODULE: &str = "jvm-facts";
 ///   [`TypeRef::parse`] accepts, and re-rendering them would lose information
 ///   the wire carried.
 ///
-/// The *typed* view of the same fact (result type through [`TypeRef`],
-/// nullability) is answered by the decorator for this identity, so a consumer
-/// that asks the provider about the returned id gets the helper's answer
-/// instead of the syntax index's silence.
+/// Nothing answers *declaration* questions for this identity: the decorator
+/// forwards every declaration-backed accessor to the syntax index, which is
+/// silent for a fact id. The helper's K2 result type is Kotlin's view of a call
+/// expression — not a declaration's return type, not a natively nongeneric
+/// signature and not the Java type of the text this crate emits — so no
+/// declaration-backed accessor may answer it, and it is not reachable through
+/// the nongeneric-declaration API at all.
 ///
 /// `None` when the helper reported no callee name — a status the decorator
 /// never hands out, guarded here so a malformed line cannot mint an identity.

@@ -101,13 +101,16 @@ annotation class Shadowed
     .unwrap();
 
     let stderr = translate(&root);
-    let retained = fs::read_to_string(root.join("Annotations.kt")).unwrap_or_default();
+    let emitted = fs::read_to_string(root.join("Shadowed.java")).unwrap_or_default();
     assert!(
-        retained.contains("@Target(\"custom\")") && retained.contains("annotation class Shadowed"),
-        "an opaque parser boundary must preserve the declaration and metadata:\n{retained}\n{stderr}"
+        emitted.contains("@Target(\"custom\")"),
+        "recovered declaration must preserve its custom annotation identity/value:\n{emitted}\n{stderr}"
+    );
+    assert!(
+        !emitted.contains("java.lang.annotation.Target") && !emitted.contains("ElementType"),
+        "a same-named source annotation is not Kotlin Target metadata:\n{emitted}"
     );
     assert!(stderr.contains("2 declarations"), "{stderr}");
-    assert!(!root.join("Shadowed.java").exists());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -173,4 +176,51 @@ annotation class RuntimeOnly(val value: String)
         "{runtime}\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn bodyless_meta_annotations_recover_with_siblings_in_one_physical_file() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = scratch();
+    let _cleanup = Cleanup(root.clone());
+    fs::write(
+        root.join("Annotations.kt"),
+        r#"package generic.annotations
+
+@Target(AnnotationTarget.CLASS, AnnotationTarget.ANNOTATION_CLASS)
+annotation class Meta
+
+@Meta
+@Target(AnnotationTarget.CLASS)
+annotation class Marker
+
+@Marker
+class Receiver
+
+const val TOKEN: Int = 7
+"#,
+    )
+    .unwrap();
+    let stderr = translate(&root);
+    for name in ["Meta", "Marker", "Receiver"] {
+        assert!(
+            root.join(format!("{name}.java")).is_file(),
+            "missing {name}.java:\n{stderr}"
+        );
+    }
+    let meta = fs::read_to_string(root.join("Meta.java")).unwrap();
+    let marker = fs::read_to_string(root.join("Marker.java")).unwrap();
+    assert!(meta.contains("public @interface Meta"), "{meta}");
+    assert!(meta.contains("ElementType.ANNOTATION_TYPE"), "{meta}");
+    assert!(
+        marker.contains("@Meta") && marker.contains("public @interface Marker"),
+        "{marker}"
+    );
+    assert!(marker.contains("RetentionPolicy.RUNTIME"), "{marker}");
+    assert!(!stderr.contains("N47BC"), "{stderr}");
 }

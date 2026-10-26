@@ -154,6 +154,22 @@ pub struct DeclarationDecision {
     /// Set only after reconciling with legacy lowering coverage.
     pub preparation_outcome: Option<PreparationOutcome>,
     pub final_owner: Option<BackendOwner>,
+    /// Whether the declaration-wide lowering contract is active here: at least
+    /// one signed receipt exists inside this declaration's span. Persisted so
+    /// every seam (inventory, emission fallback, acceptance) reads one answer
+    /// instead of recomputing it.
+    #[serde(default)]
+    pub required_mode: bool,
+    /// The persisted ABI/operation contract of a Required declaration: the
+    /// exact Java text proved for every emitted slot, bound to this snapshot.
+    /// Acceptance re-proves it from the source tree before any write.
+    #[serde(default)]
+    pub lowering_contract: Option<crate::semantics::RequiredContract>,
+    /// The lowering contract refused this declaration. Persisted through
+    /// reconciliation because the `PreparationBlocker` reason is preparation
+    /// state; a Java-owned declaration carrying this flag is a pre-write error.
+    #[serde(default)]
+    pub contract_retained: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +208,45 @@ pub struct TranslationPlan {
     /// Canonical external container calls with wrapper-only return facts.
     #[serde(default)]
     pub container_calls: Vec<crate::semantics::ContainerMemberCall>,
+    /// Signed per-call Java lowering contracts for this snapshot.
+    ///
+    /// The shared object of the declaration-contract design: planning refuses a
+    /// declaration whose inventory is not covered by these, the emitter writes
+    /// from them instead of re-deciding a spelling, and type inference reads
+    /// their [`crate::semantics::JavaRepresentation`]. Keyed by call span, never
+    /// by callee `SymbolId` (§4.3 removed that memo; a helper identity omits the
+    /// receiver form, arguments and per-call type).
+    #[serde(default)]
+    pub call_receipts: Vec<crate::semantics::CallReceipt>,
+    /// Exact source-property bindings consumed as Kotlin static-field imports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub property_imports: Vec<crate::top_level_property_callsite::PropertyImportProof>,
+    /// The annotation set emission will use for this run. Slot proofs render the
+    /// exact text with it, so planning and emission cannot disagree about a
+    /// type's annotation prefix.
+    #[serde(skip)]
+    pub annotations: crate::transpiler::types::AnnotationSet,
+    /// Required-mode obligations this snapshot inherits from an earlier
+    /// snapshot of the same file.
+    ///
+    /// A virtual re-plan is not the text on disk, so the helper cannot answer
+    /// for it and no receipt can be re-established. These identities were
+    /// proved Required on a snapshot that *did* carry receipts; carrying the
+    /// obligation — never the receipt — keeps a declaration from silently
+    /// reverting to Legacy and being emitted by an older path that never
+    /// proved its calls. Filled in by the workspace fixpoint from
+    /// [`crate::semantics::RequiredObligations`], empty for every on-disk
+    /// snapshot, and never persisted.
+    #[serde(skip)]
+    pub carried_required: std::collections::BTreeSet<SymbolId>,
+    /// Receipts the recorder could not install, kept as authoritative evidence.
+    ///
+    /// A duplicate span or a foreign snapshot is not a safe ambiguity to
+    /// resolve by first-wins or by dropping the record: dropping it would
+    /// return the declaration to an implicit Legacy mode, and the pre-write
+    /// invariant refuses any plan carrying a conflict.
+    #[serde(default)]
+    pub receipt_conflicts: Vec<ReceiptConflict>,
     /// Proven eager stdlib collection operations tied to this snapshot.
     #[serde(default)]
     pub eager_collection_calls: Vec<crate::semantics::EagerCollectionCall>,
@@ -219,6 +274,18 @@ pub struct PlannedConstructorDelegation {
     pub parameter_types: Vec<String>,
 }
 
+/// A receipt the recorder refused to install.
+///
+/// It stays on the plan so the disagreement between planning and acceptance is
+/// observable: the pre-write invariant refuses the plan instead of writing a
+/// best-effort file, and the message names the offending span.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptConflict {
+    pub message: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolDependency {
     pub from: SymbolId,
@@ -242,19 +309,39 @@ pub struct PlannedEagerCollectionHelper {
     pub operation: crate::semantics::EagerCollectionOperation,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlannedDefaultGetterBody {
+    /// Delegate to the direct interface's inherited Java default
+    /// (`Provider.super.getX()`). Valid only when that interface supplies Java
+    /// method semantics.
+    #[default]
+    JavaSuperDelegation,
+    /// Re-create the Kotlin default's own body, which was proven to be a chain
+    /// of public zero-argument accessors rooted at `this`. The listed accessors
+    /// are exactly the steps of that proven chain.
+    SourceForwarding { accessors: Vec<String> },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedDefaultGetterBridge {
     pub owner: SymbolId,
     pub location: crate::semantics::SourceLocation,
-    /// Declaring interface of the effective default; this owner must use Java
-    /// method semantics before the bridge can be emitted or repaired.
+    /// Declaring interface of the effective default. A bridge either inherits
+    /// that owner's Java method semantics (`JavaSuperDelegation`) or re-creates
+    /// the default's own proven body (`SourceForwarding`), so a Kotlin-retained
+    /// owner is only acceptable with the latter.
     pub target: SymbolId,
     /// Direct interface qualifier for the super call. It may remain Kotlin
-    /// when it inherits the selected Java default without overriding it.
+    /// when it inherits the selected Java default without overriding it. It is
+    /// unused by a source-forwarding body.
     pub provider: SymbolId,
     pub method_name: String,
     pub return_type: String,
     pub return_type_ref: crate::semantics::TypeRef,
+    /// How the accepted bridge re-creates the selected default's body. Old
+    /// plans predate this field and only ever used the Java-super delegation.
+    #[serde(default)]
+    pub body: PlannedDefaultGetterBody,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedRepair {
@@ -457,6 +544,64 @@ impl TranslationPlan {
     ) {
         self.type_facts.push((location, fact));
     }
+
+    /// Record one signed call receipt for this snapshot.
+    ///
+    /// The span is the contract key, so a second contract for the same span is
+    /// not something to resolve by picking: it is an error. So is a receipt
+    /// bound to different source bytes. Both are kept on the plan as a
+    /// [`ReceiptConflict`] — never silently dropped — and the pre-write
+    /// invariant in `planning.rs` turns the first conflict into a controlled
+    /// error before any file is written. The conflicting receipt itself is
+    /// *not* installed, so there is no arbitrary first-winner contract either.
+    pub fn record_call_receipt(
+        &mut self,
+        receipt: crate::semantics::CallReceipt,
+    ) -> Result<(), ReceiptConflict> {
+        let start_byte = receipt.location.start_byte;
+        let end_byte = receipt.location.end_byte;
+        if receipt.location.snapshot_hash != self.source_hash {
+            return Err(self.record_receipt_conflict(ReceiptConflict {
+                message: format!(
+                    "call receipt for `{}` belongs to a different source snapshot than the plan",
+                    receipt.callee.name
+                ),
+                start_byte,
+                end_byte,
+            }));
+        }
+        if let Some(existing) = self.call_receipts.iter().find(|existing| {
+            existing.location.start_byte == start_byte && existing.location.end_byte == end_byte
+        }) {
+            let detail = if *existing == receipt {
+                "the same contract twice".to_string()
+            } else {
+                format!(
+                    "`{}`({}) and `{}`({})",
+                    existing.callee.name,
+                    existing.callee.owner,
+                    receipt.callee.name,
+                    receipt.callee.owner
+                )
+            };
+            return Err(self.record_receipt_conflict(ReceiptConflict {
+                message: format!(
+                    "call span carries more than one lowering receipt ({detail}); a duplicate \
+                     contract is refused rather than resolved by first-wins"
+                ),
+                start_byte,
+                end_byte,
+            }));
+        }
+        self.call_receipts.push(receipt);
+        Ok(())
+    }
+
+    /// Keep a refused recording as plan evidence and hand it back to the caller.
+    fn record_receipt_conflict(&mut self, conflict: ReceiptConflict) -> ReceiptConflict {
+        self.receipt_conflicts.push(conflict.clone());
+        conflict
+    }
     /// Resolve explicitly identified dependencies through a provider and make
     /// every non-established required fact a retention reason.
     pub fn require_symbols<P: crate::semantics::SemanticProvider>(
@@ -545,9 +690,9 @@ impl TranslationPlan {
     }
 
     /// Record prepared Java output coverage using exact declaration spans.
-    pub fn reconcile(&mut self, source: &str, coverage: &FileCoverage) -> Result<(), &'static str> {
+    pub fn reconcile(&mut self, source: &str, coverage: &FileCoverage) -> Result<(), String> {
         if *blake3::hash(source.as_bytes()).as_bytes() != self.source_hash {
-            return Err("translation plan belongs to a different source snapshot");
+            return Err("translation plan belongs to a different source snapshot".to_string());
         }
         for decision in &mut self.declarations {
             let semantic_block = decision.retention_reasons.iter().any(|reason| {
@@ -558,10 +703,21 @@ impl TranslationPlan {
                         | RetentionReason::OwnershipCycle { .. }
                 )
             });
-            let translated = !semantic_block
-                && coverage
-                    .translated_spans
-                    .contains(&(decision.id.start_byte, decision.id.end_byte));
+            let covered = coverage
+                .translated_spans
+                .contains(&(decision.id.start_byte, decision.id.end_byte));
+            // A declaration the lowering contract refused must never arrive
+            // here as translated. The blocker reason itself is preparation
+            // state (cleared below), so the persisted `contract_retained` flag
+            // is what makes this a controlled failure instead of a silent
+            // disagreement between planning and emission.
+            if decision.contract_retained && covered {
+                return Err(format!(
+                    "the lowerer translated declaration `{}` although its declaration lowering                      contract refused it",
+                    decision.symbol_id.name
+                ));
+            }
+            let translated = !semantic_block && !decision.contract_retained && covered;
             let outcome = if translated {
                 PreparationOutcome::Prepared
             } else {
@@ -650,6 +806,11 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         todo_lowerings: Vec::new(),
         reference_string_calls: Vec::new(),
         container_calls: Vec::new(),
+        call_receipts: Vec::new(),
+        property_imports: Vec::new(),
+        annotations: crate::transpiler::types::AnnotationSet::default(),
+        carried_required: std::collections::BTreeSet::new(),
+        receipt_conflicts: Vec::new(),
         eager_collection_calls: Vec::new(),
         eager_collection_helpers: Vec::new(),
         exact_overload_calls: Vec::new(),
@@ -662,12 +823,13 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         if !is_ownership_boundary(node, source) {
             continue;
         }
-        let opaque_interface = is_opaque_annotated_interface(node, source);
-        let recovery_tree = opaque_interface
-            .then(|| crate::semantics::recover_annotated_interface_tree(source, node))
+        let opaque_type = is_opaque_annotated_interface(node, source)
+            || crate::semantics::recovered_annotation_class_name_node(node, source).is_some();
+        let recovery_tree = opaque_type
+            .then(|| crate::semantics::recover_annotated_type_tree(source, node))
             .flatten();
         let recovered_node = recovery_tree.as_ref().and_then(|tree| {
-            crate::semantics::recovered_annotated_interface_decl(source, node, tree.root_node())
+            crate::semantics::recovered_annotated_type_decl(source, node, tree.root_node())
         });
         let syntax_node = recovered_node.unwrap_or(node);
         let mut reasons = Vec::new();
@@ -677,9 +839,7 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
                 end_byte: node.end_byte(),
             });
         }
-        if (opaque_interface && recovered_node.is_none())
-            || crate::semantics::recovered_annotation_class_name_node(node, source).is_some()
-        {
+        if opaque_type && recovered_node.is_none() {
             reasons.push(RetentionReason::OpaqueBoundary {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
@@ -718,6 +878,9 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
             retention_reasons: reasons,
             preparation_outcome: None,
             final_owner: None,
+            required_mode: false,
+            lowering_contract: None,
+            contract_retained: false,
         });
     }
     let mut identities = std::collections::BTreeMap::<SymbolId, Vec<usize>>::new();

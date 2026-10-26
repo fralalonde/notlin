@@ -218,6 +218,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
             "call_expression" => {
+                // A signed receipt carries the physical result type. This is
+                // the *only* source of a call's Java type when the plan signed
+                // the call: the member-name table below guesses `Object` for
+                // anything it does not recognize, and a Required declaration
+                // must not emit a value whose type was guessed rather than
+                // contracted.
+                if let Some(receipt) = self.call_receipt(expr) {
+                    match &receipt.outcome {
+                        crate::semantics::JavaOutcome::Void => return "void".to_string(),
+                        crate::semantics::JavaOutcome::Value(value) => {
+                            return value.erased.clone();
+                        }
+                    }
+                }
                 if let Some(fact) = self
                     .reified_class_calls
                     .get(&(expr.start_byte(), expr.end_byte()))

@@ -25,12 +25,15 @@ import java.nio.charset.StandardCharsets;
  * the two jars cannot drift on {@code Ping}/{@code ClassMembers} — the only new
  * behavior is the {@code ResolveCalls} discriminator.
  *
- * <p><strong>Fail closed.</strong> Without {@code --kotlin} a {@code ResolveCalls}
- * request produces <em>no answer line</em> (exactly what the pre-Kotlin helper
- * does with an unknown discriminator), and the loop keeps serving. With
- * {@code --kotlin}, a request for a file the session did not index, or a batch
- * that fails midway, also produces no answer line rather than a partial one: the
- * Rust side maps a missing answer to {@code Unknown}, which is the truth.
+ * <p><strong>Fail closed, but answer.</strong> A {@code ResolveCalls} request
+ * this helper cannot satisfy is answered with an explicit
+ * {@link Facts#noEvidenceAnswer per-request absence}: without {@code --kotlin},
+ * for a file the session did not index, for a file it cannot read, and for a
+ * batch that fails midway. It never writes a partial batch — a partial batch
+ * would be mistakable for "every call site in this file" — and it never stays
+ * silent: the parent's client waits for exactly one line per request, so
+ * silence blocks the whole run on its own stdout pipe even though the helper
+ * is alive and Track A still works.
  *
  * <p>On stdin EOF the session is disposed and the JVM is halted — the standalone
  * K2 session leaks non-daemon threads, so a plain return from {@code main} would
@@ -133,9 +136,11 @@ public final class FullMain {
             return Main.handle(line, facts);
         }
         if (kotlinSession == null) {
-            // No --kotlin: same as any other unknown discriminator, no answer.
-            Facts.warn("ResolveCalls requires --kotlin; dropping request " + id);
-            return null;
+            // No --kotlin: this helper genuinely cannot answer. Say so for this
+            // request instead of staying silent, which the parent cannot tell
+            // apart from a stalled helper.
+            Facts.warn("ResolveCalls requires --kotlin; declining request " + id);
+            return Facts.noEvidenceAnswer(id, "ResolveCalls", "helper started without --kotlin");
         }
         cursor.expect('{');
         cursor.requireKey("file");

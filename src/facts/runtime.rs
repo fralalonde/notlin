@@ -9,40 +9,66 @@
 //!
 //! Failure policy is unchanged from Phase 0: a helper that cannot start, dies,
 //! or answers garbage yields `None`, which callers map to `Unknown`. Only
-//! `--jvm-facts=on` turns a startup failure into a run error.
+//! `--jvm-facts=on` turns a startup failure into a run error. A helper that
+//! *answers* "no evidence" for one request is not a failure: that answer is
+//! per-request, leaves the helper trusted, and never retires the run.
 
-use super::classpath::{self, CallSiteFacts, ClasspathFacts};
+use super::classpath::{self, CallSiteFacts, CallSiteLookup, ClasspathFacts};
 use super::client::FactsClient;
-use super::protocol::{Answer, CallSite, MemberFacts, Query};
+use super::protocol::{Answer, CallSite, MemberFacts, Query, SourcePropertyReference};
+use std::collections::HashMap;
+
+struct ReferenceMemo {
+    source_hash: [u8; 32],
+    references: Option<Vec<SourcePropertyReference>>,
+}
 use crate::cli::JvmFactsMode;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 pub struct FactsRuntime {
     /// `None` once the helper is known dead, so later queries fail fast.
     client: Mutex<Option<FactsClient>>,
     member_facts: ClasspathFacts,
     call_site_facts: CallSiteFacts,
+    reference_facts: Mutex<HashMap<PathBuf, ReferenceMemo>>,
     dead: AtomicBool,
 }
 
 impl FactsRuntime {
-    /// Start any program that speaks the line protocol (test seam, also used by
-    /// the jar path with a `java -jar` command).
+    /// Start a custom helper implementing all query families (test seam).
+    /// Production jars use `start` so disabled Kotlin queries remain disabled.
     pub fn with_command(command: std::process::Command) -> Result<Arc<Self>, String> {
-        let client = FactsClient::start_with_command(command)?;
-        Ok(Arc::new(Self {
+        Ok(Self::from_client(FactsClient::start_with_command(command)?))
+    }
+
+    /// Test seam: a custom helper with an explicit response deadline, so a hang
+    /// regression costs milliseconds instead of the production deadline. The
+    /// deadline is never unbounded.
+    pub fn with_command_and_timeout(
+        command: std::process::Command,
+        response_timeout: Duration,
+    ) -> Result<Arc<Self>, String> {
+        Ok(Self::from_client(
+            FactsClient::start_with_command_and_timeout(command, response_timeout)?,
+        ))
+    }
+
+    fn from_client(client: FactsClient) -> Arc<Self> {
+        Arc::new(Self {
             client: Mutex::new(Some(client)),
             member_facts: ClasspathFacts::new(),
             call_site_facts: CallSiteFacts::new(),
+            reference_facts: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
-        }))
+        })
     }
 
     /// Start the helper jar with the java binary chosen by the environment.
     pub fn start(jar: &std::path::Path) -> Result<Arc<Self>, String> {
-        Self::with_command(FactsClient::jar_command(jar))
+        Ok(Self::from_client(FactsClient::start(jar)?))
     }
 
     /// Memoized `Members` answer for one owner. `None` means the helper
@@ -61,6 +87,10 @@ impl FactsRuntime {
     /// One memoized exchange, or `None` when the helper cannot be trusted for
     /// this run. The first I/O failure marks it dead: a killed helper must not
     /// cost a failed write at every later call site.
+    ///
+    /// [`Answer::NoEvidence`] is a *successful* exchange: the helper answered
+    /// that it has nothing for this request, which says nothing about the next
+    /// one. It is returned as an answer, so it never retires the run.
     pub fn query(&self, query: Query) -> Option<Answer> {
         self.exchange(query, false)
     }
@@ -80,6 +110,11 @@ impl FactsRuntime {
         }
         let mut held = self.client.lock().unwrap_or_else(PoisonError::into_inner);
         let client = held.as_mut()?;
+        // No response is expected for a disabled query family. Do not write it,
+        // and do not confuse missing capability with a dead Track A helper.
+        if !client.supports_query(&query) {
+            return None;
+        }
         let answer = if uncached {
             client.query_uncached(query)
         } else {
@@ -104,6 +139,10 @@ impl FactsRuntime {
     /// map that to `Unknown`; it is never an error, and an empty batch is a
     /// real answer ("no calls visible"), not `None`.
     ///
+    /// An explicit per-request absence ([`Answer::NoEvidence`]) is also `None`
+    /// here, but it is not remembered: the same file may be asked about again,
+    /// because the helper — unlike a dead one — may be able to answer later.
+    ///
     /// The helper is asked about the *canonical* path so the bytes it opens are
     /// the bytes hashed here. As with any hashing scheme there is a window
     /// between hashing and the helper's own read; the guard below is what
@@ -111,7 +150,7 @@ impl FactsRuntime {
     pub fn call_sites(&self, file: &Path) -> Option<Arc<Vec<CallSite>>> {
         let (canonical, hash) = disk_snapshot(file)?;
         self.call_site_facts
-            .sites_at(&canonical, hash, || self.load_call_sites(&canonical))
+            .sites_at(&canonical, hash, || self.load_call_sites(&canonical, hash))
     }
 
     /// One call site at `byte_offset`, but only if the caller can prove it is
@@ -144,11 +183,53 @@ impl FactsRuntime {
         }
         let sites = self
             .call_site_facts
-            .sites_at(&canonical, hash, || self.load_call_sites(&canonical))?;
+            .sites_at(&canonical, hash, || self.load_call_sites(&canonical, hash))?;
         sites
             .iter()
             .find(|site| site.byte_offset == byte_offset)
             .cloned()
+    }
+
+    /// One source-property binding from the same content-addressed batch as
+    /// calls. Old helpers, stale snapshots and duplicate spans prove nothing.
+    pub fn source_property_reference_at(
+        &self,
+        file: &Path,
+        byte_offset: u64,
+        expected_source_hash: &[u8; 32],
+    ) -> Option<SourcePropertyReference> {
+        let (canonical, hash) = disk_snapshot(file)?;
+        if hash != *expected_source_hash {
+            return None;
+        }
+        self.call_site_facts
+            .sites_at(&canonical, hash, || self.load_call_sites(&canonical, hash))?;
+        let held = self
+            .reference_facts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let memo = held
+            .get(&canonical)
+            .filter(|memo| memo.source_hash == hash)?;
+        let mut matches = memo
+            .references
+            .as_ref()?
+            .iter()
+            .filter(|r| r.byte_offset == byte_offset);
+        let found = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        let bytes = std::fs::read(&canonical).ok()?;
+        let start = usize::try_from(found.byte_offset).ok()?;
+        let end = usize::try_from(found.end_byte).ok()?;
+        if source_hash_bytes(&bytes) != hash
+            || start >= end
+            || bytes.get(start..end) != Some(found.text.as_bytes())
+        {
+            return None;
+        }
+        Some(found.clone())
     }
 
     /// The batch exchange itself. An answer that names another file is not
@@ -157,20 +238,45 @@ impl FactsRuntime {
     ///
     /// Uncached on the client as well: the run's memo keyed on content hash is
     /// the only memo this answer may come from, so a new revision always asks.
-    fn load_call_sites(&self, canonical: &Path) -> Option<Vec<CallSite>> {
+    fn load_call_sites(&self, canonical: &Path, hash: [u8; 32]) -> CallSiteLookup {
         match self.query_uncached(Query::ResolveCalls {
             file: canonical.to_path_buf(),
         }) {
-            Some(Answer::CallSites { file, sites }) if same_file(&file, canonical) => Some(sites),
+            Some(Answer::CallSites {
+                file,
+                sites,
+                references,
+            }) if same_file(&file, canonical) => {
+                self.reference_facts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(
+                        canonical.to_path_buf(),
+                        ReferenceMemo {
+                            source_hash: hash,
+                            references,
+                        },
+                    );
+                CallSiteLookup::Sites(sites)
+            }
             Some(Answer::CallSites { file, .. }) => {
                 log::debug!(
                     "helper answered call sites for {} instead of {}; ignoring",
                     file.display(),
                     canonical.display()
                 );
-                None
+                CallSiteLookup::Unavailable
             }
-            _ => None,
+            Some(Answer::NoEvidence { query, reason }) => {
+                // Answered, healthy, nothing to say about this one request.
+                // Not memoized: a per-request absence may not repeat.
+                log::debug!(
+                    "helper had no evidence for {query} on {}: {reason}",
+                    canonical.display()
+                );
+                CallSiteLookup::Absent
+            }
+            _ => CallSiteLookup::Unavailable,
         }
     }
 }
@@ -178,6 +284,10 @@ impl FactsRuntime {
 /// Canonical path plus the hash of its bytes right now. Both halves are
 /// required: the memo key is the canonical path, and the hash is what makes a
 /// cached batch trustworthy for the revision being planned.
+fn source_hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
 fn disk_snapshot(file: &Path) -> Option<(PathBuf, [u8; 32])> {
     let canonical = std::fs::canonicalize(file).ok()?;
     let hash = classpath::file_hash(&canonical)?;
@@ -333,10 +443,9 @@ pub fn specifies_full_jar(jar: &Path, override_value: Option<&std::ffi::OsStr>) 
 /// treats `--kotlin` without `NOTLIN_KOTLIN_SOURCES` as a startup failure
 /// (exit 2) because a session with no module can never answer anything, and
 /// that would take Track A down with it. Without the flag the full jar still
-/// serves `Ping`/`ClassMembers` and simply never answers `ResolveCalls`; the
-/// Rust side reads a missing answer as `Unknown`, which is the same
-/// fail-closed path the slim jar takes. So the slim jar needs no flag and gets
-/// none, and a full jar with no sources runs as a Track A helper.
+/// serves `Ping`/`ClassMembers`. The client records this launch mode and skips
+/// `ResolveCalls` locally, returning no fact without disabling Track A.
+/// A full jar with no sources therefore runs as a Track A helper.
 pub(super) fn pass_kotlin_flag(jar: &Path) -> bool {
     if !is_full_jar(jar) {
         return false;

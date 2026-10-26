@@ -1,0 +1,20 @@
+[
+  {"name":"<init>","static_member":false,"parameter_types":[],"result_type":"<void>","parameter_nullability":[],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["int"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.lang.CharSequence"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.lang.String"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["[C"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["[C","int","int"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown","unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["boolean"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["char"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["double"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["float"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["int"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["java.lang.CharSequence"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["java.lang.CharSequence","int","int"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown","unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["java.lang.Object"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["java.lang.String"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["java.lang.StringBuffer"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"append","static_member":false,"parameter_types":["long"],"result_type":"java.lang.StringBuilder","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"toString","static_member":false,"parameter_types":[],"result_type":"java.lang.String","parameter_nullability":[],"result_nullability":"unknown"}
+]

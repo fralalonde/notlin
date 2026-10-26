@@ -1,0 +1,3 @@
+[
+  {"name":"sorted","static_member":false,"parameter_types":[],"result_type":"java.util.stream.Stream","parameter_nullability":[],"result_nullability":"unknown","checked_exceptions":["java.io.IOException"]}
+]

@@ -153,6 +153,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 if let Some(alias) = self.unit.local_expression_aliases.get(&name) {
                     return alias.clone();
                 }
+                // Lexical bindings win before every implicit-receiver or
+                // workspace-name lookup, even when their type is unknown.
+                if crate::function_callsite::local_shadow(node, &name, self.unit.source) {
+                    return self.narrowed_receiver(&name, &name);
+                }
                 let implicit_this = self.narrowed_receiver("this", "this");
                 // Bare self-reference inside an object body: Kotlin resolves
                 // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
@@ -261,9 +266,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             "infix_expression" => self.infix_expr(node),
             "binary_expression" => self.binary(node),
             "parenthesized_expression" | "parenthesized" => {
-                let inner = node
-                    .children(&mut node.walk())
-                    .find(|c| c.is_named())
+                let inner = self
+                    .unit
+                    .expression_children(node)
+                    .first()
+                    .copied()
                     .map(|c| self.transpile(c))
                     .unwrap_or_default();
                 format!("({})", inner)
@@ -488,17 +495,23 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         .chars()
                         .next()
                         .is_some_and(|c| c.is_ascii_lowercase())
-                        && let Some(setter) = self.unit.class_props.get(member)
                     {
-                        if setter.is_empty() {
-                            self.unit.diag_untranslatable(
-                                node,
-                                format!(
-                                    "assignment to `{}` is rejected in Kotlin (val or `private set`); declaration taints",
-                                    member
-                                ),
-                            );
-                        } else {
+                        if let Some(setter) = self.unit.class_props.get(member) {
+                            if setter.is_empty() {
+                                self.unit.diag_untranslatable(
+                                    node,
+                                    format!(
+                                        "assignment to `{}` is rejected in Kotlin (val or `private set`); declaration taints",
+                                        member
+                                    ),
+                                );
+                            } else {
+                                self.unit.pending_setter = true;
+                                return format!("{}{}(", &raw[..dot + 1], setter);
+                            }
+                        } else if let Some(setter) =
+                            self.receiver_owned_property_setter(node, member)
+                        {
                             self.unit.pending_setter = true;
                             return format!("{}{}(", &raw[..dot + 1], setter);
                         }
@@ -508,6 +521,109 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             }
             _ => self.transpile(node),
         }
+    }
+
+    /// Assignment target resolution for a property OWNED BY THE RECEIVER's
+    /// class: `other.parent = v` inside a method of any other class. The
+    /// same-class registry (`class_props`) cannot know the receiver's
+    /// properties, and falling through to the read path emits the illegal
+    /// `other.getParent() = v`. Allowed only when the receiver spelling has a
+    /// proven local/parameter type resolving to exactly one indexed Kotlin
+    /// class whose plain public `var` property exposes the ordinary
+    /// JavaBean setter ABI. `@JvmField` properties have no setter method,
+    /// a custom accessor block can hide the setter (`private set`), and
+    /// `@JvmName` can rename it — indexed as `setter_name_renamed`; all of
+    /// those keep today's behavior. Declaration-site annotations such as
+    /// serialization or tooling markers do not change the setter name and
+    /// do NOT block this rewrite. Returns just the setter name; the caller
+    /// composes `base + setter + "("`.
+    fn receiver_owned_property_setter(
+        &self,
+        node: tree_sitter::Node,
+        member: &str,
+    ) -> Option<String> {
+        let workspace = self.unit.workspace?;
+        let declaring = self
+            .unit
+            .workspace_file
+            .as_deref()
+            .unwrap_or(self.unit.file);
+        let source_file = workspace.source_file(declaring)?;
+        let base = node.named_children(&mut node.walk()).next()?;
+        if !matches!(base.kind(), "identifier" | "simple_identifier") {
+            return None;
+        }
+        // Only a two-segment target (`other.parent`): a chained receiver base
+        // would itself need read-path lowering that the raw spelling cannot
+        // carry.
+        if node.named_children(&mut node.walk()).count() != 2 {
+            return None;
+        }
+        let receiver = self.unit.text(base).trim();
+        if self.unit.text(node).contains("?.") {
+            // Safe-call assignment targets need their own lowering; the
+            // plain setter form would drop the null short-circuit.
+            return None;
+        }
+        let source = self.unit.source;
+        let call_scope = node.parent()?;
+        let declared_type = crate::semantics::lexical_parameter_type(source, call_scope, receiver)
+            .or_else(|| {
+                self.unit.var_types.get(receiver).map(|stored| {
+                    crate::semantics::TypeRef::from_java_name(
+                        stored.strip_prefix("@Nullable ").unwrap_or(stored).trim(),
+                    )
+                })
+            })?;
+        if declared_type.nullable {
+            // A nullable receiver needs a proven null check to write through
+            // its setter; smart-cast rewiring is not this path's job.
+            return None;
+        }
+        let type_spelling = match &declared_type.ty {
+            crate::semantics::KotlinType::Named { name, .. } => name.clone(),
+            crate::semantics::KotlinType::Primitive(name) => name.clone(),
+            _ => return None,
+        };
+        if type_spelling.is_empty() {
+            return None;
+        }
+        let declaration = workspace.resolve_type(source_file, &type_spelling)?;
+        if declaration.language != crate::workspace::SourceLanguage::Kotlin {
+            return None;
+        }
+        let property = declaration.members.iter().find(|candidate| {
+            candidate.kind == crate::workspace::MemberKind::Property
+                && candidate.name == member
+                && !candidate.is_static
+        })?;
+        if !property.is_mutable
+            || property.is_jvm_field
+            || property.has_custom_accessor
+            || property.setter_name_renamed
+            || !matches!(
+                property.visibility.as_deref(),
+                None | Some("public") | Some("protected")
+            )
+        {
+            return None;
+        }
+        // Ambiguous receiver type names (two indexed declarations resolving
+        // through the same spelling) have no provable setter ABI.
+        if workspace
+            .declarations_named(&type_spelling)
+            .filter(|candidate| {
+                candidate.kind == declaration.kind && candidate.package == declaration.package
+            })
+            .count()
+            != 1
+        {
+            return None;
+        }
+        Some(format!(
+            "set{}",
+            crate::transpiler::unit::capitalize(member)
+        ))
     }
 
     /// A bare assignment in a translated subclass cannot write an inherited

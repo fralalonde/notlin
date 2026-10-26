@@ -49,10 +49,25 @@ NOTLIN_CLASSPATH=/path/to/app.jar:/path/to/other.jar \
 
 ## Wire format
 
-Newline-delimited JSON, one request per line, at most one answer line per
-answered request. Field names are fixed by `src/facts/protocol.rs` on the Rust
-side and by this helper; both ends are ours, so the helper parses with a rigid
-string scanner instead of a JSON library and serializes with a `StringBuilder`.
+Newline-delimited JSON, one request per line, one answer line per **well-formed**
+request. Field names are fixed by `src/facts/protocol.rs` on the Rust side and
+by this helper; both ends are ours, so the helper parses with a rigid string
+scanner instead of a JSON library and serializes with a `StringBuilder`.
+
+The client waits for exactly one line per request, so a request this helper
+cannot satisfy is answered with an explicit `NoEvidence` line rather than
+silence. Silence is indistinguishable from a stalled helper, and a stalled
+helper costs the run its deadline (the client kills and reaps it). A
+`NoEvidence` answer costs only that request: the helper stays trusted for
+`Ping`/`ClassMembers`/the next file, and the same question may be retried.
+
+A single answer line is capped at 64 MiB including its newline, and the client
+queues at most one line ahead of the request it is waiting for. A longer line,
+a line that is not valid UTF-8, or a request left unanswered past the client's
+120 s response deadline is a channel fault: the client kills and reaps the
+helper rather than buffering or salvaging the frame. That deadline cannot tell
+a slow helper from a stalled one, so this helper must answer — with a batch or
+`NoEvidence` — rather than stay silent.
 
 Requests:
 
@@ -68,7 +83,16 @@ Answers:
 {"version":1,"id":N,"answer":{"Pong":{"version":1}}}
 {"version":1,"id":N,"answer":{"Members":{"owner":"<echo>","members":[...] or null}}}
 {"version":1,"id":N,"answer":{"CallSites":{"file":"<echo>","sites":[...]}}}
+{"version":1,"id":N,"answer":{"NoEvidence":{"query":"ResolveCalls","reason":"<diagnostic>"}}}
 ```
+
+`NoEvidence` is the per-request "asked, healthy, nothing for this one" answer:
+emitted for a `ResolveCalls` the full jar did not get `--kotlin` for, for a file
+the session did not index, for a file it cannot read, for a batch that failed
+midway (never a partial batch), and for any query discriminator this build does
+not implement. It is **not** an empty `CallSites` batch: `sites: []` means
+"looked, saw no calls". `reason` is diagnostic text and never carries paths; the
+Rust side never parses it.
 
 Each member object:
 
@@ -93,10 +117,11 @@ Each member object:
 - `members: null` (not `[]`) when the type cannot be established: invalid owner
   (outside `[A-Za-z0-9_$.]`), `ClassNotFoundException`, linkage error, non-public
   type, or a member enumeration that fails halfway. Null always means "unknown".
-- Missing/garbled lines, wrong `version`, unknown `query` discriminator: the
-  helper answers **nothing** for that line, logs to stderr, and keeps serving;
-  EOF exits 0. It never crashes the loop. The Rust client treats a missing answer
-  as `Unknown`.
+- Missing/garbled lines and a wrong `version`: the helper answers **nothing** for
+  that line (the id it carries is not trustworthy either), logs to stderr, and
+  keeps serving; EOF exits 0. It never crashes the loop. A well-formed query
+  with an unknown discriminator *is* answered, with `NoEvidence`: the id is
+  valid and the client is waiting for it.
 - `parameter_nullability` / `result_nullability` are `non_null` or `nullable`
   only when proven: class-file `RuntimeInvisibleAnnotations` (JDK 22+
   `java.lang.classfile`, which is how the CLASS-retained

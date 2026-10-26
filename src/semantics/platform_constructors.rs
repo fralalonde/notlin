@@ -1,4 +1,18 @@
 //! Applicable JDK constructors, established independently of Java rendering.
+//!
+//! One function answers every consumer: planning (`external_call_is_proven`),
+//! classifier inference (`established_platform_call_return_type`) and emission
+//! (`new <classifier>(...)`) all call [`established_platform_constructor`], so
+//! they cannot disagree about whether a constructor call is proven.
+//!
+//! Applicability itself is the shared classpath signature model, not a
+//! constructor-specific rule: [`platform_members::constructor_applicable`] reads
+//! the owner's `<init>` rows from the run's fact source and applies the same
+//! exact-argument, exact-arity and unique-applicability filter instance and
+//! static calls use. What stays local to this file is only the *bounded owner
+//! recognition* below (four JDK families, with their import and shadowing
+//! proofs) — the caller-side guard set that decides which spellings may be
+//! treated as constructors of an external JVM class at all.
 use super::*;
 
 pub(crate) fn established_platform_constructor<P: SemanticProvider + ?Sized>(
@@ -63,6 +77,43 @@ pub(crate) fn established_platform_constructor<P: SemanticProvider + ?Sized>(
             }
         }
     }
+    // Every guard above has run: a spelling the syntax layer owns never reaches
+    // the fact source. Only now is the call a candidate for a sourced answer.
+    match platform_members::constructor_applicable(source, file, call, canonical, provider) {
+        platform_members::ConstructorAnswer::Established(result) => Some(result),
+        // Final negative: the fact source covers this owner, so its rows are the
+        // whole truth for it. The fallback table's rows for the same owner are
+        // stale bootstrapping, not extra candidates.
+        platform_members::ConstructorAnswer::NotApplicable => None,
+        platform_members::ConstructorAnswer::Unavailable => {
+            fallback_constructor_table(source, file, call, canonical, provider)
+        }
+    }
+}
+
+/// FALLBACK — the hand-declared constructor rows, for runs with no usable
+/// classpath facts for this owner.
+///
+/// This is the pre-helper behavior and is kept *only* as the floor: no helper,
+/// a helper that cannot load the type, and a helper that answered `members:null`
+/// all land here, and the jar-less result must stay byte-identical to the
+/// pre-helper run. The rows themselves live in
+/// `platform_members::SIGNATURES`; they are a guessed subset of each family
+/// (BigDecimal's scalar constructors, the zero-argument builders and
+/// exceptions) and deliberately refuse shapes the JDK really has, such as
+/// `StringBuilder(String)` or `BigDecimal(String, MathContext)`. Sourcing those
+/// shapes is the fact source's job, not the table's: extending this list with
+/// invented overloads would be a guess that no evidence backs.
+///
+/// It is never consulted for an owner the fact source covers — see
+/// [`platform_members::constructor_applicable`].
+fn fallback_constructor_table<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    canonical: &str,
+    provider: &P,
+) -> Option<&'static str> {
     platform_members::applicable(
         source,
         file,

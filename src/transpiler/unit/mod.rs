@@ -58,6 +58,36 @@ pub struct Unit<'src, 'tree> {
         std::collections::HashMap<(usize, usize), crate::semantics::ExactOverloadCall>,
     pub(crate) reified_class_calls:
         std::collections::HashMap<(usize, usize), crate::semantics::ReifiedClassCall>,
+    /// Signed per-call lowering receipts for this snapshot, copied from the
+    /// plan. Emission writes from these and never re-resolves a call; a call
+    /// that has no receipt keeps today's Legacy path.
+    pub(crate) call_receipts:
+        std::collections::HashMap<(usize, usize), crate::semantics::CallReceipt>,
+    /// Proved constant-field emission contracts for this snapshot, copied from
+    /// the plan's property-import proofs and keyed by declaration span. The
+    /// field emitter writes the type from here instead of re-deriving it from a
+    /// source spelling that a wildcard import leaves ambiguous.
+    pub(crate) field_type_proofs: std::collections::BTreeMap<
+        (usize, usize),
+        crate::top_level_property_callsite::FieldEmissionProof,
+    >,
+    /// Field proofs this emission actually consumed. An unproved field whose
+    /// plan asked for a bound type would otherwise fall back to the ambiguous
+    /// spelling silently, so `lower_with_plan` fails closed on a leftover.
+    pub(crate) consumed_field_type_proofs: std::collections::BTreeSet<(usize, usize)>,
+    /// Single-type imports the proved field types require in this file's
+    /// generated Java. Empty for every file without such a proof, so the
+    /// helper-free/Legacy import block is byte-identical.
+    pub(crate) proved_field_imports: std::collections::BTreeSet<String>,
+    /// Receipt spans this emission actually consumed. `lower_with_plan`
+    /// compares it against the receipts inside translated declarations, so a
+    /// receipt that planning required but emission never read is a pre-write
+    /// failure instead of a silently unchecked file.
+    pub(crate) consumed_receipts: std::collections::BTreeSet<(usize, usize)>,
+    /// Spans of declarations whose declaration-wide lowering contract is
+    /// active. Inside one of them a call is admissible only through its planned
+    /// receipt: no provider/name/navigation fallback may re-admit it.
+    pub(crate) required_declaration_spans: Vec<(usize, usize)>,
     pub(crate) constructor_delegations: std::collections::HashMap<
         (usize, usize),
         crate::translation_plan::PlannedConstructorDelegation,
@@ -263,35 +293,112 @@ pub struct UnitOptions {
 }
 
 impl<'src, 'tree> Unit<'src, 'tree> {
-    pub(crate) fn established_standard_string_case_call(&self, node: tree_sitter::Node) -> bool {
-        self.semantic_provider.is_some_and(|provider| {
-            crate::semantics::established_standard_string_case_call(
-                self.source,
-                self.workspace_file.as_deref().unwrap_or(self.file),
-                node,
-                provider,
-            )
-        })
+    /// The shared Kotlin `String.lowercase`/`uppercase` fact for this call,
+    /// when the run has proven it. Applicability and emission read the same
+    /// answer, so a call cannot be planned as translatable and then lowered
+    /// from its spelling.
+    pub(crate) fn string_case_call(
+        &self,
+        node: tree_sitter::Node,
+    ) -> Option<crate::semantics::string_case::StringCaseCall> {
+        let provider = self.semantic_provider?;
+        let call = if node.kind() == "call_expression" {
+            node
+        } else {
+            node.parent()
+                .filter(|parent| parent.kind() == "call_expression")?
+        };
+        crate::semantics::string_case::establish(
+            self.source,
+            self.workspace_file.as_deref().unwrap_or(self.file),
+            call,
+            provider,
+        )
     }
 
     pub(crate) fn established_java_callable_member(&self, node: tree_sitter::Node) -> bool {
-        let Some(provider) = self.semantic_provider else {
-            return false;
-        };
         let call = if matches!(node.kind(), "call_expression" | "method_invocation") {
             Some(node)
         } else {
             node.parent()
                 .filter(|parent| matches!(parent.kind(), "call_expression" | "method_invocation"))
         };
-        call.is_some_and(|call| {
-            crate::semantics::established_java_callable_member(
-                self.source,
-                self.workspace_file.as_deref().unwrap_or(self.file),
-                call,
-                provider,
-            )
-        })
+        let Some(call) = call else {
+            return false;
+        };
+        // The planned receipt is the only admission for a helper-proved call.
+        // Reading it here (rather than querying the provider again) is what
+        // keeps emission and planning on one object: a call the declaration
+        // contract refused has no receipt, so no Established/platform path can
+        // emit it.
+        if self
+            .call_receipts
+            .contains_key(&(call.start_byte(), call.end_byte()))
+        {
+            return true;
+        }
+        // No legacy admission inside a Required declaration: the frozen
+        // slice admits exactly the planned receipts, so an unsigned call
+        // cannot fall back to a helper/provider identity there.
+        if self.in_required_declaration(call) {
+            return false;
+        }
+        let Some(provider) = self.semantic_provider else {
+            return false;
+        };
+        crate::semantics::established_java_callable_member(
+            self.source,
+            self.workspace_file.as_deref().unwrap_or(self.file),
+            call,
+            provider,
+        )
+    }
+
+    /// The signed lowering receipt for this call site, if the plan recorded one.
+    ///
+    /// Accepts the call node itself or a node inside it (the emitter reaches
+    /// `receiver.member` through the navigation node, whose parent is the call).
+    pub(crate) fn call_receipt(
+        &self,
+        node: tree_sitter::Node,
+    ) -> Option<&crate::semantics::CallReceipt> {
+        let call = if matches!(node.kind(), "call_expression" | "method_invocation") {
+            node
+        } else {
+            node.parent()
+                .filter(|parent| matches!(parent.kind(), "call_expression" | "method_invocation"))?
+        };
+        self.call_receipts
+            .get(&(call.start_byte(), call.end_byte()))
+    }
+
+    /// Whether `call` sits inside a declaration whose lowering contract is
+    /// active (Required mode).
+    pub(crate) fn in_required_declaration(&self, call: tree_sitter::Node<'_>) -> bool {
+        let (start, end) = (call.start_byte(), call.end_byte());
+        self.required_declaration_spans
+            .iter()
+            .any(|(declaration_start, declaration_end)| {
+                *declaration_start <= start && end <= *declaration_end
+            })
+    }
+
+    /// Named expression children under the declaration's rendering contract.
+    /// Required wrappers ignore the same explicit comment trivia as planning;
+    /// Legacy keeps its existing child-selection behavior byte for byte.
+    pub(crate) fn expression_children<'node>(
+        &self,
+        node: tree_sitter::Node<'node>,
+    ) -> Vec<tree_sitter::Node<'node>> {
+        let required = self.in_required_declaration(node);
+        node.named_children(&mut node.walk())
+            .filter(|child| !required || !matches!(child.kind(), "line_comment" | "block_comment"))
+            .collect()
+    }
+
+    /// Record that emission consumed the receipt at `key`.
+    pub(crate) fn mark_receipt_consumed(&mut self, key: (usize, usize)) {
+        self.consumed_receipts.insert(key);
     }
 
     pub(crate) fn established_platform_call_return_type(
@@ -415,6 +522,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             local_expression_types: std::collections::HashMap::new(),
             exact_overload_calls: std::collections::HashMap::new(),
             reified_class_calls: std::collections::HashMap::new(),
+            call_receipts: std::collections::HashMap::new(),
+            field_type_proofs: std::collections::BTreeMap::new(),
+            consumed_field_type_proofs: std::collections::BTreeSet::new(),
+            proved_field_imports: std::collections::BTreeSet::new(),
+            consumed_receipts: std::collections::BTreeSet::new(),
+            required_declaration_spans: Vec::new(),
             constructor_delegations: std::collections::HashMap::new(),
             default_getter_bridges: Vec::new(),
             tainted_declarations: std::collections::HashSet::new(),
@@ -1231,6 +1344,40 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 )
             })
             .collect();
+        // Receipts are snapshot-bound: a receipt proved on different bytes is
+        // not an emission input. `AcceptedTranslationPlan::accept` refuses such
+        // a plan before any write; here it simply does not enter the lookup, so
+        // emission cannot act on a stale contract.
+        self.call_receipts = plan
+            .call_receipts
+            .iter()
+            .filter(|receipt| receipt.location.snapshot_hash == self.source_hash)
+            .map(|receipt| {
+                (
+                    (receipt.location.start_byte, receipt.location.end_byte),
+                    receipt.clone(),
+                )
+            })
+            .collect();
+        self.consumed_receipts.clear();
+        // Field type proofs are snapshot-bound for the same reason receipts
+        // are: the facts describe one declaration on one text. A proof taken
+        // for a different snapshot of this file is not an emission input.
+        self.field_type_proofs = plan
+            .property_imports
+            .iter()
+            .filter_map(|proof| proof.field.as_ref())
+            .filter(|field| field.source_hash == self.source_hash)
+            .map(|field| ((field.start_byte, field.end_byte), field.clone()))
+            .collect();
+        self.consumed_field_type_proofs.clear();
+        self.proved_field_imports.clear();
+        self.required_declaration_spans = plan
+            .declarations
+            .iter()
+            .filter(|decision| decision.required_mode)
+            .map(|decision| (decision.id.start_byte, decision.id.end_byte))
+            .collect();
         self.exact_overload_calls = plan
             .exact_overload_calls
             .iter()
@@ -1431,16 +1578,34 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // for sealed classes and `final` on their subclasses.
         self.collect_type_relations(root);
         // Preflight blockers must be visible even to declarations emitted
-        // before their callees. Name lookup remains conservative until calls
-        // carry resolved symbol identities.
+        // before their callees, and they must be authoritative: a
+        // `PreparationBlocker` is a refusal of the declaration's physical Java
+        // form, so `--allow-approximations` (which governs resolution
+        // approximations) cannot opt out of it. Tainting here — before any
+        // member is lowered — is what keeps the emitted set and the plan in
+        // agreement for both halves of the declaration contract.
         for decl in &decls {
+            let reasons = plan.retain_reasons_at(decl.start_byte()).unwrap_or(&[]);
+            if reasons.is_empty() {
+                continue;
+            }
             if decl.kind() == "function_declaration"
-                && plan
-                    .retain_reasons_at(decl.start_byte())
-                    .is_some_and(|reasons| !reasons.is_empty())
                 && let Some(name) = self.top_level_name(*decl)
             {
                 self.retained_file_functions.insert(name);
+            }
+            if reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    crate::translation_plan::RetentionReason::PreparationBlocker { .. }
+                )
+            }) {
+                if let Some(name) = self.top_level_name(*decl)
+                    && self.untranslated_names.insert(name.clone())
+                {
+                    self.coverage.untranslated.push(name);
+                }
+                self.tainted_declarations.insert(decl.id());
             }
         }
 
@@ -1461,14 +1626,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         None
                     };
                     let recovered_tree = recovery_name.as_ref().and_then(|_| {
-                        crate::semantics::recover_annotated_interface_tree(
-                            self.source,
-                            original_decl,
-                        )
+                        crate::semantics::recover_annotated_type_tree(self.source, original_decl)
                     });
                     let recovered_decl = recovery_name.as_ref().and_then(|_| {
                         recovered_tree.as_ref().and_then(|tree| {
-                            crate::semantics::recovered_annotated_interface_decl(
+                            crate::semantics::recovered_annotated_type_decl(
                                 self.source,
                                 original_decl,
                                 tree.root_node(),

@@ -252,6 +252,14 @@ where
     let mut converged_plans = None;
     let mut converged_round = 0usize;
     let mut retained_seed: Option<HashSet<crate::semantics::SymbolId>> = None;
+    // Required-mode obligations each file established on the snapshot the
+    // receipts were signed on. A speculative round plans rewritten text the
+    // helper never answered for, so those receipts cannot come back; without
+    // this the declaration would silently revert to Legacy and the older
+    // platform path would emit a call nobody proved. The obligation travels,
+    // the receipt does not.
+    let mut required_obligations =
+        std::collections::BTreeMap::<PathBuf, crate::semantics::RequiredObligations>::new();
     // Cache facts may carry between analyses, while every source snapshot is
     // still rebuilt from `index` plus the current speculative overlays.
     let mut latest_cache_index: Option<crate::workspace::SourceIndex> = None;
@@ -368,7 +376,7 @@ where
             "source index",
         );
         let planned = if let Some(seed) = &retained_seed {
-            transpiler::fixpoint::plan_workspace_warm(
+            transpiler::fixpoint::plan_workspace_warm_carrying(
                 &virtual_sources,
                 cli,
                 &current_index,
@@ -376,6 +384,7 @@ where
                 cli.max_retention_passes,
                 false,
                 seed,
+                &required_obligations,
             )?
         } else {
             transpiler::fixpoint::plan_workspace_state(
@@ -423,6 +432,23 @@ where
             )?;
         }
         profile_phase(profile_speculation, round, &mut phase_started, "plan merge");
+        // Remember which declarations this round proved Required, keyed by
+        // their stable identity and by the hash of the snapshot that signed
+        // them. `or_insert_with` deliberately keeps the *proving* snapshot's
+        // hash: a declaration that is Required because the obligation was
+        // carried must not make a later round look like it proved the call.
+        for file_plan in &plans {
+            let entry = required_obligations
+                .entry(file_plan.file.clone())
+                .or_insert_with(|| {
+                    crate::semantics::RequiredObligations::new(file_plan.translation.source_hash)
+                });
+            for decision in &file_plan.translation.declarations {
+                if decision.required_mode {
+                    entry.declarations.insert(decision.symbol_id.clone());
+                }
+            }
+        }
         let mut next = virtual_sources.iter().cloned().collect::<HashMap<_, _>>();
         let cumulative_before = profile_speculation.then(|| cumulative.clone());
         let mut cumulative_changed = false;

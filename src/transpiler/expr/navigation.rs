@@ -7,6 +7,11 @@ use crate::transpiler::unit::capitalize;
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
+        if let Some((owner, member, _)) = self.unit.semantic_provider.and_then(|provider| {
+            crate::semantics::external_static_field_access(self.unit.source, node, provider)
+        }) {
+            return format!("{owner}.{member}");
+        }
         if let Some(java) = self.planned_container_property_access(node) {
             return java;
         }
@@ -860,6 +865,31 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 
     pub(crate) fn navigation_call(&mut self, node: tree_sitter::Node) -> String {
+        // A signed lowering receipt is read first, before every rewrite below.
+        //
+        // This is the whole point of the contract: the plan already decided
+        // that this call site is `receiver.<physical member>` with a proved
+        // representation and effects, so emission writes exactly that and
+        // nothing here may re-derive a spelling from the member name. A call
+        // whose declaration contract refused it carries no receipt, and the
+        // Legacy paths below stay exactly what they were for the declarations
+        // that never acquired one.
+        if let Some(receipt) = self.unit.call_receipt(node) {
+            let key = (receipt.location.start_byte, receipt.location.end_byte);
+            let name = receipt.callee.name.clone();
+            let receiver_span = receipt
+                .receiver
+                .as_ref()
+                .map(|receiver| (receiver.start_byte, receiver.end_byte));
+            let base = node.named_children(&mut node.walk()).next();
+            if let Some(base) = base
+                && receiver_span == Some((base.start_byte(), base.end_byte()))
+            {
+                let base_java = self.transpile(base);
+                self.unit.mark_receipt_consumed(key);
+                return format!("{}.{}", base_java, name);
+            }
+        }
         let mut parent = node.parent();
         while let Some(call) = parent.filter(|parent| parent.kind() == "call_expression") {
             if let Some(fact) = self
@@ -1942,8 +1972,6 @@ fn base_text(s: &str) -> bool {
 
 fn kotlin_member_to_java(member: &str) -> Option<String> {
     let mapped: Option<&str> = match member {
-        "uppercase" => Some("toUpperCase"),
-        "lowercase" => Some("toLowerCase"),
         "keys" => Some("keySet"),
         "entries" => Some("entrySet"),
         "stream" => Some("stream()"),

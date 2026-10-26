@@ -1,0 +1,21 @@
+[
+  {"name":"<init>","static_member":false,"parameter_types":["[C"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["[C","int","int"],"result_type":"<void>","parameter_nullability":["unknown","unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["[C","int","int","java.math.MathContext"],"result_type":"<void>","parameter_nullability":["unknown","unknown","unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["[C","java.math.MathContext"],"result_type":"<void>","parameter_nullability":["unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["double"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["double","java.math.MathContext"],"result_type":"<void>","parameter_nullability":["unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["int"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["int","java.math.MathContext"],"result_type":"<void>","parameter_nullability":["unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.lang.String"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.lang.String","java.math.MathContext"],"result_type":"<void>","parameter_nullability":["unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.math.BigInteger"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.math.BigInteger","int"],"result_type":"<void>","parameter_nullability":["unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.math.BigInteger","int","java.math.MathContext"],"result_type":"<void>","parameter_nullability":["unknown","unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["java.math.BigInteger","java.math.MathContext"],"result_type":"<void>","parameter_nullability":["unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["long"],"result_type":"<void>","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"<init>","static_member":false,"parameter_types":["long","java.math.MathContext"],"result_type":"<void>","parameter_nullability":["unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"add","static_member":false,"parameter_types":["java.math.BigDecimal"],"result_type":"java.math.BigDecimal","parameter_nullability":["unknown"],"result_nullability":"unknown"},
+  {"name":"add","static_member":false,"parameter_types":["java.math.BigDecimal","java.math.MathContext"],"result_type":"java.math.BigDecimal","parameter_nullability":["unknown","unknown"],"result_nullability":"unknown"},
+  {"name":"toPlainString","static_member":false,"parameter_types":[],"result_type":"java.lang.String","parameter_nullability":[],"result_nullability":"unknown"}
+]

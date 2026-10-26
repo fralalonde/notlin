@@ -1,6 +1,17 @@
 //! Versioned newline-delimited JSON protocol between notlin and the JVM
 //! facts helper. One request per line, one response per line. Requests are
-//! answered independently; an unanswered/invalid line fails closed (Unknown).
+//! answered independently.
+//!
+//! Two kinds of "nothing" are kept apart, because the client cannot wait for a
+//! line that will never come:
+//!
+//! * **An answer** — always means what it says. `CallSites` with an empty batch
+//!   is "looked, saw no calls".
+//! * **An explicit absence** — [`Answer::NoEvidence`]: the helper was asked and
+//!   has nothing for this one request. The helper stays healthy.
+//!
+//! An *unanswered* or invalid line is a fault, not a fact: the run fails that
+//! request closed and (for a fault, not an absence) stops trusting the helper.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -59,10 +70,58 @@ pub enum Answer {
     CallSites {
         file: PathBuf,
         sites: Vec<CallSite>,
+        /// Absent in old helpers; never interpreted as binding evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        references: Option<Vec<SourcePropertyReference>>,
     },
     Pong {
         version: u32,
     },
+    /// Explicit, *per-request* absence of evidence: the helper was asked, is
+    /// healthy, and has nothing to say about this one request (it did not index
+    /// that file, cannot read it, or failed to analyse it).
+    ///
+    /// This is deliberately not silence and not an empty batch. Silence is
+    /// indistinguishable from a stalled helper — the client blocks on
+    /// `read_line` — and an empty [`Answer::CallSites`] claims "looked, saw no
+    /// calls", which is a different fact. Callers map this answer to `Unknown`
+    /// for that request only; the helper stays trusted for every other query,
+    /// and the same question may be asked again later.
+    NoEvidence {
+        /// The query discriminator that produced no evidence. Diagnostic and
+        /// stable (`ResolveCalls`); never parsed for control flow.
+        query: String,
+        /// Why the helper had nothing, for logs. Diagnostic only: the truth
+        /// value is "no evidence", whatever the text says.
+        reason: String,
+    },
+}
+
+/// An exact source-backed top-level property binding, not a spelling guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourcePropertyReference {
+    pub byte_offset: u64,
+    pub end_byte: u64,
+    pub text: String,
+    pub target_file: PathBuf,
+    pub target_start_byte: u64,
+    pub target_end_byte: u64,
+    pub target_name: String,
+    pub target_package: String,
+    /// The JVM descriptor of the property's *declared* type as the Analysis API
+    /// resolved it, with no call-site substitutions (`Ljava/lang/String;`).
+    ///
+    /// This is declaration evidence, not an expression result: it says which
+    /// physical Java type the declaration's own type spelling denotes, which a
+    /// source spelling cannot say once a wildcard import is in scope. Absent
+    /// means Unknown (old helper), never "some type".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_jvm_descriptor: Option<String>,
+    /// Whether that declared type is nullable, as resolved. Tri-state for the
+    /// same reason: absent/null is Unknown, and a consumer that needs "not
+    /// nullable" must accept only `Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_nullable: Option<bool>,
 }
 
 /// How far the helper got with one call site. Serialized spellings
@@ -111,6 +170,19 @@ pub struct MemberFacts {
     /// when nothing establishes it.
     pub parameter_nullability: Vec<String>,
     pub result_nullability: String,
+    /// Checked exception binary names the physical declaration declares.
+    ///
+    /// Tri-state, and the distinction is load-bearing:
+    /// * field absent (old helper/jar, old fixture) ⇒ `None` = Unknown;
+    /// * `null` in the line ⇒ `None` = Unknown;
+    /// * `Some([])` ⇒ proved none.
+    ///
+    /// A consumer that needs "throws no checked exception" must accept only
+    /// `Some([])`; `None` is never an empty list and must never be
+    /// `unwrap_or_default()`-ed. Serialization skips the field when it is
+    /// `None`, so an old-shaped response keeps its exact old bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_exceptions: Option<Vec<String>>,
 }
 
 /// Envelope so one line carries id + payload for future multiplexing.
