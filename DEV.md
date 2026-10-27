@@ -12,6 +12,17 @@ instead of hand-rolling getters, setters, and statics.
 
 Behavior contract:
 
+- **Source migration.** Recompile callers; the application must compile and run
+  the same after conversion. Kotlin-only constraints/ABI differences can be
+  diagnosed; unchanged precompiled Kotlin compatibility is not the target.
+- **Collections.** Prefer suitable immutable Java equivalents. If none fits,
+  mutable fallbacks are allowed; mutability/read-only enforcement differences
+  alone do not block conversion. Preserve values, relevant order, overloads,
+  null/duplicate handling and evaluation effects. Keep explicitly mutable
+  collections mutable.
+- **Current work.** See `docs/translation-handoff.md` for accepted cases, exact
+  verification provenance and parked constructor/empty-enum work.
+
 - **Compiler-style diagnostics.** Parse errors → N003, untranslatable constructs
   → N001 (error or warn per `--untranslatable`), lossy/approximated translation
   → N002 warn. A transpilation with errors exits non-zero; warnings don't by

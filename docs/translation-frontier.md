@@ -1,4 +1,20 @@
-# Translation frontier: annotated marker declarations
+# Translation frontier
+
+## Current checkpoint — 2026-10-26
+
+The bounded enum companion-group slice is complete in main integration
+`731065bd` (feature `dab4e891`), together with the accepted receiver/getter repair.
+On identical frozen **6,444-source / 2,681-owner** inputs, translated owners rose
+**20 → 21, +1 / -0**. Full migrated Gradle build passed, 106/106 actionable tasks
+executed; migration was 263.275s versus 272.358s for the accepted baseline.
+
+See [the handoff](translation-handoff.md) for precise source/CLI/helper identity,
+1,630 ordinary passes, native five-case results, scope and remaining #2/#6 work.
+This is source-migration acceptance, not full companion-object ABI equivalence.
+The earlier annotation experiment below used different input bytes and owner
+counts; its figures are historical and must not be added to this checkpoint.
+
+## Historical checkpoint: annotated marker declarations
 
 ## Verified slice
 
