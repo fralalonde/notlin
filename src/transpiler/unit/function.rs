@@ -417,7 +417,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 let inferred = body_expr.map(|be| {
                     match be.kind() {
                         "number_literal" => Some("int"),
-                        "string_literal" | "interpolated_string" => Some("String"),
+                        "string_literal" | "interpolated_string" => {
+                            Some(self.inferred_string_type())
+                        }
                         "true" | "false" => Some("boolean"),
                         // when/if over numbers: pick the arm literal kinds
                         "when_expression" | "if_expression" | "binay" => {
@@ -438,7 +440,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             if has_num && !has_str {
                                 Some("int")
                             } else if has_str && !has_num {
-                                Some("String")
+                                Some(self.inferred_string_type())
                             } else {
                                 None
                             }
@@ -892,6 +894,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 let mut e = Expr { unit: self };
                 let java = e.transpile(child);
                 let java = self.coerce_optional_stream_return(java);
+                let java = self.coerce_readonly_collection_return(child, java);
                 let java = crate::transpiler::stmt::fix_join_tail(&java);
                 let trimmed = java.trim_start();
                 // `= if (…) … else …` / `= when (…)` cannot become a ternary

@@ -1,6 +1,61 @@
 # Translation frontier
 
-## Current checkpoint — 2026-10-26
+## Current checkpoint — 2026-10-27
+
+The standard clean conversion of reference commit `179bb912` now produces
+**3,924 Java files**, with 2,447 of 6,371 original Kotlin owners retained.
+That is **+36 / -0** against the earlier 3,888-output conversion: six interfaces
+and 30 classes, including `IWorkRequestContext`, `EquipmentDto`,
+`EquipmentTypeInfo` and `UIEquipmentDto`. Seven passes took 11m45s while other
+validation overlapped; this is not a controlled performance comparison.
+
+Its complete Gradle build passes with **all 110 tasks executed** in 4m21s.
+Hastings starts in 46.415s and completes both imports (50 organization records
+and 9,063 warehouse records). Observation continues for 93.4 seconds after
+`Done loading dev resources`, with **zero errors or stack traces**. An earlier
+startup was interrupted by the laptop closing; the unchanged retry supplies
+this runtime result. No acceptance sources or application configuration were
+hand-fixed. See the follow-on section of
+[the architecture review](architecture-review.md) for construction-default,
+parameter-annotation and native-test evidence.
+
+## Earlier working checkpoints
+
+The earlier 3,888-output clean run repaired source-wildcard property callers.
+The user's existing 3,889-output tree also passes its full build after two
+missed Kotlin caller expressions are repaired; all its Java sources remain
+unchanged. Its previous 133.7-second startup observation preceded the stronger
+complete-import gate above. The later getter-resolution change also translates
+the DTO that this earlier conversion retained.
+
+The interface follow-up lowers properties, default accessors and retained Kotlin
+implementers through one method model. It also handles Boolean accessor names,
+companion properties, methods with fixed arguments and forwarding to retained
+Kotlin method defaults. On the previously validated eight-output copy this
+unlocks **238 additional owners: 84 interfaces and 154 classes**, with all eight
+earlier outputs unchanged. The user's manually translated `IEnumeration.java`
+was replaced with their original Kotlin in the disposable input and regenerated
+by notlin; that proof is separate from the ownership gain. See the interface
+follow-up in [the architecture review](architecture-review.md) for tests,
+the collection-return fix and full application acceptance evidence.
+
+The architecture/coverage refactor on top of `feac6e6` removes the provider
+forwarding layer and combines independent syntax planning walks. It also admits
+zero-constant enums, multiple companion groups on parameterized enums, inferred
+interface getter results, and interface companion functions with singleton
+forwarders. See [the architecture review](architecture-review.md) for scope and
+verification. The new five-owner application fixture fully migrates and matches
+its original Kotlin runtime result. A new complete 6,443-source / 2,683-owner
+comparison measures **2 → 8, +6 / -0** on the local fact configuration. The gain
+is two enums and four classes; source-package wildcard imports no longer block
+unshadowed collection factories. Six experimental enum outputs with incompatible
+inherited overload return types were rejected by Gradle and restored to Kotlin.
+The corrected candidate completes its Gradle build tasks and starts under the
+Hastings dev profile. See the architecture review for evidence and invocation
+details. The accepted checkpoint below is historical evidence for the prior tree
+on different inputs and must not be added to this measurement.
+
+## Historical checkpoint — 2026-10-26
 
 The bounded enum companion-group slice is complete in main integration
 `731065bd` (feature `dab4e891`), together with the accepted receiver/getter repair.

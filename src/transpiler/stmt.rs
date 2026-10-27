@@ -287,7 +287,9 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
                 if op != "=" && l.kind() == "identifier" {
                     let name = self.unit.text(l).trim();
                     let e = Expr { unit: self.unit };
-                    if e.inherited_mutable_property_setter(name, l).is_some() {
+                    if e.inherited_mutable_property_setter(name, l).is_some()
+                        || e.interface_property_setter(name, l).is_some()
+                    {
                         e.unit.diag_untranslatable(
                             l,
                             "compound assignment to an inherited property has no verified read-modify-write lowering",
@@ -370,6 +372,7 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
             // Reified-generic gate: `recv.get<T>()` -> `recv.get(T.class)`.
             let java = crate::transpiler::expr::rewrite_reified_type_args(&java);
             let java = self.unit.coerce_optional_stream_return(java);
+            let java = self.unit.coerce_readonly_collection_return(exprs[0], java);
             // A Nothing-typed return expression (e.g. `TODO(...)`) lowers to
             // `throw ...` — a statement, not a value. Emit it bare.
             if java.trim_start().starts_with("throw ") {

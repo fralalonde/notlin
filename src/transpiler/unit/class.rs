@@ -494,7 +494,7 @@ fn count_kind(node: tree_sitter::Node, kind: &str) -> usize {
     found.len()
 }
 
-fn java_enum_companion_reference(source: &str, owner: &str, getter: &str) -> bool {
+fn java_enum_companion_reference(source: &str, owner: &str, getters: &[String]) -> bool {
     if !source.contains(owner) || !source.contains("Companion") {
         return false;
     }
@@ -508,7 +508,7 @@ fn java_enum_companion_reference(source: &str, owner: &str, getter: &str) -> boo
     let Some(tree) = parser.parse(source, None) else {
         return true;
     };
-    fn visit(node: tree_sitter::Node<'_>, source: &str, owner: &str, getter: &str) -> bool {
+    fn visit(node: tree_sitter::Node<'_>, source: &str, owner: &str, getters: &[String]) -> bool {
         if matches!(
             node.kind(),
             "field_access" | "scoped_identifier" | "scoped_type_identifier"
@@ -531,9 +531,11 @@ fn java_enum_companion_reference(source: &str, owner: &str, getter: &str) -> boo
             {
                 let supported_getter = node.parent().is_some_and(|call| {
                     call.kind() == "method_invocation"
-                        && call
-                            .child_by_field_name("name")
-                            .is_some_and(|name| &source[name.byte_range()] == getter)
+                        && call.child_by_field_name("name").is_some_and(|name| {
+                            getters
+                                .iter()
+                                .any(|getter| &source[name.byte_range()] == getter)
+                        })
                         && call
                             .child_by_field_name("arguments")
                             .is_some_and(|args| args.named_child_count() == 0)
@@ -545,9 +547,9 @@ fn java_enum_companion_reference(source: &str, owner: &str, getter: &str) -> boo
         }
         let mut c = node.walk();
         node.named_children(&mut c)
-            .any(|child| visit(child, source, owner, getter))
+            .any(|child| visit(child, source, owner, getters))
     }
-    visit(tree.root_node(), source, owner, getter)
+    visit(tree.root_node(), source, owner, getters)
 }
 
 fn enum_group_consumer_requires_companion(source: &str, owner: &str) -> bool {
@@ -607,6 +609,7 @@ fn enum_group_consumer_requires_companion(source: &str, owner: &str) -> bool {
 struct BridgeSig {
     signature: String,
     call: String,
+    returns_void: bool,
 }
 
 impl<'src, 'tree> Unit<'src, 'tree> {
@@ -986,31 +989,23 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // annotation's own constructor_invocation (`@JsonTypeInfo(use = ...)`)
         // the sibling is absent. Descend to the annotation for the parts and
         // prefer the in-node argument text.
-        let (annotation_node, argument_text) = if node.kind() == "annotated_expression" {
+        let (annotation_node, argument_node) = if node.kind() == "annotated_expression" {
             let annotation = kt::child(node, "annotation");
-            let args = kt::child(node, "parenthesized_expression")
-                .map(|p| self.text(p).to_string())
-                .unwrap_or_default();
+            let args = kt::child(node, "parenthesized_expression");
             let in_node_args = annotation
                 .and_then(|a| kt::child(a, "constructor_invocation"))
-                .and_then(|a| kt::child(a, "value_arguments"))
-                .map(|a| self.text(a).to_string())
-                .unwrap_or_default();
-            let args = if in_node_args.is_empty() {
-                args
-            } else {
-                in_node_args
-            };
-            (annotation, args)
+                .and_then(|a| kt::child(a, "value_arguments"));
+            (annotation, in_node_args.or(args))
         } else {
             (
                 Some(node),
                 kt::child(node, "constructor_invocation")
-                    .and_then(|a| kt::child(a, "value_arguments"))
-                    .map(|a| self.text(a).to_string())
-                    .unwrap_or_default(),
+                    .and_then(|a| kt::child(a, "value_arguments")),
             )
         };
+        let argument_text = argument_node
+            .map(|arguments| annotation_arguments_without_comments(arguments, self.source))
+            .unwrap_or_default();
         let annotation_node = annotation_node?;
         // The annotation name: the `constructor_invocation`'s `user_type`
         // (handles `com.example.Mapping`); a bare `user_type` directly under
@@ -1209,7 +1204,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // a Java interface with no members only forwards that existing ABI.
         let memberless_interface = self.retained_hint.is_some()
             && target.kind == crate::workspace::DeclarationKind::Interface
-            && target.members.is_empty();
+            && target.members.iter().all(|member| member.is_static);
         let property_bridge_result = self.retained_hint.as_ref().and_then(|retained| {
             crate::property_abi::is_property_interface_candidate(target).then(|| {
                 crate::property_abi::retained_subtypes_bridge(
@@ -1222,7 +1217,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         });
         let property_interface_bridge = property_bridge_result.as_ref().is_some_and(Result::is_ok);
         let method_interface = self.retained_hint.is_some()
-            && (crate::property_abi::is_noarg_method_interface_candidate(target)
+            && (crate::property_abi::is_method_interface_candidate(target)
                 || crate::property_abi::is_accessor_method_interface_candidate(workspace, target));
         let safe_for_retained_subtypes =
             memberless_interface || property_interface_bridge || method_interface;
@@ -2264,11 +2259,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             if !*is_property {
                 continue;
             }
-            let getter = format!("get{}", capitalize(member_name));
+            let getter = crate::workspace::property_accessor_name(member_name);
             self.class_props.insert(
                 member_name.clone(),
                 if *is_mutable {
-                    format!("set{}", capitalize(member_name))
+                    crate::property_abi::setter_name(member_name)
                 } else {
                     String::new()
                 },
@@ -2507,7 +2502,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         let property_name = self.text(property_name).to_string();
                         self.self_getters.insert(
                             property_name.clone(),
-                            format!("get{}", capitalize(&property_name)),
+                            crate::workspace::property_accessor_name(&property_name),
+                        );
+                        self.class_props.insert(
+                            property_name.clone(),
+                            if kt::child(property, "var").is_some() {
+                                crate::property_abi::setter_name(&property_name)
+                            } else {
+                                String::new()
+                            },
                         );
                     }
                 }
@@ -2550,6 +2553,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                                 )
                                             })
                                         })
+                                        .or_else(|| self.inferred_getter_type(member))
                                         .unwrap_or_else(|| "Object".to_string());
                                     let explicit_non_null_override =
                                         kt::child(member, "modifiers").is_some_and(|modifiers| {
@@ -2572,7 +2576,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                             &pty,
                                         );
                                     }
-                                    let cap = capitalize(&pname);
+                                    let getter_name =
+                                        crate::workspace::property_accessor_name(&pname);
+                                    let setter_name = crate::property_abi::setter_name(&pname);
                                     let getter = kt::child(member, "getter");
                                     // Interface properties have no backing
                                     // field, so use-site getter annotations
@@ -2599,7 +2605,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                             // locals must not leak into later
                                             // interface members.
                                             self.var_types.clear();
-                                            out.open(format!("default {} get{}()", pty, cap));
+                                            out.open(format!("default {} {}()", pty, getter_name));
                                             self.transpile_function_body(gb, out, true);
                                             out.close();
                                         }
@@ -2612,7 +2618,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                             {
                                                 out.line(annotation);
                                             }
-                                            out.line(format!("{} get{}();", pty, cap));
+                                            out.line(format!("{} {}();", pty, getter_name));
                                         }
                                     }
                                     if kt::child(member, "val").is_none() {
@@ -2620,16 +2626,25 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                         match setter.and_then(|s| kt::child(s, "function_body")) {
                                             Some(sb) => {
                                                 self.var_types.clear();
+                                                let parameter = setter
+                                                    .and_then(|setter| {
+                                                        kt::child(setter, "identifier")
+                                                    })
+                                                    .map(|name| self.text(name).to_string())
+                                                    .unwrap_or_else(|| "value".into());
+                                                self.var_types
+                                                    .insert(parameter.clone(), pty.clone());
                                                 out.open(format!(
-                                                    "default void set{}({} value)",
-                                                    cap, pty
+                                                    "default void {}({} {})",
+                                                    setter_name, pty, parameter
                                                 ));
                                                 self.transpile_function_body(sb, out, false);
                                                 out.close();
                                             }
-                                            None => {
-                                                out.line(format!("void set{}({} value);", cap, pty))
-                                            }
+                                            None => out.line(format!(
+                                                "void {}({} value);",
+                                                setter_name, pty
+                                            )),
                                         }
                                     }
                                     out.blank();
@@ -2769,6 +2784,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.line("@SuppressWarnings(\"unchecked\")");
             }
             self.emit_constructor_property_contract(decl, &params, out);
+            if self.jackson_default_factory_supported(decl, &params) {
+                // ConstructorProperties is also an implicit Jackson creator.
+                // Route Jackson through the factory that applies defaults.
+                out.line("@com.fasterxml.jackson.annotation.JsonCreator(mode = com.fasterxml.jackson.annotation.JsonCreator.Mode.DISABLED)");
+            }
             out.open(format!("public {}({})", name, {
                 params
                     .iter()
@@ -2900,6 +2920,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
             self.emit_jvm_overloads_primary_constructors(decl, &name, &params, out);
+            self.emit_jackson_default_factory(decl, &name, &params, out);
             if jpa_no_arg {
                 self.emit_jpa_no_arg_constructor(decl, &name, &params, superclass.is_some(), out);
             }
@@ -3075,9 +3096,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
                 out.blank();
                 for (_, _, fname, ftype) in &params {
-                    let cap = capitalize(fname);
-                    let getter = format!("get{cap}");
-                    let setter = format!("set{cap}");
+                    let getter = crate::workspace::property_accessor_name(fname);
+                    let setter = crate::property_abi::setter_name(fname);
                     // `@get:`-targeted annotations belong on the generated
                     // getter, which this path emits.
                     if !self.class_declares_method(decl, &getter) {
@@ -3316,9 +3336,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     if !*is_property {
                         continue;
                     }
-                    let cap = capitalize(fname);
-                    let getter = format!("get{cap}");
-                    let setter = format!("set{cap}");
+                    let getter = crate::workspace::property_accessor_name(fname);
+                    let setter = crate::property_abi::setter_name(fname);
                     // `@get:`-targeted annotations belong on the generated
                     // getter, which this path emits.
                     if !self.class_declares_method(decl, &getter) {
@@ -4071,6 +4090,210 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         format!("{annotations}{prefix}{parameter_type} {name}")
     }
 
+    fn jackson_default_factory_supported(
+        &self,
+        decl: tree_sitter::Node,
+        params: &[(bool, bool, String, String)],
+    ) -> bool {
+        let defaults = self.class_param_default_nodes(decl);
+        if !defaults.iter().any(Option::is_some) || kt::child(decl, "type_parameters").is_some() {
+            return false;
+        }
+        // Only introduce a Jackson dependency where the same source set already
+        // imports its creator API. Another module's test dependency is insufficient.
+        fn source_set(path: &std::path::Path) -> &std::path::Path {
+            path.ancestors()
+                .find(|ancestor| {
+                    ancestor.parent().and_then(std::path::Path::file_name)
+                        == Some(std::ffi::OsStr::new("src"))
+                })
+                .unwrap_or_else(|| path.parent().unwrap_or(path))
+        }
+        let file = self.workspace_file.as_deref().unwrap_or(self.file);
+        if !self.workspace.is_some_and(|workspace| {
+            let imports = || {
+                workspace
+                    .files
+                    .iter()
+                    .filter(|candidate| source_set(&candidate.path) == source_set(file))
+                    .flat_map(|candidate| &candidate.imports)
+            };
+            imports().any(|import| {
+                matches!(
+                    import.as_str(),
+                    "com.fasterxml.jackson.annotation.JsonCreator"
+                        | "com.fasterxml.jackson.annotation.*"
+                )
+            }) && imports().any(|import| {
+                matches!(
+                    import.as_str(),
+                    "com.fasterxml.jackson.databind.annotation.JsonDeserialize"
+                        | "com.fasterxml.jackson.databind.annotation.*"
+                )
+            })
+        }) {
+            return false;
+        }
+        let mut nodes = vec![decl];
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "annotation"
+                && matches!(
+                    annotation_simple_name(self.text(node)),
+                    "JsonCreator" | "JsonDeserialize"
+                )
+            {
+                return false;
+            }
+            nodes.extend(node.named_children(&mut node.walk()));
+        }
+        // A nullable non-null default needs presence tracking: explicit null is
+        // meaningful. Leave that shape to the existing metadata retention gate.
+        if params
+            .iter()
+            .zip(&defaults)
+            .any(|((_, _, param, _), default)| {
+                default.is_some_and(|value| self.text(value).trim() != "null")
+                    && self
+                        .param_node(decl, param)
+                        .is_some_and(|node| kt::child(node, "nullable_type").is_some())
+            })
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Java constructor parameters cannot distinguish an omitted primitive
+    /// from its zero value. A separate Jackson creator boxes defaulted inputs,
+    /// applies defaults in declaration order, and calls the ordinary constructor.
+    /// The constructor's ABI and Lombok null checks remain unchanged.
+    fn emit_jackson_default_factory(
+        &mut self,
+        decl: tree_sitter::Node,
+        name: &str,
+        params: &[(bool, bool, String, String)],
+        out: &mut JavaOut,
+    ) {
+        if !self.jackson_default_factory_supported(decl, params) {
+            return;
+        }
+        let defaults = self.class_param_default_nodes(decl);
+        let mut factory_name = "__notlinCreate".to_string();
+        while self.class_declares_method(decl, &factory_name) {
+            factory_name.push('_');
+        }
+        let mut parameter_deserializer = "__notlinDefaultedParameter".to_string();
+        while self.text(decl).contains(&parameter_deserializer) {
+            parameter_deserializer.push('_');
+        }
+        let factory_params = params
+            .iter()
+            .zip(&defaults)
+            .map(|((_, _, param, ty), default)| {
+                let original = self.param_node(decl, param);
+                let annotation = original
+                    .and_then(|node| {
+                        self.parameter_annotations(node)
+                            .into_iter()
+                            .map(|(_, annotation)| annotation)
+                            .find(|annotation| annotation_simple_name(annotation) == "JsonProperty")
+                    })
+                    .unwrap_or_else(|| {
+                        let property = original
+                            .and_then(|node| kt::child(node, "identifier"))
+                            .map(|identifier| self.text(identifier).trim_matches('`'))
+                            .unwrap_or(param);
+                        format!("@com.fasterxml.jackson.annotation.JsonProperty(\"{property}\")")
+                    });
+                let parameter_type = self.constructor_parameter_java_type(decl, param, ty);
+                let parameter_type = if default.is_some() {
+                    crate::transpiler::types::boxed_name(&parameter_type).unwrap_or(&parameter_type)
+                } else {
+                    &parameter_type
+                };
+                let mut annotations = self.param_parameter_annotations(decl, param)
+                    .into_iter()
+                    .filter(|annotation| annotation_simple_name(annotation) != "JsonProperty")
+                    .collect::<Vec<_>>();
+                annotations.insert(0, annotation);
+                if default.is_some_and(|node| self.text(node).trim() != "null") {
+                    annotations.push(format!("@com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = {parameter_deserializer}.class)"));
+                }
+                format!("{} {parameter_type} {param}", annotations.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.blank();
+        out.line("@com.fasterxml.jackson.annotation.JsonCreator");
+        out.open(format!(
+            "public static {name} {factory_name}({factory_params})"
+        ));
+        let previous_variables = std::mem::take(&mut self.var_types);
+        for (_, _, param, ty) in params {
+            self.var_types.insert(param.clone(), ty.clone());
+        }
+        for ((_, _, param, _), default) in params.iter().zip(defaults) {
+            if let Some(default) = default {
+                if self.text(default).trim() == "null" {
+                    continue;
+                }
+                let expression = Expr { unit: self }.transpile(default);
+                out.line(format!(
+                    "if ({param} == null) {{ {param} = {expression}; }}"
+                ));
+            }
+        }
+        self.var_types = previous_variables;
+        let arguments = params
+            .iter()
+            .map(|(_, _, param, _)| param.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.line(format!("return new {name}({arguments});"));
+        out.close();
+        // Jackson invokes getAbsentValue for omitted creator arguments and
+        // getNullValue for explicit null. Keep that distinction until the
+        // factory applies defaults; primitives retain Jackson's null policy.
+        out.blank();
+        let helper = r#"public static final class __PARAMETER__ extends com.fasterxml.jackson.databind.JsonDeserializer<Object> implements com.fasterxml.jackson.databind.deser.ContextualDeserializer {
+    private final com.fasterxml.jackson.databind.JsonDeserializer<Object> delegate;
+    private final boolean primitive;
+    public __PARAMETER__() { this(null, false); }
+    private __PARAMETER__(com.fasterxml.jackson.databind.JsonDeserializer<Object> delegate, boolean primitive) {
+        this.delegate = delegate;
+        this.primitive = primitive;
+    }
+    @Override
+    public com.fasterxml.jackson.databind.JsonDeserializer<?> createContextual(com.fasterxml.jackson.databind.DeserializationContext context, com.fasterxml.jackson.databind.BeanProperty property) throws com.fasterxml.jackson.databind.JsonMappingException {
+        Class<?> raw = property.getType().getRawClass();
+        Class<?> primitiveType = raw == java.lang.Boolean.class ? boolean.class
+            : raw == java.lang.Byte.class ? byte.class
+            : raw == java.lang.Short.class ? short.class
+            : raw == java.lang.Integer.class ? int.class
+            : raw == java.lang.Long.class ? long.class
+            : raw == java.lang.Float.class ? float.class
+            : raw == java.lang.Double.class ? double.class
+            : raw == java.lang.Character.class ? char.class : null;
+        com.fasterxml.jackson.databind.JavaType type = primitiveType == null ? property.getType() : context.constructType(primitiveType);
+        return new __PARAMETER__(context.findContextualValueDeserializer(type, property), primitiveType != null);
+    }
+    @Override
+    public Object deserialize(com.fasterxml.jackson.core.JsonParser parser, com.fasterxml.jackson.databind.DeserializationContext context) throws java.io.IOException {
+        return delegate.deserialize(parser, context);
+    }
+    @Override
+    public Object getAbsentValue(com.fasterxml.jackson.databind.DeserializationContext context) { return null; }
+    @Override
+    public Object getNullValue(com.fasterxml.jackson.databind.DeserializationContext context) throws com.fasterxml.jackson.databind.JsonMappingException {
+        if (primitive) return delegate.getNullValue(context);
+        return context.reportInputMismatch(Object.class, "Null is not allowed for a defaulted non-null property");
+    }
+}"#.replace("__PARAMETER__", &parameter_deserializer);
+        for line in helper.lines() {
+            out.line(line);
+        }
+    }
+
     /// Kotlin read-only collections are covariant at call boundaries, but a
     /// constructor property still exposes an invariant getter. Keep the field
     /// and getter type exact, widening only the Java constructor parameter.
@@ -4252,10 +4475,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .unwrap_or_default()
     }
 
-    fn class_param_default_nodes(
+    fn class_param_default_nodes<'node>(
         &self,
-        decl: tree_sitter::Node<'tree>,
-    ) -> Vec<Option<tree_sitter::Node<'tree>>> {
+        decl: tree_sitter::Node<'node>,
+    ) -> Vec<Option<tree_sitter::Node<'node>>> {
         kt::child(decl, "primary_constructor")
             .and_then(|pc| kt::child(pc, "class_parameters"))
             .map(|cps| {
@@ -4945,17 +5168,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
         }
-        if entries.is_empty() {
-            self.diag_untranslatable(
-                decl,
-                format!(
-                    "enum '{}' declares no constants; Java enums require at least one",
-                    name
-                ),
-            );
-            return;
-        }
-
         // Bodyless (abstract) enum methods are fine ONLY when every entry
         // carries an override body (checked after entries are built).
         let abstract_fns: Vec<String> = members
@@ -4996,7 +5208,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         out.open(format!("{}enum {}{}", visibility, name, implements));
         // constants
         out.line(entries.join(",\n"));
-        if !members.is_empty()
+        if entries.is_empty()
+            || !members.is_empty()
             || !params.is_empty()
             || emit_entries_bridge
             || !default_property_bridges.is_empty()
@@ -5042,9 +5255,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             }
             out.blank();
             for (_is_property, is_mutable, fname, ftype) in &params {
-                let cap = capitalize(fname);
-                let getter_name = format!("get{cap}");
-                let setter_name = format!("set{cap}");
+                let getter_name = crate::workspace::property_accessor_name(fname);
+                let setter_name = crate::property_abi::setter_name(fname);
                 let declares_getter = members.iter().any(|member| {
                     member.kind() == "function_declaration"
                         && kt::field(*member, "name")
@@ -5061,7 +5273,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     for annotation in self.param_getter_annotations(decl, fname) {
                         out.line(annotation);
                     }
-                    out.open(format!("public {} get{}()", ftype, cap));
+                    out.open(format!("public {} {}()", ftype, getter_name));
                     out.line(format!("return {};", fname));
                     out.close();
                 }
@@ -5070,7 +5282,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     for annotation in self.param_setter_annotations(decl, fname) {
                         out.line(annotation);
                     }
-                    out.open(format!("public void set{}({} {})", cap, ftype, fname));
+                    out.open(format!("public void {}({} {})", setter_name, ftype, fname));
                     out.line(format!("this.{} = {};", fname, fname));
                     out.close();
                 }
@@ -5100,6 +5312,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             out.close();
             out.blank();
         }
+        // Computed properties have no backing Java field. Register their
+        // accessors before any method, including methods declared before them.
+        for member in &members {
+            if member.kind() == "property_declaration"
+                && kt::child(*member, "getter").is_some()
+                && let Some(variable) = kt::child(*member, "variable_declaration")
+                && let Some(identifier) = kt::child(variable, "identifier")
+            {
+                let property = self.text(identifier).to_owned();
+                self.self_getters.insert(
+                    property.clone(),
+                    crate::workspace::property_accessor_name(&property),
+                );
+            }
+        }
         // body members
         for m in members {
             match m.kind() {
@@ -5119,7 +5346,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 // enum companion stays retained (as it was before this slice),
                 // because companion-object reachability is not proven here.
                 "companion_object" => {
-                    if self.enum_companion_group(m, name).is_some() {
+                    if self.enum_companion_groups(m, name).is_some() {
                         self.transpile_companion(m, name, out);
                         out.blank();
                     } else {
@@ -5197,14 +5424,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         Some((format!("{java_base}<{element}>"), element))
     }
 
-    /// The one `companion object { val GROUP: Set<Owner> = setOf(ENTRY, ...) }`
-    /// shape this backend proves: a literal, parameterless, member-free enum
-    /// plus one non-empty factory call over its own entries. Any deviation --
-    /// constructor parameters, per-entry bodies/arguments, another companion
-    /// member, annotations, accessors, spreads, named arguments, a foreign or
-    /// nullable declared type -- returns `None` so the caller keeps the
-    /// conservative existing behavior instead of guessing.
-    fn enum_companion_group(&self, companion: tree_sitter::Node, owner: &str) -> Option<EnumGroup> {
+    /// Companion collection groups over the owning enum's entries. Constructor
+    /// arguments and ordinary enum members do not affect group initialization;
+    /// declared collection types, entry order and shared group identity do.
+    fn enum_companion_groups(
+        &self,
+        companion: tree_sitter::Node,
+        owner: &str,
+    ) -> Option<Vec<EnumGroup>> {
         if enum_group_consumer_requires_companion(self.source, owner)
             || self.workspace.is_some_and(|workspace| {
                 workspace
@@ -5218,40 +5445,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if !matches!(enum_body.kind(), "enum_class_body" | "class_body") {
             return None;
         }
-        if kt::parent_of(enum_body)
-            .is_some_and(|decl| kt::child(decl, "primary_constructor").is_some())
-        {
-            return None;
-        }
-        for kind in [
-            "function_declaration",
-            "class_declaration",
-            "object_declaration",
-            "secondary_constructor",
-            "anonymous_initializer",
-        ] {
-            if count_kind(enum_body, kind) > 0 {
-                return None;
-            }
-        }
         let mut entry_nodes = Vec::new();
         collect_kind(enum_body, "enum_entry", &mut entry_nodes);
         if entry_nodes.is_empty() {
             return None;
         }
-        let mut entries: Vec<String> = Vec::new();
-        for node in entry_nodes {
-            let mut name = None;
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                match child.kind() {
-                    "identifier" => name = Some(self.text(child).to_string()),
-                    "line_comment" | "block_comment" | "modifiers" | "," | ";" => {}
-                    _ => return None,
-                }
-            }
-            entries.push(name?);
-        }
+        let entries = entry_nodes
+            .into_iter()
+            .filter_map(|node| {
+                kt::child(node, "identifier").map(|name| self.text(name).to_string())
+            })
+            .collect::<Vec<_>>();
         let companion_body = kt::child(companion, "class_body")?;
         for kind in [
             "function_declaration",
@@ -5266,65 +5470,71 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
         let mut properties = Vec::new();
         collect_kind(companion_body, "property_declaration", &mut properties);
-        if properties.len() != 1 {
+        if properties.is_empty() {
             return None;
         }
-        let property = properties[0];
-        if !self.text(property).trim_start().starts_with("val ")
-            || kt::child(property, "getter").is_some()
-            || kt::child(property, "setter").is_some()
-            || kt::child(property, "property_delegate").is_some()
-        {
-            return None;
-        }
-        let mut identifiers = Vec::new();
-        collect_kind(property, "identifier", &mut identifiers);
-        let name = self.text(*identifiers.first()?).to_string();
-        let mut type_nodes = Vec::new();
-        collect_kind(property, "user_type", &mut type_nodes);
-        let (declared, element) =
-            self.declared_collection_type(self.text(*type_nodes.first()?), owner)?;
-        let mut calls = Vec::new();
-        collect_kind(property, "call_expression", &mut calls);
-        let init = *calls.first()?;
-        let callee = init.named_child(0)?;
-        if self.text(callee) != "setOf"
-            || self
-                .semantic_provider
-                .is_some_and(|provider| !provider.symbols_named("setOf").is_empty())
-        {
-            return None;
-        }
-        if count_kind(init, "type_arguments") > 0 {
-            return None;
-        }
-        let mut argument_nodes = Vec::new();
-        collect_kind(init, "value_argument", &mut argument_nodes);
-        if argument_nodes.is_empty() {
-            return None;
-        }
-        let mut listed: Vec<String> = Vec::new();
-        for argument in argument_nodes {
-            let spelling = self.text(argument).trim().to_string();
-            if !entries.contains(&spelling) {
+        let mut groups = Vec::new();
+        for property in properties {
+            if !self.text(property).trim_start().starts_with("val ")
+                || kt::child(property, "getter").is_some()
+                || kt::child(property, "setter").is_some()
+                || kt::child(property, "property_delegate").is_some()
+            {
                 return None;
             }
-            listed.push(spelling);
+            let mut identifiers = Vec::new();
+            collect_kind(property, "identifier", &mut identifiers);
+            let name = self.text(*identifiers.first()?).to_string();
+            let mut type_nodes = Vec::new();
+            collect_kind(property, "user_type", &mut type_nodes);
+            let (declared, element) =
+                self.declared_collection_type(self.text(*type_nodes.first()?), owner)?;
+            let mut calls = Vec::new();
+            collect_kind(property, "call_expression", &mut calls);
+            let init = *calls.first()?;
+            let callee = init.named_child(0)?;
+            if self.text(callee) != "setOf"
+                || self
+                    .semantic_provider
+                    .is_some_and(|provider| !provider.symbols_named("setOf").is_empty())
+            {
+                return None;
+            }
+            if count_kind(init, "type_arguments") > 0 {
+                return None;
+            }
+            let mut argument_nodes = Vec::new();
+            collect_kind(init, "value_argument", &mut argument_nodes);
+            if argument_nodes.is_empty() {
+                return None;
+            }
+            let mut listed: Vec<String> = Vec::new();
+            for argument in argument_nodes {
+                let spelling = self.text(argument).trim().to_string();
+                if !entries.contains(&spelling) {
+                    return None;
+                }
+                listed.push(spelling);
+            }
+            groups.push(EnumGroup {
+                name,
+                declared,
+                element,
+                entries: listed,
+            });
         }
-        let getter = format!("get{}", capitalize(&name));
+        let getters = groups
+            .iter()
+            .map(|group| format!("get{}", capitalize(&group.name)))
+            .collect::<Vec<_>>();
         if self.workspace.is_some_and(|workspace| {
             workspace
                 .java_files()
-                .any(|file| java_enum_companion_reference(file.source_text(), owner, &getter))
+                .any(|file| java_enum_companion_reference(file.source_text(), owner, &getters))
         }) {
             return None;
         }
-        Some(EnumGroup {
-            name,
-            declared,
-            element,
-            entries: listed,
-        })
+        Some(groups)
     }
 
     /// `companion object { ... }` -> static members of the enclosing class.
@@ -5361,40 +5571,45 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // semantics as a shared, ordered, mutable instance behind a static field
         // whose type is the DECLARED type (aliases expanded, never narrowed from
         // the initializer). Every other companion shape keeps the existing path.
-        if let Some(group) = self.enum_companion_group(companion, owner) {
-            let cap = capitalize(&group.name);
-            let initializer = if group.entries.len() == 1 {
-                format!("java.util.Set.<{}>of({})", group.element, group.entries[0])
-            } else {
-                format!(
-                    "new java.util.LinkedHashSet<{}>(java.util.Arrays.<{}>asList({}))",
-                    group.element,
-                    group.element,
-                    group.entries.join(", ")
-                )
-            };
-            out.line(format!(
-                "public static final {} {} = {};",
-                group.declared, group.name, initializer
-            ));
-            out.blank();
-            out.open(format!("public static {} get{}()", group.declared, cap));
-            out.line(format!("return {};", group.name));
-            out.close();
-            out.blank();
-            // Java source callers may still use Enum.Companion.getGROUP().
-            // Keep that namespace as static forwarding methods, not a fake
-            // companion singleton or a replacement for first-class object uses.
+        if let Some(groups) = self.enum_companion_groups(companion, owner) {
+            for group in &groups {
+                let cap = capitalize(&group.name);
+                let initializer = if group.entries.len() == 1 {
+                    format!("java.util.Set.<{}>of({})", group.element, group.entries[0])
+                } else {
+                    format!(
+                        "new java.util.LinkedHashSet<{}>(java.util.Arrays.<{}>asList({}))",
+                        group.element,
+                        group.element,
+                        group.entries.join(", ")
+                    )
+                };
+                out.line(format!(
+                    "public static final {} {} = {};",
+                    group.declared, group.name, initializer
+                ));
+                out.open(format!("public static {} get{}()", group.declared, cap));
+                out.line(format!("return {};", group.name));
+                out.close();
+                out.blank();
+                self.companion_members
+                    .insert(group.name.clone(), format!("get{}()", cap));
+                self.static_member_types
+                    .insert(group.name.clone(), group.declared.clone());
+            }
             out.open("public static final class Companion");
             out.line("private Companion() {}");
-            out.open(format!("public static {} get{}()", group.declared, cap));
-            out.line(format!("return {};", group.name));
-            out.close();
+            for group in &groups {
+                out.open(format!(
+                    "public static {} get{}()",
+                    group.declared,
+                    capitalize(&group.name)
+                ));
+                out.line(format!("return {};", group.name));
+                out.close();
+            }
             out.close();
             out.blank();
-            self.companion_members
-                .insert(group.name.clone(), format!("get{}()", cap));
-            self.static_member_types.insert(group.name, group.declared);
             return;
         }
         let Some(body) = kt::child(companion, "class_body") else {
@@ -5421,14 +5636,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     out.blank();
                 }
                 "function_declaration" => {
-                    // Capture the Java signature from the source AST before
-                    // translating, for the nested Companion bridge.
-                    if let Some(sig) = self.companion_fn_signature(member) {
-                        bridge_sigs.push(sig);
-                    }
-                    self.transpile_function_opts(
-                        member, true, /*make_static=*/ true, false, out,
-                    );
+                    bridge_sigs.extend(self.transpile_companion_function(member, out));
                     out.blank();
                 }
                 // Trivia nodes are named by tree-sitter but are not companion
@@ -5459,7 +5667,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             out.open(String::from("public static final class Companion"));
             for sig in &bridge_sigs {
                 out.open(format!("public {}", sig.signature));
-                out.line(format!("return {}.{};", owner, sig.call));
+                let prefix = if sig.returns_void { "" } else { "return " };
+                out.line(format!("{prefix}{}.{};", owner, sig.call));
                 out.close();
             }
             out.close();
@@ -5467,52 +5676,99 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
     }
 
-    /// Java signature + delegate call captured from a companion fn's source
-    /// AST (`static Ret fn(Type p, ...)` / `fn(p, ...)`). Params with default
-    /// expressions are skipped: the bridge assumes the full argument list.
-    fn companion_fn_signature(&mut self, member: tree_sitter::Node<'_>) -> Option<BridgeSig> {
-        let name = kt::field(member, "name")?;
-        let fn_name = self.text(name).to_string();
-        let params_node = kt::child(member, "function_value_parameters")?;
-        let mut cursor = params_node.walk();
-        let mut args = Vec::new();
-        for param in params_node.children(&mut cursor) {
-            if param.kind() != "parameter" {
-                continue;
-            }
-            let param_children: Vec<_> = param.children(&mut param.walk()).collect();
-            if param_children
-                .iter()
-                .any(|c| !c.is_named() && c.kind() == "=")
-            {
-                return None;
-            }
-            let pname = param_children
-                .iter()
-                .find(|c| c.kind() == "identifier")
-                .map(|c| self.text(*c).to_string())
-                .unwrap_or_else(|| format!("p{}", args.len()));
-            let ptype_node = param_children.iter().find(|c| {
-                matches!(
-                    c.kind(),
-                    "user_type" | "nullable_type" | "type_reference" | "type"
-                )
-            })?;
-            let ptype = kt::java_type_ann(*ptype_node, self.source, self.annots);
-            args.push(format!("{} {}", ptype, pname));
+    /// Build companion bridges from the actual emitted Java methods. This
+    /// shares return inference, generic bounds, parameter types and overloads
+    /// with the function emitter instead of maintaining another Kotlin renderer.
+    fn transpile_companion_function(
+        &mut self,
+        member: tree_sitter::Node,
+        out: &mut JavaOut,
+    ) -> Vec<BridgeSig> {
+        let mut method_out = JavaOut::new();
+        self.transpile_function_opts(member, true, true, false, &mut method_out);
+        let emitted = method_out.finish();
+        out.line(&emitted);
+        self.companion_method_bridges(member, &emitted)
+    }
+
+    fn companion_method_bridges(
+        &mut self,
+        member: tree_sitter::Node,
+        emitted: &str,
+    ) -> Vec<BridgeSig> {
+        let wrapped = format!("class __Companion {{\n{emitted}\n}}");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java grammar");
+        let Some(tree) = parser
+            .parse(&wrapped, None)
+            .filter(|tree| !tree.root_node().has_error())
+        else {
+            self.diag_untranslatable(member, "companion method did not produce valid Java");
+            return Vec::new();
+        };
+        let root = tree.root_node();
+        let mut methods = Vec::new();
+        if let Some(class) = root.named_child(0)
+            && let Some(body) = class.child_by_field_name("body")
+        {
+            methods.extend(
+                body.named_children(&mut body.walk())
+                    .filter(|node| node.kind() == "method_declaration"),
+            );
         }
-        let ret = kt::child(member, "user_type")
-            .or_else(|| kt::child(member, "type_reference"))
-            .map(|t| kt::java_type_ann(t, self.source, self.annots))
-            .unwrap_or_else(|| String::from("void"));
-        let names: Vec<&str> = args
-            .iter()
-            .filter_map(|a| a.split(' ').next_back())
-            .collect();
-        Some(BridgeSig {
-            signature: format!("static {ret} {fn_name}({})", args.join(", ")),
-            call: format!("{fn_name}({})", names.join(", ")),
-        })
+        let mut bridges = Vec::new();
+        for method in methods {
+            let Some(body) = method.child_by_field_name("body") else {
+                continue;
+            };
+            let Some(name) = method.child_by_field_name("name") else {
+                continue;
+            };
+            let Some(parameters) = method.child_by_field_name("parameters") else {
+                continue;
+            };
+            let mut arguments = Vec::new();
+            for parameter in parameters.named_children(&mut parameters.walk()) {
+                if let Some(name) = parameter.child_by_field_name("name") {
+                    arguments.push(wrapped[name.byte_range()].to_string());
+                } else {
+                    self.diag_untranslatable(member, "companion bridge parameter has no Java name");
+                    return Vec::new();
+                }
+            }
+            let mut signature = wrapped[method.start_byte()..body.start_byte()].to_string();
+            if let Some(modifiers) = method
+                .named_children(&mut method.walk())
+                .find(|node| node.kind() == "modifiers")
+            {
+                let mut edits = modifiers
+                    .children(&mut modifiers.walk())
+                    .filter(|node| {
+                        matches!(node.kind(), "public" | "protected" | "private" | "static")
+                    })
+                    .map(|node| {
+                        (
+                            node.start_byte() - method.start_byte(),
+                            node.end_byte() - method.start_byte(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                edits.sort_unstable_by_key(|edit| std::cmp::Reverse(edit.0));
+                for (start, end) in edits {
+                    signature.replace_range(start..end, "");
+                }
+            }
+            bridges.push(BridgeSig {
+                signature: format!("static {}", signature.trim()),
+                call: format!("{}({})", &wrapped[name.byte_range()], arguments.join(", ")),
+                returns_void: method
+                    .child_by_field_name("type")
+                    .is_some_and(|ty| &wrapped[ty.byte_range()] == "void"),
+            });
+        }
+        bridges
     }
 
     fn transpile_object(
@@ -6041,11 +6297,64 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let Some(body) = kt::child(companion, "class_body") else {
             return;
         };
+        let owner = kt::parent_of(companion)
+            .and_then(kt::parent_of)
+            .and_then(|decl| kt::field(decl, "name"))
+            .map(|name| self.text(name).to_string())
+            .unwrap_or_default();
+        let namespace = kt::child(companion, "identifier")
+            .map(|name| self.text(name).to_string())
+            .unwrap_or_else(|| "Companion".to_string());
+        let mut bridges = Vec::new();
+        let mut fields = Vec::new();
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
             match member.kind() {
+                "function_declaration" => {
+                    bridges.extend(self.transpile_companion_function(member, out));
+                    out.blank();
+                }
                 "property_declaration" => {
-                    self.transpile_property_opts(member, out, true, Some("__interface__"));
+                    let mut property_out = JavaOut::new();
+                    self.transpile_property_opts(
+                        member,
+                        &mut property_out,
+                        true,
+                        Some("__interface__"),
+                    );
+                    let emitted = property_out.finish();
+                    bridges.extend(self.companion_method_bridges(member, &emitted));
+                    if kt::child(member, "val").is_some() {
+                        let wrapped = format!("class __Companion {{\n{emitted}\n}}");
+                        let mut parser = tree_sitter::Parser::new();
+                        parser
+                            .set_language(&tree_sitter_java::LANGUAGE.into())
+                            .expect("Java grammar");
+                        if let Some(tree) = parser.parse(&wrapped, None)
+                            && let Some(class) = tree.root_node().named_child(0)
+                            && let Some(body) = class.child_by_field_name("body")
+                        {
+                            for field in body
+                                .named_children(&mut body.walk())
+                                .filter(|node| node.kind() == "field_declaration")
+                            {
+                                if let Some(ty) = field.child_by_field_name("type") {
+                                    for variable in field
+                                        .named_children(&mut field.walk())
+                                        .filter(|node| node.kind() == "variable_declarator")
+                                    {
+                                        if let Some(name) = variable.child_by_field_name("name") {
+                                            fields.push((
+                                                wrapped[ty.byte_range()].to_owned(),
+                                                wrapped[name.byte_range()].to_owned(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    out.line(emitted);
                     out.blank();
                 }
                 "line_comment" | "block_comment" | ";" | "{" | "}" => {}
@@ -6061,6 +6370,28 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     }
                 }
             }
+        }
+        if !bridges.is_empty() {
+            out.line(format!(
+                "public static final {namespace} {namespace} = new {namespace}();"
+            ));
+            out.open(format!("public static final class {namespace}"));
+            out.line(format!("private {namespace}() {{}}"));
+            for (ty, name) in fields {
+                out.line(format!("public static final {ty} {name} = {owner}.{name};"));
+            }
+            for bridge in bridges {
+                // Instance methods keep Java/Kotlin callers of the singleton
+                // working; the interface itself exposes the convenient statics.
+                out.open(format!(
+                    "public {}",
+                    bridge.signature.trim_start_matches("static ")
+                ));
+                let prefix = if bridge.returns_void { "" } else { "return " };
+                out.line(format!("{prefix}{owner}.{};", bridge.call));
+                out.close();
+            }
+            out.close();
         }
     }
 
@@ -6645,11 +6976,31 @@ fn import_is_referenced(import: &str, body: &str) -> bool {
     false
 }
 
-/// After `@`-prefixing, Kotlin's auto-wrapped array form — unnamed top-level
-/// nested annotation invocations (`@JsonSubTypes(T(...), T(...))`) — must
-/// become a Java brace array literal (`{...}`) or javac rejects every element
-/// with "annotation values must be of the form 'name=value'". Named elements
-/// (`name = value`) and single simple values stay untouched.
+/// Drop only parsed comment nodes; comment-like text inside annotation string
+/// values remains data. A disabled class literal cannot authorize or block code.
+fn annotation_arguments_without_comments(root: tree_sitter::Node, source: &str) -> String {
+    let mut comments = Vec::new();
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if node.kind().ends_with("comment") {
+            comments.push((
+                node.start_byte() - root.start_byte(),
+                node.end_byte() - root.start_byte(),
+            ));
+        } else {
+            nodes.extend(node.children(&mut node.walk()));
+        }
+    }
+    let mut arguments = source[root.byte_range()].to_owned();
+    comments.sort_unstable();
+    for (start, end) in comments.into_iter().rev() {
+        arguments.replace_range(start..end, " ");
+    }
+    arguments
+}
+
+/// Kotlin auto-wraps nested annotation arguments into arrays; Java requires
+/// braces around them. Named elements and ordinary values stay unchanged.
 fn brace_wrap_unnamed_nested_annotations(prefixed: &str) -> String {
     // The argument text arrives wrapped in its enclosing parentheses (from
     // `value_arguments` or the wrapper's parenthesized_expression) — strip
@@ -6660,8 +7011,8 @@ fn brace_wrap_unnamed_nested_annotations(prefixed: &str) -> String {
     } else {
         trimmed
     };
-    // Already a brace array literal.
-    if trimmed.starts_with('{') {
+    // An empty argument list or an existing array needs no wrapping.
+    if trimmed.is_empty() || trimmed.starts_with('{') {
         return prefixed.to_string();
     }
     // Split the top-level elements at depth-0 commas.
@@ -6700,6 +7051,7 @@ fn brace_wrap_unnamed_nested_annotations(prefixed: &str) -> String {
     // value means the shape is already valid Java.
     let all_nested_annotations = elements
         .iter()
+        .filter(|element| !element.trim().is_empty())
         .all(|element| element.trim_start().starts_with('@'));
     if !all_nested_annotations {
         return prefixed.to_string();

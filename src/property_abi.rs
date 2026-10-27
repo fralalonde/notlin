@@ -203,15 +203,18 @@ pub(crate) fn is_property_interface_candidate(target: &Declaration) -> bool {
         && target
             .members
             .iter()
-            .any(|member| member.kind == MemberKind::Property)
-        && target.members.iter().all(|member| {
-            member.kind == MemberKind::Method
-                || (member.kind == MemberKind::Property
-                    && !member.is_static
-                    && (!member.has_body || !member.is_mutable)
-                    && !member.has_unsupported_property_shape
-                    && !member.has_unsupported_property_annotations)
-        })
+            .any(|member| member.kind == MemberKind::Property && !member.is_static)
+        && target
+            .members
+            .iter()
+            .filter(|member| !member.is_static)
+            .all(|member| {
+                member.kind == MemberKind::Method
+                    || (member.kind == MemberKind::Property
+                        && !member.is_static
+                        && !member.has_unsupported_property_shape
+                        && !member.has_unsupported_property_annotations)
+            })
 }
 
 /// A getter-only interface already has Java-compatible method signatures.
@@ -235,6 +238,36 @@ pub(crate) fn is_noarg_method_interface_candidate(target: &Declaration) -> bool 
                 matches!(member.visibility.as_deref(), None | Some("public"))
                     && plain_java_method_name(&member.name)
             }))
+}
+
+/// Ordinary interface methods already have Java method implementations on
+/// Kotlin descendants. Companion state does not change that instance contract.
+pub(crate) fn is_method_interface_candidate(target: &Declaration) -> bool {
+    is_noarg_method_interface_candidate(target)
+        || (target.kind == DeclarationKind::Interface
+            && target.members.iter().any(|member| !member.is_static)
+            && target
+                .members
+                .iter()
+                .filter(|member| !member.is_static)
+                .all(|member| {
+                    member.kind == MemberKind::Method
+                        && matches!(member.visibility.as_deref(), None | Some("public"))
+                        && plain_java_method_name(&member.name)
+                        && member
+                            .callable_arity
+                            .is_some_and(|arity| !arity.vararg && arity.required == arity.fixed)
+                        && member
+                            .parameter_types
+                            .iter()
+                            .all(|ty| is_jvm_getter_return_type(ty))
+                        && member.type_name.as_deref().map_or(!member.has_body, |ty| {
+                            is_jvm_getter_return_type(ty)
+                                || matches!(ty.trim(), "Unit" | "kotlin.Unit" | "void")
+                        })
+                        && !member.has_unsupported_property_shape
+                        && !member.has_unsupported_property_annotations
+                }))
 }
 
 /// Prove a method-only Kotlin interface whose methods form ordinary JavaBean
@@ -1661,7 +1694,6 @@ fn interface_member_repairable(
 ) -> bool {
     let setter = bridged_setter_name(property, member.is_mutable);
     property_type_matches(index, contract_owner, owner, member, property)
-        && (!member.has_body || !member.is_mutable)
         && !member.has_unsupported_property_shape
         && !member.has_unsupported_property_annotations
         && (property.setter.is_none() || member.is_mutable)
@@ -1932,24 +1964,28 @@ fn source_contract_properties(
     let type_source = index.declaration_source_file(target)?.path.clone();
     let mut properties = Vec::new();
     for member in &target.members {
-        if member.kind == MemberKind::Method {
+        if member.kind == MemberKind::Method || member.is_static {
             continue;
         }
-        if member.kind != MemberKind::Property
-            || member.is_static
-            || (member.has_body && member.is_mutable)
-            || member.has_unsupported_property_annotations
-            || member
-                .type_name
-                .as_deref()
-                .is_none_or(|ty| ty.contains("->") || ty.contains(['{', '}']))
-        {
+        if member.kind != MemberKind::Property || member.has_unsupported_property_annotations {
+            return None;
+        }
+        let inferred = member
+            .type_name
+            .is_none()
+            .then(|| index.inferred_simple_property_type(target, member))
+            .flatten();
+        let type_name = member
+            .type_name
+            .as_ref()
+            .or_else(|| inferred.as_ref().map(|(ty, _)| ty))?;
+        if type_name.contains("->") || type_name.contains(['{', '}']) {
             return None;
         }
         properties.push(PropertyContract {
             name: member.name.clone(),
-            type_name: member.type_name.clone()?,
-            type_source: type_source.clone(),
+            type_name: type_name.clone(),
+            type_source: inferred.map_or_else(|| type_source.clone(), |(_, file)| file),
             getter: crate::workspace::property_accessor_name(&member.name),
             setter: member.is_mutable.then(|| setter_name(&member.name)),
         });
@@ -2194,7 +2230,16 @@ fn property_type_matches(
     member: &crate::workspace::Member,
     contract: &PropertyContract,
 ) -> bool {
-    let Some(member_type) = member.type_name.as_deref() else {
+    let inferred = member
+        .type_name
+        .is_none()
+        .then(|| index.inferred_simple_property_type(subtype, member))
+        .flatten();
+    let Some(member_type) = member
+        .type_name
+        .as_deref()
+        .or_else(|| inferred.as_ref().map(|(ty, _)| ty.as_str()))
+    else {
         return false;
     };
     if member_type.contains(['{', '}'])
@@ -5057,6 +5102,53 @@ pub(crate) fn inferred_simple_property_type(
     if member.kind != MemberKind::Property || member.type_name.is_some() {
         return None;
     }
+    let file = index.declaration_source_file(declaration)?;
+    let tree = crate::transpiler::parse_tree(file.source_text());
+    let mut owners = vec![tree.root_node()];
+    let owner = loop {
+        let node = owners.pop()?;
+        if declaration_node(node) && declaration_name(node, file.source_text()) == declaration.name
+        {
+            break node;
+        }
+        owners.extend(node.named_children(&mut node.walk()));
+    };
+    let mut pending = vec![owner];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "property_declaration"
+            && property_name(node, file.source_text()) == member.name
+        {
+            let getter = crate::transpiler::kt::child(node, "getter")?;
+            let body = crate::transpiler::kt::child(getter, "function_body")?;
+            let expression = body
+                .named_children(&mut body.walk())
+                .find(|child| !matches!(child.kind(), "line_comment" | "block_comment"))?;
+            let ty = match expression.kind() {
+                "string_literal" => Some("kotlin.String"),
+                "boolean_literal" => Some("kotlin.Boolean"),
+                "number_literal"
+                    if node_text(expression, file.source_text())
+                        .parse::<i32>()
+                        .is_ok() =>
+                {
+                    Some("kotlin.Int")
+                }
+                _ => None,
+            };
+            if let Some(ty) = ty {
+                return Some((ty.into(), file.path.clone()));
+            }
+            break;
+        }
+        if node.id() == owner.id()
+            || !matches!(
+                node.kind(),
+                "class_declaration" | "object_declaration" | "companion_object"
+            )
+        {
+            pending.extend(node.named_children(&mut node.walk()));
+        }
+    }
     let (receiver, selected_property) =
         simple_inferred_property_getter_rhs(index, declaration, &member.name)?;
     if selected_property != member.name {
@@ -5140,9 +5232,21 @@ fn interface_property_methods(
     setter_override: bool,
 ) -> Option<String> {
     let (prefix, mutable) = property_prefix(text)?;
-    if text.contains(" set(") {
-        return None;
-    }
+    let wrapped = format!("interface __Accessors {{\n{text}\n}}");
+    let tree = crate::transpiler::parse_tree(&wrapped);
+    let mut pending = vec![tree.root_node()];
+    let property = loop {
+        let node = pending.pop()?;
+        if node.kind() == "property_declaration" {
+            break node;
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    };
+    let getter_body = crate::transpiler::kt::child(property, "getter")
+        .and_then(|getter| crate::transpiler::kt::child(getter, "function_body"));
+    let setter = crate::transpiler::kt::child(property, "setter");
+    let setter_body =
+        setter.and_then(|setter| crate::transpiler::kt::child(setter, "function_body"));
     let overrides_property = prefix.split_whitespace().any(|word| word == "override");
     let ty = property_type(text).unwrap_or(&contract.type_name);
     let mut output = String::new();
@@ -5155,21 +5259,15 @@ fn interface_property_methods(
         if overrides_property { "override " } else { "" },
         contract.getter
     ));
-    if let Some(getter_at) = text.find("get()") {
-        let body = text[getter_at + "get()".len()..].trim();
-        if body.is_empty() {
-            return None;
-        }
+    if let Some(body) = getter_body {
         output.push(' ');
         output.push_str(&rewrite_super_property_access(
             index,
             declaration,
             contract,
-            body,
+            node_text(body, &wrapped),
         ));
-        return (!mutable).then_some(output);
-    }
-    if text.contains('=') {
+    } else if text.contains('=') {
         return None;
     }
     if contract.setter.is_some() && !mutable {
@@ -5185,10 +5283,23 @@ fn interface_property_methods(
             output.push_str(&annotation);
             output.push('\n');
         }
+        let parameter = crate::transpiler::kt::child(property, "setter")
+            .and_then(|setter| crate::transpiler::kt::child(setter, "identifier"))
+            .map(|name| node_text(name, &wrapped))
+            .unwrap_or("value");
         output.push_str(&format!(
-            "{}fun {setter}(value: {ty})",
+            "{}fun {setter}({parameter}: {ty})",
             if setter_override { "override " } else { "" }
         ));
+        if let Some(body) = setter_body {
+            output.push(' ');
+            output.push_str(&rewrite_super_property_access(
+                index,
+                declaration,
+                contract,
+                node_text(body, &wrapped),
+            ));
+        }
     }
     Some(output)
 }
@@ -5847,7 +5958,7 @@ fn setter_property<'a>(
     }
 }
 
-fn setter_name(property: &str) -> String {
+pub(crate) fn setter_name(property: &str) -> String {
     let property = property
         .strip_prefix("is")
         .filter(|rest| rest.chars().next().is_some_and(char::is_uppercase))

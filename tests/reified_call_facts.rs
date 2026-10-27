@@ -1,4 +1,4 @@
-use notlin::semantics::{SemanticProvider, SyntaxSemanticProvider, plan_reified_class_calls};
+use notlin::semantics::{SemanticProvider, SyntaxSemanticProvider, plan_syntax_lowerings};
 use std::path::{Path, PathBuf};
 
 const TYPES: &str = "package sample\ninterface Context\nclass Entry : Context\n";
@@ -34,7 +34,7 @@ fn plan(
     let tree = parser.parse(caller, None).unwrap();
     let path = Path::new("Caller.kt");
     let mut plan = notlin::translation_plan::analyze(caller, tree.root_node(), path);
-    plan_reified_class_calls(caller, &tree, path, &provider, &mut plan);
+    plan_syntax_lowerings(caller, &tree, path, &provider, &mut plan);
     assert!(provider.source_for_file(path).is_some());
     plan
 }

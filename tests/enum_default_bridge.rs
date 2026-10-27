@@ -102,6 +102,10 @@ enum class NestedGenericVariant : Middle<String>, ItemsContract { ONE }
 interface VoidGetter { default void getFlag() {} }
 interface StaticGetter { static String getLabel() { return "x"; } }
 interface PrivateGetter { private String getSecret() { return "x"; } }
+interface ValuesDefault { default java.util.Map<String, String> valuesByName() { return java.util.Map.of(); } }
+interface ValuesContract { java.util.Map<String, String> valuesByName(); }
+interface OverloadDefault { default String valuesByName(String input) { return input; } }
+interface OverloadContract { String valuesByName(String input); }
 "#,
     )
     .unwrap();
@@ -117,6 +121,11 @@ enum class PrivateVariant : PrivateGetter, SecretContract { ONE }
 "#,
     )
     .unwrap();
+
+    fs::write(
+        root.join("methods.kt"),
+        "package neutral.defaults\nenum class ValuesVariant : ValuesDefault, ValuesContract {\n ONE\n}\nenum class OverloadedVariant : ValuesDefault, ValuesContract, OverloadDefault, OverloadContract {\n ONE\n}\n",
+    ).unwrap();
 
     let index = notlin::workspace::SourceIndex::discover(&root).unwrap();
     let path = root.join("types.kt");
@@ -144,6 +153,18 @@ enum class PrivateVariant : PrivateGetter, SecretContract { ONE }
             return_type: "Boolean".to_owned(),
             provider: "BooleanGetter".to_owned(),
         }]
+    );
+    assert_eq!(
+        index.enum_default_property_bridges(&root.join("methods.kt"), "ValuesVariant"),
+        [notlin::workspace::EnumDefaultBridge {
+            method_name: "valuesByName".to_owned(),
+            return_type: "java.util.Map<String, String>".to_owned(),
+            provider: "ValuesDefault".to_owned(),
+        }]
+    );
+    assert_eq!(
+        index.enum_default_obligations(&root.join("methods.kt"), "OverloadedVariant"),
+        ["valuesByName".to_owned(), "valuesByName(String)".to_owned()]
     );
     for name in [
         "AbstractVariant",

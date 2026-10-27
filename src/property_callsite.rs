@@ -1659,7 +1659,8 @@ fn declared_type_evidence(context: &RewriteContext<'_>, ty: String, opaque: bool
     // Carry the selected classifier's qualified spelling, not the written
     // spelling: an import alias may denote a different declaration than a
     // same-named classifier that a later convenience lookup would find.
-    match crate::workspace::canonical_type_binding(context.index, context.source_file, &ty) {
+    match crate::workspace::property_receiver_type_binding(context.index, context.source_file, &ty)
+    {
         Some(binding) => Lookup::bound(binding.qualified, opaque),
         None => Lookup::unknown(opaque),
     }
@@ -2114,7 +2115,9 @@ fn enclosing_member_resolution(
             // A member's declared type is canonical evidence only when this
             // file provably binds the spelling; the index's unique-simple-name
             // global fallback would name a classifier from an unrelated package.
-            let Some(resolved) = crate::workspace::proven_type_declaration(index, context, ty)
+            let Some(resolved) =
+                crate::workspace::property_receiver_type_binding(index, context, ty)
+                    .and_then(|binding| binding.declaration)
             else {
                 return Resolution::Unknown;
             };
@@ -2162,7 +2165,9 @@ fn enclosing_member_resolution(
             let context = index
                 .declaration_source_file(current)
                 .unwrap_or(source_file);
-            let Some(resolved) = crate::workspace::proven_type_declaration(index, context, ty)
+            let Some(resolved) =
+                crate::workspace::property_receiver_type_binding(index, context, ty)
+                    .and_then(|binding| binding.declaration)
             else {
                 return Resolution::Unknown;
             };
@@ -2403,6 +2408,42 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn wildcard_receiver_binding_repairs_unique_imports_and_preserves_shadows() {
+        for (imports, local, should_rewrite) in [
+            ("import api.*", "", true),
+            ("import api.*\nimport other.*", "", false),
+            ("import api.*\nimport other.Work", "", false),
+            ("import api.*", "class Work\n", false),
+            ("", "", false),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write(
+                "api/Types.kt",
+                "package api\ninterface Api {\n fun getRequest(): String\n}\ninterface Work: Api\n",
+            );
+            fixture.write("other/Types.kt", "package other\nclass Work\n");
+            let source = format!(
+                "package caller\n{imports}\n{local}class Caller(val work: Work) {{\n fun read(): String = work.request\n}}\n"
+            );
+            let path = fixture.write("caller/Caller.kt", &source);
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let contract = PropertyAccessorContract {
+                owner_type: "api.Api".into(),
+                property: "request".into(),
+                getter: "getRequest".into(),
+                setter: None,
+            };
+            let (updated, count) = rewrite_file(&index, &path, &source, &[contract]);
+            assert_eq!(count, usize::from(should_rewrite), "{updated}");
+            assert_eq!(
+                updated.contains("work.getRequest()"),
+                should_rewrite,
+                "{updated}"
+            );
         }
     }
 

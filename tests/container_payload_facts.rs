@@ -1,6 +1,6 @@
 use notlin::semantics::{
     ContainerMemberCall, KotlinType, SemanticProvider, SyntaxSemanticProvider, TypeRef,
-    plan_container_calls, plan_eager_collection_calls, plan_required_calls,
+    plan_eager_collection_calls, plan_required_calls, plan_syntax_lowerings,
 };
 use std::path::{Path, PathBuf};
 
@@ -43,7 +43,7 @@ fn plan(
     assert!(!tree.root_node().has_error(), "invalid fixture:\n{source}");
     let path = Path::new(file);
     let mut plan = notlin::translation_plan::analyze(source, tree.root_node(), path);
-    plan_container_calls(source, &tree, path, provider, &mut plan);
+    plan_syntax_lowerings(source, &tree, path, provider, &mut plan);
     plan_required_calls(source, &tree, path, provider, false, &mut plan);
     plan
 }

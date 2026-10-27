@@ -36,7 +36,7 @@ fn plan(source: &str, file: &str, provider: &SyntaxSemanticProvider) -> Translat
     let tree = parser.parse(source, None).unwrap();
     let path = Path::new(file);
     let mut plan = notlin::translation_plan::analyze(source, tree.root_node(), path);
-    notlin::semantics::plan_todo_lowerings(source, &tree, path, provider, &mut plan);
+    notlin::semantics::plan_syntax_lowerings(source, &tree, path, provider, &mut plan);
     plan
 }
 

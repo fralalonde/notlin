@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 /// implemented by an ordinary Kotlin `fun getX()`. In that case its default
 /// provider must retain Kotlin metadata along with the descendant. The direct
 /// super qualifier may stay Kotlin: bridge analysis already proves that it
-/// inherits the selected default without overriding or reabstracting it. Only
-/// that default's declaring owner needs Java method semantics.
+/// inherits the selected default without reabstracting it. A default declared
+/// as a Kotlin function already has method semantics and can be forwarded to
+/// before its provider moves; a Kotlin property still needs conversion first.
 pub(crate) fn can_repair_contract(
     index: &SourceIndex,
     descendant: &crate::workspace::Declaration,
@@ -40,17 +41,36 @@ pub(crate) fn can_repair_contract(
     }
     bridges.iter().any(|bridge| {
         bridge.method_name == method_name
-            && bridge
-                .property_contract_owners
-                .iter()
-                .chain([&bridge.target])
-                .all(|owner| {
-                    is_java_file(&owner.file)
-                        || (index.is_selected(&owner.file, roots)
-                            && (owner == &moving_provider
-                                || !index.symbol_retained(owner, retained)))
-                })
+            && bridge.property_contract_owners.iter().all(|owner| {
+                is_java_file(&owner.file)
+                    || (index.is_selected(&owner.file, roots)
+                        && (owner == &moving_provider || !index.symbol_retained(owner, retained)))
+            })
+            && (is_java_file(&bridge.target.file)
+                || bridge.target == moving_provider
+                || kotlin_method_default(index, &bridge.target, method_name))
     })
+}
+
+/// A Kotlin `fun getX()` already has method override semantics. Its provider
+/// need not move first: a retained implementer can explicitly forward to that
+/// method while parallel Kotlin `val` contracts still follow the property path.
+fn kotlin_method_default(index: &SourceIndex, owner: &SymbolId, name: &str) -> bool {
+    let Some(file) = index.source_file(&owner.file) else {
+        return false;
+    };
+    file.language == SourceLanguage::Kotlin
+        && file.declarations.iter().any(|declaration| {
+            crate::semantics::workspace_symbol(index, declaration) == *owner
+                && declaration.members.iter().any(|member| {
+                    member.kind == crate::workspace::MemberKind::Method
+                        && member.name == name
+                        && member.parameter_types.is_empty()
+                        && member.has_body
+                        && !member.is_static
+                        && member.visibility.as_deref() != Some("private")
+                })
+        })
 }
 
 fn is_java_file(path: &Path) -> bool {
@@ -87,7 +107,8 @@ pub(crate) fn repair_virtual_sources(
             };
             let owner = crate::semantics::workspace_symbol(index, declaration);
             for bridge in bridges {
-                if !is_java_file(&bridge.target.file)
+                if !(is_java_file(&bridge.target.file)
+                    || kotlin_method_default(index, &bridge.target, &bridge.method_name))
                     || !bridge
                         .property_contract_owners
                         .iter()
@@ -428,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn kotlin_qualifier_cannot_replace_or_reabstract_the_selected_default() {
+    fn kotlin_qualifier_can_forward_its_replacement_method_but_not_reabstract_it() {
         for getter in [
             "override fun getOwner(): StoredId",
             "override fun getOwner(): StoredId = StoredId()",
@@ -443,8 +464,18 @@ mod tests {
             let (index, mut sources) = fixture.indexed_sources();
             let original = sources.clone();
             let report = repair_virtual_sources(&index, &mut sources, &HashSet::new()).unwrap();
-            assert_eq!(report.count, 0, "{getter}");
-            assert_eq!(sources, original, "{getter}");
+            if getter.contains('=') {
+                assert_eq!(report.count, 1, "{getter}");
+                assert!(
+                    sources
+                        .iter()
+                        .any(|(_, source)| source.contains("super<sample.Step>.getOwner()")),
+                    "{sources:?}"
+                );
+            } else {
+                assert_eq!(report.count, 0, "{getter}");
+                assert_eq!(sources, original, "{getter}");
+            }
         }
     }
 

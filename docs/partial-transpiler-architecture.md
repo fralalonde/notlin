@@ -6,6 +6,25 @@ The Rust pipeline prepares a complete migration before application:
 
 Classes are ownership boundaries. Top-level functions and properties are independently selectable. Rejected declarations remain Kotlin; no method extraction into helper classes is performed.
 
+Interface properties lower to accessor methods: `val alias` becomes `getAlias()`,
+`var alias` adds `setAlias(value)`, and Boolean `isReady` uses `isReady()` and
+`setReady(value)`. Accessor bodies become default methods; reads and writes in
+those bodies use the same accessor model. Retained Kotlin implementers are
+rewritten to explicit method overrides, including custom setter bodies. Companion
+members use a singleton and Java method bridges derived from emitted signatures.
+Ordinary interface methods with fixed arguments can move with these contracts.
+
+A retained Kotlin interface's concrete `fun getX()` can still supply an explicit
+forwarding override on a retained descendant. The provider need not move merely
+to call a method it already declares; property contracts must still satisfy the
+Java conversion requirements. This removes a circular retention dependency in
+covariant default getter hierarchies.
+
+Explicit read-only collection return boundaries use an erased Java view cast
+when Java invariance would reject Kotlin covariance. The cast preserves collection
+identity and live contents. Mutable collection declarations and custom types
+shadowing standard collection names do not use this rule.
+
 ## Identity and facts
 
 `SymbolId` contains module, declaring file, package, enclosing declarations, kind, name, receiver and normalized parameter types. Bodies, whitespace and snapshot locations are separate. `DeclarationId` and `SourceLocation` carry source hashes and byte ranges; stale snapshots cannot authorize edits. Generated symbols have explicit mappings to their origins.
@@ -134,18 +153,27 @@ file with every call expression in it (`byte_offset`, expression `text`,
 nullability, erased JVM descriptor).
 
 **The seam.** `SemanticProvider::established_call_site(file, byte_offset,
-source_hash)` is the only door into that data. `FactsProvider` implements it as a
+source_hash)` is the only door into that data. The semantic index implements it as a
 hash-guarded lookup; `resolve_required_call` calls it *after* the syntax resolver
 answered `Unknown`/`Ambiguous` and turns an `Established` site into
 `FactStatus::Established` for a **fact identity**: `module = "jvm-facts"`, the
 helper's `callee_owner` split at its last dot into `package` / `owner_path`, and
 the K2 parameter renderings. That identity cannot collide with an indexed
 declaration, and rules phrased about *user declarations* (builtin shadowing) skip
-it. The decorator answers the typed view of the same identity
-(`explicit_nongeneric_kotlin_return`) from the site's result type, mapped through
-`TypeRef`, so a resolved call can feed the existing type machinery instead of
-being a bare boolean. Nothing keys on the name: a call resolves because the
-helper resolved *that call expression*, never because it is spelled `let`.
+it. Call-site observations never answer declaration-return accessors such as
+`explicit_nongeneric_kotlin_return`: a substituted K2 expression type does not
+prove a nongeneric declaration or the representation of emitted Java. Fact-backed
+emission and result typing require the same snapshot-bound lowering receipt.
+Nothing keys on the name: a call resolves because the helper resolved *that call
+expression*, never because it is spelled `let`.
+
+The index owns an optional shared `FactsRuntime`; the old
+`facts::decorator::FactsProvider` path is a type alias for policy-based callers.
+There is one `SemanticProvider` implementation, so adding a source-backed
+accessor cannot silently lose it at a forwarding wrapper. Only external member,
+call-site, and source-property observation accessors consult the runtime.
+Declaration accessors read
+the source index regardless of whether a helper is attached.
 
 **The hash guard.** The Analysis API answers for the file *on disk*, while notlin
 plans on snapshots (overlays, speculative repairs, candidate revisions).

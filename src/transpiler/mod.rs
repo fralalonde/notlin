@@ -948,13 +948,9 @@ fn build_static_plan(
     plan.plan_type_losses(source, tree.root_node(), cli.allow_approximations);
     plan.plan_constructor_metadata_losses(identity_path, provider, cli.allow_approximations);
     plan.plan_jackson_default_constructor_losses(identity_path, provider, cli.allow_approximations);
-    crate::semantics::plan_enum_when_lowerings(source, tree, identity_path, provider, &mut plan);
-    crate::semantics::plan_todo_lowerings(source, tree, identity_path, provider, &mut plan);
-    crate::semantics::plan_reference_string_calls(source, tree, identity_path, provider, &mut plan);
-    crate::semantics::plan_container_calls(source, tree, identity_path, provider, &mut plan);
+    crate::semantics::plan_syntax_lowerings(source, tree, identity_path, provider, &mut plan);
     crate::semantics::plan_eager_collection_calls(source, tree, identity_path, provider, &mut plan);
     eager_collection_plan::plan_helpers(source, tree.root_node(), provider, &mut plan);
-    crate::semantics::plan_reified_class_calls(source, tree, identity_path, provider, &mut plan);
     crate::semantics::plan_constructor_delegations(
         source,
         tree,

@@ -45,6 +45,45 @@ fn chained_return_uses_the_producers_import_context() {
 }
 
 #[test]
+fn inherited_getters_select_the_return_below_all_sibling_contracts() {
+    for (returns, expected) in [
+        ("class Narrow: Left, Right", true),
+        ("class Narrow: Left", false),
+    ] {
+        let file = PathBuf::from("Covariant.kt");
+        let source = format!(
+            "package variants\ninterface Left\ninterface Right\n{returns}\ninterface First {{\n fun getCategory(): Left\n}}\ninterface Second {{\n fun getCategory(): Right\n}}\ninterface Specific {{\n fun getCategory(): Narrow\n}}\ninterface Combined: First, Second, Specific\nfun category(value: Combined) = value.getCategory()\n"
+        );
+        let index = SyntaxSemanticProvider::new([(file.clone(), source.clone())]);
+        let result = dependency(&source, &file, &index, "getCategory");
+        if expected {
+            assert!(
+                matches!(result, FactStatus::Established(ref id) if id.owner_path == ["Specific"]),
+                "{result:?}"
+            );
+        } else {
+            assert!(matches!(result, FactStatus::Ambiguous(_)), "{result:?}");
+        }
+    }
+}
+
+#[test]
+fn later_member_properties_supply_receiver_types_without_overriding_parameters() {
+    let file = PathBuf::from("Later.kt");
+    for (parameter, expected) in [("", "Source"), ("peer: Other", "Other")] {
+        let source = format!(
+            "package later\nclass Source {{\n fun getKey(): String = \"source\"\n}}\nclass Other {{\n fun getKey(): String = \"other\"\n}}\nclass Holder {{\n fun read({parameter}): String = peer.getKey()\n val peer: Source get() = Source()\n}}\n"
+        );
+        let provider = SyntaxSemanticProvider::new([(file.clone(), source.clone())]);
+        let result = dependency(&source, &file, &provider, "getKey");
+        assert!(
+            matches!(result, FactStatus::Established(ref id) if id.owner_path == [expected]),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
 fn unknown_or_ambiguous_producer_types_do_not_bind_to_consumer_names() {
     let unknown_file = PathBuf::from("UnknownProvider.kt");
     let consumer_file = PathBuf::from("UnknownConsumer.kt");

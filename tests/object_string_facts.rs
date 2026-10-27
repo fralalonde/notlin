@@ -1,6 +1,6 @@
 use notlin::semantics::{
     FactStatus, ReferenceStringCallKind, SemanticProvider, SyntaxSemanticProvider,
-    plan_reference_string_calls, plan_required_calls,
+    plan_required_calls, plan_syntax_lowerings,
 };
 use std::path::{Path, PathBuf};
 
@@ -63,7 +63,7 @@ fn reference_string_plan(
     assert!(!tree.root_node().has_error(), "invalid fixture:\n{source}");
     let path = Path::new(file);
     let mut plan = notlin::translation_plan::analyze(source, tree.root_node(), path);
-    plan_reference_string_calls(source, &tree, path, provider, &mut plan);
+    plan_syntax_lowerings(source, &tree, path, provider, &mut plan);
     plan
 }
 

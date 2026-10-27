@@ -402,7 +402,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         let init = self.property_initializer(decl);
                         match init {
                             Some(init_node) => self.infer_type(init_node),
-                            None => "Object".to_string(),
+                            None => self
+                                .inferred_getter_type(decl)
+                                .unwrap_or_else(|| "Object".to_string()),
                         }
                     }
                 }
@@ -467,7 +469,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 self.property_repair_bridge_annotations(&owner, property_node, &property, false)
             })
             .unwrap_or_default();
-        if self.class_declares_method(decl, &format!("get{}", capitalize(&name))) {
+        if self.class_declares_method(decl, &crate::workspace::property_accessor_name(&name)) {
             field_annotations.append(&mut getter_annotations);
         }
 
@@ -493,9 +495,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
         // getter — but not if the user declared their own accessor-method
         // of the same name in the class body (would collide in Java).
-        let cap = capitalize(&name);
-        let getter_name = format!("get{}", cap);
-        let setter_name = format!("set{}", cap);
+        let getter_name = crate::workspace::property_accessor_name(&name);
+        let setter_name = crate::property_abi::setter_name(&name);
         let set_private = setter
             .as_ref()
             .and_then(|s| kt::child(*s, "modifiers"))
@@ -545,11 +546,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.line(annotation.clone());
             }
             out.open(format!(
-                "{}{}{} get{}()",
+                "{}{}{} {}()",
                 visibility,
                 if make_static { "static " } else { "" },
                 ty,
-                cap
+                getter_name
             ));
             match getter_body {
                 Some(gb) => {
@@ -573,6 +574,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             // inlined `T::class.java`; the Java-visible ABI is
                             // the `Class<T>` overload (`get(Ty.class)`).
                             let java = crate::transpiler::expr::rewrite_reified_type_args(&java);
+                            let java = self.coerce_readonly_collection_return(c, java);
                             // A Nothing-typed body (e.g. `TODO(...)`) lowers
                             // to `throw ...` — that is a statement, not a
                             // value; `return throw ...;` would not compile.
@@ -612,10 +614,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out.line(annotation.clone());
             }
             out.open(format!(
-                "{}{}void set{}({} {})",
+                "{}{}void {}({} {})",
                 set_vis,
                 if make_static { "static " } else { "" },
-                cap,
+                setter_name,
                 ty,
                 name
             ));

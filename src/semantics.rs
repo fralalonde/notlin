@@ -2,6 +2,7 @@
 //!
 //! This layer deliberately reports uncertainty instead of inventing compiler
 //! answers. In particular, an unresolved type is never silently Object.
+use crate::facts::protocol::{CallSite, MemberFacts, SiteStatus};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -793,47 +794,10 @@ fn ordinary_java_field_lookup(declaration: tree_sitter::Node<'_>) -> bool {
     true
 }
 
-/// Record snapshot-bound lowering decisions before Java preparation. Emitters
-/// consume these decisions; unsupported `when` forms keep the existing rules.
-pub fn plan_enum_when_lowerings(
-    source: &str,
-    tree: &tree_sitter::Tree,
-    file: &Path,
-    provider: &(impl SemanticProvider + ?Sized),
-    plan: &mut crate::translation_plan::TranslationPlan,
-) {
-    assert_eq!(
-        plan.source_hash,
-        *blake3::hash(source.as_bytes()).as_bytes(),
-        "when planning requires the current source snapshot"
-    );
-    let owners = DeclarationOwnerIndex::new(plan);
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "when_expression"
-            && let Some(index) = owners.owner(node)
-            && let Some(lowering) = enum_when::establish(source, node, file, provider)
-        {
-            plan.require_symbol(
-                index,
-                lowering.enum_owner.name.clone(),
-                FactStatus::Established(lowering.enum_owner.clone()),
-            );
-            for label in lowering.arms.iter().flat_map(|arm| &arm.labels) {
-                plan.require_symbol(
-                    index,
-                    label.name.clone(),
-                    FactStatus::Established(label.clone()),
-                );
-            }
-            plan.enum_when_lowerings.push(lowering);
-        }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
-}
-
-/// Plan exact stdlib TODO throws before Java preparation.
-pub fn plan_todo_lowerings(
+/// Record independent syntax-backed lowerings in one workspace-tree walk.
+/// Eager collections keep a separate, inner-first pass because chained calls
+/// consume facts recorded for their receivers.
+pub fn plan_syntax_lowerings(
     source: &str,
     tree: &tree_sitter::Tree,
     file: &Path,
@@ -847,81 +811,69 @@ pub fn plan_todo_lowerings(
     let owners = DeclarationOwnerIndex::new(plan);
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if node.kind() == "call_expression"
-            && owners.owner(node).is_some()
-            && let Some(lowering) = todo::establish(source, node, file, provider)
-        {
-            plan.todo_lowerings.push(lowering);
-        }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
-}
-
-/// Plan source-checked reference-string calls and their indexed dependencies.
-pub fn plan_reference_string_calls(
-    source: &str,
-    tree: &tree_sitter::Tree,
-    file: &Path,
-    provider: &(impl SemanticProvider + ?Sized),
-    plan: &mut crate::translation_plan::TranslationPlan,
-) {
-    assert_eq!(
-        plan.source_hash,
-        *blake3::hash(source.as_bytes()).as_bytes()
-    );
-    let owners = DeclarationOwnerIndex::new(plan);
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "call_expression"
-            && let Some(index) = owners.owner(node)
-            && let Some(fact) = object_calls::establish(source, file, node, provider)
-        {
-            let dependency = match &fact.receiver {
-                ReferenceStringReceiver::Indexed(classifier) => Some(classifier),
-                ReferenceStringReceiver::Returned { producer, .. } => Some(producer),
-                ReferenceStringReceiver::Standard { .. } => None,
-            };
-            if let Some(dependency) = dependency {
-                plan.require_symbol(
-                    index,
-                    dependency.name.clone(),
-                    FactStatus::Established(dependency.clone()),
-                );
+        if let Some(index) = owners.owner(node) {
+            match node.kind() {
+                "when_expression" => {
+                    if let Some(lowering) = enum_when::establish(source, node, file, provider) {
+                        for symbol in std::iter::once(&lowering.enum_owner)
+                            .chain(lowering.arms.iter().flat_map(|arm| &arm.labels))
+                        {
+                            plan.require_symbol(
+                                index,
+                                symbol.name.clone(),
+                                FactStatus::Established(symbol.clone()),
+                            );
+                        }
+                        plan.enum_when_lowerings.push(lowering);
+                    }
+                }
+                "call_expression" => {
+                    if let Some(lowering) = todo::establish(source, node, file, provider) {
+                        plan.todo_lowerings.push(lowering);
+                    }
+                    if let Some(fact) = object_calls::establish(source, file, node, provider) {
+                        let dependency = match &fact.receiver {
+                            ReferenceStringReceiver::Indexed(classifier) => Some(classifier),
+                            ReferenceStringReceiver::Returned { producer, .. } => Some(producer),
+                            ReferenceStringReceiver::Standard { .. } => None,
+                        };
+                        if let Some(symbol) = dependency {
+                            plan.require_symbol(
+                                index,
+                                symbol.name.clone(),
+                                FactStatus::Established(symbol.clone()),
+                            );
+                        }
+                        plan.reference_string_calls.push(fact);
+                    }
+                    if let Some(mut fact) = container_calls::establish(source, file, node, provider)
+                    {
+                        fact.owner = Some(plan.declarations[index].symbol_id.clone());
+                        for symbol in &fact.dependencies {
+                            plan.require_symbol(
+                                index,
+                                symbol.name.clone(),
+                                FactStatus::Established(symbol.clone()),
+                            );
+                        }
+                        plan.container_calls.push(fact);
+                    }
+                    if let Some(fact) = reified_calls::establish(source, file, node, provider) {
+                        for symbol in [&fact.source_target, &fact.java_target, &fact.type_argument]
+                            .into_iter()
+                            .chain(&fact.receiver_dependencies)
+                        {
+                            plan.require_symbol(
+                                index,
+                                symbol.name.clone(),
+                                FactStatus::Established(symbol.clone()),
+                            );
+                        }
+                        plan.reified_class_calls.push(fact);
+                    }
+                }
+                _ => {}
             }
-            plan.reference_string_calls.push(fact);
-        }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
-}
-
-/// Record canonical container calls and source-proven, scoped payload facts.
-pub fn plan_container_calls(
-    source: &str,
-    tree: &tree_sitter::Tree,
-    file: &Path,
-    provider: &(impl SemanticProvider + ?Sized),
-    plan: &mut crate::translation_plan::TranslationPlan,
-) {
-    assert_eq!(
-        plan.source_hash,
-        *blake3::hash(source.as_bytes()).as_bytes()
-    );
-    let owners = DeclarationOwnerIndex::new(plan);
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "call_expression"
-            && let Some(index) = owners.owner(node)
-            && let Some(mut fact) = container_calls::establish(source, file, node, provider)
-        {
-            fact.owner = Some(plan.declarations[index].symbol_id.clone());
-            for dependency in &fact.dependencies {
-                plan.require_symbol(
-                    index,
-                    dependency.name.clone(),
-                    FactStatus::Established(dependency.clone()),
-                );
-            }
-            plan.container_calls.push(fact);
         }
         stack.extend(node.named_children(&mut node.walk()));
     }
@@ -1019,45 +971,6 @@ pub fn plan_eager_collection_calls(
             }
             plan.eager_collection_calls.push(fact);
         }
-    }
-}
-
-/// Record exact class-token forwarders before Java emission.
-pub fn plan_reified_class_calls(
-    source: &str,
-    tree: &tree_sitter::Tree,
-    file: &Path,
-    provider: &(impl SemanticProvider + ?Sized),
-    plan: &mut crate::translation_plan::TranslationPlan,
-) {
-    assert_eq!(
-        plan.source_hash,
-        *blake3::hash(source.as_bytes()).as_bytes()
-    );
-    let owners = DeclarationOwnerIndex::new(plan);
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "call_expression"
-            && let Some(index) = owners.owner(node)
-            && let Some(fact) = reified_calls::establish(source, file, node, provider)
-        {
-            for symbol in [&fact.source_target, &fact.java_target, &fact.type_argument] {
-                plan.require_symbol(
-                    index,
-                    symbol.name.clone(),
-                    FactStatus::Established(symbol.clone()),
-                );
-            }
-            for symbol in &fact.receiver_dependencies {
-                plan.require_symbol(
-                    index,
-                    symbol.name.clone(),
-                    FactStatus::Established(symbol.clone()),
-                );
-            }
-            plan.reified_class_calls.push(fact);
-        }
-        stack.extend(node.named_children(&mut node.walk()));
     }
 }
 
@@ -2397,6 +2310,7 @@ pub trait SemanticProvider: Send + Sync {
 /// A conservative index over already parsed source snapshots.
 #[derive(Debug, Clone, Default)]
 pub struct SyntaxSemanticProvider {
+    pub(crate) facts_runtime: Option<Arc<crate::facts::runtime::FactsRuntime>>,
     symbols: Vec<SemanticSymbol>,
     by_name: BTreeMap<String, Vec<usize>>,
     by_file: BTreeMap<PathBuf, Vec<usize>>,
@@ -3081,7 +2995,16 @@ impl SyntaxSemanticProvider {
                         || other.id.receiver.is_some()
                         || self.is_java_static_member(&candidate.id)
                         || self.is_java_static_member(&other.id)
-                        || !matches!((&candidate.ty, &other.ty),
+                    {
+                        return false;
+                    }
+                    // Compatible inherited getters share one source call. A
+                    // return classifier below every other return is the result
+                    // Kotlin and Java both expose, even through sibling parents.
+                    if self.return_classifier_narrows(other, candidate) {
+                        return true;
+                    }
+                    if !matches!((&candidate.ty, &other.ty),
                         (FactStatus::Established(a), FactStatus::Established(b)) if a == b)
                     {
                         return false;
@@ -3096,6 +3019,35 @@ impl SyntaxSemanticProvider {
                 (!overridden).then_some(*candidate)
             })
             .collect()
+    }
+
+    fn return_classifier_narrows(&self, narrow: &SemanticSymbol, wide: &SemanticSymbol) -> bool {
+        let classifier = |method: &SemanticSymbol| {
+            let FactStatus::Established(TypeRef {
+                ty: KotlinType::Named { name, arguments },
+                nullable: false,
+            }) = &method.ty
+            else {
+                return None;
+            };
+            if !arguments.is_empty() || self.has_type_alias_in_package(&method.id.package, name) {
+                return None;
+            }
+            match self.resolve_type_in_file(&method.id.file, &method.id.package, name) {
+                FactStatus::Established(owner)
+                    if is_type_symbol(&owner)
+                        && owner.kind != "typealias"
+                        && !self.is_jvm_value_class(&owner) =>
+                {
+                    Some(owner)
+                }
+                _ => None,
+            }
+        };
+        let (Some(narrow), Some(wide)) = (classifier(narrow), classifier(wide)) else {
+            return false;
+        };
+        narrow != wide && self.inherits_type(&narrow, &wide) && !self.inherits_type(&wide, &narrow)
     }
 
     pub fn new(sources: impl IntoIterator<Item = (PathBuf, String)>) -> Self {
@@ -3511,6 +3463,67 @@ fn supertype_uses_import_alias(source: &str, supertype: &str) -> bool {
     })
 }
 impl SemanticProvider for SyntaxSemanticProvider {
+    fn source_property_reference(
+        &self,
+        file: &Path,
+        byte_offset: u64,
+        source_hash: &[u8; 32],
+    ) -> Option<crate::facts::protocol::SourcePropertyReference> {
+        self.facts_runtime
+            .as_ref()?
+            .source_property_reference_at(file, byte_offset, source_hash)
+    }
+
+    fn has_classpath_facts(&self) -> bool {
+        self.facts_runtime.is_some()
+    }
+
+    fn classpath_member_facts(&self, owner: &str) -> Option<Arc<Vec<MemberFacts>>> {
+        self.facts_runtime.as_ref()?.member_facts(owner)
+    }
+
+    /// One Track B call site, hash-guarded end to end.
+    ///
+    /// Three gates, in order, and each one is a way to answer *nothing*:
+    /// the file must be a Kotlin source the session indexed (the helper never
+    /// parses Java), the run must have a helper, and the helper must have a
+    /// site *at that exact offset* for bytes hashing to `source_hash`. The
+    /// last gate is the soundness rule: `FactsRuntime::call_site_at` refuses
+    /// when the snapshot being planned is not the text on disk, so a candidate
+    /// revision or an in-memory overlay never inherits disk facts.
+    ///
+    /// Only `Established` sites leave this function. The fact is remembered
+    /// nowhere: a call site is an *observation at an offset*, not a
+    /// declaration, and no provider accessor in this type pretends otherwise.
+    /// Consumers that need the fact ask
+    /// [`SemanticProvider::established_call_site`] again (hash-guarded, and
+    /// memoized by the run runtime); they do not read it back out of this
+    /// provider's declaration accessors.
+    fn established_call_site(
+        &self,
+        file: &Path,
+        byte_offset: u64,
+        source_hash: &[u8; 32],
+    ) -> Option<CallSite> {
+        if !file
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("kt"))
+        {
+            return None;
+        }
+        let site = self
+            .facts_runtime
+            .as_ref()?
+            .call_site_at(file, byte_offset, source_hash)?;
+        if site.status != SiteStatus::Established {
+            return None;
+        }
+        // Keep the existing identity-validation boundary without retaining
+        // an observation in the declaration provider's state.
+        crate::facts::call_site_symbol(file, &site)?;
+        Some(site)
+    }
+
     fn has_plain_java_package_nullability(&self, package: &str) -> bool {
         !self.annotated_java_packages.contains(package)
             && !self.annotated_java_packages.contains("*")
@@ -5863,6 +5876,15 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
     {
         return None;
     }
+    if matches!(receiver.kind(), "identifier" | "simple_identifier")
+        && let Ok(name) = receiver.utf8_text(source.as_bytes())
+        && let Some(classifier) =
+            unqualified_instance_property_classifier(source, receiver, file, name, provider)
+    {
+        // A class property is visible throughout a method body, including
+        // before its declaration. Keep lexical shadowing in the shared proof.
+        return Some(classifier);
+    }
     if let Some(property_type) =
         established_direct_property_receiver_type(source, call, receiver, file, provider)
     {
@@ -8138,12 +8160,10 @@ fn has_wildcard_import(source: &str) -> bool {
     })
 }
 
-/// A Java `java.util.*` import cannot shadow Kotlin's collection factory
-/// functions, but arbitrary wildcard imports can. Keep unresolved wildcard
-/// calls conservative unless every wildcard import is exactly `java.util.*`.
-/// Use the emitter's structural proof for populated calls too. Kotlin
-/// read-only collections intentionally map to ordinary mutable Java
-/// collections; arbitrary package wildcard imports remain unsupported.
+/// Admit Java utilities and indexed source-package stars when their declarations
+/// do not shadow the factory. Library and member stars still need binding facts.
+/// Populated calls also need the emitter's structural proof. Kotlin read-only
+/// collections intentionally map to ordinary mutable Java collections.
 fn known_collection_factory_from_java_util_wildcard<P: SemanticProvider + ?Sized>(
     source: &str,
     call: tree_sitter::Node,
@@ -8164,7 +8184,7 @@ fn known_collection_factory_from_java_util_wildcard<P: SemanticProvider + ?Sized
     for import in kotlin_import_lines(source) {
         let path = import.split(" as ").next().unwrap_or(import).trim();
         if path.ends_with(".*") {
-            if path != "java.util.*" || import.contains(" as ") {
+            if import.contains(" as ") || !source_wildcard_allows_factory(path, name, provider) {
                 return false;
             }
             saw_java_util_wildcard = true;
@@ -8250,7 +8270,7 @@ pub(crate) fn known_collection_factory_shape<P: SemanticProvider + ?Sized>(
             .split_once(" as ")
             .map(|(path, alias)| (path.trim(), Some(alias.trim())))
             .unwrap_or((import.trim(), None));
-        if path.ends_with(".*") && path != "java.util.*" {
+        if path.ends_with(".*") && !source_wildcard_allows_factory(path, name, provider) {
             return false;
         }
         let stdlib_path = format!("kotlin.collections.{name}");
@@ -8290,6 +8310,9 @@ pub(crate) fn known_collection_factory_shape<P: SemanticProvider + ?Sized>(
             .split_once(" as ")
             .map(|(path, alias)| (path.trim(), Some(alias.trim())))
             .unwrap_or((import.trim(), None));
+        if path.ends_with(".*") && !source_wildcard_allows_factory(path, "to", provider) {
+            return false;
+        }
         if (alias == Some("to") || (alias.is_none() && path.rsplit('.').next() == Some("to")))
             && path != "kotlin.to"
         {
@@ -8311,6 +8334,30 @@ pub(crate) fn known_collection_factory_shape<P: SemanticProvider + ?Sized>(
         let named: Vec<_> = pair.named_children(&mut pair.walk()).collect();
         named.len() == 3 && named[1].utf8_text(source.as_bytes()).ok() == Some("to")
     })
+}
+
+/// Source packages are indexed as a whole. A star importing one does not
+/// hide a default-imported factory unless that package actually declares the
+/// name. Unknown library packages and object/member stars still need facts.
+fn source_wildcard_allows_factory<P: SemanticProvider + ?Sized>(
+    path: &str,
+    name: &str,
+    provider: &P,
+) -> bool {
+    if path == "java.util.*" {
+        return true;
+    }
+    let Some(package) = path.strip_suffix(".*") else {
+        return false;
+    };
+    provider
+        .symbols()
+        .iter()
+        .any(|symbol| symbol.id.package == package)
+        && !provider
+            .symbols_named(name)
+            .iter()
+            .any(|symbol| symbol.id.package == package && symbol.id.owner_path.is_empty())
 }
 
 fn kotlin_import_lines(source: &str) -> impl Iterator<Item = &str> {

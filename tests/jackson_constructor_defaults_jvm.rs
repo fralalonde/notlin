@@ -118,6 +118,69 @@ fn populate(root: &Path) {
     }
 }
 
+fn populate_unannotated(root: &Path) {
+    populate(root);
+    fs::write(
+        root.join("Payload.kt"),
+        r#"package boundary.defaults
+import com.fasterxml.jackson.annotation.JsonCreator
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize
+data class Tags(val values: List<String> = emptyList())
+data class Payload(
+    @Marker("scoped") val reference: String,
+    val tags: Tags = Tags(),
+    val note: String?,
+    val enabled: Boolean = true,
+    val label: String = "${reference}-auto"
+)
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("RoundTrip.java"), r#"package boundary.defaults;
+import java.util.Map;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.module.kotlin.KotlinModule;
+public final class RoundTrip {
+    private static String detail(ObjectMapper mapper, Object value) {
+        JsonNode node = mapper.valueToTree(value);
+        return node.path("tags").path("values").size() + "/" + node.path("enabled").asBoolean()
+            + "/" + node.path("label").asText() + "/" + node.path("note").asText();
+    }
+    public static String verify() throws Exception {
+        ObjectMapper mapper = new ObjectMapper().registerModule(new KotlinModule.Builder().build())
+            .registerModule(new com.fasterxml.jackson.databind.module.SimpleModule().addDeserializer(String.class, new ContextString()));
+        String missing = detail(mapper, mapper.readValue("{\"reference\":\"r1\"}", Payload.class));
+        String supplied = detail(mapper, mapper.readValue("{\"reference\":\"r2\",\"tags\":{\"values\":[\"a\"]},\"enabled\":false,\"label\":\"given\",\"note\":\"memo\"}", Payload.class));
+        String converted = detail(mapper, mapper.convertValue(Map.of("reference", "r3"), Payload.class));
+        String convertedSupplied = detail(mapper, mapper.convertValue(Map.of("reference", "r4", "enabled", false, "label", "mapped"), Payload.class));
+        return missing + "|" + supplied + "|" + converted + "|" + convertedSupplied
+            + "|tag-null=" + observeNull(mapper, "{\"reference\":\"r5\",\"tags\":null}")
+            + "|boolean-null=" + observeNull(mapper, "{\"reference\":\"r6\",\"enabled\":null}");
+    }
+    private static String observeNull(ObjectMapper mapper, String json) {
+        try { return detail(mapper, mapper.readValue(json, Payload.class)); }
+        catch (Exception expected) { return "rejected"; }
+    }
+}
+"#).unwrap();
+    fs::write(root.join("Marker.java"), "package boundary.defaults; import java.lang.annotation.*; @Target(ElementType.PARAMETER) @Retention(RetentionPolicy.RUNTIME) public @interface Marker { String value(); }\n").unwrap();
+    fs::write(root.join("ContextString.java"), r#"package boundary.defaults;
+public final class ContextString extends com.fasterxml.jackson.databind.deser.std.StdScalarDeserializer<String> implements com.fasterxml.jackson.databind.deser.ContextualDeserializer {
+    private final String prefix;
+    public ContextString() { this(""); }
+    private ContextString(String prefix) { super(String.class); this.prefix = prefix; }
+    @Override public com.fasterxml.jackson.databind.JsonDeserializer<?> createContextual(com.fasterxml.jackson.databind.DeserializationContext context, com.fasterxml.jackson.databind.BeanProperty property) {
+        Marker marker = property == null ? null : property.getAnnotation(Marker.class);
+        return new ContextString(marker == null ? "" : marker.value() + ":");
+    }
+    @Override public String deserialize(com.fasterxml.jackson.core.JsonParser parser, com.fasterxml.jackson.databind.DeserializationContext context) throws java.io.IOException {
+        return prefix + parser.getValueAsString();
+    }
+}
+"#).unwrap();
+}
+
 fn translate(root: &Path, lombok_enabled: bool) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_notlin"));
     command
@@ -201,6 +264,110 @@ fn cli_preserves_jackson_constructor_defaults_in_both_lombok_modes() {
             "{kotlin}"
         );
     }
+}
+
+#[test]
+fn unannotated_data_defaults_use_a_boxed_jackson_factory() {
+    let scratch = Scratch::new();
+    populate_unannotated(&scratch.0);
+    let translated = translate(&scratch.0, true);
+    assert!(
+        translated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translated.stderr)
+    );
+    let java =
+        fs::read_to_string(scratch.0.join("Payload.java")).expect("unannotated DTO translates");
+    assert!(
+        java.contains("@com.fasterxml.jackson.annotation.JsonCreator"),
+        "{java}"
+    );
+    assert!(java.contains("Boolean enabled"), "{java}");
+    assert!(
+        java.contains("if (tags == null) { tags = new Tags(); }"),
+        "{java}"
+    );
+    assert!(
+        java.contains("if (enabled == null) { enabled = true; }"),
+        "{java}"
+    );
+    assert!(
+        java.contains("boolean enabled"),
+        "ordinary constructor keeps primitive ABI: {java}"
+    );
+}
+
+#[test]
+fn another_modules_jackson_dependency_does_not_change_plain_data_classes() {
+    let scratch = Scratch::new();
+    populate(&scratch.0);
+    fs::write(
+        scratch.0.join("Payload.kt"),
+        "package boundary.defaults\ndata class Payload(val enabled: Boolean = true)\n",
+    )
+    .unwrap();
+    let other = scratch.0.join("other/src/main/java");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(
+        other.join("Hint.java"),
+        "import com.fasterxml.jackson.annotation.JsonCreator; class Hint {}\n",
+    )
+    .unwrap();
+    let translated = translate(&scratch.0, true);
+    assert!(
+        translated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translated.stderr)
+    );
+    let java = fs::read_to_string(scratch.0.join("Payload.java")).unwrap();
+    assert!(!java.contains("com.fasterxml.jackson"), "{java}");
+}
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin reflect, Lombok, and Jackson jars in NOTLIN_* environment variables"]
+fn unannotated_jackson_dto_preserves_omitted_and_supplied_defaults() {
+    let classpath = [
+        "NOTLIN_KOTLIN_STDLIB",
+        "NOTLIN_KOTLIN_REFLECT",
+        "NOTLIN_LOMBOK",
+        "NOTLIN_JACKSON_CORE",
+        "NOTLIN_JACKSON_ANNOTATIONS",
+        "NOTLIN_JACKSON_DATABIND",
+        "NOTLIN_JACKSON_KOTLIN",
+    ]
+    .map(|name| PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name}"))));
+    let scratch = Scratch::new();
+    let original = scratch.0.join("original");
+    populate_unannotated(&original);
+    let before = validate_jvm_sources(&config(
+        &original,
+        scratch.0.join("original-classes"),
+        &classpath,
+        false,
+    ))
+    .expect("original default DTO runs");
+    let expected = before.commands.last().unwrap().stdout.trim().to_owned();
+    assert!(expected.starts_with("0/true/scoped:r1-auto/null|1/false/given/memo|0/true/scoped:r3-auto/null|0/false/mapped/null|tag-null=rejected|boolean-null="), "{expected}");
+    let migrated = scratch.0.join("migrated");
+    populate_unannotated(&migrated);
+    let translated = translate(&migrated, true);
+    assert!(
+        translated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translated.stderr)
+    );
+    assert!(
+        migrated.join("Payload.java").is_file(),
+        "must exercise converted DTO"
+    );
+    let after = validate_jvm_sources(&config(
+        &migrated,
+        scratch.0.join("mixed-classes"),
+        &classpath,
+        true,
+    ))
+    .expect("translated default DTO runs");
+    assert_eq!(after.commands.last().unwrap().stdout.trim(), expected);
 }
 
 #[test]

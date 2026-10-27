@@ -4,10 +4,130 @@ use super::Unit;
 use crate::transpiler::kt;
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    /// Kotlin's read-only collection variance is erased on the JVM. Java needs
+    /// an explicit unchecked view at a typed return boundary; copying would
+    /// change the identity and live contents of the collection being returned.
+    pub(crate) fn coerce_readonly_collection_return(
+        &self,
+        expression: tree_sitter::Node,
+        java: String,
+    ) -> String {
+        if java.trim_start().starts_with("throw ")
+            || java.trim_start().starts_with("if (")
+            || java.trim_start().starts_with("switch (")
+        {
+            return java;
+        }
+        let Some(java_type) = self.current_function_return_type.as_deref() else {
+            return java;
+        };
+        let java_type = java_type
+            .trim()
+            .strip_prefix("@Nullable ")
+            .unwrap_or(java_type.trim());
+        let Some((base, _)) = java_type.split_once('<') else {
+            return java;
+        };
+        let arity = match base {
+            "List"
+            | "Set"
+            | "Collection"
+            | "Iterable"
+            | "Iterator"
+            | "java.util.List"
+            | "java.util.Set"
+            | "java.util.Collection"
+            | "java.lang.Iterable"
+            | "java.util.Iterator" => 1,
+            "Map" | "java.util.Map" => 2,
+            _ => return java,
+        };
+        let mut scope = expression.parent();
+        let declared = loop {
+            let Some(node) = scope else {
+                return java;
+            };
+            if matches!(node.kind(), "lambda_literal" | "anonymous_function") {
+                return java;
+            }
+            if node.kind() == "property_declaration" {
+                break kt::child(node, "variable_declaration").and_then(|variable| {
+                    variable
+                        .named_children(&mut variable.walk())
+                        .find(|child| matches!(child.kind(), "user_type" | "nullable_type"))
+                });
+            }
+            if node.kind() == "function_declaration" {
+                let parameters = kt::child(node, "function_value_parameters");
+                break parameters.and_then(|parameters| {
+                    node.named_children(&mut node.walk()).find(|child| {
+                        child.start_byte() >= parameters.end_byte()
+                            && matches!(child.kind(), "user_type" | "nullable_type")
+                    })
+                });
+            }
+            scope = node.parent();
+        };
+        let Some(declared) = declared else {
+            return java;
+        };
+        let kotlin_base = self.text(declared).split('<').next().unwrap_or("").trim();
+        let simple = kotlin_base
+            .strip_prefix("kotlin.collections.")
+            .unwrap_or(kotlin_base);
+        if !matches!(
+            simple,
+            "List" | "Set" | "Collection" | "Iterable" | "Iterator" | "Map"
+        ) {
+            return java;
+        }
+        if let Some(index) = self.workspace
+            && let Some(file) =
+                index.source_file(self.workspace_file.as_deref().unwrap_or(self.file))
+            && !crate::workspace::collection_base_is_unshadowed(index, file, simple)
+        {
+            return java;
+        }
+        let wildcard = if arity == 2 { "?, ?" } else { "?" };
+        format!("({java_type}) ({base}<{wildcard}>) ({java})")
+    }
+
     /// Element type of a collection/array Java type (`List<X>` -> X, `X[]` ->
     /// X); exposed for destructuring-site extraction in stmt.rs.
     pub(crate) fn elem_type_of(&self, java_ty: &str) -> String {
         elem_type_of(java_ty)
+    }
+
+    /// Literal strings always denote java.lang.String, even beside a user type
+    /// named String. Qualify only when a source declaration could capture it.
+    pub(crate) fn inferred_string_type(&self) -> &'static str {
+        if self.semantic_provider.is_some_and(|provider| {
+            provider.symbols_named("String").iter().any(|symbol| {
+                matches!(
+                    symbol.id.kind.as_str(),
+                    "class" | "interface" | "enum" | "object" | "typealias"
+                )
+            })
+        }) {
+            "java.lang.String"
+        } else {
+            "String"
+        }
+    }
+
+    pub(crate) fn inferred_getter_type(&mut self, property: tree_sitter::Node) -> Option<String> {
+        let getter = kt::child(property, "getter")?;
+        let body = kt::child(getter, "function_body")?;
+        if !body
+            .children(&mut body.walk())
+            .any(|node| node.kind() == "=")
+        {
+            return None;
+        }
+        let expression = body
+            .named_children(&mut body.walk())
+            .find(|node| !matches!(node.kind(), "line_comment" | "block_comment"))?;
+        Some(self.infer_type(expression))
     }
 
     pub fn infer_type(&mut self, expr: tree_sitter::Node) -> String {
@@ -123,7 +243,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     "Object".to_string()
                 }
             }
-            "string_literal" => "String".to_string(),
+            "string_literal" => self.inferred_string_type().to_string(),
             "number_literal" | "float_literal" | "real_literal" | "long_literal"
             | "hex_literal" => {
                 let t = self.text(expr);
@@ -375,7 +495,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
         let recv_ty: Option<String> = match base.kind() {
             "identifier" => self.var_types.get(self.text(base).trim()).cloned(),
-            "string_literal" => Some("String".to_string()),
+            "string_literal" => Some(self.inferred_string_type().to_string()),
             _ => None,
         };
         // Object/companion member datums recorded at emission: the member

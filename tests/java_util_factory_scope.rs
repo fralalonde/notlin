@@ -192,6 +192,37 @@ fn arbitrary_stars_aliases_and_spreads_still_retain_factory_callers() {
 }
 
 #[test]
+fn indexed_source_package_stars_admit_factories_unless_the_name_is_declared() {
+    let source =
+        "package sample\nimport models.*\nfun entries(): Map<String, Int> = mapOf(\"key\" to 1)\n";
+    for (dependency, expected) in [
+        ("package models\nclass Entry\n", BackendOwner::Java),
+        (
+            "package models\nfun mapOf(value: Pair<String, Int>): Map<String, Int> = TODO()\n",
+            BackendOwner::Kotlin,
+        ),
+        (
+            "package models\ninfix fun String.to(value: Int): Pair<String, Int> = TODO()\n",
+            BackendOwner::Kotlin,
+        ),
+    ] {
+        let path = PathBuf::from("Caller.kt");
+        let provider = SyntaxSemanticProvider::new(vec![
+            (path.clone(), source.to_owned()),
+            (PathBuf::from("Models.kt"), dependency.to_owned()),
+        ]);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut plan = notlin::translation_plan::analyze(source, tree.root_node(), &path);
+        plan_required_calls(source, &tree, &path, &provider, false, &mut plan);
+        assert_eq!(function_owner(&plan, "entries"), expected, "{dependency}");
+    }
+}
+
+#[test]
 fn same_package_factory_shadow_is_not_rewritten_as_a_stdlib_factory() {
     let source = r#"package sample
 import java.util.*

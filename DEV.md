@@ -15,6 +15,15 @@ Behavior contract:
 - **Source migration.** Recompile callers; the application must compile and run
   the same after conversion. Kotlin-only constraints/ABI differences can be
   diagnosed; unchanged precompiled Kotlin compatibility is not the target.
+- **Reference build gate.** Acceptance requires exporting the clean reference
+  commit, running `notlin --in-place --lombok .` from its root, and passing the
+  complete Gradle `build` on the resulting tree. Incremental translation trials
+  are useful for iteration but do not establish that a full conversion builds.
+  Do not hand-fix generated sources in the acceptance copy. Run Hastings dev
+  startup after the build and inspect its runtime log for stack traces. Wait
+  for `Done loading dev resources [customers/hastings/hastings-dev.csv]`;
+  Spring's started marker and the first completed import do not prove that
+  the complete development dataset loaded successfully.
 - **Collections.** Prefer suitable immutable Java equivalents. If none fits,
   mutable fallbacks are allowed; mutability/read-only enforcement differences
   alone do not block conversion. Preserve values, relevant order, overloads,
@@ -36,32 +45,29 @@ Behavior contract:
 
 ## Architecture
 
-```
-src/
-  main.rs       CLI plumbing (clap) + in-place semantics
-  cli.rs        arg definitions
-  lib.rs        crate root
-  diagnostics.rs  N001/N002/N003 compiler diagnostics (spans, colors, counts)
-  transpiler/
-    mod.rs      RunEngine: transpile() — parse, iterate top-level nodes, emit
-    unit.rs     classes/functions/properties: signatures, params, type params,
-                receivers, sealed pre-pass, interface default bodies (~1200 lines)
-    stmt.rs     statements: if/while/for/try, single-statement bodies
-    expr.rs     expressions: operators, calls, navigation/member rewrite,
-                extension call-site rewriting, type inference (~900 lines)
-    types.rs    type mapping tables (map_type_name, boxed_name)
-    kt.rs       tree-sitter helpers + java_type()
-    java.rs     JavaOut: output buffer/emit helpers
-vendor/
-  jetbrains-annotations.jar   nullability annotations (vendored: /tmp is volatile)
-samples/        source corpus; every file must transpile AND javac-compile
-tests/          Rust integration tests (assert transpile output + diagnostics)
-tests/fixtures/audit/*.kt   probe corpus from the silent-drop audit (regression)
-tools/e2e.sh    the integration gate (see below)
-.github/workflows/check.yml    CI: fmt, clippy, test, e2e gate
-.github/workflows/release.yml  tag-triggered binary matrix + GitHub release
-release.sh      version bump/tag (user-reserved; never run from automation)
-```
+The run has five boundaries:
+
+1. `workspace.rs` discovers and caches source snapshots and declaration identity.
+2. `semantics.rs` indexes source facts and optionally shares one JVM helper
+   runtime. Modules under `semantics/` prove particular language contracts;
+   `facts/` owns the helper process, wire data, and hash-guarded observations.
+3. `transpiler/fixpoint.rs` converges workspace ownership. `transpiler/mod.rs`
+   builds each `TranslationPlan`; independent syntax lowerings share one walk,
+   while eager collection chains use an inner-first pass.
+4. `transpiler/unit/`, `expr/`, `stmt.rs`, and `types.rs` prepare Java candidates
+   using the recorded plan. `planning.rs` checks source/receipt agreement and
+   strictly parses candidates into `java_ir.rs` before accepting output.
+5. `migration_pipeline.rs` stages repairs and replans; `migrate.rs` applies the
+   accepted transaction. Optional `jvm_validation.rs` compiles the staged tree.
+
+`main.rs` and `cli.rs` provide the CLI. `translation_plan.rs` holds decisions,
+retention, and proof obligations; `coverage.rs` and `translation_advice.rs`
+report them. See `docs/partial-transpiler-architecture.md` for proof conditions.
+
+Tests live in `tests/`, language samples in `samples/`, and JVM helpers in
+`jvm-facts/`. CI (`.github/workflows/check.yml`) runs formatting, clippy, Rust
+suites, and `tools/e2e.sh`. Releases are separate; `release.sh` is user-reserved
+and must never run from automation.
 
 ## Grammar notes (tree-sitter-kotlin-ng)
 
@@ -131,9 +137,10 @@ Three levels, cheapest first:
 cargo test
 ```
 
-5 suites / 15 tests: e2e_samples asserts every `samples/*.kt` transpiles with
-zero errors, non-empty output, balanced braces; other suites cover
-diagnostics, type mapping, in-place behavior.
+Library tests and integration suites cover semantic facts, retention, planning,
+source/receipt agreement, Java emission, and migration. `e2e_samples` checks
+that each sample transpiles; JVM tests requiring native compilers are ignored
+by default. Shell-backed helper fixtures also require a working POSIX `sh`.
 
 ### 2. javac e2e gate (the real integration test)
 

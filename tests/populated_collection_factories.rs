@@ -425,6 +425,12 @@ fun arrayAsOne(): List<IntArray> = listOf(intArrayOf(1, 2))
 "#;
     for root in [&original, &migrated] {
         fs::write(root.join("Factories.kt"), source).unwrap();
+        fs::write(root.join("SourceStar.kt"), "package factorycase\nimport factorymodels.*\nfun sourceStarMap(): Map<String, Int> = mapOf(\"key\" to 7)\n").unwrap();
+        fs::write(
+            root.join("Marker.kt"),
+            "package factorymodels\nclass Marker\n",
+        )
+        .unwrap();
         fs::write(
             root.join("Runner.kt"),
             r#"package factorycase
@@ -443,7 +449,7 @@ fun main() {
     val list = nullableList(probe)
     val set = nullableSet(probe)
     val arrays = arrayAsOne()
-    println("${probe.events}|$map|$literal|$singletonNull|$aliased|$mixedMap|$mixedList|$companionMap|$localMap|$list|$set|${arrays.size}")
+    println("${probe.events}|$map|$literal|$singletonNull|$aliased|$mixedMap|$mixedList|$companionMap|$localMap|$list|$set|${arrays.size}|${sourceStarMap()}")
 }
 "#,
         )
@@ -467,6 +473,8 @@ fun main() {
         original.join("Factories.kt"),
         original.join("Aliases.kt"),
         original.join("Runner.kt"),
+        original.join("Marker.kt"),
+        original.join("SourceStar.kt"),
     ]);
     baseline.classpath.push(stdlib.clone());
     baseline.run_main_class = Some("factorycase.RunnerKt".into());
@@ -521,6 +529,7 @@ fun main() {
         "generated facade must be compiled with all translated classes"
     );
     let factory_java = fs::read_to_string(&generated).unwrap();
+    assert!(migrated.join("SourceStar.java").is_file());
     assert!(
         factory_java.contains("orderedMap")
             && factory_java.contains("literalPairs")

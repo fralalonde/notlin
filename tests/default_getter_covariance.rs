@@ -185,7 +185,7 @@ fn aliases_and_generic_returns_remain_conservative() {
 }
 
 #[test]
-fn ambiguous_or_wildcard_only_type_binding_does_not_prove_covariance() {
+fn unique_source_wildcard_proves_covariance_but_ambiguous_imports_do_not() {
     let ambiguous = Fixture::new(&[
         (
             "left/Types.kt",
@@ -245,7 +245,7 @@ fn ambiguous_or_wildcard_only_type_binding_does_not_prove_covariance() {
              }\n",
         ),
     ]);
-    assert!(wildcard_only.conflicts());
+    assert!(!wildcard_only.conflicts());
 }
 
 #[test]

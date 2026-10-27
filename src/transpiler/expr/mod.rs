@@ -445,6 +445,10 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         match node.kind() {
             "identifier" => {
                 let name = self.unit.text(node).trim().to_string();
+                if let Some(setter) = self.interface_property_setter(&name, node) {
+                    self.unit.pending_setter = true;
+                    return format!("this.{setter}(");
+                }
                 // Bare self-reference inside an object body: Kotlin resolves
                 // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
                 if self.unit.current_object.as_deref() == Some(name.as_str()) {
@@ -631,6 +635,26 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     /// supertype chain proves the inherited property is mutable and exposes
     /// the ordinary JavaBean setter ABI. Locals/parameters and properties
     /// declared on the current class keep their existing target handling.
+    pub(crate) fn interface_property_setter(
+        &self,
+        name: &str,
+        node: tree_sitter::Node,
+    ) -> Option<String> {
+        if self.unit.var_types.contains_key(name)
+            || crate::semantics::lexical_parameter_type(self.unit.source, node, name).is_some()
+        {
+            return None;
+        }
+        let owner = std::iter::successors(node.parent(), |node| node.parent())
+            .find(|node| node.kind() == "class_declaration")?;
+        kt::child(owner, "interface")?;
+        self.unit
+            .class_props
+            .get(name)
+            .filter(|setter| !setter.is_empty())
+            .cloned()
+    }
+
     pub(crate) fn inherited_mutable_property_setter(
         &self,
         name: &str,

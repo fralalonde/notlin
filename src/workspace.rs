@@ -2244,7 +2244,7 @@ impl SourceIndex {
         }
         groups
             .into_iter()
-            .filter_map(|((name, _), members)| {
+            .filter_map(|((name, parameters), members)| {
                 if !members.iter().any(|(_, m)| m.has_body) {
                     return None;
                 }
@@ -2263,8 +2263,15 @@ impl SourceIndex {
                         })
                     })
                     .collect();
-                (most_specific.len() > 1 || most_specific.iter().any(|(_, m)| !m.has_body))
-                    .then_some(name)
+                (most_specific.len() > 1 || most_specific.iter().any(|(_, m)| !m.has_body)).then(
+                    || {
+                        if parameters.is_empty() {
+                            name
+                        } else {
+                            format!("{name}({})", parameters.join(", "))
+                        }
+                    },
+                )
             })
             .collect()
     }
@@ -2363,7 +2370,12 @@ impl SourceIndex {
                     && member.visibility.as_deref() != Some("private")
                     && (member.kind == MemberKind::Property
                         && property_accessor_name(&member.name) == method_name
-                        || is_physical_zero_arg_getter(member, method_name)))
+                        || (member.kind == MemberKind::Method
+                            && member.name == method_name
+                            && member.parameter_types.is_empty()
+                            && member.type_name.as_deref().is_some_and(|ty| {
+                                !matches!(ty.trim(), "" | "Unit" | "kotlin.Unit" | "void")
+                            }))))
                 .then_some((declaration, member))
             }));
         }
@@ -7597,8 +7609,8 @@ fn declaration_type_parameter_shadows(owner: &Declaration, source_type: &str) ->
 }
 
 /// Resolve a simple/qualified source reference only when its binding is
-/// explicit in that file's package/import scope. Wildcard imports are not
-/// enough to establish this proof's nominal identity.
+/// explicit in that file's package/import scope, including a unique indexed
+/// classifier reached through a source-package wildcard import.
 fn exact_source_reference_type<'a>(
     index: &'a SourceIndex,
     file: &SourceFile,
@@ -7635,7 +7647,12 @@ fn exact_source_reference_type<'a>(
     if !imports.is_empty() {
         return (imports.len() == 1 && imports[0].as_str() == qualified).then_some(declaration);
     }
-    (file.package.as_deref() == declaration.package.as_deref()).then_some(declaration)
+    (file.package.as_deref() == declaration.package.as_deref()
+        || file
+            .imports
+            .iter()
+            .any(|import| import.strip_suffix(".*") == declaration.package.as_deref()))
+    .then_some(declaration)
 }
 
 fn scoped_type_parameter_bindings(
@@ -8052,16 +8069,58 @@ pub(crate) fn resolve_unique_getter_type<'a>(
     }
 }
 
-/// The source declaration a written type name provably denotes from `file`, or
-/// `None` when the spelling has no visible binding there. `resolve_type` ends in
-/// a unique-simple-name GLOBAL fallback — a convenience lookup, not a binding —
-/// so canonical receiver evidence must not be minted from it.
-pub(crate) fn proven_type_declaration<'a>(
+/// Caller repairs can follow a uniquely imported workspace classifier through
+/// a source-package wildcard. Do not use the global simple-name fallback, or
+/// broaden the stricter binding used to prove JVM covariance contracts.
+pub(crate) fn property_receiver_type_binding<'a>(
     index: &'a SourceIndex,
     file: &SourceFile,
-    type_name: &str,
-) -> Option<&'a Declaration> {
-    canonical_type_binding(index, file, type_name)?.declaration
+    ty: &str,
+) -> Option<CanonicalTypeBinding<'a>> {
+    if let Some(binding) = canonical_type_binding(index, file, ty) {
+        return Some(binding);
+    }
+    let head = type_head(ty)?;
+    if head.contains('.')
+        || file.type_aliases.contains_key(&head)
+        || !matches!(
+            structural_import_binding(file, &head),
+            WrittenImport::NotApplicable
+        )
+        || index
+            .declarations_named(&head)
+            .any(|owner| owner.package == file.package)
+    {
+        return None;
+    }
+    let source = file.source_text();
+    let tree = crate::transpiler::parse_tree(source);
+    let mut nodes = vec![tree.root_node()];
+    let mut selected: Option<CanonicalTypeBinding<'a>> = None;
+    while let Some(node) = nodes.pop() {
+        if node.kind() != "import" {
+            nodes.extend(node.named_children(&mut node.walk()));
+            continue;
+        }
+        let Some(header) = crate::semantics::java_member_calls::import_header(source, node) else {
+            continue;
+        };
+        if !header.wildcard || header.alias.is_some() {
+            continue;
+        }
+        let qualified = format!("{}.{head}", header.path);
+        let Some(binding) = canonical_type_binding(index, file, &qualified) else {
+            continue;
+        };
+        if selected
+            .as_ref()
+            .is_some_and(|prior| prior.qualified != binding.qualified)
+        {
+            return None;
+        }
+        selected = Some(binding);
+    }
+    selected
 }
 
 /// Prefer a candidate type whose bare name is an indexed enum declaration.

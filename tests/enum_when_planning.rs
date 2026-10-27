@@ -1,5 +1,5 @@
 use notlin::semantics::{
-    FactStatus, SemanticProvider, SemanticSymbol, SyntaxSemanticProvider, plan_enum_when_lowerings,
+    FactStatus, SemanticProvider, SemanticSymbol, SyntaxSemanticProvider, plan_syntax_lowerings,
 };
 use notlin::translation_plan::TranslationPlan;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ fn plan_with_provider(
     let tree = parser.parse(source, None).unwrap();
     let path = Path::new(file);
     let mut plan = notlin::translation_plan::analyze(source, tree.root_node(), path);
-    plan_enum_when_lowerings(source, &tree, path, provider, &mut plan);
+    plan_syntax_lowerings(source, &tree, path, provider, &mut plan);
     plan
 }
 
