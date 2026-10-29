@@ -1,6 +1,31 @@
 # Translation frontier
 
-## Current checkpoint — 2026-10-27
+## Current checkpoint — 2026-10-29
+
+The standard clean conversion of the same reference commit `179bb912` produces
+**3,930 Java files**, with 2,441 of 6,371 original Kotlin owners retained:
+**+6 / -0** against the previous accepted conversion. Checked instance
+`lateinit` accessors unlock `GetBinStateResponseParams` and `ImportOrderLineDto`.
+Scoped annotation class literals, including imported dependency nested classes,
+unlock `TOHPickRequestDto`, `TOHPutawayRequestDto`, `TOHItemMasterRequestDto`
+and `TOHLocationDto`. The baseline trial translates the five owners in the two
+agent source files before the full clean pass confirms all six gains.
+
+The fresh conversion passes the complete Gradle build: **110 tasks**, 80 executed
+and 30 from cache. Hastings loads all **9,113 records** (50 organization and
+9,063 warehouse records) with no errors or stack traces. Acceptance uses the
+unchanged Hastings dev profile and no hand-fixed application sources.
+Evidence is under `target/field-annotation-20261029/`.
+
+The six focused tests pass, including a real Kotlin/Java/Jackson comparison in
+both Lombok modes covering initialization checks, null setters, naming-strategy
+serialization/deserialization, and parent back-references. All four standalone
+samples compile; formatting and clippy pass. The broader Rust sweep is not
+green on Windows: 1,560 pass and 74 fail, including shell-helper fixtures and
+an intermittent access-denied failure while deleting indexed source files.
+Those results are retained separately from application acceptance.
+
+## Previous checkpoint — 2026-10-27
 
 The standard clean conversion of reference commit `179bb912` now produces
 **3,924 Java files**, with 2,447 of 6,371 original Kotlin owners retained.

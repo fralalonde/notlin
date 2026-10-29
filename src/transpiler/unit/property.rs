@@ -7,6 +7,14 @@ use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    fn property_is_lateinit(&self, decl: tree_sitter::Node) -> bool {
+        kt::child(decl, "modifiers").is_some_and(|modifiers| {
+            modifiers
+                .children(&mut modifiers.walk())
+                .any(|modifier| self.text(modifier).trim() == "lateinit")
+        })
+    }
+
     /// The proved Java type for a constant field, or `None`.
     ///
     /// Emission never re-derives a proved field type: it writes exactly what the
@@ -43,7 +51,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         && self.text(modifier).trim() == "private"
                 })
             });
-            if !private || !self.property_emits_backing_field(property) {
+            if !private
+                || self.property_is_lateinit(property)
+                || !self.property_emits_backing_field(property)
+            {
                 continue;
             }
             let Some(variable) = kt::child(property, "variable_declaration") else {
@@ -270,19 +281,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return;
         }
 
-        // lateinit: Kotlin promises non-null after init, Java fields start
-        // null — flag the null-init gap.
-        if kt::child(decl, "modifiers")
-            .map(|m| self.text(m).contains("lateinit"))
-            .unwrap_or(false)
-        {
-            self.diag_approx(
+        let is_lateinit = self.property_is_lateinit(decl);
+        // Static properties currently expose public fields to retained Kotlin
+        // callers. Those reads would bypass the initialization check below.
+        if is_lateinit && make_static {
+            self.diag_untranslatable(
                 decl,
-                format!(
-                    "lateinit var '{}': Java fields default to null — no non-null enforcement (reading before init returns null instead of throwing)",
-                    name
-                ),
+                "static lateinit property reads require an established getter call",
             );
+            return;
         }
 
         // Delegated property (`by lazy {}` / `by observable` / ...): the
@@ -586,6 +593,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         }
                     }
                 }
+                None if is_lateinit => {
+                    out.line(format!("{} value = this.{};", ty, name));
+                    out.open("if (value == null)");
+                    out.line(format!(
+                        "throw new IllegalStateException(\"lateinit property {} has not been initialized\");",
+                        name
+                    ));
+                    out.close();
+                    out.line("return value;");
+                }
                 None => out.line(format!("return {};", name)),
             }
             out.close();
@@ -641,6 +658,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     }
                 }
                 None => {
+                    if is_lateinit {
+                        out.line(format!(
+                            "java.util.Objects.requireNonNull({}, \"{}\");",
+                            name, name
+                        ));
+                    }
                     // `this.x = x` is illegal in a static method; qualify the
                     // field with the owner class name instead.
                     match owner {

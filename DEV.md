@@ -123,6 +123,14 @@ explicit capability proof; recognizing an annotation is insufficient.
   (`__receiver__`); call sites `x.f(...)` rewrite to `f(x, ...)`.
 - Delegated properties: `by lazy {}` → eager initializer + N002; other
   delegates → N001.
+- Instance `lateinit var` properties use a backing field and explicit accessors.
+  The getter reads the field once and throws `IllegalStateException` before
+  initialization; the setter rejects null. Private member reads also use the
+  checked getter. Static forms remain Kotlin until their callers use accessors.
+- Annotation class literals resolve in the declaring file's scope. Explicit
+  dependency imports support nested classes; import aliases become qualified
+  Java names. Unknown names, ambiguous imports and unresolved Kotlin type
+  aliases remain Kotlin rather than borrowing an unrelated source declaration.
 - Kotlin stdlib member mapping (`kotlin_member_to_java` in expr.rs +
   property-read table): `uppercase`→`toUpperCase`, `keys`→`keySet()`, etc.
   Unmapped stdlib members warn N002 and pass through verbatim.

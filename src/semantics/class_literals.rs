@@ -3,6 +3,67 @@
 use super::{FactStatus, SemanticProvider};
 use std::path::Path;
 
+/// An annotation class literal denotes a reference classifier, not a runtime
+/// KClass value. Source classifiers use the normal scoped resolver. An
+/// explicit import also establishes the spelling of a dependency classifier
+/// (including nested classes) without requiring its sources in the workspace.
+pub(crate) fn annotation_reference_class(
+    source: &str,
+    file: &Path,
+    site: tree_sitter::Node<'_>,
+    spelling: &str,
+    provider: Option<&dyn SemanticProvider>,
+) -> Option<String> {
+    let root = spelling.split('.').next()?;
+    let package = super::package_name(source);
+    if root.is_empty()
+        || super::is_proven_local_shadow(site, root, source)
+        || super::is_proven_constructor_property_shadow(site, root, source)
+        || super::declaration_type_parameters(source, site)
+            .iter()
+            .any(|name| name == root)
+        || provider.is_some_and(|provider| {
+            provider.has_type_alias_in_package(&package, root)
+                || provider
+                    .symbols_named(root)
+                    .iter()
+                    .any(|symbol| symbol.id.file == file && !super::is_type_symbol(&symbol.id))
+        })
+    {
+        return None;
+    }
+    let imports = super::kotlin_import_lines(source)
+        .filter_map(|import| {
+            let (path, alias) = import
+                .split_once(" as ")
+                .map_or((import, None), |(path, alias)| {
+                    (path.trim(), Some(alias.trim()))
+                });
+            (alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == root)
+                .then_some((path, alias))
+        })
+        .collect::<Vec<_>>();
+    if imports.len() > 1 {
+        return None;
+    }
+    if let Some((path, alias)) = imports.first() {
+        let (namespace, name) = path.rsplit_once('.')?;
+        if provider.is_some_and(|provider| provider.has_type_alias_in_package(namespace, name)) {
+            return None;
+        }
+        return Some(if alias.is_some() {
+            format!("{path}{}", &spelling[root.len()..])
+        } else {
+            spelling.to_owned()
+        });
+    }
+    let provider = provider?;
+    match provider.resolve_type_in_file(file, &package, spelling) {
+        FactStatus::Established(id) if super::is_type_symbol(&id) => Some(spelling.to_owned()),
+        _ => None,
+    }
+}
+
 pub(crate) fn established_default_companion_call(
     source: &str,
     file: &Path,

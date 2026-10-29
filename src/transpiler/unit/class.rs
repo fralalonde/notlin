@@ -1052,18 +1052,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 return None;
             }
             for class_name in class_literals {
-                let simple = class_name.rsplit('.').next().unwrap_or(&class_name);
-                let java_visible = self.workspace.is_some_and(|ws| {
-                    ws.declarations_named(simple).any(|d| {
-                        d.name == simple && d.kind != crate::workspace::DeclarationKind::Annotation
-                    })
-                });
-                if !java_visible {
-                    return None;
-                }
+                let java_class = crate::semantics::annotation_reference_class(
+                    self.source,
+                    self.workspace_file.as_deref().unwrap_or(self.file),
+                    node,
+                    &class_name,
+                    self.semantic_provider,
+                )?;
                 lowered = lowered.replace(
                     &format!("{class_name}::class"),
-                    &format!("{class_name}.class"),
+                    &format!("{java_class}.class"),
                 );
             }
             if lowered.contains("::class") {
