@@ -5340,17 +5340,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     self.transpile_type_decl(m, out);
                     out.blank();
                 }
-                // Only the proven #5 group shape leaves Kotlin; every other
-                // enum companion stays retained (as it was before this slice),
-                // because companion-object reachability is not proven here.
                 "companion_object" => {
-                    if self.enum_companion_groups(m, name).is_some() {
+                    if !enum_group_consumer_requires_companion(self.source, name)
+                        && !self.workspace.is_some_and(|workspace| {
+                            workspace.kotlin_files().any(|file| {
+                                enum_group_consumer_requires_companion(file.source_text(), name)
+                            })
+                        })
+                    {
                         self.transpile_companion(m, name, out);
                         out.blank();
                     } else {
                         self.diag_untranslatable(
                             m,
-                            "enum companion object shape is not the proven constant group",
+                            "enum companion is consumed as a value; a static namespace cannot represent it",
                         );
                     }
                 }
@@ -5540,9 +5543,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// Kotlin companion member call sites (`Outer.member`) resolve the same
     /// way as Java statics, so functions become `static` methods, `val`
     /// properties become `static final` fields (with accessors), and `var`
-    /// properties become static fields + accessors with an N002 approximation
-    /// warning (Kotlin keeps companion state on the Companion singleton, not
-    /// as class statics). Named companions and companions holding init logic
+    /// properties become static fields + accessors sharing that storage.
+    /// Nested Companion bridges preserve member call paths for source callers.
+    /// Named companions and companions holding init logic
     /// or other non-member constructs TAINT with N001 — there is no Java
     /// shape that preserves reachability (`Outer.Factory` vs statics).
     fn transpile_companion(
@@ -5613,15 +5616,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let Some(body) = kt::child(companion, "class_body") else {
             return;
         };
-        let mut mutable_state = false;
         let mut bridge_sigs: Vec<BridgeSig> = Vec::new();
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
             match member.kind() {
                 "property_declaration" => {
-                    if kt::child(member, "var").is_some() {
-                        mutable_state = true;
-                    }
                     if let Some(vd) = kt::child(member, "variable_declaration")
                         && let Some(n) = kt::child(vd, "identifier")
                     {
@@ -5630,7 +5629,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         self.companion_members
                             .insert(pname.clone(), format!("get{}()", cap));
                     }
-                    self.transpile_property_opts(member, out, true, Some(owner));
+                    let mut property_out = JavaOut::new();
+                    self.transpile_property_opts(member, &mut property_out, true, Some(owner));
+                    let emitted = property_out.finish();
+                    bridge_sigs.extend(self.companion_method_bridges(member, &emitted));
+                    out.line(emitted);
                     out.blank();
                 }
                 "function_declaration" => {
@@ -5650,17 +5653,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
         }
-        if mutable_state {
-            self.diag_approx(
-                companion,
-                "companion object state (var members) approximated as static fields of the enclosing class — Kotlin stores companion state on the Companion singleton instance; API shape preserved, storage location approximated",
-            );
-        }
         if !bridge_sigs.is_empty() {
-            self.diag_approx(
-                companion,
-                "companion fns also reachable via Owner.Companion.fn(...) in Kotlin call sites; emitted a nested Companion bridge that delegates to the class statics so both call forms compile",
-            );
             out.blank();
             out.open(String::from("public static final class Companion"));
             for sig in &bridge_sigs {

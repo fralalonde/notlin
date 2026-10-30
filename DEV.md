@@ -131,6 +131,16 @@ explicit capability proof; recognizing an annotation is insufficient.
   dependency imports support nested classes; import aliases become qualified
   Java names. Unknown names, ambiguous imports and unresolved Kotlin type
   aliases remain Kotlin rather than borrowing an unrelated source declaration.
+- Enum companions share the ordinary companion member emitter. Maps and other
+  supported initializers keep their declared types, and Companion getter/setter
+  bridges forward to the same static storage. First-class enum companion values
+  still require a separate object representation.
+- A resolved ordinary source instance method takes precedence over a builtin spelling.
+  The plan records the target and source span for ordinary positional calls;
+  emission uses that identity instead of applying stdlib rewrites by name.
+  Companion members keep their separate namespace rules.
+- Secondary-constructor receiver method lookup includes indexed Java types and
+  their inherited methods, using the same scoped type resolver as other calls.
 - Kotlin stdlib member mapping (`kotlin_member_to_java` in expr.rs +
   property-read table): `uppercase`→`toUpperCase`, `keys`→`keySet()`, etc.
   Unmapped stdlib members warn N002 and pass through verbatim.

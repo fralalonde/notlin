@@ -4008,7 +4008,7 @@ impl SourceIndex {
         type_name: &str,
         method_name: &str,
     ) -> bool {
-        let Some(declaration) = self.resolve_kotlin_type(source_file, type_name) else {
+        let Some(declaration) = self.resolve_type(source_file, type_name) else {
             return false;
         };
         let mut visited = HashSet::new();

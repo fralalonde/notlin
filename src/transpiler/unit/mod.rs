@@ -56,6 +56,8 @@ pub struct Unit<'src, 'tree> {
     pub(crate) local_expression_types: std::collections::HashMap<String, crate::semantics::TypeRef>,
     pub(crate) exact_overload_calls:
         std::collections::HashMap<(usize, usize), crate::semantics::ExactOverloadCall>,
+    pub(crate) ordinary_source_calls:
+        std::collections::HashMap<(usize, usize), crate::semantics::OrdinarySourceCall>,
     pub(crate) reified_class_calls:
         std::collections::HashMap<(usize, usize), crate::semantics::ReifiedClassCall>,
     /// Signed per-call lowering receipts for this snapshot, copied from the
@@ -521,6 +523,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             local_expression_aliases: std::collections::HashMap::new(),
             local_expression_types: std::collections::HashMap::new(),
             exact_overload_calls: std::collections::HashMap::new(),
+            ordinary_source_calls: std::collections::HashMap::new(),
             reified_class_calls: std::collections::HashMap::new(),
             call_receipts: std::collections::HashMap::new(),
             field_type_proofs: std::collections::BTreeMap::new(),
@@ -1377,6 +1380,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             .iter()
             .filter(|decision| decision.required_mode)
             .map(|decision| (decision.id.start_byte, decision.id.end_byte))
+            .collect();
+        self.ordinary_source_calls = plan
+            .ordinary_source_calls
+            .iter()
+            .map(|fact| {
+                assert_eq!(fact.location.snapshot_hash, self.source_hash);
+                (
+                    (fact.location.start_byte, fact.location.end_byte),
+                    fact.clone(),
+                )
+            })
             .collect();
         self.exact_overload_calls = plan
             .exact_overload_calls

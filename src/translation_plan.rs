@@ -256,6 +256,8 @@ pub struct TranslationPlan {
     #[serde(default)]
     pub exact_overload_calls: Vec<crate::semantics::ExactOverloadCall>,
     #[serde(default)]
+    pub ordinary_source_calls: Vec<crate::semantics::OrdinarySourceCall>,
+    #[serde(default)]
     pub reified_class_calls: Vec<crate::semantics::ReifiedClassCall>,
     /// Unambiguous secondary-to-secondary delegation, tied to this snapshot.
     #[serde(default)]
@@ -814,6 +816,7 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         eager_collection_calls: Vec::new(),
         eager_collection_helpers: Vec::new(),
         exact_overload_calls: Vec::new(),
+        ordinary_source_calls: Vec::new(),
         reified_class_calls: Vec::new(),
         constructor_delegations: Vec::new(),
         diagnostics: Vec::new(),

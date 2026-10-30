@@ -28,10 +28,13 @@ fn companion_property_reads_use_the_public_static_field() {
     let (files, errors, _warnings, _coverage) =
         notlin::transpiler::transpile(source, &PathBuf::from("Gate.kt"), &cli);
     assert_eq!(errors, 0);
-    let output = files
-        .into_iter()
-        .map(|(_, content)| content)
-        .collect::<String>();
+    // Inspect the consumer independently of the new legitimate Companion
+    // bridge, which forwards to Gate.getDEFAULT() in Gate.java.
+    let output = &files
+        .iter()
+        .find(|(name, _)| name == "Consumer.java")
+        .unwrap()
+        .1;
     assert!(
         output.contains("Gate.DEFAULT"),
         "companion reads must use the public static field:\n{output}"

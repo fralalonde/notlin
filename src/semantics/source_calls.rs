@@ -1,5 +1,104 @@
 //! Syntax facts specific to invoking retained Kotlin source methods from Java.
 
+use super::{SemanticProvider, SourceLocation, SymbolId};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+/// A source declaration takes precedence over a stdlib spelling. Keep its
+/// identity and call span in the plan so emission never dispatches by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrdinarySourceCall {
+    pub location: SourceLocation,
+    pub target: SymbolId,
+}
+
+pub(super) fn ordinary_call<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    target: &SymbolId,
+    provider: &P,
+) -> Option<OrdinarySourceCall> {
+    if crate::facts::is_fact_symbol(target)
+        || target.receiver.is_some()
+        || !matches!(target.kind.as_str(), "function" | "method")
+        || !super::enum_when::is_java_identifier(&target.name)
+        || target.parameters.len() != super::call_argument_count(call)
+        || target
+            .parameters
+            .iter()
+            .any(|ty| ty.starts_with("vararg:") || ty.contains("->"))
+        || !provider.is_public_instance_callable(target)
+        || !provider.has_plain_callable_parameters(target)
+    {
+        return None;
+    }
+    let (owner_name, owner_path) = target.owner_path.split_last()?;
+    let owners = provider.symbols_named(owner_name);
+    let owners: Vec<_> = owners
+        .iter()
+        .filter(|symbol| {
+            symbol.id.file == target.file
+                && symbol.id.owner_path == owner_path
+                && super::is_type_symbol(&symbol.id)
+        })
+        .collect();
+    let [owner] = owners.as_slice() else {
+        return None;
+    };
+    // Reuse the indexed ownership fact. Companion methods are instance methods
+    // on their holder, not on the enclosing class; their namespace lowering
+    // remains responsible for them. No source reparse belongs on this path.
+    if provider
+        .companion_members(&owner.id, &target.name)
+        .iter()
+        .any(|member| member.id == *target)
+    {
+        return None;
+    }
+    // Named/default arguments, spreads, safe calls and function-valued
+    // arguments require their own mapping; do not erase that obligation.
+    let callee = super::call_callee_node(call)?;
+    if super::explicit_receiver_node(call, callee).is_some_and(|_| {
+        call.named_child(0).is_some_and(|nav| {
+            nav.children(&mut nav.walk())
+                .any(|child| child.kind() == "?.")
+        })
+    }) {
+        return None;
+    }
+    let arguments = call
+        .named_children(&mut call.walk())
+        .find(|node| node.kind() == "value_arguments")?;
+    if call
+        .named_children(&mut call.walk())
+        .any(|node| matches!(node.kind(), "lambda_literal" | "annotated_lambda"))
+    {
+        return None;
+    }
+    for argument in arguments
+        .named_children(&mut arguments.walk())
+        .filter(|node| !node.is_extra())
+    {
+        let values: Vec<_> = argument
+            .named_children(&mut argument.walk())
+            .filter(|node| !node.is_extra())
+            .collect();
+        if values.len() != 1 || matches!(values[0].kind(), "spread_expression" | "lambda_literal") {
+            return None;
+        }
+    }
+    Some(OrdinarySourceCall {
+        location: SourceLocation {
+            file: file.to_path_buf(),
+            snapshot_hash: *blake3::hash(source.as_bytes()).as_bytes(),
+            start_byte: call.start_byte(),
+            end_byte: call.end_byte(),
+        },
+        target: target.clone(),
+    })
+}
+
 /// A Kotlin Exceptions attribute needs a separate Java catch/throws plan. Until
 /// that exists, even unchecked-only @Throws lists do not prove a plain call.
 pub(super) fn declares_checked_throws(source: &str, node: tree_sitter::Node<'_>) -> bool {

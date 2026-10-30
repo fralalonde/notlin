@@ -1,6 +1,42 @@
 # Translation frontier
 
-## Current checkpoint — 2026-10-29
+## Current checkpoint — 2026-10-30
+
+The standard clean conversion of reference commit `179bb912` produces
+**3,933 Java files**, retaining 2,438 of 6,371 original Kotlin owners:
+**+3 / -0** against the accepted 3,930-output baseline. The gains are
+`ExpiryProperty`, `LotNoProperty`, and `JobActivity`.
+
+Enum companions share the ordinary companion emitter, including map initializers,
+declared collection types and property getter/setter bridges to shared static
+storage. Ordinary instance methods named `with`, `let`, or another builtin
+spelling use their resolved source target. Parameter ABI and indexed companion
+ownership facts keep mangled methods and companion-holder calls out of that
+ordinary instance path. Secondary-constructor lookup now includes Java receiver
+types and their inherited methods.
+
+The `with` blocker is removed from `SystemValue`; the class still stays Kotlin
+because its parent `PropertyValue` is retained for ambiguous `of` overloads.
+`OrderActivityLineInfo` now reaches its separate inherited `getItems` proof
+boundary. These are additional requirements beyond method-name dispatch.
+
+The fresh full Gradle build passes: **110 tasks**, 44 executed and 66 from cache.
+Hastings loads all **9,113 records**, followed by 105.5 seconds with no errors or
+stack traces after the complete-import marker. No application sources or runtime
+configuration were hand-fixed. Evidence is under
+`target/generic-translations-20261030/`, using `notlin-indexed.exe` and `clean-v4`.
+Every generated Java file matches the earlier fully built and started candidate;
+ten retained Kotlin files differ only in retention notes.
+
+The native regression passes in both Lombok modes, covering map nulls, duplicates,
+order, identity, mutable companion state, Java companion callers, ordinary method
+dispatch, constructor argument evaluation, and retained companion/mangled-method
+boundaries. Three standalone samples emit Java and compile; `Nullspotting` remains
+fully retained, as in the baseline. Formatting and clippy pass. The full Rust
+sweep remains red: **1,563 pass, 73 fail, 135 ignored**; every failing test name
+appears in the recorded prior run, including the intermittent file-deletion race.
+
+## Previous checkpoint — 2026-10-29
 
 The standard clean conversion of the same reference commit `179bb912` produces
 **3,930 Java files**, with 2,441 of 6,371 original Kotlin owners retained:
@@ -20,7 +56,8 @@ Evidence is under `target/field-annotation-20261029/`.
 The six focused tests pass, including a real Kotlin/Java/Jackson comparison in
 both Lombok modes covering initialization checks, null setters, naming-strategy
 serialization/deserialization, and parent back-references. All four standalone
-samples compile; formatting and clippy pass. The broader Rust sweep is not
+samples are checked; three emit Java and compile while `Nullspotting` stays
+Kotlin. Formatting and clippy pass. The broader Rust sweep is not
 green on Windows: 1,560 pass and 74 fail, including shell-helper fixtures and
 an intermittent access-denied failure while deleting indexed source files.
 Those results are retained separately from application acceptance.

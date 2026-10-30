@@ -578,14 +578,13 @@ fn companion_object_members_become_statics() {
     }
 }"#;
     let (files, errors, warnings, _cov) = {
-        let cli =
-            notlin::cli::Cli::parse_from(vec!["notlin", "--allow-approximations", "Counter.kt"]);
+        let cli = notlin::cli::Cli::parse_from(vec!["notlin", "Counter.kt"]);
         let path = PathBuf::from("Counter.kt");
         notlin::transpiler::transpile(source, &path, &cli)
     };
     assert_eq!(errors, 0);
-    // N002 for the mutable companion state
-    assert!(warnings > 0);
+    // Mutable companion state and its bridges share one static backing field.
+    assert_eq!(warnings, 0);
     let counter = &files
         .iter()
         .find(|(n, _)| n == "Counter.java")
@@ -1041,7 +1040,18 @@ fn interface_companion_val_emits_nested_holder() {
         contract.contains("public static final String PREFIX = \"p\";"),
         "{contract}"
     );
-    assert!(!contract.contains("class Companion"), "{contract}");
+    assert!(
+        contract.contains("public static final class Companion"),
+        "{contract}"
+    );
+    assert!(
+        contract.contains("public static final Companion Companion = new Companion();"),
+        "{contract}"
+    );
+    assert!(
+        contract.contains("return Contract.getPREFIX();"),
+        "{contract}"
+    );
     assert!(
         contract.contains("public static String getPREFIX()"),
         "{contract}"

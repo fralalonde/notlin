@@ -34,6 +34,7 @@ mod platform_members;
 mod property_getter_equivalence;
 mod reified_calls;
 mod source_calls;
+pub use source_calls::OrdinarySourceCall;
 pub(crate) mod string_case;
 mod todo;
 pub(crate) use class_literals::{
@@ -2172,6 +2173,10 @@ pub trait SemanticProvider: Send + Sync {
     fn is_public_instance_callable(&self, _member: &SymbolId) -> bool {
         false
     }
+    /// Direct parameters preserve the source method's JVM name and argument ABI.
+    fn has_plain_callable_parameters(&self, _member: &SymbolId) -> bool {
+        false
+    }
     /// An ordinary public Kotlin property getter with no unresolved accessor
     /// annotations or visibility changes. Providers without this fact retain.
     fn has_plain_instance_property_getter(&self, _property: &SymbolId) -> bool {
@@ -2785,7 +2790,7 @@ struct CompanionLocation {
 }
 
 impl SyntaxSemanticProvider {
-    fn companion_parameters_have_plain_jvm_names(&self, member: &SymbolId) -> bool {
+    fn parameters_have_plain_jvm_names(&self, member: &SymbolId) -> bool {
         member.parameters.iter().all(|signature| {
             let ty = TypeRef::parse(signature.strip_prefix("vararg:").unwrap_or(signature));
             let name = match &ty.ty {
@@ -3595,6 +3600,10 @@ impl SemanticProvider for SyntaxSemanticProvider {
                     .java_public_instance_getter_locations
                     .contains(&(symbol.location.file.clone(), symbol.location.start_byte)))
     }
+    fn has_plain_callable_parameters(&self, member: &SymbolId) -> bool {
+        member.file.extension().is_some_and(|ext| ext == "java")
+            || self.parameters_have_plain_jvm_names(member)
+    }
     fn has_plain_instance_property_getter(&self, property: &SymbolId) -> bool {
         let candidates = self.symbols_named(&property.name);
         let matches = candidates
@@ -4291,7 +4300,7 @@ impl SemanticProvider for SyntaxSemanticProvider {
                         .nongeneric_kotlin_callable_locations
                         .contains(&(symbol.location.file.clone(), symbol.location.start_byte))
             })
-            && self.companion_parameters_have_plain_jvm_names(member)
+            && self.parameters_have_plain_jvm_names(member)
     }
     fn is_java_static_member(&self, symbol: &SymbolId) -> bool {
         self.symbols_named(&symbol.name).into_iter().any(|indexed| {
@@ -4834,7 +4843,16 @@ pub fn plan_required_calls(
                                 // A helper fact names an external callee, not a
                                 // user declaration: it cannot shadow a builtin
                                 // *with a declaration of its own*.
-                                if known_builtin(&name) && !crate::facts::is_fact_symbol(target) {
+                                if known_builtin(&name)
+                                    && !crate::facts::is_fact_symbol(target)
+                                    && let Some(call) = source_calls::ordinary_call(
+                                        source, file, node, target, provider,
+                                    )
+                                {
+                                    plan.ordinary_source_calls.push(call);
+                                } else if known_builtin(&name)
+                                    && !crate::facts::is_fact_symbol(target)
+                                {
                                     let decision = &mut plan.declarations[index];
                                     let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
                                         kind: crate::translation_plan::PreparationBlockerKind::UnresolvedAssumption,

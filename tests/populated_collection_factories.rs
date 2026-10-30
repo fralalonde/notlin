@@ -143,9 +143,9 @@ class Holder {
     let (java, errors, warnings) =
         translated_with_provider(source, "Aliases.kt", &[("Aliases.kt", source)]);
     assert_eq!(errors, 0, "{java}");
-    // The source alias stays Kotlin, and the companion receives its existing
-    // informational bridge diagnostic. Neither blocks these three contexts.
-    assert_eq!(warnings, 2, "{java}");
+    // The source alias stays Kotlin. The ordinary companion bridge needs no
+    // approximation diagnostic; all three value contexts still translate.
+    assert_eq!(warnings, 1, "{java}");
     assert!(
         java.matches("Stream.<java.util.Map.Entry<java.lang.String, java.lang.Integer>>of(new java.util.AbstractMap.SimpleImmutableEntry<>(null, null))").count() >= 3,
         "function return, companion return, and local property contexts should all provide exact Java arguments:\n{java}"

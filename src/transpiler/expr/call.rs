@@ -502,6 +502,26 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             args.push(value);
         }
 
+        if let Some(fact) = self
+            .unit
+            .ordinary_source_calls
+            .get(&(node.start_byte(), node.end_byte()))
+            .cloned()
+        {
+            assert_eq!(fact.location.snapshot_hash, self.unit.source_hash);
+            let callee = callee.expect("planned source call has a callee");
+            let java = if callee.kind() == "navigation_expression" {
+                let (base, _) = self
+                    .unit
+                    .nav_base_member(callee)
+                    .expect("planned member call has a receiver");
+                format!("{}.{}", self.transpile(base), fact.target.name)
+            } else {
+                fact.target.name
+            };
+            return format!("{java}({})", args.join(", "));
+        }
+
         if let Some(provider) = self.unit.semantic_provider
             && let Some(classifier) = crate::semantics::established_platform_constructor(
                 self.unit.source,
