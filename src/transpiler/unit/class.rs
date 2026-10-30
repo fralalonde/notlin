@@ -336,92 +336,6 @@ fn constructor_has_jvm_overloads(
     false
 }
 
-/// One inherited interface member with the declaration that owns it, so the
-/// forwarding gate can resolve its type spelling in the declaring file's scope.
-type InterfaceObligation<'a> = (
-    &'a crate::workspace::Declaration,
-    &'a crate::workspace::Member,
-);
-
-/// A JVM method spelling the forwarding emitter can re-create: a non-empty
-/// ASCII Java identifier made of letters, digits and `_`. The Kotlin proof may
-/// accept Unicode source identifiers, but the emitted Java accessors cannot,
-/// so an unsupported spelling must be declined here rather than asserted
-/// later in the emitter.
-fn plain_java_method_name(name: &str) -> bool {
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
-}
-
-/// Interface members are public unless the source says otherwise. Kotlin and
-/// Java interface declarations typically omit the redundant modifier.
-fn public_jvm_member(member: &crate::workspace::Member) -> bool {
-    matches!(member.visibility.as_deref(), None | Some("public"))
-}
-
-/// The exact non-nullable, non-generic type spelling of a member, or `None`
-/// when its JVM return needs projection this slice cannot prove.
-fn plain_jvm_type_spelling(member: &crate::workspace::Member) -> Option<&str> {
-    let spelling = member.type_name.as_deref()?.trim();
-    (!spelling.is_empty()
-        && !spelling.ends_with('?')
-        && !spelling.contains('<')
-        && !spelling.contains("->"))
-    .then_some(spelling)
-}
-
-/// Prove that the bridge's concrete return type is the obligation's return or
-/// a source-resolved subtype of it, which is what makes the Java override
-/// satisfy every ancestor interface method with the same name and arity.
-fn forwarding_return_is_subtype(
-    workspace: &crate::workspace::SourceIndex,
-    bridge_return: &str,
-    contract_file: &crate::workspace::SourceFile,
-    contract_return: &str,
-) -> bool {
-    if matches!(
-        contract_return,
-        "Any" | "Object" | "kotlin.Any" | "java.lang.Object"
-    ) {
-        return true;
-    }
-    let (Some(concrete), Some(contract)) = (
-        workspace.resolve_type(contract_file, bridge_return),
-        workspace.resolve_type(contract_file, contract_return),
-    ) else {
-        return false;
-    };
-    let contract_id = crate::semantics::workspace_symbol(workspace, contract);
-    let mut pending = vec![concrete];
-    let mut visited = HashSet::new();
-    while let Some(declaration) = pending.pop() {
-        let id = crate::semantics::workspace_symbol(workspace, declaration);
-        if !visited.insert(id.clone()) {
-            continue;
-        }
-        if id == contract_id {
-            return true;
-        }
-        let Some(file) = workspace.declaration_source_file(declaration) else {
-            continue;
-        };
-        for spelling in &declaration.supertypes {
-            let spelling = spelling.trim();
-            // A generic instantiation edge is not a source subtype proof.
-            if spelling.is_empty() || spelling.contains('<') || spelling.contains('(') {
-                continue;
-            }
-            if let Some(parent) = workspace.resolve_type(file, spelling) {
-                pending.push(parent);
-            }
-        }
-    }
-    false
-}
-
 /// One companion constant group: the enum member name, its DECLARED Java type
 /// (`Set<Owner>` / `Collection<Owner>`) and the entries in source order.
 struct EnumGroup {
@@ -1460,201 +1374,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         target: &crate::workspace::Declaration,
         parent: &crate::workspace::Declaration,
     ) -> bool {
-        let owner = crate::semantics::workspace_symbol(workspace, target);
-        let parent_id = crate::semantics::workspace_symbol(workspace, parent);
-        let bridges = self
-            .default_getter_bridges
-            .iter()
-            .filter(|bridge| {
-                bridge.owner == owner
-                    && bridge.target == parent_id
-                    && matches!(
-                        bridge.body,
-                        crate::translation_plan::PlannedDefaultGetterBody::SourceForwarding { .. }
-                    )
-            })
-            .collect::<Vec<_>>();
-        if bridges.is_empty() {
-            return false;
-        }
-        let Some(obligations) = self.retained_interface_obligations(workspace, parent) else {
-            return false;
-        };
-        let Some(target_file) = workspace.declaration_source_file(target) else {
-            return false;
-        };
-        obligations.into_iter().all(|(contract_owner, member)| {
-            if member.is_static {
-                return true;
-            }
-            match member.kind {
-                // A method is a JVM signature, not a name. Only the exact
-                // planned default getter that this proof re-creates may cover
-                // it; a same-named overload, private helper or `suspend`
-                // member is a different obligation and must retain.
-                crate::workspace::MemberKind::Method => self.forwarding_bridge_covers_method(
-                    workspace,
-                    contract_owner,
-                    member,
-                    &bridges,
-                ),
-                // A property getter is covered only by an own readonly,
-                // public, non-nullable property of the exact same type; field
-                // or private presence alone implements no JVM getter.
-                crate::workspace::MemberKind::Property => self.forwarding_property_covers(
-                    workspace,
-                    target,
-                    target_file,
-                    contract_owner,
-                    member,
-                ),
-                // Constructors and fields are never interface getter
-                // obligations, and an unknown shape must not be assumed.
-                crate::workspace::MemberKind::Constructor | crate::workspace::MemberKind::Field => {
-                    false
-                }
-            }
+        self.semantic_provider.is_some_and(|provider| {
+            workspace.concrete_getters_cover_retained_interface(
+                target,
+                parent,
+                &self.default_getter_bridges,
+                provider,
+            )
         })
-    }
-
-    /// Every instance member a Java implementor of `parent` owes its JVM
-    /// interface, including all transitive interface ancestors.
-    ///
-    /// The Kotlin compiler decides per `-jvm-default` mode whether a default
-    /// body stays on the interface, so any inherited member the child does not
-    /// physically implement may be abstract at run time. The walk therefore
-    /// fails closed on an unresolvable, generic or non-interface ancestor
-    /// instead of trusting the declaring interface's own member list.
-    fn retained_interface_obligations<'a>(
-        &self,
-        workspace: &'a crate::workspace::SourceIndex,
-        parent: &'a crate::workspace::Declaration,
-    ) -> Option<Vec<InterfaceObligation<'a>>> {
-        let mut obligations = Vec::new();
-        let mut pending = vec![parent];
-        let mut visited = HashSet::new();
-        while let Some(declaration) = pending.pop() {
-            if declaration.kind != crate::workspace::DeclarationKind::Interface {
-                return None;
-            }
-            let id = crate::semantics::workspace_symbol(workspace, declaration);
-            if !visited.insert(id) {
-                // A repeated edge is a cycle or diamond; its members were
-                // already collected exactly once.
-                continue;
-            }
-            let file = workspace.declaration_source_file(declaration)?;
-            for member in &declaration.members {
-                obligations.push((declaration, member));
-            }
-            for spelling in &declaration.supertypes {
-                let spelling = spelling.trim();
-                // A generic supertype changes every inherited member's JVM
-                // descriptor; no such obligation is proven here.
-                if spelling.is_empty() || spelling.contains('<') || spelling.contains('(') {
-                    return None;
-                }
-                let ancestor = workspace.resolve_type(file, spelling)?;
-                if ancestor.kind != crate::workspace::DeclarationKind::Interface {
-                    return None;
-                }
-                pending.push(ancestor);
-            }
-        }
-        Some(obligations)
-    }
-
-    /// A planned default getter re-creates exactly one method. Its name must
-    /// match, the obligation must be a public zero-argument non-null method,
-    /// and the bridge's proven concrete return must be the obligation's return
-    /// or a source-proven subtype of it (a JVM covariant override).
-    fn forwarding_bridge_covers_method(
-        &self,
-        workspace: &crate::workspace::SourceIndex,
-        contract_owner: &crate::workspace::Declaration,
-        member: &crate::workspace::Member,
-        bridges: &[&crate::translation_plan::PlannedDefaultGetterBridge],
-    ) -> bool {
-        if !plain_java_method_name(&member.name)
-            || !member.parameter_types.is_empty()
-            || member.is_nullable
-            || !public_jvm_member(member)
-        {
-            return false;
-        }
-        let Some(contract_return) = plain_jvm_type_spelling(member) else {
-            return false;
-        };
-        let Some(contract_file) = workspace.declaration_source_file(contract_owner) else {
-            return false;
-        };
-        bridges.iter().any(|bridge| {
-            bridge.method_name == member.name
-                && forwarding_return_is_subtype(
-                    workspace,
-                    &bridge.return_type,
-                    contract_file,
-                    contract_return,
-                )
-        })
-    }
-
-    /// A non-bridged property obligation is covered only by the target's own
-    /// declaration of the same readonly, public, non-nullable property with
-    /// the identical resolved type.
-    fn forwarding_property_covers(
-        &self,
-        workspace: &crate::workspace::SourceIndex,
-        target: &crate::workspace::Declaration,
-        target_file: &crate::workspace::SourceFile,
-        contract_owner: &crate::workspace::Declaration,
-        member: &crate::workspace::Member,
-    ) -> bool {
-        if !public_jvm_member(member)
-            || member.is_mutable
-            || member.is_jvm_field
-            || member.is_nullable
-            || member.has_unsupported_property_annotations
-            || member.has_unsupported_property_shape
-        {
-            return false;
-        }
-        let accessor = crate::workspace::property_accessor_name(&member.name);
-        if !plain_java_method_name(&accessor) {
-            return false;
-        }
-        let Some(contract_type) = plain_jvm_type_spelling(member) else {
-            return false;
-        };
-        let Some(contract_file) = workspace.declaration_source_file(contract_owner) else {
-            return false;
-        };
-        let mut declared = target.members.iter().filter(|own| {
-            own.kind == crate::workspace::MemberKind::Property && own.name == member.name
-        });
-        let (Some(own), None) = (declared.next(), declared.next()) else {
-            return false;
-        };
-        if !public_jvm_member(own)
-            || own.is_mutable
-            || own.is_jvm_field
-            || own.is_nullable
-            || own.has_unsupported_property_annotations
-            || own.has_unsupported_property_shape
-        {
-            return false;
-        }
-        let Some(own_type) = plain_jvm_type_spelling(own) else {
-            return false;
-        };
-        let (Some(own_declaration), Some(contract_declaration)) = (
-            workspace.resolve_type(target_file, own_type),
-            workspace.resolve_type(contract_file, contract_type),
-        ) else {
-            return false;
-        };
-        crate::semantics::workspace_symbol(workspace, own_declaration)
-            == crate::semantics::workspace_symbol(workspace, contract_declaration)
     }
 
     /// A JVM class with an explicit open/abstract boundary and a complete
@@ -2201,6 +1928,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 out,
             );
             return;
+        }
+        if let Some(builder) = self.jackson_default_builder_name(decl) {
+            annotations.push(format!("@com.fasterxml.jackson.databind.annotation.JsonDeserialize(builder = {name}.{builder}.class)"));
         }
         // primary constructor parameters -> fields + constructor
         // Class type parameters `class Gen<T : Bound>(...)` must be emitted or
@@ -2932,6 +2662,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
         if is_data && !params.is_empty() {
             let as_record = !self.lombok && self.data_class_can_be_record(decl);
+            let jackson_defaults = self.jackson_default_factory_supported(decl, &params);
             let has_initialization = kt::child(decl, "class_body").is_some_and(|body| {
                 body.children(&mut body.walk()).any(|member| {
                     member.kind() == "anonymous_initializer"
@@ -2980,9 +2711,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     body.children(&mut body.walk())
                         .any(|member| member.kind() == "anonymous_initializer")
                 });
-                if has_initializers || !self.primary_constructor_annotations(decl).is_empty() {
+                if has_initializers
+                    || !self.primary_constructor_annotations(decl).is_empty()
+                    || jackson_defaults
+                {
                     for annotation in self.primary_constructor_annotations(decl) {
                         out.line(annotation);
+                    }
+                    if jackson_defaults {
+                        out.line("@com.fasterxml.jackson.annotation.JsonCreator(mode = com.fasterxml.jackson.annotation.JsonCreator.Mode.DISABLED)");
                     }
                     out.open(format!("public {}({})", name, comps.join(", ")));
                     for (_, _, field, _) in &params {
@@ -3061,6 +2798,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     out.line(annotation);
                 }
                 self.emit_constructor_property_contract(decl, &params, out);
+                if jackson_defaults {
+                    out.line("@com.fasterxml.jackson.annotation.JsonCreator(mode = com.fasterxml.jackson.annotation.JsonCreator.Mode.DISABLED)");
+                }
                 if self.constructor_has_covariant_input(decl, &params) {
                     out.line("@SuppressWarnings(\"unchecked\")");
                 }
@@ -3134,6 +2874,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             // same delegating overloads a plain class gets — without them the
             // retained Kotlin that called `Configuration()` no longer resolves.
             self.emit_jvm_overloads_primary_constructors(decl, &name, &params, out);
+            self.emit_jackson_default_factory(decl, &name, &params, out);
             out.close();
         } else {
             // Java places type params after the class name: `class Name<T>`.
@@ -4097,6 +3838,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if !defaults.iter().any(Option::is_some) || kt::child(decl, "type_parameters").is_some() {
             return false;
         }
+        if self.jackson_default_builder_name(decl).is_some() {
+            return false;
+        }
         // Only introduce a Jackson dependency where the same source set already
         // imports its creator API. Another module's test dependency is insufficient.
         fn source_set(path: &std::path::Path) -> &std::path::Path {
@@ -4172,6 +3916,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         params: &[(bool, bool, String, String)],
         out: &mut JavaOut,
     ) {
+        if let Some(builder) = self.jackson_default_builder_name(decl) {
+            self.emit_jackson_default_builder(decl, name, params, &builder, out);
+            return;
+        }
         if !self.jackson_default_factory_supported(decl, params) {
             return;
         }
@@ -4241,6 +3989,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 ));
             }
         }
+        for (_, _, param, ty) in params {
+            if !self.lombok
+                && crate::transpiler::types::boxed_name(ty).is_none()
+                && self
+                    .param_node(decl, param)
+                    .is_some_and(|node| kt::child(node, "nullable_type").is_none())
+            {
+                out.line(format!(
+                    "java.util.Objects.requireNonNull({param}, \"{param}\");"
+                ));
+            }
+        }
         self.var_types = previous_variables;
         let arguments = params
             .iter()
@@ -4261,6 +4021,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         this.delegate = delegate;
         this.primitive = primitive;
     }
+
     @Override
     public com.fasterxml.jackson.databind.JsonDeserializer<?> createContextual(com.fasterxml.jackson.databind.DeserializationContext context, com.fasterxml.jackson.databind.BeanProperty property) throws com.fasterxml.jackson.databind.JsonMappingException {
         Class<?> raw = property.getType().getRawClass();
@@ -4290,6 +4051,115 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         for line in helper.lines() {
             out.line(line);
         }
+    }
+
+    fn jackson_default_builder_name(&self, decl: tree_sitter::Node) -> Option<String> {
+        let file = self.workspace_file.as_deref().unwrap_or(self.file);
+        let supported = self.semantic_provider.is_some_and(|provider| {
+            provider.symbols_in_file(file).iter().any(|symbol| {
+                symbol.location.start_byte == decl.start_byte()
+                    && symbol.location.end_byte == decl.end_byte()
+                    && symbol.location.snapshot_hash == self.source_hash
+                    && provider.has_jackson_default_factory(&symbol.id)
+            })
+        });
+        if !supported {
+            return None;
+        }
+        let mut name = "__notlinDefaults".to_owned();
+        while self.text(decl).contains(&name) {
+            name.push('_');
+        }
+        Some(name)
+    }
+
+    /// Builder fields begin at their Kotlin defaults. Jackson calls a setter
+    /// only for a supplied property, so omission never becomes an explicit null.
+    /// Implicit setter names also preserve the mapper's naming strategy.
+    fn emit_jackson_default_builder(
+        &mut self,
+        decl: tree_sitter::Node,
+        name: &str,
+        params: &[(bool, bool, String, String)],
+        builder: &str,
+        out: &mut JavaOut,
+    ) {
+        let defaults = self.class_param_default_nodes(decl);
+        out.blank();
+        let file = self.workspace_file.as_deref().unwrap_or(self.file);
+        if self.semantic_provider.is_some_and(|provider| {
+            provider.symbols_in_file(file).iter().any(|symbol| {
+                symbol.location.start_byte == decl.start_byte()
+                    && symbol.location.end_byte == decl.end_byte()
+                    && provider.jackson_ignores_unknown_properties(&symbol.id)
+            })
+        }) {
+            out.line(
+                "@com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)",
+            );
+        }
+        out.line("@com.fasterxml.jackson.databind.annotation.JsonPOJOBuilder(withPrefix = \"\")");
+        out.open(format!("public static final class {builder}"));
+        for ((_, _, param, ty), default) in params.iter().zip(&defaults) {
+            let ty = self.constructor_parameter_java_type(decl, param, ty);
+            let initial = default.map(|value| Expr { unit: self }.transpile(value));
+            out.line(format!(
+                "private {ty} {param}{};",
+                initial
+                    .map(|value| format!(" = {value}"))
+                    .unwrap_or_default()
+            ));
+        }
+        for (_, _, param, ty) in params {
+            out.blank();
+            if let Some(node) = self.param_node(decl, param) {
+                for (_, annotation) in self.parameter_annotations(node) {
+                    if matches!(
+                        annotation_simple_name(&annotation),
+                        "JsonProperty" | "JsonAlias"
+                    ) {
+                        out.line(annotation);
+                    }
+                }
+            }
+            let ty = self.constructor_parameter_java_type(decl, param, ty);
+            out.open(format!("public {builder} {param}({ty} value)"));
+            if crate::transpiler::types::boxed_name(&ty).is_none()
+                && self
+                    .param_node(decl, param)
+                    .is_some_and(|node| kt::child(node, "nullable_type").is_none())
+            {
+                out.line(format!(
+                    "java.util.Objects.requireNonNull(value, \"{param}\");"
+                ));
+            }
+            out.line(format!("this.{param} = value;"));
+            out.line("return this;");
+            out.close();
+        }
+        out.blank();
+        out.open(format!("public {name} build()"));
+        for (_, _, param, ty) in params {
+            if crate::transpiler::types::boxed_name(ty).is_none()
+                && self
+                    .param_node(decl, param)
+                    .is_some_and(|node| kt::child(node, "nullable_type").is_none())
+            {
+                out.line(format!(
+                    "java.util.Objects.requireNonNull({param}, \"{param}\");"
+                ));
+            }
+        }
+        out.line(format!(
+            "return new {name}({});",
+            params
+                .iter()
+                .map(|(_, _, param, _)| param.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        out.close();
+        out.close();
     }
 
     /// Kotlin read-only collections are covariant at call boundaries, but a

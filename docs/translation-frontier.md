@@ -2,6 +2,57 @@
 
 ## Current checkpoint — 2026-10-30
 
+The standard fresh conversion of reference commit `179bb912` now produces
+**3,940 Java files**, retaining 2,431 of 6,371 original Kotlin owners:
+**+7 / -0** against the accepted 3,933-output baseline. The gains are
+`ResourceActivityEntityDto`, `OAuthAuthenticationDto`,
+`PlcDeviceWriteInstruction`, `IntegrationAdjustmentInfo`,
+`ItemUnitPositionTypeDto`, `APIKeyCredentialsDto`, and `OAuthCredentialsDto`.
+
+Visible string constants resolve across explicit, wildcard and aliased imports;
+their consumers can migrate while a constant declaration stays Kotlin. Concrete
+forwarding getter chains no longer reject an unrelated owner type parameter.
+Compatibility with retained parents reuses instantiated getter types and checks
+the child's complete getter obligations, replacing the older duplicate checks.
+Jackson-observed data classes with literal or enum-entry defaults can use a
+generated builder, preserving omission, explicit values, null checks and implicit
+JSON naming. Custom binding, generic DTOs and nullable non-null defaults retain.
+The builder also carries an established inherited
+`JsonIgnoreProperties(ignoreUnknown = true)` contract. This preserves the original
+request DTO behavior without changing strict DTOs to accept unknown fields.
+
+The fresh standard invocation establishes the seven gains above. No application
+source or runtime configuration was hand-fixed. Evidence and the frozen
+`notlin-final.exe` are under `target/property-frontier-20261030/`; the fresh
+translated tree is `clean-v3`. The executable SHA256 is
+`006d041ffa8bcd9de6bfec1d868f7f71bf025d40f906a4b8e65e57da4cdf6353`.
+The fresh full Gradle build passes in 7m04s: **110 tasks**, 80 executed and
+30 from cache. Hastings loads all **9,113 records** (50 organization records and
+9,063 warehouse records), followed by **105.9 seconds** with no errors or stack
+traces after `Done loading dev resources [customers/hastings/hastings-dev.csv]`.
+The disposable application is stopped after observation. The earlier candidate
+that lost inherited ignore-unknown behavior is rejected; its failed startup logs
+are preserved separately under `rejected-*`.
+
+The frozen CLI passes the native before/after comparison in both Lombok modes:
+literal string splitting and trailing empties, local shadowing, generic parent
+getter dispatch and evaluation count, JSON defaults, explicit enum values,
+renamed properties, snake-case naming, polymorphic reads, null rejection,
+inherited ignore-unknown behavior and strict unknown-field rejection.
+Formatting and clippy pass. Three standalone samples emit Java and compile;
+`Nullspotting` remains Kotlin. The full host Rust sweep has **1,569 pass,
+72 fail, 136 ignored**, with no newly failing test names against the recorded
+baseline. The intermittent file-deletion race passes this run; it was not fixed.
+The separate sandbox sweep also records its shell/cache/symlink limitations.
+
+The two item-unit DTOs no longer stop at `LOOKUP_SEPARATOR`; their chained
+`getType().getId().split(...).last()` calls still lack the required string-return
+proof. The workflow command examples still retain their parent interfaces after
+the concrete getter body is established. These remaining boundaries are not
+reported as translation gains.
+
+## Previous checkpoint — 2026-10-30
+
 The standard clean conversion of reference commit `179bb912` produces
 **3,933 Java files**, retaining 2,438 of 6,371 original Kotlin owners:
 **+3 / -0** against the accepted 3,930-output baseline. The gains are

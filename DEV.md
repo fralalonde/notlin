@@ -141,6 +141,23 @@ explicit capability proof; recognizing an annotation is insufficient.
   Companion members keep their separate namespace rules.
 - Secondary-constructor receiver method lookup includes indexed Java types and
   their inherited methods, using the same scoped type resolver as other calls.
+- Visible top-level string constants can be inlined across files, including
+  explicit, wildcard and aliased imports. Binding uses the consumer's scope;
+  literal/type validation uses the declaration's snapshot. Shadowed reads,
+  receiver lambdas and unsupported literal spellings remain conservative. The
+  constant declaration can stay Kotlin while its Java consumers move.
+- Simple inherited default getter chains can belong to generic interfaces when
+  the chain itself has concrete types. Java child compatibility uses the shared
+  instantiated type graph to check every inherited getter against the child's
+  own methods/properties and accepted bridges. Extra defaults with arguments,
+  unresolved type substitutions and unsupported JVM shapes still retain Kotlin.
+- Jackson-observed data classes with literal or enum-entry constructor defaults
+  can use generated builders when the source set proves the Jackson API is
+  available. Omitted properties retain defaults; explicit inputs use setters,
+  with the original nullability checks. Implicit setter names respect mapper
+  naming strategies; explicit JSON names and aliases are preserved. Inherited
+  `JsonIgnoreProperties(ignoreUnknown = true)` is forwarded to the builder.
+  Custom binding, nullable non-null defaults and generic data classes remain Kotlin.
 - Kotlin stdlib member mapping (`kotlin_member_to_java` in expr.rs +
   property-read table): `uppercase`→`toUpperCase`, `keys`→`keySet()`, etc.
   Unmapped stdlib members warn N002 and pass through verbatim.

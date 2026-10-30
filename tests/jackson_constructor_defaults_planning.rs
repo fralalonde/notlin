@@ -178,3 +178,77 @@ fn explicit_approximation_mode_reports_the_loss_without_forcing_retention() {
             .all(|decision| decision.retention_reasons.is_empty())
     );
 }
+
+#[test]
+fn simple_default_factories_resolve_enums_and_preserve_custom_binding_boundaries() {
+    let source = r#"
+package sample
+import com.fasterxml.jackson.annotation.JsonCreator
+import com.fasterxml.jackson.annotation.JsonTypeName
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize as Deserialize
+enum class Kind { DEFAULT, OTHER }
+@JsonTypeName("simple")
+data class Simple(val kind: Kind = Kind.DEFAULT, val enabled: Boolean = true, val note: String? = null)
+@JsonTypeName("nullable")
+data class Nullable(val note: String? = "fallback")
+@JsonTypeName("generic")
+data class Generic<T>(val value: T? = null)
+@Deserialize(using = Custom::class)
+interface CustomBound
+data class Inherited(val enabled: Boolean = true) : CustomBound
+@JsonTypeName("custom")
+data class CustomCreator @JsonCreator constructor(val enabled: Boolean = true)
+"#;
+    let index = provider(&[("Defaults.kt", source)]);
+    for (name, supported) in [
+        ("Simple", true),
+        ("Nullable", false),
+        ("Generic", false),
+        ("Inherited", false),
+        ("CustomCreator", false),
+    ] {
+        let owner = &index.symbols_named(name)[0].id;
+        assert!(
+            index.has_jackson_default_constructor_semantics(owner),
+            "{name}"
+        );
+        assert_eq!(
+            index.has_jackson_default_factory(owner),
+            supported,
+            "{name}"
+        );
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    let mut plan =
+        notlin::translation_plan::analyze(source, tree.root_node(), Path::new("Defaults.kt"));
+    plan.plan_jackson_default_constructor_losses(Path::new("Defaults.kt"), &index, false);
+    let simple = plan
+        .declarations
+        .iter()
+        .find(|decision| decision.symbol_id.name == "Simple")
+        .unwrap();
+    assert!(simple.retention_reasons.is_empty(), "{simple:?}");
+}
+
+#[test]
+fn inherited_ignore_unknown_uses_the_annotation_binding_not_its_spelling() {
+    let contract = "package sample; import com.fasterxml.jackson.annotation.*; import java.util.*; @JsonIgnoreProperties(ignoreUnknown = true) public interface Contract {}";
+    let fake =
+        "package domain; public @interface JsonIgnoreProperties { boolean ignoreUnknown(); }";
+    let custom = "package sample; import com.fasterxml.jackson.annotation.*; import domain.JsonIgnoreProperties; @JsonIgnoreProperties(ignoreUnknown = true) public interface Custom {}";
+    let source = "package sample\nimport com.fasterxml.jackson.annotation.JsonTypeName\nimport com.fasterxml.jackson.annotation.JsonCreator\nimport com.fasterxml.jackson.databind.annotation.JsonDeserialize\n@JsonTypeName(\"real\") data class Real(val enabled: Boolean = true) : Contract\n@JsonTypeName(\"custom\") data class Other(val enabled: Boolean = true) : Custom\n";
+    let index = provider(&[
+        ("Contract.java", contract),
+        ("Fake.java", fake),
+        ("Custom.java", custom),
+        ("Dtos.kt", source),
+    ]);
+    let real = &index.symbols_named("Real")[0].id;
+    let other = &index.symbols_named("Other")[0].id;
+    assert!(index.jackson_ignores_unknown_properties(real));
+    assert!(!index.jackson_ignores_unknown_properties(other));
+}

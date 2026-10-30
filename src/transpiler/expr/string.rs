@@ -124,7 +124,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             return format!("this.{}()", getter);
         }
         if !self.unit.var_types.contains_key(ident)
-            && let Some(literal) = self.inline_same_file_string_const(ident, reference)
+            && let Some(literal) = self.inline_top_level_string_const(ident, reference)
         {
             return literal;
         }
@@ -144,7 +144,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         ident.to_string()
     }
 
-    pub(crate) fn inline_same_file_string_const(
+    pub(crate) fn inline_top_level_string_const(
         &self,
         ident: &str,
         reference: tree_sitter::Node,
@@ -155,7 +155,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .workspace_file
             .as_deref()
             .unwrap_or(self.unit.file);
-        crate::semantics::same_file_string_const_literal(
+        crate::semantics::top_level_string_const_literal(
             self.unit.source,
             file,
             ident,

@@ -386,6 +386,7 @@ impl TranslationPlan {
         for symbol in provider.symbols_in_file(file) {
             if !matches!(symbol.id.kind.as_str(), "class" | "object" | "enum")
                 || !provider.has_jackson_default_constructor_semantics(&symbol.id)
+                || provider.has_jackson_default_factory(&symbol.id)
             {
                 continue;
             }

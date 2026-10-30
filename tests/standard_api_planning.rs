@@ -49,6 +49,44 @@ const LOOKUP_KEY: &str = "package sample\npublic interface LookupKey { String ge
 const IDENTIFIER: &str = "package sample\nimport java.util.*\nprivate const val KEY_DELIMITER: String = \"/\"\ninterface Identifier : LookupKey {\n    val objectId: UUID\n    fun text(): String { return objectId.toString() }\n    fun separatorText(): String = \"before:$KEY_DELIMITER:${KEY_DELIMITER}\"\n    val externalKey: String\n        get() { return getLookupKey().split(KEY_DELIMITER).last() }\n}\n";
 
 #[test]
+fn cross_file_constants_use_their_own_type_scope_and_the_consumers_import_binding() {
+    for (import, visible) in [
+        ("import literals.*", "DELIMITER"),
+        ("import literals.DELIMITER", "DELIMITER"),
+        ("import literals.DELIMITER as SEP", "SEP"),
+    ] {
+        let source = format!(
+            "package sample\n{import}\ninterface Identifier : LookupKey {{\n fun text(): String = getLookupKey().split({visible}).last()\n fun label(): String = \"before:${visible}\"\n}}\n"
+        );
+        let (root, _, outputs, errors, _, coverage) = workspace(
+            "cross-file-constant",
+            &[
+                ("LookupKey.java", LOOKUP_KEY),
+                (
+                    "Constants.kt",
+                    "package literals\nimport java.util.*\nconst val DELIMITER: String = \".\"\n",
+                ),
+                (
+                    "Unrelated.kt",
+                    "package unrelated\nconst val DELIMITER: String = \"wrong\"\n",
+                ),
+                ("Identifier.kt", &source),
+            ],
+            "Identifier.kt",
+        );
+        assert_eq!(errors, 0);
+        let java = outputs
+            .iter()
+            .find(|(name, _)| name == "Identifier.java")
+            .map(|(_, java)| java)
+            .unwrap_or_else(|| panic!("{import}: {coverage:?}"));
+        assert!(java.contains("new java.lang.String[]{\".\"}"), "{java}");
+        assert!(!java.contains("wrong") && !java.contains(visible), "{java}");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn java_util_uuid_with_known_java_super_method_translates_in_strict_mode() {
     let (root, _, outputs, errors, _, coverage) = workspace(
         "jdk-uuid-bridge",

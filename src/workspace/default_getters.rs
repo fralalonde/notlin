@@ -814,14 +814,17 @@ fn source_getter<'a>(
 /// ones the Kotlin default already performs. Everything else stays unproven:
 /// annotations (including accessor renames), non-public or static members,
 /// mutable or nullable steps, safe calls, `!!`, calls, casts, `super`/outer or
-/// labelled receivers, and anything generic.
+/// labelled receivers, and steps whose types require generic substitution.
 fn proven_forwarding_getter_body(
     index: &SourceIndex,
     target: &Declaration,
     member: &Member,
     expected_return: &super::CanonicalGetterType,
 ) -> Option<ForwardingGetterBody> {
-    if target.language != SourceLanguage::Kotlin || !target.type_params.is_empty() {
+    // An unrelated owner type parameter does not change a concrete accessor
+    // chain. Each step below still has to establish its exact return type
+    // without substituting type parameters or manufacturing casts.
+    if target.language != SourceLanguage::Kotlin {
         return None;
     }
     let file = index.declaration_source_file(target)?;
@@ -1217,6 +1220,171 @@ fn imported_marker_alias(index: &SourceIndex, file: &SourceFile, base: &str) -> 
 }
 
 impl SourceIndex {
+    /// Check the complete retained interface after substituting the concrete
+    /// child's type arguments. Every instance obligation must be a getter
+    /// implemented by an own public member or an accepted forwarding bridge.
+    pub(crate) fn concrete_getters_cover_retained_interface(
+        &self,
+        child: &Declaration,
+        parent: &Declaration,
+        bridges: &[crate::translation_plan::PlannedDefaultGetterBridge],
+        provider: &dyn semantics::SemanticProvider,
+    ) -> bool {
+        let Some(file) = self.declaration_source_file(child) else {
+            return false;
+        };
+        let own_bindings = scoped_type_ref_bindings(self, child);
+        let matching = child
+            .supertypes
+            .iter()
+            .filter(|ty| {
+                self.resolve_type(file, ty).is_some_and(|declaration| {
+                    semantics::workspace_symbol(self, declaration)
+                        == semantics::workspace_symbol(self, parent)
+                })
+            })
+            .collect::<Vec<_>>();
+        let [spelling] = matching.as_slice() else {
+            return false;
+        };
+        let Some(bindings) = inherited_raw_bindings(self, parent, spelling, child, &own_bindings)
+        else {
+            return false;
+        };
+        let mut profile = super::profile::GetterTraversal::start();
+        let (routes, incomplete) = instantiated_routes(
+            self,
+            InstantiatedOwner {
+                declaration: parent,
+                bindings,
+            },
+            file,
+            &mut profile,
+        );
+        let owner = semantics::workspace_symbol(self, child);
+        let bridges = bridges
+            .iter()
+            .filter(|bridge| {
+                bridge.owner == owner
+                    && matches!(
+                        bridge.body,
+                        crate::translation_plan::PlannedDefaultGetterBody::SourceForwarding { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        if incomplete || bridges.is_empty() {
+            return false;
+        }
+        for route in routes {
+            if route.declaration.kind != DeclarationKind::Interface {
+                return false;
+            }
+            for member in route
+                .declaration
+                .members
+                .iter()
+                .filter(|member| !member.is_static)
+            {
+                let Some(contract) = source_getter(self, route.declaration, member) else {
+                    return false;
+                };
+                if member.is_mutable || member.is_nullable || member.is_jvm_field {
+                    return false;
+                }
+                let name = if member.kind == MemberKind::Property {
+                    property_accessor_name(&member.name)
+                } else {
+                    member.name.clone()
+                };
+                if member.kind == MemberKind::Method {
+                    let Some(method_file) = self.declaration_source_file(route.declaration) else {
+                        return false;
+                    };
+                    if !super::getter_has_no_method_type_parameters(
+                        method_file,
+                        route.declaration,
+                        &member.name,
+                    ) {
+                        return false;
+                    }
+                    let id = semantics::workspace_symbol(self, route.declaration);
+                    let methods = provider
+                        .symbols_named(&member.name)
+                        .into_iter()
+                        .filter(|symbol| {
+                            let mut path = id.owner_path.clone();
+                            path.push(id.name.clone());
+                            symbol.id.file == id.file
+                                && symbol.id.owner_path == path
+                                && symbol.id.parameters.is_empty()
+                        })
+                        .collect::<Vec<_>>();
+                    let [method] = methods.as_slice() else {
+                        return false;
+                    };
+                    if !provider.is_public_instance_callable(&method.id)
+                        || !provider.has_plain_callable_parameters(&method.id)
+                    {
+                        return false;
+                    }
+                }
+                let Some(contract_type) = canonical_return(
+                    self,
+                    route.declaration,
+                    &contract.return_type,
+                    &route.bindings,
+                ) else {
+                    return false;
+                };
+                let matches = |candidate: &super::CanonicalGetterType| {
+                    candidate == &contract_type
+                        || canonical_reference_subtype(self, candidate, &contract_type)
+                };
+                let bridged = bridges.iter().any(|bridge| {
+                    bridge.method_name == name
+                        && canonical_return(self, child, &bridge.return_type, &own_bindings)
+                            .is_some_and(|ty| matches(&ty))
+                });
+                if bridged {
+                    continue;
+                }
+                let implementations = child
+                    .members
+                    .iter()
+                    .filter_map(|own| {
+                        if own.kind == MemberKind::Method
+                            && !super::getter_has_no_method_type_parameters(file, child, &own.name)
+                        {
+                            return None;
+                        }
+                        let getter = source_getter(self, child, own)?;
+                        let own_name = if own.kind == MemberKind::Property {
+                            property_accessor_name(&own.name)
+                        } else {
+                            own.name.clone()
+                        };
+                        (own_name == name
+                            && !own.is_mutable
+                            && !own.is_nullable
+                            && !own.is_jvm_field
+                            && !own.has_unsupported_property_annotations
+                            && !own.has_unsupported_property_shape)
+                            .then_some(getter)
+                    })
+                    .collect::<Vec<_>>();
+                let [implementation] = implementations.as_slice() else {
+                    return false;
+                };
+                if !canonical_return(self, child, &implementation.return_type, &own_bindings)
+                    .is_some_and(|ty| matches(&ty))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Proves a supertype spelling denotes one of the canonical JVM marker
     /// interfaces that declare no methods at all, so an ancestor outside the
     /// workspace index cannot own a callable member name.
@@ -3256,6 +3424,20 @@ mod tests {
             .map(|step| step.accessor.as_str())
             .collect::<Vec<_>>();
         assert_eq!(accessors, ["getEnvelope", "getMarker"]);
+    }
+
+    #[test]
+    fn a_generic_owner_does_not_taint_an_independent_concrete_getter_chain() {
+        let providers =
+            FORWARDING_PROVIDERS.replace("interface Provider :", "interface Provider<T> :");
+        let child = FORWARDING_CHILD.replace(": Provider {", ": Provider<String> {");
+        let (_root, path, index) =
+            index_for_sources(&[("Providers.kt", &providers), ("Child.kt", &child)]);
+        let bridges = index
+            .covariant_default_getter_bridges(&path, "Child")
+            .unwrap();
+        assert_eq!(bridges.len(), 1, "{bridges:?}");
+        assert!(bridges[0].body.is_some(), "{bridges:?}");
     }
 
     #[test]

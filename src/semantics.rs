@@ -2125,6 +2125,13 @@ pub trait SemanticProvider: Send + Sync {
     fn has_jackson_default_constructor_semantics(&self, _owner: &SymbolId) -> bool {
         false
     }
+    /// A defaulted DTO supported by the presence-aware Java creator emitter.
+    fn has_jackson_default_factory(&self, _owner: &SymbolId) -> bool {
+        false
+    }
+    fn jackson_ignores_unknown_properties(&self, _owner: &SymbolId) -> bool {
+        false
+    }
     fn symbols_in_file(&self, file: &Path) -> Vec<&SemanticSymbol> {
         self.symbols()
             .iter()
@@ -2353,6 +2360,8 @@ pub struct SyntaxSemanticProvider {
     callable_shapes: BTreeMap<(PathBuf, usize), CallableShape>,
     constructor_metadata_dependencies: BTreeMap<SymbolId, KotlinConstructorMetadataDependency>,
     jackson_default_constructor_classes: BTreeSet<SymbolId>,
+    jackson_default_factory_classes: BTreeSet<SymbolId>,
+    jackson_ignore_unknown_classes: BTreeSet<SymbolId>,
     workspace_builtin_types: BTreeMap<PathBuf, BTreeMap<String, &'static str>>,
     generated_java_property_reads: BTreeMap<(SymbolId, String), Vec<JavaPropertyRead>>,
 }
@@ -3133,6 +3142,10 @@ impl SyntaxSemanticProvider {
         p.constructor_metadata_dependencies =
             constructor_metadata::resolve(&p, &metadata_relations);
         p.jackson_default_constructor_classes = jackson_defaults::resolve(&p, &jackson_relations);
+        p.jackson_default_factory_classes =
+            jackson_defaults::resolve_factories(&p, &jackson_relations);
+        p.jackson_ignore_unknown_classes =
+            jackson_defaults::resolve_ignored_unknown(&p, &jackson_relations);
         p
     }
     pub fn index_file(&mut self, file: &Path, source: &str) {
@@ -3140,6 +3153,8 @@ impl SyntaxSemanticProvider {
         self.generated_java_property_reads.clear();
         self.constructor_metadata_dependencies.clear();
         self.jackson_default_constructor_classes.clear();
+        self.jackson_default_factory_classes.clear();
+        self.jackson_ignore_unknown_classes.clear();
         self.index_file_relations(file, source);
     }
 
@@ -3542,6 +3557,12 @@ impl SemanticProvider for SyntaxSemanticProvider {
     }
     fn has_jackson_default_constructor_semantics(&self, owner: &SymbolId) -> bool {
         self.jackson_default_constructor_classes.contains(owner)
+    }
+    fn has_jackson_default_factory(&self, owner: &SymbolId) -> bool {
+        self.jackson_default_factory_classes.contains(owner)
+    }
+    fn jackson_ignores_unknown_properties(&self, owner: &SymbolId) -> bool {
+        self.jackson_ignore_unknown_classes.contains(owner)
     }
     fn source_for_file(&self, file: &Path) -> Option<&str> {
         self.sources.get(file).map(String::as_str)
@@ -7106,7 +7127,7 @@ fn known_string_split_argument<P: SemanticProvider + ?Sized>(
     let Ok(name) = expression.utf8_text(source.as_bytes()) else {
         return false;
     };
-    if same_file_string_const_literal(source, file, name.trim(), expression, provider).is_some() {
+    if top_level_string_const_literal(source, file, name.trim(), expression, provider).is_some() {
         return true;
     }
     let Some(scope) = enclosing_callable(call) else {
@@ -7148,29 +7169,81 @@ fn known_string_split_argument<P: SemanticProvider + ?Sized>(
         })
 }
 
-/// Return a Java-safe literal for an indexed top-level `const val NAME:
-/// String = "literal"` in this exact source snapshot. The caller supplies the
-/// reference node so local/parameter shadowing can keep the reference
-/// unresolved. This deliberately excludes interpolated, raw, and escaped-
-/// dollar strings whose source spelling differs between Kotlin and Java.
-pub(crate) fn same_file_string_const_literal<P: SemanticProvider + ?Sized>(
+/// Resolve a visible top-level string constant and return its Java-safe literal.
+/// Constant reads need no initialization or accessor call, even when their
+/// declaration stays Kotlin. Bind in the consumer's scope, then inspect the
+/// declaration's own snapshot and imports. Unknown receivers and shadowing
+/// remain unproven; interpolated, raw and escaped-dollar strings are excluded.
+pub(crate) fn top_level_string_const_literal<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
     name: &str,
     reference: tree_sitter::Node<'_>,
     provider: &P,
 ) -> Option<String> {
-    if name.is_empty() || is_proven_local_shadow(reference, name, source) {
+    if name.is_empty()
+        || is_proven_local_shadow(reference, name, source)
+        || is_proven_constructor_property_shadow(reference, name, source)
+    {
         return None;
     }
-    // Any other declaration with this spelling can change what an unqualified
-    // reference means (including an inherited property in another file).
-    let matching = provider.symbols_named(name);
+    let mut scope = reference.parent();
+    while let Some(owner) = scope {
+        if matches!(owner.kind(), "lambda_literal" | "function_literal")
+            || (owner.kind() == "function_declaration"
+                && symbol_id_for_node(source, owner, file).receiver.is_some())
+        {
+            return None;
+        }
+        scope = owner.parent();
+    }
+    // Members can shadow imports through an inherited or enclosing receiver.
+    // Until that binding is established, do not inline the imported constant.
+    if provider.symbols_named(name).iter().any(|symbol| {
+        !symbol.id.owner_path.is_empty()
+            && matches!(symbol.id.kind.as_str(), "property" | "parameter")
+    }) {
+        return None;
+    }
+    let imports = kotlin_import_lines(source).collect::<Vec<_>>();
+    let exact = imports
+        .iter()
+        .filter_map(|import| {
+            let (path, alias) = import
+                .split_once(" as ")
+                .map_or((*import, None), |(path, alias)| (path, Some(alias)));
+            (alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == name)
+                .then_some(path)
+        })
+        .collect::<Vec<_>>();
+    let (wanted, imported_package) = match exact.as_slice() {
+        [] => (name, None),
+        [path] => {
+            let (package, member) = path.rsplit_once('.')?;
+            (member, Some(package))
+        }
+        _ => return None,
+    };
+    let package = package_name(source);
+    let matching = provider
+        .symbols_named(wanted)
+        .into_iter()
+        .filter(|symbol| {
+            if let Some(package) = imported_package {
+                symbol.id.package == package
+            } else {
+                symbol.id.package == package
+                    || imports
+                        .iter()
+                        .any(|import| import.strip_suffix(".*") == Some(symbol.id.package.as_str()))
+            }
+        })
+        .collect::<Vec<_>>();
     let [symbol] = matching.as_slice() else {
         return None;
     };
-    if symbol.id.file != file
-        || symbol.id.kind != "property"
+    let source = provider.source_for_file(&symbol.id.file)?;
+    if symbol.id.kind != "property"
         || !symbol.id.owner_path.is_empty()
         || symbol.location.snapshot_hash != *blake3::hash(source.as_bytes()).as_bytes()
         || !matches!(
@@ -7229,39 +7302,26 @@ pub(crate) fn same_file_string_const_literal<P: SemanticProvider + ?Sized>(
     if !canonical_string_type {
         return None;
     }
-    if source
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("import "))
-        .any(|line| {
-            let path = line.split(';').next().unwrap_or(line).trim();
-            let (path, alias) = path
-                .split_once(" as ")
-                .map(|(path, alias)| (path.trim(), Some(alias.trim())))
-                .unwrap_or((path, None));
-            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == name
-        })
-    {
-        return None;
-    }
-    let mut root = reference;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
-    let mut cursor = root.walk();
-    let declarations = root
+    // Parse just the indexed declaration, not its entire file for each use.
+    let source = source.get(symbol.location.start_byte..symbol.location.end_byte)?;
+    let tree = crate::transpiler::parse_tree(source);
+    let mut cursor = tree.root_node().walk();
+    let declarations = tree
+        .root_node()
         .named_children(&mut cursor)
         .filter(|node| node.kind() == "property_declaration")
         .filter(|node| {
             declaration_identifier(*node, source)
                 .and_then(|identifier| identifier.utf8_text(source.as_bytes()).ok())
-                == Some(name)
+                == Some(wanted)
         })
         .collect::<Vec<_>>();
     let [declaration] = declarations.as_slice() else {
         return None;
     };
-    if declaration.start_byte() != symbol.location.start_byte
-        || declaration.end_byte() != symbol.location.end_byte
+    if tree.root_node().has_error()
+        || declaration.start_byte() != 0
+        || declaration.end_byte() != source.len()
         || !declaration_type_node(*declaration)
             .and_then(|ty| ty.utf8_text(source.as_bytes()).ok())
             .is_some_and(|ty| matches!(ty.trim(), "String" | "java.lang.String" | "kotlin.String"))
@@ -8800,7 +8860,7 @@ pub fn plan_required_property_references<P: SemanticProvider + ?Sized>(
                 && (retained || crosses_file)
                 && !is_proven_local_shadow(node, spelling, source)
                 && !is_proven_constructor_property_shadow(node, spelling, source)
-                && same_file_string_const_literal(source, file, spelling, node, provider).is_none()
+                && top_level_string_const_literal(source, file, spelling, node, provider).is_none()
             {
                 let decision = &mut plan.declarations[index];
                 let reason = crate::translation_plan::RetentionReason::PreparationBlocker {

@@ -209,7 +209,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     // unrelated imported `data` cannot capture the name.
                     format!("{implicit_this}.{name}")
                 } else if !self.unit.var_types.contains_key(&name)
-                    && let Some(literal) = self.inline_same_file_string_const(&name, node)
+                    && let Some(literal) = self.inline_top_level_string_const(&name, node)
                 {
                     literal
                 } else if !self.unit.var_types.contains_key(&name)

@@ -2460,7 +2460,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         self.is_known_string_receiver(node)
             || (matches!(node.kind(), "identifier" | "simple_identifier")
                 && self
-                    .inline_same_file_string_const(self.unit.text(node).trim(), node)
+                    .inline_top_level_string_const(self.unit.text(node).trim(), node)
                     .is_some())
     }
 
