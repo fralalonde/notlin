@@ -353,7 +353,8 @@ fn getter_marker(
             | "lombok.RequiredArgsConstructor"
             | "lombok.AllArgsConstructor"
             | "lombok.EqualsAndHashCode"
-            | "lombok.ToString" => None,
+            | "lombok.ToString"
+            | "lombok.Setter" => None,
             _ => None,
         } {
             if marker.replace(current).is_some() {
@@ -366,6 +367,7 @@ fn getter_marker(
                 | "AllArgsConstructor"
                 | "EqualsAndHashCode"
                 | "ToString"
+                | "Setter"
         ) {
             return None;
         }
@@ -374,6 +376,81 @@ fn getter_marker(
         }
     }
     marker
+}
+
+/// Public setter under an established default Lombok configuration. Plain
+/// Setter/Data class markers and field-level Setter are supported; implicit
+/// final fields, suppression, access overrides and competing methods decline.
+pub(crate) fn has_plain_public_setter(source: &str, owner: &str, property: &str) -> bool {
+    let Ok(unit) = crate::java_ir::parse_java(source) else {
+        return false;
+    };
+    let imports = lombok_imports(&unit.root);
+    let Some(class) = unit
+        .root
+        .children
+        .iter()
+        .filter_map(element_node)
+        .find(|node| {
+            node.kind == "class_declaration" && declaration_name(node).as_deref() == Some(owner)
+        })
+    else {
+        return false;
+    };
+    if !matches!(
+        getter_marker(class, &imports),
+        Some(GetterMarker::Getter | GetterMarker::Data)
+    ) {
+        return false;
+    }
+    let Some(body) = field(class, "body") else {
+        return false;
+    };
+    let Some(target) = body.children.iter().filter_map(element_node).find(|node| {
+        node.kind == "field_declaration" && field_property_name(node).as_deref() == Some(property)
+    }) else {
+        return false;
+    };
+    let Some(modifiers) = field_or_kind(target, "modifiers") else {
+        return false;
+    };
+    if has_token(modifiers, "final")
+        || has_token(modifiers, "static")
+        || field_nullability(modifiers, &imports).is_none()
+    {
+        return false;
+    }
+    let marked = |modifiers: &JavaSyntaxNode| {
+        modifiers
+            .children
+            .iter()
+            .filter_map(element_node)
+            .filter(|node| matches!(node.kind.as_str(), "annotation" | "marker_annotation"))
+            .any(|annotation| {
+                annotation_name(annotation)
+                    .and_then(|name| resolve_annotation(&name, &imports))
+                    .is_some_and(|name| matches!(name.as_str(), "lombok.Setter" | "lombok.Data"))
+                    && field(annotation, "arguments").is_none()
+            })
+    };
+    if !marked(modifiers) && !field_or_kind(class, "modifiers").is_some_and(marked) {
+        return false;
+    }
+    let setter = crate::property_abi::setter_name(property);
+    if body.children.iter().filter_map(element_node).any(|node| {
+        node.kind == "method_declaration"
+            && declaration_name(node).is_some_and(|name| name.eq_ignore_ascii_case(&setter))
+    }) {
+        return false;
+    }
+    body.children
+        .iter()
+        .filter_map(element_node)
+        .filter(|node| node.kind == "field_declaration")
+        .filter_map(field_property_name)
+        .filter(|name| name.eq_ignore_ascii_case(property))
+        .count()
+        == 1
 }
 
 struct GetterFieldCandidate {
@@ -1631,4 +1708,35 @@ mod tests {
         assert_eq!(contracts.len(), 1);
         assert_eq!(contracts[0].method_name, "getCount");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn plain_setter_contract_covers_field_and_class_markers_and_rejects_overrides() {
+    let field = "import lombok.Getter; import lombok.Setter; import lombok.AllArgsConstructor; @Getter @AllArgsConstructor public class Node { @Setter private String name; private final Node child; }";
+    assert!(has_plain_public_setter(field, "Node", "name"));
+    assert!(!has_plain_public_setter(field, "Node", "child"));
+    assert!(!has_plain_public_setter(
+        "import lombok.Value; import lombok.Setter; @Value @Setter class Node { String name; }",
+        "Node",
+        "name"
+    ));
+    assert!(!has_plain_public_setter(
+        &field.replace(
+            "@Setter private",
+            "@Setter(lombok.AccessLevel.PRIVATE) private"
+        ),
+        "Node",
+        "name"
+    ));
+    assert!(!has_plain_public_setter(
+        &field.replace("@Setter private", "@Setter private final"),
+        "Node",
+        "name"
+    ));
+    assert!(has_plain_public_setter(
+        "import lombok.Data; @Data class Node { private java.util.List<String> names; }",
+        "Node",
+        "names"
+    ));
 }

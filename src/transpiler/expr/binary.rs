@@ -186,6 +186,15 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         let receiver = self.transpile(receiver);
                         return format!("java.util.Objects.hashCode({receiver})");
                     }
+                    if self.safe_call_receiver(l).is_some() {
+                        let left = self.transpile(l);
+                        let right = self.transpile(r);
+                        let name = self.fresh_safe_receiver();
+                        let ty = self.safe_receiver_java_type(l);
+                        return format!(
+                            "((java.lang.Object) ({left}) instanceof java.lang.Object {name} ? ({ty}) {name} : {right})"
+                        );
+                    }
                     self.unit.diags.warn_approx(
                         node,
                         self.unit.file,

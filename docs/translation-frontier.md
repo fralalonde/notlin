@@ -1,6 +1,55 @@
 # Translation frontier
 
-## Current checkpoint — 2026-10-30
+## Current checkpoint � 2026-10-30
+
+The standard fresh conversion of reference commit `179bb912` produces
+**3,944 Java files**, retaining 2,427 of 6,371 original Kotlin owners:
+**+4 / -0** against the accepted 3,940-output baseline. The gains are
+`UpperCaseStrategy`, `LookupIdentifierDto`, `LookupEntityDto`, and `DisplayAction`.
+The baseline trial independently translates all three requested examples.
+
+Safe calls share a selector-level null guard across established receiver types.
+Expressions use a ternary; statements and assignments use a temporary and `if`.
+Effectful receivers evaluate once, arguments stay lazy, nested safe calls compose,
+and nullable Unit results and Elvis fallbacks preserve their behavior. Property
+writes use established fields or setters, including plain Lombok setters.
+Ordinary nullable-receiver extensions remain outside an earlier selector's guard.
+
+Separator-only array and vararg joining uses `String.join` for proven string
+elements and Kotlin's array operation otherwise, preserving ordering, default
+separators, empty arrays, primitive arrays and null elements. Secondary
+constructors retain Java varargs and reuse the ordinary established member
+lowerings. Returned-reference string calls reuse ordinary override selection;
+return facts follow inherited nullability without letting an unannotated override
+erase an annotated ancestor. Checked exceptions and unproved contracts retain.
+Imported Java static calls also use complete type identity, while local and
+parameter bindings take precedence over classifier spelling.
+
+The baseline full Gradle build passes: **110 tasks**, 80 executed and 30 from
+cache. The fresh full Gradle build passes in 5m 43s: **110 actionable tasks: 80 executed, 30 from cache**.
+Hastings imports all **9,113 records** (50 + 9,063), followed by
+**105.8 seconds** without errors or stack traces after
+`Done loading dev resources [customers/hastings/hastings-dev.csv]`.
+The disposable application is stopped after observation. No application source
+or runtime configuration was hand-fixed.
+
+The frozen CLI passes Kotlin-versus-Java runtime comparisons in both Lombok
+modes, including null propagation, evaluation counts, lazy arguments, property
+writes, locale behavior, Unit results, foreign return types, inherited getter
+chains and array formatting. All four standalone samples emit Java and compile;
+`Nullspotting` now migrates. Formatting and default-target clippy pass.
+The full Rust sweep remains red: **1,572 pass, 72 fail,
+137 ignored**, with no new failing names against the recorded
+baseline. The intermittent file-deletion race passes this run; it was not fixed.
+
+Evidence is under `target/safe-frontier-20261030/`, using `notlin-safe.exe`,
+`incremental-v3`, and fresh `clean-v2`. The executable SHA256 is
+`b3c1969e3b654f334d5899b3f4d73d43871d28e25aa031f0b07a941f73fdc835`. `acceptance.json` records the frozen source and
+input identities, coverage comparison, build, runtime, native and Rust results.
+Rejected prototypes and the stale override-retention expectation are preserved
+in their earlier logs; the final Rust comparison is `rust-comparison-final.json`.
+
+## Previous checkpoint — 2026-10-30
 
 The standard fresh conversion of reference commit `179bb912` now produces
 **3,940 Java files**, retaining 2,431 of 6,371 original Kotlin owners:

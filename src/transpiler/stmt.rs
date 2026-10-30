@@ -10,6 +10,34 @@ pub struct Stmt<'a, 'src, 'tree> {
 
 impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
     pub fn transpile(&mut self, stmt: tree_sitter::Node, out: &mut JavaOut) {
+        if matches!(
+            stmt.kind(),
+            "call_expression" | "assignment" | "navigation_expression"
+        ) && let Some((navigation, receiver)) =
+            (Expr { unit: self.unit }).safe_call_receiver(stmt)
+        {
+            let mut expression = Expr { unit: self.unit };
+            let receiver_java = expression.transpile(receiver);
+            let name = expression.fresh_safe_receiver();
+            let nav_key = (navigation.start_byte(), navigation.end_byte());
+            let receiver_key = (receiver.start_byte(), receiver.end_byte());
+            out.open("");
+            out.line(format!("var {name} = {receiver_java};"));
+            out.open(format!("if ({name} != null)"));
+            self.unit.guarded_navigations.insert(nav_key);
+            let previous = self.unit.safe_receiver_aliases.insert(receiver_key, name);
+            self.transpile(stmt, out);
+            self.unit.guarded_navigations.remove(&nav_key);
+            self.unit.safe_receiver_aliases.remove(&receiver_key);
+            if let Some(previous) = previous {
+                self.unit
+                    .safe_receiver_aliases
+                    .insert(receiver_key, previous);
+            }
+            out.close();
+            out.close();
+            return;
+        }
         match stmt.kind() {
             "line_comment" | "block_comment" | "multiline_comment" => {}
             "property_declaration" => self.transpile_local_property(stmt, out),
@@ -381,7 +409,14 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
             }
             if !self.unit.current_function_returns_value {
                 if java != "kotlin.Unit.INSTANCE" {
-                    out.line(format!("{};", java));
+                    if (Expr { unit: self.unit })
+                        .safe_call_receiver(exprs[0])
+                        .is_some()
+                    {
+                        self.transpile(exprs[0], out);
+                    } else {
+                        out.line(format!("{};", java));
+                    }
                 }
                 out.line("return;");
                 return;
@@ -1002,7 +1037,9 @@ pub(crate) fn fix_join_tail(java: &str) -> String {
     // (b) residual `.joinToString(sep)` tail (collector already joined):
     // strip that member and merge the sep into the upstream join, which is
     // the joinToString emitter's own arg.
-    if let Some(j) = java.find(".joinToString(") {
+    if let Some(j) = java.find(".joinToString(")
+        && java[..j].contains(".collect(java.util.stream.Collectors.joining(")
+    {
         let close = java[j + ".joinToString(".len()..]
             .rfind(')')
             .map(|i| i + j + ".joinToString(".len());

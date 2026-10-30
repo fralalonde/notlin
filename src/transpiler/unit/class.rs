@@ -5788,8 +5788,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// Lower a secondary constructor with a direct `this(...)`/`super(...)`
     /// delegation and, optionally, a simple assignment-only body. Java requires
     /// the delegation call to be the constructor's first statement; bodies
-    /// with control flow, calls, defaults, or varargs remain Kotlin until a
-    /// wider flow and call-site analysis exists.
+    /// with control flow or defaults remain Kotlin until a wider flow and
+    /// call-site analysis exists. A trailing vararg keeps its Java varargs ABI.
     fn transpile_secondary_constructor(
         &mut self,
         member: tree_sitter::Node,
@@ -5822,7 +5822,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             let children: Vec<_> = param.children(&mut param.walk()).collect();
             if children
                 .iter()
-                .any(|child| (!child.is_named() && child.kind() == "=") || child.kind() == "vararg")
+                .any(|child| !child.is_named() && child.kind() == "=")
             {
                 self.var_types = prior_var_types;
                 return false;
@@ -5842,8 +5842,22 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             };
             let name = self.text(*name_node).to_string();
             let ty = kt::java_type_ann(*type_node, self.source, self.annots);
-            self.var_types.insert(name.clone(), ty.clone());
-            params.push((name, ty));
+            let vararg = param.prev_named_sibling().is_some_and(|node| {
+                node.kind() == "parameter_modifiers"
+                    && self
+                        .text(node)
+                        .split_whitespace()
+                        .any(|word| word == "vararg")
+            }) || children.iter().any(|node| node.kind() == "vararg");
+            self.var_types.insert(
+                name.clone(),
+                if vararg {
+                    format!("{ty}[]")
+                } else {
+                    ty.clone()
+                },
+            );
+            params.push((name, if vararg { format!("{ty}...") } else { ty }));
         }
         let Some(args_node) = kt::child(delegation, "value_arguments") else {
             self.var_types = prior_var_types;
@@ -6035,8 +6049,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
     /// Delegated constructor arguments are narrower than the general expression
     /// lowerer. Admit constructor calls and the Java-compatible library calls
-    /// needed by constructor defaults, while leaving Kotlin collection/extension
-    /// calls (for example `joinToString`) in Kotlin.
+    /// needed by constructor defaults and shared established member lowerings.
     fn is_safe_secondary_constructor_argument(&self, node: tree_sitter::Node) -> bool {
         if self
             .reference_string_calls
@@ -6094,6 +6107,14 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         ) == Some("java.util.UUID")
                     });
                 let is_supported_method = platform_uuid
+                    || self.semantic_provider.is_some_and(|provider| {
+                        crate::semantics::has_standard_member_lowering(
+                            self.source,
+                            self.workspace_file.as_deref().unwrap_or(self.file),
+                            node,
+                            provider,
+                        )
+                    })
                     || matches!(method, "getOrDefault" | "now" | "toInstant")
                     || self.semantic_provider.is_some_and(|provider| {
                         crate::semantics::established_own_companion_delegation_call(
@@ -6117,7 +6138,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     fn is_declared_zero_arg_instance_call(
         &self,
         call: tree_sitter::Node,
-        callee_text: &str,
+        _callee_text: &str,
     ) -> bool {
         let Some(arguments) = kt::child(call, "value_arguments") else {
             return false;
@@ -6128,10 +6149,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         {
             return false;
         }
-        let Some((receiver, method)) = callee_text.rsplit_once('.') else {
+        let Some(callee) = crate::semantics::call_callee_node(call) else {
             return false;
         };
-        if receiver.contains('.') {
+        let Some(receiver_node) = crate::semantics::explicit_receiver_node(call, callee) else {
+            return false;
+        };
+        let receiver = self.text(receiver_node).trim();
+        let method = self.text(callee).trim();
+        if !matches!(receiver_node.kind(), "identifier" | "simple_identifier") {
             return self.semantic_provider.is_some_and(|provider| {
                 crate::semantics::established_projected_receiver_instance_call(
                     self.source,

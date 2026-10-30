@@ -29,9 +29,9 @@ fn root(label: &str) -> Scratch {
 }
 
 /// The declaring file keeps a wildcard import *and* a consumer that must stay
-/// Kotlin (`string_literal` / nullable `trim` are unproved operations), so the
+/// Kotlin (an unsupported suspend member anchors it), so the
 /// field proof is the only thing that can release the constant.
-const WILDCARD_STATE: &str = "package probe\nimport java.util.*\nconst val TOKEN: String = \"token\"\nclass Reader {\n    fun read(): String = \"[$TOKEN]\"\n    fun pad(v: String?): String? = v?.trim()\n}\n";
+const WILDCARD_STATE: &str = "package probe\nimport java.util.*\nconst val TOKEN: String = \"token\"\nclass Reader {\n    fun read(): String = \"[$TOKEN]\"\n    fun pad(v: String?): String? = v?.trim()\n    suspend fun retainedAnchor() {}\n}\n";
 
 fn run_fixture(label: &str, mutation: &str, state: &str, enabled: bool) -> Scratch {
     let root = root(label);

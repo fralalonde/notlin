@@ -316,6 +316,31 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 
     fn call_body(&mut self, node: tree_sitter::Node) -> String {
+        if let Some((receiver, separator, string_elements)) =
+            self.unit.semantic_provider.and_then(|provider| {
+                crate::semantics::string_join::establish(
+                    self.unit.source,
+                    self.unit
+                        .workspace_file
+                        .as_deref()
+                        .unwrap_or(self.unit.file),
+                    node,
+                    provider,
+                )
+            })
+        {
+            let receiver = self.transpile(receiver);
+            let separator = separator
+                .map(|node| self.transpile(node))
+                .unwrap_or_else(|| "\", \"".to_string());
+            return if string_elements {
+                format!("java.lang.String.join({separator}, {receiver})")
+            } else {
+                format!(
+                    "kotlin.collections.ArraysKt.joinToString({receiver}, {separator}, \"\", \"\", -1, \"...\", null)"
+                )
+            };
+        }
         if let Some(expression) = self.planned_eager_collection_call(node) {
             return expression;
         }

@@ -5,6 +5,7 @@ mod call;
 mod container_lambdas;
 mod eager_collections;
 mod navigation;
+mod safe_call;
 mod string;
 
 pub(crate) use navigation::rewrite_reified_type_args;
@@ -98,6 +99,16 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 
     pub fn transpile(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(alias) = self
+            .unit
+            .safe_receiver_aliases
+            .get(&(node.start_byte(), node.end_byte()))
+        {
+            return alias.clone();
+        }
+        if let Some(java) = self.safe_call_expression(node) {
+            return java;
+        }
         if self.is_unit_singleton(node) {
             return "kotlin.Unit.INSTANCE".to_string();
         }
@@ -469,6 +480,86 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 }
             }
             "navigation_expression" => {
+                if let Some((receiver, member)) = self.unit.nav_base_member(node)
+                    && let Some(alias) = self
+                        .unit
+                        .safe_receiver_aliases
+                        .get(&(receiver.start_byte(), receiver.end_byte()))
+                        .cloned()
+                {
+                    let receiver_type = self.safe_receiver_java_type(receiver);
+                    if let Some(workspace) = self.unit.workspace
+                        && let Some(file) = workspace.source_file(
+                            self.unit
+                                .workspace_file
+                                .as_deref()
+                                .unwrap_or(self.unit.file),
+                        )
+                        && let Some(owner) = workspace.resolve_type(file, &receiver_type)
+                    {
+                        use crate::workspace::{MemberKind, SourceLanguage};
+                        let setter = format!("set{}", crate::transpiler::unit::capitalize(&member));
+                        let property = owner.members.iter().find(|candidate| {
+                            candidate.name == member && candidate.kind == MemberKind::Property
+                        });
+                        if property.is_some_and(|property| property.is_jvm_field)
+                            || owner.members.iter().any(|candidate| {
+                                candidate.name == member
+                                    && candidate.kind == MemberKind::Field
+                                    && candidate.visibility.as_deref() == Some("public")
+                            })
+                        {
+                            return format!("{alias}.{member}");
+                        }
+                        let lombok_setter = owner.language == SourceLanguage::Java
+                            && workspace
+                                .declaration_source_file(owner)
+                                .is_some_and(|source| {
+                                    workspace.has_default_lombok_accessors(&source.path)
+                                        || self.unit.semantic_provider.is_some_and(|provider| {
+                                            provider
+                                                .java_property_read(
+                                                    &crate::semantics::workspace_symbol(
+                                                        workspace, owner,
+                                                    ),
+                                                    &member,
+                                                )
+                                                .is_some()
+                                        })
+                                })
+                            && workspace
+                                .declaration_source_file(owner)
+                                .is_some_and(|source| {
+                                    crate::lombok_getter_contracts::has_plain_public_setter(
+                                        source.source_text(),
+                                        &owner.name,
+                                        &member,
+                                    )
+                                });
+                        if lombok_setter
+                            || (owner.language == SourceLanguage::Kotlin
+                                && property.is_some_and(|property| {
+                                    property.is_mutable
+                                        && !property.setter_name_renamed
+                                        && !property.has_custom_accessor
+                                }))
+                            || owner.members.iter().any(|candidate| {
+                                candidate.kind == MemberKind::Method
+                                    && candidate.name == setter
+                                    && candidate.parameter_types.len() == 1
+                                    && candidate.visibility.as_deref() == Some("public")
+                            })
+                        {
+                            self.unit.pending_setter = true;
+                            return format!("{alias}.{setter}(");
+                        }
+                    }
+                    self.unit.diag_untranslatable(
+                        node,
+                        format!("safe assignment has no established writable field or setter for {receiver_type}"),
+                    );
+                    return "null".into();
+                }
                 // Assignment target: the property-read path emits getter calls
                 // (`h.late = "x"` -> `h.getLate() = "x"`, illegal Java). A
                 // known class property rewrites to its setter; unknown/local

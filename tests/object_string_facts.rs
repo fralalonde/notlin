@@ -458,7 +458,7 @@ fn arbitrary_reference_results_need_a_separate_to_string_dispatch_contract() {
 }
 
 #[test]
-fn return_nullability_contracts_reject_defaults_exceptions_inheritance_and_stale_symbols() {
+fn return_nullability_contracts_reject_defaults_exceptions_and_stale_symbols() {
     use notlin::semantics::ReferenceReturnNullability::{NonNull, Nullable, Platform};
     for (annotation, expected) in [
         ("", Some(Platform)),
@@ -482,7 +482,6 @@ fn return_nullability_contracts_reject_defaults_exceptions_inheritance_and_stale
     for java in [
         "package objectstring;\nimport java.util.UUID;\n@NullMarked public interface Provider { UUID readId(); }",
         "package objectstring;\nimport java.util.UUID;\npublic interface Provider { UUID readId() throws java.io.IOException; }",
-        "package objectstring;\nimport java.util.UUID;\ninterface Parent { UUID readId(); }\npublic interface Provider extends Parent { UUID readId(); }",
         "package objectstring;\npublic interface Provider { <T> T readId(); }",
         "package objectstring;\npublic interface Provider { java.util.@org.jetbrains.annotations.NotNull UUID readId(); }",
     ] {
@@ -532,6 +531,46 @@ fn return_nullability_contracts_reject_defaults_exceptions_inheritance_and_stale
             .reference_string_calls
             .is_empty()
     );
+}
+
+#[test]
+fn return_nullability_contracts_follow_overridden_slots() {
+    use notlin::semantics::ReferenceReturnNullability::{NonNull, Nullable, Platform};
+    let source = "package objectstring\ndata class Snapshot(val value: String) {\n constructor(provider: Provider): this(provider.readId().toString())\n}\n";
+    for (direct, parent, grandparent, expected) in [
+        ("", "", "", Some(Platform)),
+        ("@NotNull", "", "", Some(NonNull)),
+        ("@Nullable", "", "", Some(Nullable)),
+        ("@NotNull", "@Nullable", "@Nullable", Some(NonNull)),
+        ("@Nullable", "@NotNull", "@NotNull", None),
+        ("", "@Nullable", "@Nullable", None),
+        ("", "@NotNull", "@NotNull", None),
+        ("", "", "@NotNull", None),
+        ("", "", "@Nullable", None),
+    ] {
+        let java = format!(
+            "package objectstring;\nimport java.util.UUID;\nimport org.jetbrains.annotations.NotNull;\nimport org.jetbrains.annotations.Nullable;\ninterface Root {{ {grandparent} UUID readId(); }}\ninterface Parent extends Root {{ {parent} UUID readId(); }}\npublic interface Provider extends Parent {{ {direct} UUID readId(); }}"
+        );
+        let provider = indexed(&[("Returned.kt", source), ("Provider.java", &java)]);
+        let member = &provider
+            .symbols_named("readId")
+            .into_iter()
+            .find(|member| member.id.owner_path == ["Provider"])
+            .unwrap()
+            .id;
+        assert_eq!(
+            provider.reference_return_nullability(member),
+            expected,
+            "{java}"
+        );
+        assert_eq!(
+            reference_string_plan(source, "Returned.kt", &provider)
+                .reference_string_calls
+                .len(),
+            usize::from(expected.is_some()),
+            "{java}"
+        );
+    }
 }
 
 #[test]

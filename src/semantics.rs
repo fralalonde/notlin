@@ -34,6 +34,7 @@ mod platform_members;
 mod property_getter_equivalence;
 mod reified_calls;
 mod source_calls;
+pub(crate) mod string_join;
 pub use source_calls::OrdinarySourceCall;
 pub(crate) mod string_case;
 mod todo;
@@ -3915,7 +3916,6 @@ impl SemanticProvider for SyntaxSemanticProvider {
         let owner_source = self.source_for_file(&owner.file)?;
         if *blake3::hash(owner_source.as_bytes()).as_bytes() != owner_symbol.location.snapshot_hash
             || !self.has_complete_inheritance(&owner)
-            || !self.inherited_members(&owner, &member.name).is_empty()
         {
             return None;
         }
@@ -3929,9 +3929,47 @@ impl SemanticProvider for SyntaxSemanticProvider {
         {
             return None;
         }
-        self.reference_return_nullability_locations
+        let nullability = self
+            .reference_return_nullability_locations
             .get(&(symbol.location.file.clone(), symbol.location.start_byte))
-            .copied()
+            .copied()?;
+        // A direct annotation may narrow an inherited return contract. An
+        // unannotated Java override must not erase an inherited nullness fact.
+        // Walk all overridden slots so a platform intermediary cannot hide an
+        // annotated grandparent. Overloads with required arguments are separate.
+        let mut pending = self.inherited_members(&owner, &member.name);
+        let mut seen = BTreeSet::new();
+        while let Some(overridden) = pending.pop() {
+            if overridden.id == *member {
+                return None;
+            }
+            if !overridden.id.parameters.is_empty() || !seen.insert(overridden.id.clone()) {
+                continue;
+            }
+            let inherited = self.reference_return_nullability_locations.get(&(
+                overridden.location.file.clone(),
+                overridden.location.start_byte,
+            ))?;
+            if (nullability == ReferenceReturnNullability::Platform
+                && *inherited != ReferenceReturnNullability::Platform)
+                || (nullability == ReferenceReturnNullability::Nullable
+                    && *inherited == ReferenceReturnNullability::NonNull)
+                || (overridden
+                    .id
+                    .file
+                    .extension()
+                    .is_some_and(|extension| extension == "java")
+                    && (self
+                        .annotated_java_packages
+                        .contains(&overridden.id.package)
+                        || self.annotated_java_packages.contains("*")))
+            {
+                return None;
+            }
+            let ancestor = self.declaring_type(overridden)?;
+            pending.extend(self.inherited_members(&ancestor, &member.name));
+        }
+        Some(nullability)
     }
     fn returned_receiver_capability(
         &self,
@@ -5292,19 +5330,21 @@ fn resolve_required_call_in_source<P: SemanticProvider + ?Sized>(
             {
                 let mut path = receiver.owner_path.clone();
                 path.push(receiver.name.clone());
-                let direct = if type_qualifier {
-                    Vec::new()
-                } else {
-                    symbols
-                        .iter()
-                        .filter(|symbol| {
-                            symbol.id.file == receiver.file
-                                && symbol.id.owner_path == path
-                                && matches!(symbol.id.kind.as_str(), "function" | "method")
-                        })
-                        .map(|symbol| symbol.id.clone())
-                        .collect::<Vec<_>>()
-                };
+                let direct = symbols
+                    .iter()
+                    .filter(|symbol| {
+                        symbol.id.file == receiver.file
+                            && symbol.id.owner_path == path
+                            && matches!(symbol.id.kind.as_str(), "function" | "method")
+                            && (!type_qualifier
+                                || (receiver
+                                    .file
+                                    .extension()
+                                    .is_some_and(|extension| extension == "java")
+                                    && provider.is_java_static_member(&symbol.id)))
+                    })
+                    .map(|symbol| symbol.id.clone())
+                    .collect::<Vec<_>>();
                 let mut candidates = if !direct.is_empty() {
                     direct
                 } else {
@@ -5899,13 +5939,29 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
         return indexed_call_return_type(source, call, callee, file, provider);
     }
     let receiver = explicit_receiver_node(call, callee)?;
+    let guarded = source
+        .get(receiver.end_byte()..callee.start_byte())
+        .is_some_and(|text| text.trim() == "?.");
     if matches!(receiver.kind(), "identifier" | "simple_identifier")
         && let Ok(name) = receiver.utf8_text(source.as_bytes())
         && let Some(ty) = container_types::parameter_type(source, file, call, name, provider)
     {
         return match ty.ty {
-            KotlinType::Named { name, .. } if !ty.nullable => Some(name),
-            KotlinType::Primitive(name) if !ty.nullable => Some(format!("kotlin.{name}")),
+            KotlinType::Named { name, .. } if !ty.nullable || guarded => Some(name),
+            KotlinType::Primitive(name) if !ty.nullable || guarded => {
+                Some(format!("kotlin.{name}"))
+            }
+            _ => None,
+        };
+    }
+    if guarded
+        && matches!(receiver.kind(), "identifier" | "simple_identifier")
+        && let Ok(name) = receiver.utf8_text(source.as_bytes())
+        && let Some(ty) = lexical_parameter_type(source, call, name)
+    {
+        return match ty.ty {
+            KotlinType::Named { name, .. } => Some(name),
+            KotlinType::Primitive(name) => Some(format!("kotlin.{name}")),
             _ => None,
         };
     }
@@ -5925,6 +5981,12 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
         // before its declaration. Keep lexical shadowing in the shared proof.
         return Some(classifier);
     }
+    if guarded
+        && receiver.kind() == "navigation_expression"
+        && let Some(ty) = guarded_receiver_classifier(source, file, receiver, provider)
+    {
+        return Some(ty);
+    }
     if let Some(property_type) =
         established_direct_property_receiver_type(source, call, receiver, file, provider)
     {
@@ -5940,7 +6002,7 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
         let constructor = call_callee_node(receiver)?;
         let name = constructor.utf8_text(source.as_bytes()).ok()?.trim();
         if let Some(return_type) =
-            indexed_call_return_type(source, receiver, constructor, file, provider)
+            indexed_call_return_classifier(source, receiver, constructor, file, provider, guarded)
         {
             return Some(return_type);
         }
@@ -6608,11 +6670,78 @@ fn enclosing_dispatch_owner<P: SemanticProvider + ?Sized>(
     None
 }
 
+fn guarded_receiver_classifier<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    expression: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<String> {
+    match expression.kind() {
+        "identifier" | "simple_identifier" => {
+            let name = expression.utf8_text(source.as_bytes()).ok()?;
+            let ty = lexical_parameter_type(source, expression, name)?;
+            let KotlinType::Named { name, .. } = ty.ty else {
+                return None;
+            };
+            match provider.resolve_type_in_file(file, &package_name(source), &name) {
+                FactStatus::Established(id) => Some(qualified_source_type_name(&id)),
+                FactStatus::Unknown => standard_external_type(source, provider, &name, false),
+                _ => None,
+            }
+        }
+        "call_expression" => indexed_call_return_classifier(
+            source,
+            expression,
+            call_callee_node(expression)?,
+            file,
+            provider,
+            true,
+        ),
+        "navigation_expression" => {
+            let base = expression.named_child(0)?;
+            let member = expression
+                .named_child(1)?
+                .utf8_text(source.as_bytes())
+                .ok()?;
+            let classifier = guarded_receiver_classifier(source, file, base, provider)?;
+            let FactStatus::Established(owner) =
+                provider.resolve_type_in_file(file, &package_name(source), &classifier)
+            else {
+                return None;
+            };
+            direct_property_classifier_with_nullability(&owner, member, provider, true)
+        }
+        _ => None,
+    }
+}
+
 fn direct_property_classifier<P: SemanticProvider + ?Sized>(
     owner: &SymbolId,
     property: &str,
     provider: &P,
 ) -> Option<String> {
+    direct_property_classifier_with_nullability(owner, property, provider, false)
+}
+
+fn direct_property_classifier_with_nullability<P: SemanticProvider + ?Sized>(
+    owner: &SymbolId,
+    property: &str,
+    provider: &P,
+    allow_nullable: bool,
+) -> Option<String> {
+    if allow_nullable
+        && owner
+            .file
+            .extension()
+            .is_some_and(|extension| extension == "java")
+        && let Some(read) = provider.java_property_read(owner, property)
+    {
+        return match read.result_type.ty {
+            KotlinType::Named { name, .. } => Some(name),
+            KotlinType::Primitive(name) => Some(format!("kotlin.{name}")),
+            _ => None,
+        };
+    }
     let mut owner_path = owner.owner_path.clone();
     owner_path.push(owner.name.clone());
     let mut properties = provider
@@ -6645,7 +6774,7 @@ fn direct_property_classifier<P: SemanticProvider + ?Sized>(
     let FactStatus::Established(property_type) = &property.ty else {
         return None;
     };
-    if property_type.nullable {
+    if property_type.nullable && !allow_nullable {
         return None;
     }
     let KotlinType::Named { name, arguments } = &property_type.ty else {
@@ -7009,6 +7138,17 @@ fn indexed_call_return_type<P: SemanticProvider + ?Sized>(
     file: &Path,
     provider: &P,
 ) -> Option<String> {
+    indexed_call_return_classifier(source, call, callee, file, provider, false)
+}
+
+fn indexed_call_return_classifier<P: SemanticProvider + ?Sized>(
+    source: &str,
+    call: tree_sitter::Node<'_>,
+    callee: tree_sitter::Node<'_>,
+    file: &Path,
+    provider: &P,
+    allow_nullable: bool,
+) -> Option<String> {
     let name = callee.utf8_text(source.as_bytes()).ok()?.trim();
     if let Some(fact) = container_calls::establish(source, file, call, provider) {
         return fact.return_type;
@@ -7028,7 +7168,7 @@ fn indexed_call_return_type<P: SemanticProvider + ?Sized>(
     let FactStatus::Established(return_type) = &symbol.ty else {
         return None;
     };
-    if return_type.nullable {
+    if return_type.nullable && !allow_nullable {
         return None;
     }
     let KotlinType::Named { name, .. } = &return_type.ty else {
@@ -7495,6 +7635,9 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
     name: &str,
     provider: &P,
 ) -> bool {
+    if string_join::establish(source, file, call, provider).is_some() {
+        return true;
+    }
     if container_calls::establish(source, file, call, provider).is_some() {
         return true;
     }
@@ -7595,6 +7738,30 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
             | ("java.util.List", "toList", 0)
             | ("kotlin.Array", "toList", 0)
     )
+}
+
+/// Constructor delegation consumes the same established member lowerings as
+/// ordinary expression bodies, instead of a second library spelling table.
+pub(crate) fn has_standard_member_lowering<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    provider: &P,
+) -> bool {
+    call_callee_node(call)
+        .and_then(|callee| {
+            callee
+                .utf8_text(source.as_bytes())
+                .ok()
+                .map(|name| (callee, name))
+        })
+        .is_some_and(|(callee, name)| {
+            // Constructor chains require the planned reference-string fact for
+            // toString: a classifier alone cannot prove nullability, extension
+            // dispatch or checked exceptions along the receiver chain.
+            name != "toString"
+                && known_external_member_call(source, file, call, callee, name, provider)
+        })
 }
 
 /// The lowering for these calls implements the Kotlin stdlib extension itself.
@@ -7724,7 +7891,7 @@ fn simple_lambda_variable(node: tree_sitter::Node<'_>, source: &str) -> bool {
         == 1
 }
 
-fn standard_external_type<P: SemanticProvider + ?Sized>(
+pub(crate) fn standard_external_type<P: SemanticProvider + ?Sized>(
     source: &str,
     provider: &P,
     spelling: &str,
@@ -7949,9 +8116,18 @@ fn explicit_receiver_is_type_qualifier<P: SemanticProvider + ?Sized>(
     let Some(spelling) = explicit_receiver_spelling(source, call, callee) else {
         return false;
     };
+    if !spelling.chars().next().is_some_and(char::is_uppercase) {
+        return false;
+    }
     let Some(receiver) = explicit_receiver_node(call, callee) else {
         return false;
     };
+    if matches!(receiver.kind(), "identifier" | "simple_identifier")
+        && (lexical_parameter_is_declared(source, call, spelling)
+            || is_proven_local_shadow(receiver, spelling, source))
+    {
+        return false;
+    }
     if receiver.kind() == "call_expression" {
         return false;
     }
@@ -7968,12 +8144,11 @@ fn explicit_receiver_is_type_qualifier<P: SemanticProvider + ?Sized>(
     {
         return false;
     }
-    spelling.chars().next().is_some_and(char::is_uppercase)
-        && !provider.symbols_named(spelling).into_iter().any(|symbol| {
-            symbol.id.file == file
-                && symbol.location.start_byte <= call.start_byte()
-                && !is_type_symbol(&symbol.id)
-        })
+    !provider.symbols_named(spelling).into_iter().any(|symbol| {
+        symbol.id.file == file
+            && symbol.location.start_byte <= call.start_byte()
+            && !is_type_symbol(&symbol.id)
+    })
 }
 fn retain_matching_arity(candidates: &mut Vec<SymbolId>, call: tree_sitter::Node<'_>) {
     let argument_count = call_argument_count(call);

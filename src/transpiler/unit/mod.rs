@@ -53,6 +53,10 @@ pub struct Unit<'src, 'tree> {
         std::collections::HashMap<(usize, usize), crate::semantics::EagerCollectionCall>,
     pub(crate) eager_collection_helpers: Vec<crate::translation_plan::PlannedEagerCollectionHelper>,
     pub(crate) local_expression_aliases: std::collections::HashMap<String, String>,
+    /// Scoped receiver bindings while lowering a safe-call chain.
+    pub(crate) safe_receiver_aliases: std::collections::HashMap<(usize, usize), String>,
+    pub(crate) guarded_navigations: std::collections::HashSet<(usize, usize)>,
+    pub(crate) next_safe_receiver: usize,
     pub(crate) local_expression_types: std::collections::HashMap<String, crate::semantics::TypeRef>,
     pub(crate) exact_overload_calls:
         std::collections::HashMap<(usize, usize), crate::semantics::ExactOverloadCall>,
@@ -521,6 +525,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             eager_collection_calls: std::collections::HashMap::new(),
             eager_collection_helpers: Vec::new(),
             local_expression_aliases: std::collections::HashMap::new(),
+            safe_receiver_aliases: std::collections::HashMap::new(),
+            guarded_navigations: std::collections::HashSet::new(),
+            next_safe_receiver: 0,
             local_expression_types: std::collections::HashMap::new(),
             exact_overload_calls: std::collections::HashMap::new(),
             ordinary_source_calls: std::collections::HashMap::new(),

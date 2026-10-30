@@ -146,6 +146,29 @@ explicit capability proof; recognizing an annotation is insufficient.
   literal/type validation uses the declaration's snapshot. Shadowed reads,
   receiver lambdas and unsupported literal spellings remain conservative. The
   constant declaration can stay Kotlin while its Java consumers move.
+- Safe calls lower at their selector boundary, before the ordinary property or
+  method emitter. Expressions use a null-check ternary; effectful receivers bind
+  once through a Java pattern variable. Statements and safe assignments use a
+  temporary and `if (receiver != null)`. Arguments stay inside the guard, nested
+  safe calls compose, and ordinary nullable-receiver extensions remain outside
+  an earlier selector's guard. Unit-valued expressions preserve a nullable Unit
+  result. These pattern bindings use Java 21+ syntax (CI uses JDK 25).
+- Separator-only `joinToString` on array and vararg parameters uses `String.join`
+  for proven string elements, or Kotlin's array operation otherwise. Both preserve
+  the default `", "` separator and null elements. Transforms and extra formatting
+  options remain outside this lowering.
+- Secondary constructors retain Java varargs and reuse established standard
+  member lowerings for delegation arguments. Getter chains use receiver syntax
+  and scoped declarations, rather than a second interpretation of dotted text.
+- Returned-reference string calls reuse ordinary override selection. Return
+  facts follow inherited slots: an explicit non-null override can narrow the
+  contract, while an unannotated Java override cannot erase an ancestor's
+  nullability. Unproved annotations and checked exceptions remain conservative.
+- Imported Java static methods resolve through the declaring type's complete
+  identity. A same-named parameter or local value cannot become a static type
+  qualifier. Guarded writes also recognize plain Lombok setters under an
+  established default accessor configuration; access overrides and suppression
+  remain conservative.
 - Simple inherited default getter chains can belong to generic interfaces when
   the chain itself has concrete types. Java child compatibility uses the shared
   instantiated type graph to check every inherited getter against the child's

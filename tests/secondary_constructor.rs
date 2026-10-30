@@ -196,7 +196,7 @@ fn named_secondary_delegation_lowers_supported_expressions_and_primary_defaults(
 }
 
 #[test]
-fn secondary_constructor_with_complex_delegation_argument_stays_kotlin() {
+fn secondary_constructor_with_string_array_join_translates() {
     let root = Path::new("tests/tmp_scratch_secondary_ctor_complex");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -215,15 +215,13 @@ fn secondary_constructor_with_complex_delegation_argument_stays_kotlin() {
 
     assert!(output.status.success(), "notlin failed:\n{stderr}");
     assert!(
-        root.join("Token.kt").exists(),
-        "complex delegated argument was emitted as Java:\n{stderr}"
+        !root.join("Token.kt").exists(),
+        "supported string-array join retained:\n{stderr}"
     );
-    let kotlin = fs::read_to_string(root.join("Token.kt")).unwrap_or_default();
+    let java = fs::read_to_string(root.join("Token.java")).unwrap();
     assert!(
-        (kotlin.contains("NOTLIN NE5A7: secondary constructor is not a direct `this(...)` or `super(...)` delegation with an empty or simple assignment-only body")
-            || kotlin.contains("NOTLIN S001: required symbol `joinToString` could not be resolved"))
-            && kotlin.contains("constructor(parts: Array<String>)"),
-        "missing conservative diagnostic for the unsupported delegated expression:\n{kotlin}\n{stderr}"
+        java.contains("this(java.lang.String.join(\", \", parts));"),
+        "{java}"
     );
     let _ = fs::remove_dir_all(root);
 }

@@ -687,18 +687,25 @@ fn authoritative_foreign_or_misshapen_sites_never_fall_back_to_spelling() {
 }
 
 #[test]
-fn unproven_receivers_safe_calls_and_wrong_arity_stay_retained() {
+fn safe_calls_propagate_null_while_unproven_receivers_and_wrong_arity_retain() {
     let file = Path::new("Casing.kt");
-    // A safe call propagates null; a member lowering would drop that.
+    // Safe-call lowering guards the member conversion before Elvis handling.
     let safe = r#"package stringcase
 class Casing {
     fun lower(value: String?): String = value?.lowercase() ?: ""
 }
 "#;
     let provider = SyntaxSemanticProvider::new([(file.to_path_buf(), safe.to_owned())]);
+    let result = translate(safe, file, &provider);
     assert!(
-        retained(&translate(safe, file, &provider), "Casing"),
-        "a safe call has no invariant member lowering"
+        !retained(&result, "Casing"),
+        "{:?}",
+        result.plan.diagnostics
+    );
+    let output = java(&result);
+    assert!(
+        output.contains("value != null") && output.contains("toLowerCase(java.util.Locale.ROOT)"),
+        "{output}"
     );
 
     let wrong_arity = r#"package stringcase

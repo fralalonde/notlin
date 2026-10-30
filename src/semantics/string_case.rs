@@ -130,10 +130,7 @@ pub(crate) fn establish<P: SemanticProvider + ?Sized>(
     let callee = super::call_callee_node(call)?;
     let spelling = callee.utf8_text(source.as_bytes()).ok()?.trim();
     let receiver = explicit_receiver_node(call, callee)?;
-    if direct_trailing_lambda(call).is_some()
-        || call_argument_count(call) > 1
-        || safe_access(source, callee, receiver)
-    {
+    if direct_trailing_lambda(call).is_some() || call_argument_count(call) > 1 {
         return None;
     }
     // An indexed workspace extension with this spelling owns the call, whatever
@@ -373,12 +370,6 @@ fn proven_string_receiver<P: SemanticProvider + ?Sized>(
     };
     super::standard_external_type(source, provider, &receiver_type, false).as_deref()
         == Some("java.lang.String")
-}
-
-/// `value?.lowercase()` propagates null; a member lowering would not.
-fn safe_access(source: &str, callee: Node<'_>, receiver: Node<'_>) -> bool {
-    receiver.end_byte() <= callee.start_byte()
-        && source[receiver.end_byte()..callee.start_byte()].contains('?')
 }
 
 fn location(source: &str, file: &Path, node: Node<'_>) -> SourceLocation {

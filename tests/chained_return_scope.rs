@@ -120,7 +120,7 @@ fn unknown_or_ambiguous_producer_types_do_not_bind_to_consumer_names() {
 }
 
 #[test]
-fn nullable_and_generic_returns_remain_conservative() {
+fn guarded_nullable_returns_resolve_while_generic_returns_remain_conservative() {
     let payload = "package model\nclass Payload { fun getId(): String = \"id\" }\n";
     let nullable_provider = "package producer\nimport model.Payload\nclass Provider { fun payload(): Payload? = null }\n";
     let nullable_consumer = "package consumer\nimport producer.Provider\nfun read(provider: Provider) = provider.payload()?.getId()\n";
@@ -143,7 +143,7 @@ fn nullable_and_generic_returns_remain_conservative() {
             &index,
             "getId"
         ),
-        FactStatus::Unknown
+        FactStatus::Established(ref id) if id.file == Path::new("Payload.kt") && id.owner_path == ["Payload"]
     ));
 
     let generic_provider =

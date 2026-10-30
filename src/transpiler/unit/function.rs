@@ -891,6 +891,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 && !matches!(child.kind(), "line_comment" | "block_comment")
             {
                 // expression body: `= expr` -> `return expr;`
+                if !returns_value && (Expr { unit: self }).safe_call_receiver(child).is_some() {
+                    self.transpile_statement(child, out);
+                    continue;
+                }
                 let mut e = Expr { unit: self };
                 let java = e.transpile(child);
                 let java = self.coerce_optional_stream_return(java);

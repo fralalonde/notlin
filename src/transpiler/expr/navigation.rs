@@ -268,16 +268,6 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         }
         for w in kids.windows(3) {
             if w[1].kind() == "." || w[1].kind() == "?." {
-                if w[1].kind() == "?." {
-                    // proper safe-call: `x?.m` -> `x == null ? null : x.m`
-                    // (or a ternary on the whole nav text if in a value
-                    // context). Textual: wrap the segment.
-                    self.unit.diags.warn_approx(
-                        w[1],
-                        self.unit.file,
-                        "safe-call `?.` -> null-check ternary",
-                    );
-                }
                 if w[2].is_named() {
                     // Kotlin properties become Java accessor calls: `x.age` ->
                     // `x.getAge()` (user classes), `x.length` -> `x.length()`
@@ -773,66 +763,6 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         if result.is_empty() {
             result = self.unit.text(node).replace("?.", ".");
         }
-        // safe-call: if the source had any `?.`, wrap the whole nav in a
-        // null-check ternary: `a?.b` -> `a != null ? a.b : null`.
-        // (Do it AFTER windoing so the inner members are already mapped.)
-        if self.unit.text(node).contains("?.") {
-            // re-derive base text: everything before the last `?.`
-            let raw = self.unit.text(node).replace("?.", ".");
-            // base = first segment; member chain = the rest
-            if let Some(q) = raw.find('.') {
-                let (b, m) = raw.split_at(q);
-                let m = &m[1..];
-                let m_java = rewrite_reified_type_args(m);
-                // Wrap in getters: every terminal simple-name segment in the
-                // chain that names a property reads through its accessor —
-                // cross-package Java field access must not exist.
-                let m_java = {
-                    let (head, tail) = m_java
-                        .rsplit_once('.')
-                        .map(|(h, t)| (h.to_string(), t.to_string()))
-                        .unwrap_or((String::new(), m_java.clone()));
-                    let last = tail.trim_end_matches("()");
-                    let builtin = matches!(
-                        last,
-                        "length"
-                            | "size"
-                            | "isEmpty"
-                            | "isNotEmpty"
-                            | "keys"
-                            | "values"
-                            | "entries"
-                            | "stream"
-                    );
-                    if !last.is_empty()
-                        && last.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-                        && !builtin
-                        && !tail.contains('(')
-                    {
-                        if head.is_empty() {
-                            format!("get{}()", capitalize(last))
-                        } else {
-                            format!("{}.get{}()", head, capitalize(last))
-                        }
-                    } else {
-                        m_java
-                    }
-                };
-                let mut res = format!("{} != null ? {}.{} : null", b, b, m_java);
-                // if the member chain already carries an accessor method
-                // applied (getter etc.) the rewritten form here might be
-                // stale — leave the current result as-is; the ternary wrap
-                // only applies when the whole raw nav is what came out.
-                if result.contains(b) {
-                    res = format!(
-                        "{} != null ? {} : null",
-                        b,
-                        rewrite_reified_type_args(&result)
-                    );
-                }
-                result = res;
-            }
-        }
         // Mid-chain joinToString: the stream arm terminated with
         // `collect(toList())`; swap the tail for joining(sep) so the chain
         // compiles (Kotlin List has no joinToString; this is the
@@ -908,6 +838,16 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         let raw = self.unit.text(node).replace("?.", ".");
         // member call: `.name(...)`
         let mut raw_trimmed = raw.trim().to_string();
+        if let Some(base) = node.named_child(0)
+            && let Some(alias) = self
+                .unit
+                .safe_receiver_aliases
+                .get(&(base.start_byte(), base.end_byte()))
+        {
+            let suffix = self.unit.source[base.end_byte()..node.end_byte()].replace("?.", ".");
+            raw_trimmed = format!("{alias}{suffix}");
+        }
+
         if let Some(base) = node.named_children(&mut node.walk()).next()
             && matches!(base.kind(), "identifier" | "simple_identifier")
             && self.unit.semantic_provider.is_some_and(|provider| {

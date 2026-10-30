@@ -402,9 +402,20 @@ fn returned_receiver<P: SemanticProvider + ?Sized>(
         return None;
     }
     let name = callee.utf8_text(source.as_bytes()).ok()?.trim();
-    let FactStatus::Established(producer) = resolve_reference_producer(&owner, name, provider)
-    else {
-        return None;
+    // Reuse ordinary override selection before the bounded nullable-getter
+    // fallback. Counting all inherited declarations would make an override and
+    // its own parent ambiguous despite a unique effective method.
+    let producer = match resolve_required_call(source, file, receiver, callee, name, provider) {
+        FactStatus::Established(producer) if provider.has_complete_inheritance(&owner) => producer,
+        FactStatus::Unknown => {
+            let FactStatus::Established(producer) =
+                resolve_reference_producer(&owner, name, provider)
+            else {
+                return None;
+            };
+            producer
+        }
+        _ => return None,
     };
     if !provider.is_java_callable_member(&producer) {
         return None;

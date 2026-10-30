@@ -308,6 +308,26 @@ public interface Provider {
         &[("NotNull.java", NOT_NULL), ("Provider.java", checked)],
     );
 
+    for parent_annotation in ["@org.jetbrains.annotations.Nullable", "@NotNull"] {
+        assert_retained(
+            "unannotated-override",
+            &[("Snapshot.kt", snapshot)],
+            &[
+                ("NotNull.java", NOT_NULL),
+                (
+                    "Base.java",
+                    &format!(
+                        "package sample; import java.util.UUID; import org.jetbrains.annotations.NotNull; public interface Base {{ {parent_annotation} UUID readId(); }}"
+                    ),
+                ),
+                (
+                    "Provider.java",
+                    "package sample; public interface Provider extends Base { java.util.UUID readId(); }",
+                ),
+            ],
+        );
+    }
+
     let generic = r#"package sample;
 import org.jetbrains.annotations.NotNull;
 public interface Provider<T> {
