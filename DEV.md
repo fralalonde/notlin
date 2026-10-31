@@ -152,11 +152,6 @@ explicit capability proof; recognizing an annotation is insufficient.
   directly, avoiding a recursive call to itself. Other methods retain ordinary
   accessor dispatch. Property order, explicit `this` and local shadowing are
   covered by the original-versus-converted native fixture.
-- Migration snapshot inventory is deduplicated before stale-output discovery.
-  Indexed Java already has a byte-exact snapshot and is not reopened for each
-  neighboring Kotlin origin. Cleanup filters retained type filenames and origin
-  headers before parsing Java; the final snapshot verification still rereads
-  inputs before writing and rejects changed Java sources.
 - Standard Map+Map operators and explicit `plus` calls share source-bound operand
   proof and lower to `kotlin.collections.MapsKt.plus`. An explicit Map argument
   selects the overload for collector expressions. Preserve key order, right-hand

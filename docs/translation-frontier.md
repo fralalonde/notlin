@@ -25,20 +25,16 @@ The native fixture independently compiles original Kotlin and compares both
 Lombok modes, including default nullness annotations, producer-scope types,
 Unicode values, receiver effects and backing-field reads.
 
-Process-specific Windows I/O counters found repeated Java reads during stale
-output discovery and cleanup. Reusing indexed snapshots and filtering candidate
-filenames/headers before parsing cuts reads from **114,219 to 51,999 (54.47%)**
-and bytes read from **150,124,233 to 108,016,298 (28.05%)** on the same baseline.
-Other I/O operations fall 14.68%; writes remain essentially unchanged. Final
-snapshot verification remains mandatory and a mutation test confirms it rejects
-changed supporting Java. This pair took **115.219 seconds before and 125.281
-seconds after**: it establishes lower I/O, not an end-to-end speedup.
+The I/O experiment reduced reads by 54.47% and bytes read by 28.05%, but took
+**125.281 seconds versus 115.219 seconds before**. At the user's request, the
+experiment is reverted: migration snapshot collection and stale-output cleanup
+use their original implementations. The translation and getter fixes remain.
 
-Both full Gradle builds pass: baseline **4m 24s**
-(110 actionable tasks: 51 executed, 59 from cache), fresh **2m 34s**
-(110 actionable tasks: 53 executed, 57 from cache). Both Hastings runs load
-**9,113 records**, then remain free of errors and stack traces for **105.6**
-and **105.9 seconds** after the complete dataset marker. Both disposable apps
+Both full Gradle builds pass: baseline **2m 41s**
+(110 actionable tasks: 44 executed, 66 from cache), fresh **1m 24s**
+(110 actionable tasks: 44 executed, 66 from cache). Both Hastings runs load
+**9,113 records**, then remain free of errors and stack traces for **105.8**
+and **105.6 seconds** after the complete dataset marker. Both disposable apps
 are stopped. No generated application source is patched.
 
 Of 6,564 Java files in each tree, 6,555 match as text. All nine variants are
@@ -47,16 +43,18 @@ scaffolding, nullness annotations, member order, equivalent string conversion,
 and corrections to recursive getters already present in the old baseline.
 The audit explicitly records those intended corrections rather than treating
 their old recursive behavior as a requirement.
+The I/O revert leaves all 6,564 Java files unchanged in each conversion path
+compared with the experimental executable.
 
 Formatting, lint, four standalone samples and frozen native checks pass. The
-Windows Rust sweep is **1,611 pass, 62 known fail, 142 ignored**, with no new
+Windows Rust sweep is **1,610 pass, 62 known fail, 142 ignored**, with no new
 failure names. It uses CI's debug-symbol and incremental settings. The preceding
 intermittent source-deletion failure is absent. Exact-head Linux CI is required
 before installing the frozen executable.
 
-Evidence: `target/io-optimization-frontier-20261031/acceptance.json` and
-`target/optimization-pass-20261031/io-comparison.json`.
-Frozen SHA256: `fa7d7448f3c756f761cde93b8e85b55f130cbe462b00717ed1e7b7c17e3e3333`.
+Evidence: `target/text-whitespace-final-20261031/acceptance.json`.
+The declined experiment is preserved in `target/optimization-pass-20261031/io-comparison.json`.
+Frozen SHA256: `13019a5b24fbdd7d5420eb8a56bab2e41ac7bbeaecaefdd8a3a7348b31392c50`.
 The translation frontier remains active.
 
 ## Previous checkpoint — 2026-10-31
