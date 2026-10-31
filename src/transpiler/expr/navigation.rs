@@ -7,6 +7,20 @@ use crate::transpiler::unit::capitalize;
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(field) = self.unit.semantic_provider.and_then(|provider| {
+            crate::semantics::direct_source_static_field(
+                self.unit.source,
+                self.unit
+                    .workspace_file
+                    .as_deref()
+                    .unwrap_or(self.unit.file),
+                node,
+                provider,
+            )
+        }) && let Some(base) = node.named_child(0)
+        {
+            return format!("{}.{}", self.transpile(base), field.name);
+        }
         if let Some((owner, member, _)) = self.unit.semantic_provider.and_then(|provider| {
             crate::semantics::external_static_field_access(self.unit.source, node, provider)
         }) {
@@ -290,7 +304,18 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                             | "values"
                             | "entries"
                             | "stream"
-                    ) {
+                    ) && !self.unit.semantic_provider.is_some_and(|provider| {
+                        crate::semantics::direct_source_instance_property(
+                            self.unit.source,
+                            self.unit
+                                .workspace_file
+                                .as_deref()
+                                .unwrap_or(self.unit.file),
+                            node,
+                            provider,
+                        )
+                        .is_some()
+                    }) {
                         // property-like reads -> Java accessor calls; keys/
                         // entries have different Java names (Map API)
                         let java_member: String = match member_name.as_str() {

@@ -3,6 +3,61 @@
 ## Current checkpoint — 2026-10-31
 
 The standard fresh conversion of reference commit `179bb912` produces
+**4,362 Java files**, retaining 2,009 of 6,371 original Kotlin owners:
+**+5 / -0** against the accepted 4,357-output baseline.
+
+New owners: `PickOrderBatchProperties`, `AccessGateProperties`,
+`WorkstationGateProperties`, `WmsJobProperties` and `IWorkflowOrderBatchProperties`.
+All 6,371 original owner identities are compared.
+
+The baseline trial gains one interface; the fresh pass gains four additional
+classes. Their already-Java supertype signatures trigger the existing covariant
+return guard in the baseline trial. Added files are checked against these exact
+fresh-only owners; all 6,505 common Java outputs match after generated temporary
+names are normalized.
+
+Proven standard map operands now support `left + right` and `left.plus(right)`
+through Kotlin's static map helper. The shared binding follows parameters,
+locals, constructor properties, companion properties, source returns, aliases
+and nested merges. Java static fields are indexed with their declared types,
+including implicit interface statics, so the same operation works after a
+provider has already migrated. Static field reads preserve their actual names,
+including lowercase names. Own source properties such as `holder.values` take
+precedence over same-named collection intrinsics. Typed locals initialized from
+covariant collection parameters keep the same collection reference through an
+erased Java cast. The map overload is selected explicitly for target-typed
+collectors; both operands are evaluated once, left to right.
+
+The native fixture independently compiles original Kotlin, then compares mixed
+Java/Kotlin behavior in both Lombok modes using the frozen executable. It checks
+null keys and values, duplicate-key replacement, iteration order, independence
+from later input mutations, generic maps, property/companion/static receivers,
+locals, chains and effectful calls. Custom maps/operators, foreign imports,
+nullable operands and shadowed bindings retain their guards. Map-plus-Pair,
+map removal and collection/sequence operand families are separate work.
+
+Both full Gradle builds pass: baseline **9m 39s**, fresh **8m 56s**
+(110 actionable tasks: 80 executed, 30 from cache). Both Hastings runs import
+all **9,113 records**, followed by **105.0** and **106.0 seconds**, respectively,
+without errors or stack traces after the complete dataset marker. Both
+disposable applications are stopped. Application sources receive no manual fixes.
+
+Formatting, lint, focused tests, the frozen native fixture and all four standalone
+samples pass. The Windows Rust sweep is **1,594 pass, 62 fail, 139 ignored**;
+its existing failures are compared by target and name against the preceding
+accepted checkpoint. No previously unseen failures remain. Linux CI on
+`541e586` passes the complete suite, build and Java end-to-end checks after
+updating retention fixtures and reducing CI debug artifacts to fit the runner.
+
+Evidence: `target/map-algebra-frontier-v2-20261031/acceptance.json`.
+Frozen SHA256: `d8735a2adbc6f2493c78b82bdf021854d0f9c44661d64720d8cf27e6fe1289e4`.
+The zero-gain candidate is preserved under `target/map-algebra-frontier-20261031/`;
+its disposable workers were stopped before correcting Java static-field binding.
+The translation frontier remains active.
+
+## Previous checkpoint — 2026-10-31
+
+The standard fresh conversion of reference commit `179bb912` produces
 **4,357 Java files**, retaining 2,014 of 6,371 original Kotlin owners:
 **+403 / -0** against the accepted 3,954-output baseline. The gains include
 146 interfaces, 245 classes and 12 enums.

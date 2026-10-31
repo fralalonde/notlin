@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub(crate) mod map_algebra;
 mod map_alias;
 
 mod bottom_returns;
@@ -2301,6 +2302,13 @@ pub trait SemanticProvider: Send + Sync {
     fn companion_members<'a>(&'a self, _owner: &SymbolId, _name: &str) -> Vec<&'a SemanticSymbol> {
         Vec::new()
     }
+    fn companion_properties<'a>(
+        &'a self,
+        _owner: &SymbolId,
+        _name: &str,
+    ) -> Vec<&'a SemanticSymbol> {
+        Vec::new()
+    }
     /// A public callable whose source name is available on the ordinary
     /// `Companion` holder, independently of whether its owner migrates.
     fn has_default_companion_jvm_abi(&self, _member: &SymbolId) -> bool {
@@ -2494,8 +2502,38 @@ impl FileSemanticFacts {
                                 facts.java_visible_fields.insert((
                                     file.to_path_buf(),
                                     path.clone(),
-                                    name,
+                                    name.clone(),
                                 ));
+                                if has_java_modifier(node, "static") || owner.kind == "interface" {
+                                    let ty = node
+                                        .child_by_field_name("type")
+                                        .and_then(|ty| ty.utf8_text(source.as_bytes()).ok())
+                                        .map(TypeRef::parse)
+                                        .map(FactStatus::Established)
+                                        .unwrap_or(FactStatus::Unknown);
+                                    facts.symbols.push(SemanticSymbol {
+                                        id: SymbolId {
+                                            module: String::new(),
+                                            package: package_name(source),
+                                            file: file.to_path_buf(),
+                                            owner_path: path.clone(),
+                                            kind: "field".into(),
+                                            name,
+                                            receiver: None,
+                                            parameters: vec![],
+                                        },
+                                        location: SourceLocation {
+                                            file: file.to_path_buf(),
+                                            snapshot_hash: hash,
+                                            start_byte: variable.start_byte(),
+                                            end_byte: variable.end_byte(),
+                                        },
+                                        ty,
+                                    });
+                                    facts
+                                        .java_static_member_locations
+                                        .insert((file.to_path_buf(), variable.start_byte()));
+                                }
                             }
                         }
                         break;
@@ -3420,11 +3458,13 @@ impl SyntaxSemanticProvider {
                         if symbol.id.file == *file
                             && symbol.location.start_byte >= location.start
                             && symbol.location.end_byte <= location.end
-                            && matches!(symbol.id.kind.as_str(), "function" | "method")
+                            && matches!(symbol.id.kind.as_str(), "function" | "method" | "property")
                             && (direct_path || companion_path)
                         {
                             indexed.push((symbol.id.clone(), owner.clone()));
-                            if location.unnamed {
+                            if location.unnamed
+                                && matches!(symbol.id.kind.as_str(), "function" | "method")
+                            {
                                 default_locations.push((file.clone(), symbol.location.start_byte));
                             }
                         }
@@ -4354,7 +4394,19 @@ impl SemanticProvider for SyntaxSemanticProvider {
     fn companion_members<'a>(&'a self, owner: &SymbolId, name: &str) -> Vec<&'a SemanticSymbol> {
         self.symbols_named(name)
             .into_iter()
-            .filter(|symbol| self.companion_member_owners.get(&symbol.id) == Some(owner))
+            .filter(|symbol| {
+                matches!(symbol.id.kind.as_str(), "function" | "method")
+                    && self.companion_member_owners.get(&symbol.id) == Some(owner)
+            })
+            .collect()
+    }
+    fn companion_properties<'a>(&'a self, owner: &SymbolId, name: &str) -> Vec<&'a SemanticSymbol> {
+        self.symbols_named(name)
+            .into_iter()
+            .filter(|symbol| {
+                symbol.id.kind == "property"
+                    && self.companion_member_owners.get(&symbol.id) == Some(owner)
+            })
             .collect()
     }
     fn has_default_companion_jvm_abi(&self, member: &SymbolId) -> bool {
@@ -6495,6 +6547,101 @@ fn plain_parameter_property_projection<P: SemanticProvider + ?Sized>(
     }
 }
 
+/// Bind a direct Java static field by declaring type, independently of case.
+pub(crate) fn direct_source_static_field<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    expression: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<SymbolId> {
+    let mut cursor = expression.walk();
+    let parts = expression
+        .named_children(&mut cursor)
+        .filter(|node| !node.is_extra())
+        .collect::<Vec<_>>();
+    let [base, member] = parts.as_slice() else {
+        return None;
+    };
+    if source.get(base.end_byte()..member.start_byte())?.trim() != "." {
+        return None;
+    }
+    let qualifier = base.utf8_text(source.as_bytes()).ok()?.trim();
+    if is_proven_local_shadow(*base, qualifier, source)
+        || is_proven_constructor_property_shadow(*base, qualifier, source)
+    {
+        return None;
+    }
+    let FactStatus::Established(owner) =
+        provider.resolve_type_in_file(file, &package_name(source), qualifier)
+    else {
+        return None;
+    };
+    let name = member.utf8_text(source.as_bytes()).ok()?.trim();
+    let mut path = owner.owner_path;
+    path.push(owner.name);
+    let fields = provider
+        .symbols_named(name)
+        .into_iter()
+        .filter(|symbol| {
+            symbol.id.file == owner.file
+                && symbol.id.owner_path == path
+                && symbol.id.kind == "field"
+                && provider.is_java_static_member(&symbol.id)
+        })
+        .collect::<Vec<_>>();
+    match fields.as_slice() {
+        [field] => Some(field.id.clone()),
+        _ => None,
+    }
+}
+
+/// Distinguish an own Kotlin property on `this` or a bound parameter from a
+/// same-named collection intrinsic, such as `holder.values` versus `map.values`.
+pub(crate) fn direct_source_instance_property<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    expression: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<SymbolId> {
+    let mut cursor = expression.walk();
+    let parts = expression
+        .named_children(&mut cursor)
+        .filter(|node| !node.is_extra())
+        .collect::<Vec<_>>();
+    let [base, member] = parts.as_slice() else {
+        return None;
+    };
+    let receiver = base.utf8_text(source.as_bytes()).ok()?.trim();
+    let name = member.utf8_text(source.as_bytes()).ok()?.trim();
+    let owner = if receiver == "this" {
+        enclosing_dispatch_owner(source, expression, file, provider)?
+    } else {
+        lexical_parameter_classifier(source, expression, receiver, file, provider)?
+    };
+    if owner
+        .file
+        .extension()
+        .is_none_or(|extension| extension != "kt")
+    {
+        return None;
+    }
+    let mut path = owner.owner_path;
+    path.push(owner.name);
+    let candidates = provider
+        .symbols_named(name)
+        .into_iter()
+        .filter(|symbol| {
+            symbol.id.file == owner.file
+                && symbol.id.owner_path == path
+                && symbol.id.kind == "property"
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [property] => Some(property.id.clone()),
+        _ => None,
+    }
+}
+
 /// Establish the classifier of a direct, explicitly typed Kotlin property
 /// access on a proven receiver, including a resolved method return or another
 /// property projection. Each hop must identify one direct property; inherited
@@ -7646,6 +7793,9 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
     name: &str,
     provider: &P,
 ) -> bool {
+    if map_algebra::establish(source, file, call, provider).is_some() {
+        return true;
+    }
     if string_join::establish(source, file, call, provider).is_some() {
         return true;
     }

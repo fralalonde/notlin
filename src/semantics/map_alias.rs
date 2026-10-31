@@ -80,7 +80,7 @@ fn resolve_definition<P: SemanticProvider + ?Sized>(
     }
 }
 
-fn resolve_visible_alias<P: SemanticProvider + ?Sized>(
+pub(super) fn resolve_visible_alias<P: SemanticProvider + ?Sized>(
     provider: &P,
     file: &Path,
     package: &str,

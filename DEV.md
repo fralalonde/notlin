@@ -113,6 +113,14 @@ and its effect on the JVM contract. A new annotation name is not itself a new
 translation rule. Library behavior that observes Kotlin metadata requires an
 explicit capability proof; recognizing an annotation is insufficient.
 
+- Standard Map+Map operators and explicit `plus` calls share source-bound operand
+  proof and lower to `kotlin.collections.MapsKt.plus`. An explicit Map argument
+  selects the overload for collector expressions. Preserve key order, right-hand
+  replacement, null entries, independent results and single operand evaluation.
+  Java static fields carry declared types, including implicit interface statics;
+  their reads do not depend on capitalization. Source properties outrank
+  collection intrinsics with the same spelling. Covariant collection parameters
+  assigned to typed locals keep their reference through an erased cast.
 - Kotlin `==` is structural equality: emitted as `Objects.equals(a, b)` when an
   operand is a known non-primitive (via `var_types` tracking); `!=` likewise.
   Primitives keep `==`.

@@ -52,7 +52,7 @@ fn enum_implementing_retained_kotlin_interface_translates() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("State.kt"),
-        "package neutral.er\ninterface State {\n    val code: String\n    fun unsupported() = mapOf(\"a\" to 1).plus(emptyMap())\n}\n",
+        "package neutral.er\n@Deprecated(\"keep Kotlin metadata\")\ninterface State {\n    val code: String\n    fun merged() = mapOf(\"a\" to 1).plus(emptyMap())\n}\n",
     )
     .unwrap();
     fs::write(
@@ -76,7 +76,7 @@ fn enum_implementing_retained_kotlin_interface_translates() {
     let state_residue = fs::read_to_string(root.join("State.kt")).unwrap();
     assert!(
         !root.join("State.java").exists() && state_residue.contains("interface State"),
-        "unsupported-body owner must remain Kotlin:\n{state_residue}"
+        "annotation-metadata owner must remain Kotlin:\n{state_residue}"
     );
     assert!(
         root.join("Mode.java").exists(),

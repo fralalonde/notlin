@@ -106,6 +106,21 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         {
             return alias.clone();
         }
+        let file = self
+            .unit
+            .workspace_file
+            .as_deref()
+            .unwrap_or(self.unit.file);
+        if let Some(merge) = self.unit.semantic_provider.and_then(|provider| {
+            crate::semantics::map_algebra::establish(self.unit.source, file, node, provider)
+        }) {
+            let left = self.transpile(merge.left);
+            let right = self.transpile(merge.right);
+            // The RHS may be a target-typed collector. Select the Map overload
+            // explicitly, rather than allowing javac to infer Pair/Sequence.
+            // Both operands have already been proved to be standard maps.
+            return format!("kotlin.collections.MapsKt.plus({left}, (java.util.Map) ({right}))");
+        }
         if let Some(java) = self.safe_call_expression(node) {
             return java;
         }

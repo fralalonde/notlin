@@ -149,12 +149,36 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
 
         let init = self.unit.property_initializer(decl);
         let mut e = Expr { unit: self.unit };
-        let init_java = init.map(|i| e.transpile(i));
+        let mut init_java = init.map(|i| e.transpile(i));
+
+        let explicitly_typed = declared_ty.is_some();
 
         let mut ty = declared_ty.unwrap_or_else(|| match init {
             Some(i) => self.unit.infer_type(i),
             None => "var".to_string(),
         });
+
+        // Kotlin's read-only collection parameters accept covariant values.
+        // A typed local keeps the invariant getter shape, just like a stored
+        // constructor property. Preserve the same reference with an erased cast.
+        if explicitly_typed
+            && ty.contains('<')
+            && let Some(initializer) = init.filter(|node| node.kind() == "identifier")
+            && self
+                .unit
+                .var_types
+                .get(self.unit.text(initializer).trim())
+                .is_some_and(|source| {
+                    source.contains("? extends ")
+                        && source.split('<').next() == ty.split('<').next()
+                })
+            && let Some(value) = init_java.as_mut()
+        {
+            *value = format!(
+                "({}) (Object) ({value})",
+                crate::transpiler::types::cast_type(&ty)
+            );
+        }
 
         // Record the local's Java type so later statements in this function
         // get receiver context: `arr.size` -> `arr.length` for arrays, known

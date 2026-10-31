@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 /// Same member-call shape but with a `private val` backing field
 /// (`private val contexts: Map<K, V>`): the index must still record the
-/// property type so algebra member calls taint.
+/// property type so algebra member calls translate.
 #[test]
-fn map_plus_member_private_val_taints() {
+fn map_plus_member_private_val_translates() {
     let root = std::env::temp_dir().join(format!("notlin-plusp-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
@@ -40,11 +40,11 @@ fn map_plus_member_private_val_taints() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !m.contains(".plus("),
+        m.contains("kotlin.collections.MapsKt.plus("),
         "Map plus on a private-val receiver survived: {m}"
     );
     assert!(
-        m.trim().is_empty() || errors > 0,
+        !m.trim().is_empty() && errors == 0,
         "broken Java emitted: {m}"
     );
     let _ = fs::remove_dir_all(&root);
