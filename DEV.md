@@ -131,6 +131,23 @@ explicit capability proof; recognizing an annotation is insufficient.
   method type parameters cannot be mistaken for same-named source classifiers.
   Primitive/value-class representations and property ownership keep their
   separate checks. The index cache records method type parameters (version 32).
+- Kotlin's no-argument `trim`, `trimStart`, `trimEnd`, blank/empty queries and
+  nullable String `orEmpty` share one typed receiver/callee contract. Whitespace
+  operations call Kotlin's stdlib: JDK `trim` and `isBlank` differ for Unicode.
+  String results remain String, CharSequence results keep their views, and safe
+  calls and nullable queries evaluate the receiver once. Import aliases retain
+  callable identity; foreign bindings and unsupported overloads keep their guards.
+  An indexed source wildcard that declares no conflicting name can preserve a
+  standard type binding. Unknown library and member wildcards remain guarded.
+- Expression-bodied calls use the selected source method's declared return,
+  including qualified parent-interface calls. Java return contracts share the
+  getter proof for scope, nullness and boxing. Inferred nullable results become
+  reference types; a boxed Java value never becomes a primitive signature.
+  Platform returns stay unannotated so retained Kotlin callers keep their flexible
+  Java type; explicitly nullable results keep their nullness contract.
+  `tests/text_whitespace_jvm.rs` compares original Kotlin against both Lombok
+  modes, including Unicode, receiver effects, record getters, parent selection,
+  producer-scope type binding and primitive/boxed return types.
 - Standard Map+Map operators and explicit `plus` calls share source-bound operand
   proof and lower to `kotlin.collections.MapsKt.plus`. An explicit Map argument
   selects the overload for collector expressions. Preserve key order, right-hand

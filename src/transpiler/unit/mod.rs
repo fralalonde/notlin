@@ -299,6 +299,35 @@ pub struct UnitOptions {
 }
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    pub(super) fn proven_call_return_type(
+        &self,
+        node: tree_sitter::Node<'_>,
+    ) -> Option<crate::semantics::DeclaredCallReturn> {
+        if let Some(text) = self.text_operation_call(node) {
+            return Some(crate::semantics::DeclaredCallReturn {
+                result_type: text.return_type(),
+                platform: false,
+            });
+        }
+        crate::semantics::declared_source_call_return_type(
+            self.source,
+            self.workspace_file.as_deref().unwrap_or(self.file),
+            node,
+            self.semantic_provider?,
+        )
+    }
+    pub(crate) fn text_operation_call<'node>(
+        &self,
+        node: tree_sitter::Node<'node>,
+    ) -> Option<crate::semantics::text_operations::TextCall<'node>> {
+        crate::semantics::text_operations::establish(
+            self.source,
+            self.workspace_file.as_deref().unwrap_or(self.file),
+            node,
+            self.semantic_provider?,
+        )
+    }
+
     /// The shared Kotlin `String.lowercase`/`uppercase` fact for this call,
     /// when the run has proven it. Applicability and emission read the same
     /// answer, so a call cannot be planned as translatable and then lowered
@@ -1184,6 +1213,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     fn kotlin_import_to_java(&self, node: tree_sitter::Node<'tree>) -> String {
+        if crate::semantics::text_operations::is_lowered_import(self.source, node) {
+            return String::new();
+        }
         let raw = self.text(node).trim();
         let path = raw
             .strip_prefix("import")

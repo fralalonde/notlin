@@ -38,7 +38,9 @@ mod reified_calls;
 mod source_calls;
 pub(crate) mod string_join;
 pub use source_calls::OrdinarySourceCall;
+mod stdlib_import;
 pub(crate) mod string_case;
+pub(crate) mod text_operations;
 mod todo;
 pub(crate) use class_literals::{
     annotation_reference_class, contains_unlowerable_class_literal,
@@ -2214,6 +2216,11 @@ pub trait SemanticProvider: Send + Sync {
     fn java_property_read(&self, _owner: &SymbolId, _property: &str) -> Option<JavaPropertyRead> {
         None
     }
+    /// A physical, source-bound no-argument Java method's return contract.
+    /// Shares the getter's nullness, boxing and declaration-binding proof.
+    fn declared_java_method_return(&self, _member: &SymbolId) -> Option<JavaPropertyRead> {
+        None
+    }
     /// All declared enum entries, in source order. Missing or ambiguous enum
     /// syntax does not prove exhaustiveness.
     fn enum_entries(&self, _owner: &SymbolId) -> FactStatus<Vec<SymbolId>> {
@@ -2361,7 +2368,7 @@ pub struct SyntaxSemanticProvider {
     default_companion_member_locations: BTreeSet<(PathBuf, usize)>,
     java_static_member_locations: BTreeSet<(PathBuf, usize)>,
     java_public_instance_getter_locations: BTreeSet<(PathBuf, usize)>,
-    java_property_read_shapes: BTreeMap<(PathBuf, usize), java_property_reads::GetterShape>,
+    java_return_shapes: BTreeMap<(PathBuf, usize), java_property_reads::JavaReturnShape>,
     java_uncertain_getter_owners: BTreeSet<SymbolId>,
     reference_return_nullability_locations: BTreeMap<(PathBuf, usize), ReferenceReturnNullability>,
     annotated_java_packages: BTreeSet<String>,
@@ -2400,7 +2407,7 @@ struct FileSemanticFacts {
     aliases: BTreeMap<(String, String), TypeAliasDefinition>,
     java_static_member_locations: BTreeSet<(PathBuf, usize)>,
     java_public_instance_getter_locations: BTreeSet<(PathBuf, usize)>,
-    java_property_read_shapes: BTreeMap<(PathBuf, usize), java_property_reads::GetterShape>,
+    java_return_shapes: BTreeMap<(PathBuf, usize), java_property_reads::JavaReturnShape>,
     java_uncertain_getter_owners: BTreeSet<SymbolId>,
     reference_return_nullability_locations: BTreeMap<(PathBuf, usize), ReferenceReturnNullability>,
     java_visible_fields: BTreeSet<(PathBuf, Vec<String>, String)>,
@@ -2763,7 +2770,7 @@ impl FileSemanticFacts {
                         java_property_reads::collect(source, node, java_metadata.as_ref().unwrap())
                     {
                         facts
-                            .java_property_read_shapes
+                            .java_return_shapes
                             .insert((file.to_path_buf(), node.start_byte()), shape);
                     }
                     let mut cursor = node.walk();
@@ -3294,7 +3301,7 @@ impl SyntaxSemanticProvider {
             aliases,
             java_static_member_locations,
             java_public_instance_getter_locations,
-            java_property_read_shapes,
+            java_return_shapes,
             java_uncertain_getter_owners,
             reference_return_nullability_locations,
             java_visible_fields,
@@ -3338,8 +3345,7 @@ impl SyntaxSemanticProvider {
             .extend(java_static_member_locations);
         self.java_public_instance_getter_locations
             .extend(java_public_instance_getter_locations);
-        self.java_property_read_shapes
-            .extend(java_property_read_shapes);
+        self.java_return_shapes.extend(java_return_shapes);
         self.java_uncertain_getter_owners
             .extend(java_uncertain_getter_owners);
         self.reference_return_nullability_locations
@@ -4129,6 +4135,9 @@ impl SemanticProvider for SyntaxSemanticProvider {
     }
     fn java_property_read(&self, owner: &SymbolId, property: &str) -> Option<JavaPropertyRead> {
         self.java_property_read_contract(owner, property)
+    }
+    fn declared_java_method_return(&self, member: &SymbolId) -> Option<JavaPropertyRead> {
+        self.declared_java_method_return_contract(member)
     }
     fn is_java_callable_member(&self, id: &SymbolId) -> bool {
         if id.receiver.is_some() || !matches!(id.kind.as_str(), "function" | "method") {
@@ -5028,6 +5037,22 @@ pub fn plan_required_calls(
                                 // shape this lowering does not implement — is
                                 // retained here, because the emitter has no
                                 // Java form for the Kotlin spelling.
+                                if text_operations::claims(
+                                    source, file, node, callee, &name, provider,
+                                ) && text_operations::establish(source, file, node, provider)
+                                    .is_none()
+                                {
+                                    let decision = &mut plan.declarations[index];
+                                    let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
+                                        kind: crate::translation_plan::PreparationBlockerKind::UnresolvedAssumption,
+                                        message: format!("call `{name}` is not the proven Kotlin text operation"),
+                                    };
+                                    if !decision.retention_reasons.contains(&reason) {
+                                        decision.retention_reasons.push(reason);
+                                        decision.candidate_owner =
+                                            crate::translation_plan::BackendOwner::Kotlin;
+                                    }
+                                }
                                 if string_case::spelling_claims_string_case(
                                     source, file, node, callee, &name, provider,
                                 ) && string_case::establish(source, file, node, provider)
@@ -6039,6 +6064,17 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
     let guarded = source
         .get(receiver.end_byte()..callee.start_byte())
         .is_some_and(|text| text.trim() == "?.");
+    let mut receiver = receiver;
+    while receiver.kind() == "parenthesized_expression" {
+        let children = receiver
+            .named_children(&mut receiver.walk())
+            .filter(|child| !child.is_extra())
+            .collect::<Vec<_>>();
+        let [inner] = children.as_slice() else {
+            return None;
+        };
+        receiver = *inner;
+    }
     if matches!(receiver.kind(), "identifier" | "simple_identifier")
         && let Ok(name) = receiver.utf8_text(source.as_bytes())
         && let Some(ty) = container_types::parameter_type(source, file, call, name, provider)
@@ -6096,6 +6132,9 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
     // spelling. Resolve only a uniquely indexed type; a same-named function
     // or unknown call result is deliberately left unresolved.
     if receiver.kind() == "call_expression" {
+        if let Some(text) = text_operations::establish(source, file, receiver, provider) {
+            return Some(text.result_classifier().to_owned());
+        }
         let constructor = call_callee_node(receiver)?;
         let name = constructor.utf8_text(source.as_bytes()).ok()?.trim();
         if let Some(return_type) =
@@ -6171,7 +6210,7 @@ fn explicit_receiver_type<P: SemanticProvider + ?Sized>(
         }
         return None;
     }
-    let spelling = explicit_receiver_spelling(source, call, callee)?;
+    let spelling = receiver.utf8_text(source.as_bytes()).ok()?.trim();
     if spelling.is_empty()
         || spelling.contains('.')
         || !spelling.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -6869,9 +6908,21 @@ fn guarded_receiver_classifier<P: SemanticProvider + ?Sized>(
     provider: &P,
 ) -> Option<String> {
     match expression.kind() {
+        "parenthesized_expression" => {
+            guarded_receiver_classifier(source, file, expression.named_child(0)?, provider)
+        }
+        "this_expression" if expression.utf8_text(source.as_bytes()).ok()?.trim() == "this" => {
+            Some(qualified_source_type_name(&enclosing_dispatch_owner(
+                source, expression, file, provider,
+            )?))
+        }
         "identifier" | "simple_identifier" => {
             let name = expression.utf8_text(source.as_bytes()).ok()?;
-            let ty = lexical_parameter_type(source, expression, name)?;
+            let Some(ty) = lexical_parameter_type(source, expression, name) else {
+                return unqualified_instance_property_classifier_with_nullability(
+                    source, expression, file, name, provider, true,
+                );
+            };
             let KotlinType::Named { name, .. } = ty.ty else {
                 return None;
             };
@@ -7048,6 +7099,19 @@ fn unqualified_instance_property_classifier<P: SemanticProvider + ?Sized>(
     name: &str,
     provider: &P,
 ) -> Option<String> {
+    unqualified_instance_property_classifier_with_nullability(
+        source, expression, file, name, provider, false,
+    )
+}
+
+fn unqualified_instance_property_classifier_with_nullability<P: SemanticProvider + ?Sized>(
+    source: &str,
+    expression: tree_sitter::Node<'_>,
+    file: &Path,
+    name: &str,
+    provider: &P,
+    allow_nullable: bool,
+) -> Option<String> {
     if is_proven_local_shadow(expression, name, source) {
         return None;
     }
@@ -7067,7 +7131,7 @@ fn unqualified_instance_property_classifier<P: SemanticProvider + ?Sized>(
         scope = node.parent();
     }
     let owner = enclosing_dispatch_owner(source, expression, file, provider)?;
-    direct_property_classifier(&owner, name, provider)
+    direct_property_classifier_with_nullability(&owner, name, provider, allow_nullable)
 }
 
 fn lexical_parameter_is_declared(source: &str, call: tree_sitter::Node<'_>, name: &str) -> bool {
@@ -7328,6 +7392,76 @@ fn resolve_public_instance_call<P: SemanticProvider + ?Sized>(
         .collect::<Vec<_>>();
     retain_matching_arity(&mut candidates, call);
     fact_from_candidates(candidates)
+}
+
+/// Infer an expression-bodied member from the selected source declaration,
+/// including qualified super dispatch. Generic/boxed JVM shapes never become
+/// primitives merely because their Kotlin spelling resembles one.
+pub(crate) struct DeclaredCallReturn {
+    pub result_type: TypeRef,
+    pub platform: bool,
+}
+
+pub(crate) fn declared_source_call_return_type<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<DeclaredCallReturn> {
+    if call.kind() != "call_expression" || provider.source_for_file(file)? != source {
+        return None;
+    }
+    let callee = call_callee_node(call)?;
+    let name = callee.utf8_text(source.as_bytes()).ok()?;
+    let FactStatus::Established(target) =
+        resolve_required_call(source, file, call, callee, name, provider)
+    else {
+        return None;
+    };
+    if crate::facts::is_fact_symbol(&target) {
+        return None;
+    }
+    let safe = explicit_receiver_node(call, callee).is_some_and(|receiver| {
+        receiver.parent().is_some_and(|navigation| {
+            navigation
+                .children(&mut navigation.walk())
+                .any(|child| child.kind() == "?.")
+        })
+    });
+    if let Some(read) = provider.declared_java_method_return(&target) {
+        let mut ty = read.result_type;
+        if !read.jvm_primitive
+            && let KotlinType::Primitive(name) = &ty.ty
+        {
+            let boxed = match name.as_str() {
+                "Boolean" => "Boolean",
+                "Byte" => "Byte",
+                "Short" => "Short",
+                "Int" => "Integer",
+                "Long" => "Long",
+                "Char" => "Character",
+                "Float" => "Float",
+                "Double" => "Double",
+                _ => return None,
+            };
+            ty.ty = KotlinType::Named {
+                name: format!("java.lang.{boxed}"),
+                arguments: vec![],
+            };
+        }
+        ty.nullable |= safe;
+        return Some(DeclaredCallReturn {
+            result_type: ty,
+            platform: !safe && read.nullability == ReferenceReturnNullability::Platform,
+        });
+    }
+    let ty = provider.explicit_nongeneric_kotlin_return(&target)?;
+    let mut ty = qualify_type_in_file(&ty, &target.file, provider, &mut Vec::new())?;
+    ty.nullable |= safe;
+    Some(DeclaredCallReturn {
+        result_type: ty,
+        platform: false,
+    })
 }
 
 fn indexed_call_return_type<P: SemanticProvider + ?Sized>(
@@ -7834,6 +7968,9 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
     name: &str,
     provider: &P,
 ) -> bool {
+    if text_operations::establish(source, file, call, provider).is_some() {
+        return true;
+    }
     if map_algebra::establish(source, file, call, provider).is_some() {
         return true;
     }
@@ -7906,11 +8043,18 @@ fn known_external_member_call<P: SemanticProvider + ?Sized>(
     {
         return known_kotlin_collection_extension(source, call, name, provider);
     }
+    if call.kind() == "method_invocation"
+        && receiver_type == "java.lang.String"
+        && name == "trim"
+        && arity == 0
+    {
+        return true;
+    }
     matches!(
         (receiver_type.as_str(), name, arity),
         ("java.util.UUID", "toString" | "hashCode", 0)
             | ("java.util.UUID", "equals", 1)
-            | ("java.lang.String", "toString" | "hashCode" | "trim", 0)
+            | ("java.lang.String", "toString" | "hashCode", 0)
             | ("java.lang.String", "equals" | "compareTo", 1)
             | (
                 "java.util.Map"
@@ -8112,6 +8256,9 @@ pub(crate) fn standard_external_type<P: SemanticProvider + ?Sized>(
         "Locale" | "java.util.Locale" => ("Locale", "java.util.Locale", false),
         "Instant" | "java.time.Instant" => ("Instant", "java.time.Instant", false),
         "String" | "java.lang.String" | "kotlin.String" => ("String", "java.lang.String", true),
+        "CharSequence" | "java.lang.CharSequence" | "kotlin.CharSequence" => {
+            ("CharSequence", "java.lang.CharSequence", true)
+        }
         "Any" | "kotlin.Any" if !java_source => ("Any", "kotlin.Any", true),
         "Object" | "java.lang.Object" => ("Object", "java.lang.Object", true),
         "Int" | "kotlin.Int" => ("Int", "kotlin.Int", true),
@@ -8190,7 +8337,9 @@ pub(crate) fn standard_external_type<P: SemanticProvider + ?Sized>(
         return None;
     }
     if spelling.contains('.') {
-        return (spelling == canonical).then(|| canonical.to_owned());
+        return (spelling == canonical
+            || (!java_source && intrinsic && spelling == format!("kotlin.{simple}")))
+        .then(|| canonical.to_owned());
     }
     if canonical == "java.math.BigDecimal"
         && provider.has_type_alias_in_package(&package_name(source), simple)
@@ -8238,6 +8387,7 @@ pub(crate) fn standard_external_type<P: SemanticProvider + ?Sized>(
             path.ends_with(".*")
                 && !is_known_jdk_wildcard(path)
                 && !(canonical == "java.math.BigDecimal" && path == "java.math.*")
+                && !source_wildcard_does_not_declare(path, simple, provider)
         })
     {
         return None;
@@ -8640,7 +8790,7 @@ fn known_collection_factory_from_java_util_wildcard<P: SemanticProvider + ?Sized
     for import in kotlin_import_lines(source) {
         let path = import.split(" as ").next().unwrap_or(import).trim();
         if path.ends_with(".*") {
-            if import.contains(" as ") || !source_wildcard_allows_factory(path, name, provider) {
+            if import.contains(" as ") || !source_wildcard_does_not_declare(path, name, provider) {
                 return false;
             }
             saw_java_util_wildcard = true;
@@ -8726,7 +8876,7 @@ pub(crate) fn known_collection_factory_shape<P: SemanticProvider + ?Sized>(
             .split_once(" as ")
             .map(|(path, alias)| (path.trim(), Some(alias.trim())))
             .unwrap_or((import.trim(), None));
-        if path.ends_with(".*") && !source_wildcard_allows_factory(path, name, provider) {
+        if path.ends_with(".*") && !source_wildcard_does_not_declare(path, name, provider) {
             return false;
         }
         let stdlib_path = format!("kotlin.collections.{name}");
@@ -8766,7 +8916,7 @@ pub(crate) fn known_collection_factory_shape<P: SemanticProvider + ?Sized>(
             .split_once(" as ")
             .map(|(path, alias)| (path.trim(), Some(alias.trim())))
             .unwrap_or((import.trim(), None));
-        if path.ends_with(".*") && !source_wildcard_allows_factory(path, "to", provider) {
+        if path.ends_with(".*") && !source_wildcard_does_not_declare(path, "to", provider) {
             return false;
         }
         if (alias == Some("to") || (alias.is_none() && path.rsplit('.').next() == Some("to")))
@@ -8793,9 +8943,8 @@ pub(crate) fn known_collection_factory_shape<P: SemanticProvider + ?Sized>(
 }
 
 /// Source packages are indexed as a whole. A star importing one does not
-/// hide a default-imported factory unless that package actually declares the
-/// name. Unknown library packages and object/member stars still need facts.
-fn source_wildcard_allows_factory<P: SemanticProvider + ?Sized>(
+/// hide a default-imported name unless that package actually declares it. Unknown library packages and object/member stars still need facts.
+fn source_wildcard_does_not_declare<P: SemanticProvider + ?Sized>(
     path: &str,
     name: &str,
     provider: &P,

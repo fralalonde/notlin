@@ -410,6 +410,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 self.transpile(receiver)
             );
         }
+        if let Some(text) = self.unit.text_operation_call(node) {
+            let receiver = self.transpile(text.receiver);
+            return text.java(&receiver);
+        }
+
         if let Some(lowering) = self.unit.todo_lowerings.get(&node.start_byte()).cloned() {
             assert_eq!(lowering.location.snapshot_hash, self.unit.source_hash);
             assert_eq!(

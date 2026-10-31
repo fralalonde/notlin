@@ -1180,7 +1180,7 @@ data class Entry(override val name: Label) : Named, Comparable<Entry> {
         .map(|(_, content)| content)
         .expect("class emitted");
     assert!(
-        entry.contains("return this.name().getValue().trim();"),
+        entry.contains("return kotlin.text.StringsKt.trim((java.lang.CharSequence) ((java.lang.String) (this.name().getValue()))).toString();"),
         "{entry}"
     );
     assert!(

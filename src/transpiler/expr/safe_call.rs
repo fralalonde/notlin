@@ -4,6 +4,7 @@
 use super::Expr;
 use crate::semantics::FactStatus;
 use crate::transpiler::kt;
+use crate::transpiler::types::kotlin_type_text;
 use tree_sitter::Node;
 
 impl Expr<'_, '_, '_> {
@@ -188,41 +189,6 @@ fn java_type_spelling(ty: &str) -> String {
         })
         .map(|node| kt::java_type(node, &text))
         .unwrap_or_else(|| "Object".to_string())
-}
-
-fn kotlin_type_text(ty: &crate::semantics::KotlinType, nullable: bool) -> String {
-    use crate::semantics::{KotlinType, Variance};
-    let core = match ty {
-        KotlinType::Primitive(name)
-        | KotlinType::TypeParameter(name)
-        | KotlinType::Unknown(name) => name.clone(),
-        KotlinType::Named { name, arguments } => {
-            if arguments.is_empty() {
-                name.clone()
-            } else {
-                let args = arguments
-                    .iter()
-                    .map(|arg| {
-                        let Some(ty) = &arg.ty else {
-                            return "*".to_string();
-                        };
-                        let variance = match arg.variance {
-                            Variance::Invariant => "",
-                            Variance::In => "in ",
-                            Variance::Out => "out ",
-                        };
-                        format!("{variance}{}", kotlin_type_text(ty, false))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{name}<{args}>")
-            }
-        }
-        KotlinType::Array(inner) => format!("Array<{}>", kotlin_type_text(inner, false)),
-        KotlinType::Nullable(inner) => return kotlin_type_text(inner, true),
-        KotlinType::Function { .. } => "Object".to_string(),
-    };
-    format!("{core}{}", if nullable { "?" } else { "" })
 }
 
 fn qualify_receiver_type(

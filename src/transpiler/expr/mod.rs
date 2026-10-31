@@ -185,6 +185,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     return self.narrowed_receiver(&name, &name);
                 }
                 let implicit_this = self.narrowed_receiver("this", "this");
+                if self.unit.self_getters.contains_key(&name)
+                    && self.unit.reads_own_getter_field(&name)
+                {
+                    return format!("{implicit_this}.{name}");
+                }
                 // Bare self-reference inside an object body: Kotlin resolves
                 // `Registry` to the singleton; Java needs `Registry.INSTANCE`.
                 let value = if self.unit.current_object.as_deref() == Some(name.as_str()) {

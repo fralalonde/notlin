@@ -1005,6 +1005,8 @@ where
     original_snapshots.extend(observed_output_snapshots.values().cloned());
     original_snapshots.extend(lombok_configuration.snapshots());
     original_snapshots.extend(index.kotlin_compiler_configuration_snapshots());
+    let mut snapshot_seen = HashSet::with_capacity(original_snapshots.len());
+    original_snapshots.retain(|(path, _)| snapshot_seen.insert(normalized(path)));
     if cli.out_dir.is_none() {
         for (source, _) in &sources {
             let Some(directory) = source.parent() else {
@@ -1028,19 +1030,25 @@ where
                 {
                     continue;
                 }
-                let owned = std::fs::read_to_string(&path)
+                // Indexed Java already has a byte-exact snapshot. A package can
+                // contain several Kotlin files; do not reopen all its Java for
+                // each origin. Aliases still share the original snapshot guard.
+                if snapshot_seen.contains(&path) || snapshot_seen.contains(&normalized(&path)) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let owned = std::str::from_utf8(&bytes)
                     .ok()
-                    .is_some_and(|text| generated_header_matches_source(&text, source));
+                    .is_some_and(|text| generated_header_matches_source(text, source));
                 if owned {
-                    let bytes = std::fs::read(&path)
-                        .map_err(|e| format!("{}: {e}", crate::paths::display(&path)))?;
+                    snapshot_seen.insert(normalized(&path));
                     original_snapshots.push((path, Some(bytes)));
                 }
             }
         }
     }
-    let mut snapshot_seen: HashSet<PathBuf> = HashSet::new();
-    original_snapshots.retain(|(p, _)| snapshot_seen.insert(normalized(p)));
     for generated in &generated_java {
         if snapshot_seen.insert(normalized(&generated.path))
             && let Some((path, snapshot)) =

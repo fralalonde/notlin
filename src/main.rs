@@ -1056,6 +1056,9 @@ fn remove_stale_generated_outputs(
     emitted_names: HashSet<String>,
     retained_java_types: HashSet<String>,
 ) -> Result<(), String> {
+    if retained_java_types.is_empty() {
+        return Ok(());
+    }
     let Some(directory) = source.parent() else {
         return Ok(());
     };
@@ -1073,6 +1076,10 @@ fn remove_stale_generated_outputs(
             .unwrap_or_default();
         if path.extension().and_then(|extension| extension.to_str()) != Some("java")
             || emitted_names.contains(name)
+            || path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !retained_java_types.contains(name))
         {
             continue;
         }
@@ -1100,6 +1107,9 @@ fn remove_stale_generated_outputs(
                                 .is_some_and(|suffix| suffix.starts_with(" —"))
                     })
             });
+            if !header_matches {
+                return false;
+            }
             let declared_type = notlin::java_ir::parse_java(&content).ok().and_then(|unit| {
                 let declarations = unit
                     .root

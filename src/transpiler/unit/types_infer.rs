@@ -185,6 +185,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     fn infer_type_inner(&mut self, expr: tree_sitter::Node) -> String {
+        if let Some(text) = self.text_operation_call(expr)
+            && let Some(java) = crate::transpiler::types::type_ref_to_java(
+                &text.return_type(),
+                crate::transpiler::types::AnnotationSet::None,
+                false,
+            )
+        {
+            return java;
+        }
         match expr.kind() {
             "as_expression" => kt::child(expr, "user_type")
                 .or_else(|| kt::child(expr, "nullable_type"))

@@ -244,3 +244,66 @@ fn split_top_level_type_arguments(arguments: &str) -> Vec<&str> {
     parts.push(&arguments[start..]);
     parts
 }
+
+pub(crate) fn kotlin_type_text(ty: &crate::semantics::KotlinType, nullable: bool) -> String {
+    use crate::semantics::{KotlinType, Variance};
+    let core = match ty {
+        KotlinType::Primitive(name)
+        | KotlinType::TypeParameter(name)
+        | KotlinType::Unknown(name) => name.clone(),
+        KotlinType::Named { name, arguments } => {
+            let name = match name.as_str() {
+                "kotlin.collections.List" | "kotlin.collections.MutableList" => "java.util.List",
+                "kotlin.collections.Set" | "kotlin.collections.MutableSet" => "java.util.Set",
+                "kotlin.collections.Map" | "kotlin.collections.MutableMap" => "java.util.Map",
+                "kotlin.collections.Collection" | "kotlin.collections.MutableCollection" => {
+                    "java.util.Collection"
+                }
+                _ => name,
+            };
+            if arguments.is_empty() {
+                name.to_owned()
+            } else {
+                let args = arguments
+                    .iter()
+                    .map(|arg| {
+                        let Some(ty) = &arg.ty else {
+                            return "*".to_string();
+                        };
+                        let variance = match arg.variance {
+                            Variance::Invariant => "",
+                            Variance::In => "in ",
+                            Variance::Out => "out ",
+                        };
+                        format!("{variance}{}", kotlin_type_text(ty, false))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name}<{args}>")
+            }
+        }
+        KotlinType::Array(inner) => format!("Array<{}>", kotlin_type_text(inner, false)),
+        KotlinType::Nullable(inner) => return kotlin_type_text(inner, true),
+        KotlinType::Function { .. } => "Object".to_string(),
+    };
+    format!("{core}{}", if nullable { "?" } else { "" })
+}
+
+pub(crate) fn type_ref_to_java(
+    ty: &crate::semantics::TypeRef,
+    annotations: AnnotationSet,
+    returns: bool,
+) -> Option<String> {
+    let source = format!("val __type: {}", kotlin_type_text(&ty.ty, ty.nullable));
+    let tree = crate::transpiler::parse_tree(&source);
+    let declaration = tree.root_node().named_child(0)?;
+    let variable = crate::transpiler::kt::child(declaration, "variable_declaration")?;
+    let node = variable
+        .named_children(&mut variable.walk())
+        .find(|node| matches!(node.kind(), "user_type" | "nullable_type"))?;
+    Some(if returns {
+        crate::transpiler::kt::java_return_type(node, &source, annotations)
+    } else {
+        crate::transpiler::kt::java_type_ann(node, &source, annotations)
+    })
+}

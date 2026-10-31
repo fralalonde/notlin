@@ -16,7 +16,7 @@
 
 use super::{
     FactStatus, SemanticProvider, SourceLocation, call_argument_count, direct_trailing_lambda,
-    explicit_receiver_node, kotlin_call_site_offset, kotlin_import_lines, resolve_required_call,
+    explicit_receiver_node, kotlin_call_site_offset, resolve_required_call,
 };
 use crate::facts::protocol::{CallSite, SiteStatus};
 use std::path::Path;
@@ -213,46 +213,17 @@ pub(crate) fn spelling_claims_string_case<P: SemanticProvider + ?Sized>(
 fn stdlib_case_binding(
     source: &str,
     spelling: &str,
-    mut context: Node<'_>,
+    context: Node<'_>,
 ) -> Option<StringCaseDirection> {
     if let Some(direction) = StringCaseDirection::from_stdlib_name(spelling) {
         return Some(direction);
     }
-    while let Some(parent) = context.parent() {
-        context = parent;
+    match super::stdlib_import::binding(source, context, spelling, "kotlin.text") {
+        super::stdlib_import::Binding::Standard(name) => {
+            StringCaseDirection::from_stdlib_name(&name)
+        }
+        _ => None,
     }
-    // Read import syntax from this call's tree, not line text: comments,
-    // whitespace around `as`, and quoted identifiers do not change a binding.
-    context
-        .named_children(&mut context.walk())
-        .filter(|node| node.kind() == "import")
-        .find_map(|import| {
-            let alias = import
-                .named_children(&mut import.walk())
-                .find(|node| node.kind() == "identifier")?;
-            if alias.utf8_text(source.as_bytes()).ok()?.trim_matches('`')
-                != spelling.trim_matches('`')
-            {
-                return None;
-            }
-            let path = import
-                .named_children(&mut import.walk())
-                .find(|node| node.kind() == "qualified_identifier")?;
-            let mut cursor = path.walk();
-            let mut names = path
-                .named_children(&mut cursor)
-                .filter(|node| node.kind() == "identifier")
-                .map(|node| node.utf8_text(source.as_bytes()).ok());
-            let (Some(Some(package)), Some(Some(module)), Some(Some(name)), None) =
-                (names.next(), names.next(), names.next(), names.next())
-            else {
-                return None;
-            };
-            if package.trim_matches('`') != "kotlin" || module.trim_matches('`') != "text" {
-                return None;
-            }
-            StringCaseDirection::from_stdlib_name(name.trim_matches('`'))
-        })
 }
 
 /// The hash-guarded Track B answer for this call, or `None`.
@@ -260,7 +231,7 @@ fn stdlib_case_binding(
 /// Both keys matter: the offset of the callee selector and the blake3 of the
 /// text being planned. The provider refuses a snapshot that is not the text on
 /// disk, so a candidate revision never inherits facts.
-fn call_site<P: SemanticProvider + ?Sized>(
+pub(super) fn call_site<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
     call: Node<'_>,
@@ -311,7 +282,7 @@ fn syntax_contract<P: SemanticProvider + ?Sized>(
     provider: &P,
 ) -> Option<(StringCaseDirection, StringCaseLocale, StringCaseEvidence)> {
     let direction = StringCaseDirection::from_stdlib_name(spelling)?;
-    if shadowing_import(source, spelling) {
+    if shadowing_import(source, call, spelling) {
         return None;
     }
     if !matches!(
@@ -333,16 +304,12 @@ fn syntax_contract<P: SemanticProvider + ?Sized>(
 
 /// An explicit import of another declaration under this spelling keeps the
 /// source precedence: the lowering only implements `kotlin.text.{name}`.
-fn shadowing_import(source: &str, spelling: &str) -> bool {
-    kotlin_import_lines(source).any(|import| {
-        let (path, alias) = import
-            .split_once(" as ")
-            .map_or((import, None), |(path, alias)| {
-                (path.trim(), Some(alias.trim()))
-            });
-        alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or("")) == spelling
-            && path != format!("kotlin.text.{spelling}")
-    })
+fn shadowing_import(source: &str, call: Node<'_>, spelling: &str) -> bool {
+    match super::stdlib_import::binding(source, call, spelling, "kotlin.text") {
+        super::stdlib_import::Binding::Absent => false,
+        super::stdlib_import::Binding::Standard(name) => name != spelling,
+        super::stdlib_import::Binding::Foreign => true,
+    }
 }
 
 /// A non-null `String` receiver: a proven parameter/property/literal type, or

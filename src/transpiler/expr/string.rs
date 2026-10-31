@@ -118,6 +118,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         if self.unit.current_object.as_deref() == Some(ident) {
             return format!("{}.INSTANCE", ident);
         }
+        if self.unit.self_getters.contains_key(ident) && self.unit.reads_own_getter_field(ident) {
+            return format!("this.{ident}");
+        }
         if !self.unit.var_types.contains_key(ident)
             && let Some(getter) = self.unit.self_getters.get(ident)
         {

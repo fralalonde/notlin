@@ -7,6 +7,14 @@ use crate::transpiler::unit::capitalize;
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
+        if let (Some(receiver), Some(member)) = (node.named_child(0), node.named_child(1))
+            && self.unit.text(receiver).trim() == "this"
+            && self
+                .unit
+                .reads_own_getter_field(self.unit.text(member).trim())
+        {
+            return format!("this.{}", self.unit.text(member).trim());
+        }
         if let Some(field) = self.unit.semantic_provider.and_then(|provider| {
             crate::semantics::direct_source_static_field(
                 self.unit.source,

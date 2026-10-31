@@ -7,6 +7,45 @@ use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    /// An explicit getter reading its JVM backing field must not call itself.
+    /// Other property reads keep their accessor path, including virtual dispatch
+    /// through getters added while a Kotlin owner was retained.
+    pub(crate) fn reads_own_getter_field(&self, property: &str) -> bool {
+        if self.self_getters.get(property).map(String::as_str)
+            != self.current_function_name.as_deref()
+            || self.current_function_name.is_none()
+        {
+            return false;
+        }
+        let mut owner = self.current_decl;
+        while let Some(node) = owner {
+            if matches!(
+                node.kind(),
+                "class_declaration" | "enum_class_declaration" | "object_declaration"
+            ) {
+                let matches = |member| {
+                    let variable = kt::child(member, "variable_declaration").unwrap_or(member);
+                    kt::child(variable, "identifier")
+                        .is_some_and(|name| self.text(name) == property)
+                        && crate::workspace::member_modifiers(member, self.source).1
+                };
+                return kt::child(node, "class_body").is_some_and(|body| {
+                    body.named_children(&mut body.walk())
+                        .filter(|member| member.kind() == "property_declaration")
+                        .any(matches)
+                }) || kt::child(node, "primary_constructor")
+                    .and_then(|constructor| kt::child(constructor, "class_parameters"))
+                    .is_some_and(|parameters| {
+                        parameters
+                            .named_children(&mut parameters.walk())
+                            .any(matches)
+                    });
+            }
+            owner = node.parent();
+        }
+        false
+    }
+
     fn property_is_lateinit(&self, decl: tree_sitter::Node) -> bool {
         kt::child(decl, "modifiers").is_some_and(|modifiers| {
             modifiers

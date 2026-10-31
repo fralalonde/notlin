@@ -1,4 +1,4 @@
-//! Snapshot-scoped contracts for Java synthetic property reads.
+//! Snapshot-scoped Java return contracts shared by calls and synthetic property reads.
 //!
 //! JVM primitives and reference nullability are independent facts: a boxed
 //! `Double` must never acquire the primitive contract of `double`.
@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone)]
-pub(super) struct GetterShape {
+pub(super) struct JavaReturnShape {
     pub result_type: TypeRef,
     pub nullability: ReferenceReturnNullability,
     pub jvm_primitive: bool,
@@ -53,19 +53,7 @@ pub(super) fn collect(
     source: &str,
     node: Node<'_>,
     metadata: &super::java_metadata::Scope<'_>,
-) -> Option<GetterShape> {
-    let name = node
-        .child_by_field_name("name")?
-        .utf8_text(source.as_bytes())
-        .ok()?;
-    if !name.strip_prefix("get").is_some_and(|suffix| {
-        suffix
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_uppercase())
-    }) {
-        return None;
-    }
+) -> Option<JavaReturnShape> {
     if node.kind() != "method_declaration"
         || own_type_parameters(node).is_some()
         || source_calls::java_method_declares_throws(source, node)
@@ -180,7 +168,7 @@ pub(super) fn collect(
         }
         result_type.nullable = nullability != ReferenceReturnNullability::NonNull;
     }
-    Some(GetterShape {
+    Some(JavaReturnShape {
         result_type,
         nullability,
         jvm_primitive,
@@ -330,6 +318,32 @@ fn enclosing_annotation_bindings(
 }
 
 impl SyntaxSemanticProvider {
+    pub(super) fn declared_java_method_return_contract(
+        &self,
+        member: &SymbolId,
+    ) -> Option<JavaPropertyRead> {
+        if member
+            .file
+            .extension()
+            .is_none_or(|extension| extension != "java")
+            || member.receiver.is_some()
+            || !member.parameters.is_empty()
+        {
+            return None;
+        }
+        let (name, path) = member.owner_path.split_last()?;
+        let owners = self
+            .symbols_named(name)
+            .into_iter()
+            .filter(|symbol| symbol.id.file == member.file && symbol.id.owner_path == path)
+            .collect::<Vec<_>>();
+        let [owner] = owners.as_slice() else {
+            return None;
+        };
+        let read = self.java_local_property_read(&owner.id, "", &member.name)??;
+        (read.target == *member).then_some(read)
+    }
+
     pub(super) fn enrich_generated_property_reads(
         &mut self,
         index: &crate::workspace::SourceIndex,
@@ -680,7 +694,7 @@ impl SyntaxSemanticProvider {
             return None;
         }
         let shape = self
-            .java_property_read_shapes
+            .java_return_shapes
             .get(&(owner.file.clone(), symbol.location.start_byte))?;
         if !shape.metadata_bindings.is_empty()
             && (!self.java_metadata_preserves_members(owner)

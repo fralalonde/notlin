@@ -143,7 +143,7 @@ impl<P: SemanticProvider + ?Sized> Context<'_, P> {
             let path = path.trim();
             if path.ends_with(".*") {
                 return matches!(path, "kotlin.collections.*" | "kotlin.*" | "java.util.*")
-                    || super::source_wildcard_allows_factory(path, "plus", self.provider);
+                    || super::source_wildcard_does_not_declare(path, "plus", self.provider);
             }
             let visible = if alias.is_empty() {
                 path.rsplit('.').next().unwrap_or("")
@@ -200,7 +200,7 @@ impl<P: SemanticProvider + ?Sized> Context<'_, P> {
                         let (path, alias) = import.split_once(" as ").unwrap_or((import, ""));
                         if path.trim().ends_with(".*") {
                             return matches!(path.trim(), "kotlin.collections.*" | "kotlin.*")
-                                || super::source_wildcard_allows_factory(
+                                || super::source_wildcard_does_not_declare(
                                     path.trim(),
                                     name,
                                     self.provider,
@@ -499,7 +499,7 @@ impl<P: SemanticProvider + ?Sized> Context<'_, P> {
             }
             if path.ends_with(".*")
                 && !matches!(path, "kotlin.collections.*" | "kotlin.*" | "java.util.*")
-                && !super::source_wildcard_allows_factory(path, name, self.provider)
+                && !super::source_wildcard_does_not_declare(path, name, self.provider)
             {
                 return false;
             }

@@ -6523,7 +6523,10 @@ fn contains_descendant_kind(node: tree_sitter::Node<'_>, kind: &str) -> bool {
 
 /// Modifier facts come from syntax tokens, never from annotation arguments or
 /// comments: `@Tag("public val x; JvmField") private var x` is still private.
-fn member_modifiers<'s>(node: tree_sitter::Node<'_>, source: &'s str) -> (HashSet<&'s str>, bool) {
+pub(crate) fn member_modifiers<'s>(
+    node: tree_sitter::Node<'_>,
+    source: &'s str,
+) -> (HashSet<&'s str>, bool) {
     let mut words = HashSet::new();
     let mut jvm_field = false;
     let Some(modifiers) = node

@@ -451,6 +451,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         // javac rejects with "unexpected return value" and turns
                         // every call site into "'void' type not allowed here".
                         "call_expression" => {
+                            if let Some(contract) = self.proven_call_return_type(be)
+                                && let Some(java) = crate::transpiler::types::type_ref_to_java(
+                                    &contract.result_type,
+                                    if contract.platform {
+                                        // Kotlin callers must retain Java's flexible platform
+                                        // type, rather than gaining an explicit nullable API.
+                                        crate::transpiler::types::AnnotationSet::None
+                                    } else {
+                                        self.annots
+                                    },
+                                    true,
+                                )
+                            {
+                                return Some(java);
+                            }
                             if let Some(fact) = self
                                 .reified_class_calls
                                 .get(&(be.start_byte(), be.end_byte()))
