@@ -119,7 +119,7 @@ class Child : Middle()
 }
 
 #[test]
-fn covariant_override_is_not_selected_without_return_proof() {
+fn covariant_override_uses_the_declared_return_hierarchy() {
     let source = r#"package inherited
 open class Id
 class SpecificId : Id()
@@ -136,10 +136,26 @@ open class Middle : Root() {
 class Child : Middle()
 "#;
     let index = provider(&[("Covariant.kt", source)]);
-    assert!(matches!(
+    assert_eq!(
         inherited(&index, "Child", "getId"),
-        FactStatus::Ambiguous(candidates) if candidates.len() == 2
-    ));
+        FactStatus::Established(member(&index, "Middle", "getId"))
+    );
+}
+
+#[test]
+fn covariant_override_without_indexed_return_hierarchy_remains_unproven() {
+    let source = r#"package inherited
+interface Root {
+    fun getId(): library.Id
+}
+interface Middle : Root {
+    override fun getId(): library.SpecificId
+}
+abstract class Child : Middle
+"#;
+    let index = provider(&[("UnknownCovariance.kt", source)]);
+    let actual = inherited(&index, "Child", "getId");
+    assert!(!matches!(actual, FactStatus::Established(_)), "{actual:?}");
 }
 
 #[test]

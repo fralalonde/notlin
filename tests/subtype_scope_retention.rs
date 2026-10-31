@@ -56,7 +56,7 @@ fn interface_with_only_selected_kotlin_subtypes_translate_via_fixpoint() {
 }
 
 #[test]
-fn interface_with_unselected_kotlin_subtype_and_unproven_method_stays_retained() {
+fn interface_with_unselected_kotlin_subtype_and_proven_method_translates() {
     let root = Path::new("tests/tmp_scratch_subtype_scope2");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root.join("selected")).unwrap();
@@ -80,7 +80,7 @@ fn interface_with_unselected_kotlin_subtype_and_unproven_method_stays_retained()
     )
     .unwrap();
     // Translate ONLY the selected subtree; the Cat file stays Kotlin outside it.
-    // This parameterized method shape remains an unproven JVM ABI contract.
+    // Its declared builtin parameter and return types establish the JVM ABI.
     let out = Command::new(env!("CARGO_BIN_EXE_notlin"))
         .args([
             "--root",
@@ -96,14 +96,45 @@ fn interface_with_unselected_kotlin_subtype_and_unproven_method_stays_retained()
     let speaker_java =
         fs::read_to_string(root.join("selected").join("Speaker.java")).unwrap_or_default();
     assert!(
-        speaker_java.is_empty(),
-        "hub with an UNSELECTED Kotlin subtype must stay Kotlin, got:\n{speaker_java}"
+        speaker_java.contains("String speak(int volume)"),
+        "an ordinary proven method remains usable by an unselected Kotlin implementor:\n{speaker_java}"
     );
     assert!(
-        stderr.contains(RetentionKind::SubtypeOutsideTranslationSet.summary()),
-        "expected the retention diagnostic, stderr:\n{stderr}"
+        !stderr.contains(RetentionKind::SubtypeOutsideTranslationSet.summary()),
+        "a compatible unselected implementor does not require retention:\n{stderr}"
     );
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_unselected_member_extension_override_keeps_the_interface_kotlin() {
+    let root = std::env::temp_dir().join(format!("notlin-mangled-subtype-{}", std::process::id()));
+    fs::create_dir_all(root.join("selected")).unwrap();
+    fs::create_dir_all(root.join("elsewhere")).unwrap();
+    let source =
+        "package neutral.mangled\ninterface Speaker { fun String.speak(volume: Int): String }\n";
+    let unselected = "package neutral.mangled\nclass Cat : Speaker { override fun String.speak(volume: Int): String = \"meow\" }\n";
+    fs::write(root.join("selected/Hub.kt"), source).unwrap();
+    fs::write(root.join("elsewhere/Cat.kt"), unselected).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--root", root.to_str().unwrap(), "--in-place"])
+        .arg(root.join("selected/Hub.kt"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !root.join("selected/Speaker.java").exists(),
+        "an unselected member-extension override cannot become an ordinary Java override"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("elsewhere/Cat.kt")).unwrap(),
+        unselected
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

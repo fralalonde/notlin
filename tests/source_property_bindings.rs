@@ -19,7 +19,7 @@ fn root(label: &str) -> Scratch {
     fs::create_dir(&path).unwrap();
     Scratch(path)
 }
-const SOURCE: &str = "package probe\nconst val TOKEN: String = \"token\"\nclass Reader {\n    fun read(): String = \"[$TOKEN]\"\n    fun pad(v: String?): String? = v?.trim()\n}\n";
+const SOURCE: &str = "package probe\nconst val TOKEN: String = \"token\"\nclass Reader {\n    fun read(): String = \"[$TOKEN]\"\n    fun pad(v: String?): String? = v?.trim()\n    suspend fun retainedAnchor() {}\n}\n";
 fn run_fixture(contradiction: &str, enabled: bool) -> Scratch {
     let root = root(contradiction);
     fs::write(root.0.join("State.kt"), SOURCE).unwrap();
@@ -56,6 +56,12 @@ for line in sys.stdin:
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
     }
+    #[cfg(windows)]
+    let helper = {
+        let launcher = root.0.join("helper.cmd");
+        fs::write(&launcher, "@echo off\r\npython \"%~dp0helper.py\" %*\r\n").unwrap();
+        launcher
+    };
     let jar = root.0.join("notlin-jvm-facts-full.jar");
     fs::write(&jar, "scripted helper fixture").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))

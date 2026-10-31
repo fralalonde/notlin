@@ -72,6 +72,12 @@ for line in sys.stdin:
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
     }
+    #[cfg(windows)]
+    let helper = {
+        let launcher = root.0.join("helper.cmd");
+        fs::write(&launcher, "@echo off\r\npython \"%~dp0helper.py\" %*\r\n").unwrap();
+        launcher
+    };
     let jar = root.0.join("notlin-jvm-facts-full.jar");
     fs::write(&jar, "scripted helper fixture").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
@@ -200,14 +206,27 @@ fn a_name_that_java_can_capture_is_not_bound_by_import() {
         "a conflicting `String` import cannot be shadowed: {}",
         diagnostics(&root)
     );
+}
 
-    // A typealias named `String` would make the emitted spelling depend on
-    // alias lowering, which is a different proof: refuse rather than guess.
+#[test]
+fn an_alias_to_kotlin_string_keeps_the_proven_builtin_identity() {
+    // Alias expansion independently proves this is still the builtin String.
     let aliased = "package probe\nimport java.util.*\ntypealias String = kotlin.String\nconst val TOKEN: String = \"token\"\nclass Reader {\n    fun read(): String = \"[$TOKEN]\"\n    fun pad(v: String?): String? = v?.trim()\n}\n";
     let root = run_fixture("aliased-type", "valid", aliased, true);
     assert!(
+        root.0.join("State.java").exists(),
+        "an alias to kotlin.String preserves its builtin identity: {}",
+        diagnostics(&root)
+    );
+}
+
+#[test]
+fn a_foreign_string_alias_cannot_be_signed_as_the_builtin() {
+    let aliased = "package probe\nimport java.util.*\nclass DomainString\ntypealias String = DomainString\nconst val TOKEN: String = \"token\"\nclass Reader {\n    fun read(): String = \"[$TOKEN]\"\n    suspend fun retainedAnchor() {}\n}\n";
+    let root = run_fixture("foreign-alias", "valid", aliased, true);
+    assert!(
         !root.0.join("State.java").exists(),
-        "a `String` typealias is not the builtin binding this proof means: {}",
+        "a contradictory helper descriptor cannot turn a domain alias into String: {}",
         diagnostics(&root)
     );
 }
