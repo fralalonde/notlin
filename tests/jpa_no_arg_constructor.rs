@@ -189,7 +189,7 @@ fn the_jpa_no_arg_constructor_clears_every_field() {
         "kotlinc emits one zero-argument constructor here, not two:\n{defaulted}"
     );
     assert!(
-        defaulted.contains("this(\"x\", 1);"),
+        defaulted.contains("this(\"x\");") && defaulted.contains("this(a, 1);"),
         "the existing delegating constructor is the faithful one:\n{defaulted}"
     );
 

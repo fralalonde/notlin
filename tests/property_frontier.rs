@@ -24,6 +24,10 @@ impl Drop for Scratch {
 
 const SOURCES: &[(&str, &str)] = &[
     (
+        "DirectCalls.kt",
+        "package sample\nobject DirectCalls { @JvmStatic fun make(): String = DeferredPayload(\"direct\").full; suspend fun retained() {} }\n",
+    ),
+    (
         "Constants.kt",
         "package constants\nconst val SEPARATOR: String = \".\"\nsuspend fun retained() {}\n",
     ),
@@ -84,6 +88,39 @@ data class Payload(
 )
 @JsonTypeName("poly")
 data class PolyPayload(val id: String, val category: Category = Category.BASIC) : PolyContract
+interface HasId { val id: String }
+@JsonTypeName("deferred")
+data class DeferredPayload(
+    override val id: String,
+    val items: List<String> = DefaultsTrace.items(),
+    val options: Map<String, String> = emptyMap(),
+    val note: String? = DefaultsTrace.note(),
+    val full: String = id + DefaultsTrace.suffix(),
+    val count: Int = items.size,
+    val summary: String = id + items + options + mapOf("x" to 1, "y" to 2)
+) : HasId {
+    val kind: Category get() = Category.BASIC
+}
+@JsonTypeName("recursive")
+data class RecursivePayload(val id: String, val child: RecursivePayload? = null, val amount: Int? = null)
+@JsonTypeName("initialized")
+data class InitializedPayload(val id: String = DefaultsTrace.note()) {
+    val derived: String = DefaultsTrace.derived(id)
+    init { DefaultsTrace.constructed() }
+}
+"#,
+    ),
+    (
+        "DefaultsTrace.java",
+        r#"package sample;
+public class DefaultsTrace {
+    public static String trace = "";
+    public static java.util.List<String> items() { trace += "items,"; return new java.util.ArrayList<>(java.util.List.of("seed")); }
+    public static String note() { trace += "note,"; return "note"; }
+    public static Object suffix() { trace += "suffix,"; return new Object() { public String toString() { return "!"; } }; }
+    public static String derived(String id) { trace += "derived,"; return id + "?"; }
+    public static void constructed() { trace += "init,"; }
+}
 "#,
     ),
     (
@@ -118,6 +155,29 @@ public class Runner {
         ObjectMapper snake = mapper.copy().setPropertyNamingStrategy(com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
         System.out.println("snake=" + snake.readValue("{\"id\":\"s\",\"external_code\":\"kept\"}", Payload.class).getExternalCode());
         System.out.println("poly=" + ((PolyPayload) mapper.readValue("{\"kind\":\"poly\",\"id\":\"p\",\"unrelated\":\"ignored\"}", PolyContract.class)).getCategory());
+        DefaultsTrace.trace = "";
+        DeferredPayload omitted = mapper.readValue("{\"id\":\"a\"}", DeferredPayload.class);
+        System.out.println("deferred=" + omitted.getItems() + "/" + omitted.getOptions() + "/" + omitted.getNote() + "/" + omitted.getFull() + "/" + omitted.getCount() + "/" + DefaultsTrace.trace);
+        DefaultsTrace.trace = "";
+        DeferredPayload supplied = mapper.readValue("{\"id\":\"b\",\"items\":[\"x\",\"y\"],\"options\":{\"k\":\"v\"},\"note\":null,\"full\":\"given\",\"count\":0}", DeferredPayload.class);
+        System.out.println("supplied=" + supplied.getItems() + "/" + supplied.getOptions() + "/" + supplied.getNote() + "/" + supplied.getFull() + "/" + supplied.getCount() + "/" + DefaultsTrace.trace);
+        System.out.println("summaries=" + omitted.getSummary() + "/" + supplied.getSummary());
+        DefaultsTrace.trace = "";
+        try { mapper.readValue("{}", DeferredPayload.class); System.out.println("missing=false"); }
+        catch (Exception expected) { System.out.println("missing=true/" + DefaultsTrace.trace); }
+        DefaultsTrace.trace = "";
+        try { mapper.readValue("{\"id\":\"x\",\"items\":null}", DeferredPayload.class); System.out.println("null-list=false"); }
+        catch (Exception expected) { System.out.println("null-list=true/" + DefaultsTrace.trace); }
+        DeferredPayload another = mapper.readValue("{\"id\":\"c\"}", DeferredPayload.class);
+        omitted.getItems().add("changed");
+        System.out.println("fresh=" + another.getItems() + "/" + (omitted.getItems() != another.getItems()) + "/" + another.getKind());
+        RecursivePayload tree = mapper.readerFor(RecursivePayload.class).readValue("{\"id\":\"root\",\"child\":{\"id\":\"leaf\",\"amount\":7}}");
+        System.out.println("recursive=" + tree.getId() + "/" + tree.getChild().getId() + "/" + tree.getChild().getChild() + "/" + tree.getAmount() + "/" + tree.getChild().getAmount());
+        DefaultsTrace.trace = "";
+        InitializedPayload initialized = mapper.readValue("{}", InitializedPayload.class);
+        System.out.println("initialized=" + initialized.getDerived() + "/" + DefaultsTrace.trace);
+        DefaultsTrace.trace = "";
+        System.out.println("constructor=" + DirectCalls.make() + "/" + DefaultsTrace.trace);
     }
 }
 "#,
@@ -139,7 +199,7 @@ fn translate(root: &Path, lombok: bool) -> std::process::Output {
             "--jvm-facts=off",
             "--in-place",
             "--annotations",
-            "none",
+            "jetbrains",
             "--root",
         ])
         .arg(root);
@@ -151,11 +211,21 @@ fn translate(root: &Path, lombok: bool) -> std::process::Output {
 fn assert_migrated(root: &Path, output: &std::process::Output) {
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{diagnostics}");
-    for name in ["Reader", "Subject", "Payload", "PolyPayload"] {
+    for name in [
+        "Reader",
+        "Subject",
+        "Payload",
+        "PolyPayload",
+        "DeferredPayload",
+        "RecursivePayload",
+        "InitializedPayload",
+    ] {
         assert!(
             root.join(format!("{name}.java")).is_file(),
             "{name} remains Kotlin:\n{}\n{diagnostics}",
-            fs::read_to_string(root.join(format!("{name}.kt"))).unwrap_or_default()
+            fs::read_to_string(root.join(format!("{name}.kt")))
+                .or_else(|_| fs::read_to_string(root.join("Payload.kt")))
+                .unwrap_or_default()
         );
     }
     let reader = fs::read_to_string(root.join("Reader.java")).unwrap();
@@ -171,7 +241,7 @@ fn assert_migrated(root: &Path, output: &std::process::Output) {
     );
     let payload = fs::read_to_string(root.join("Payload.java")).unwrap();
     assert!(
-        payload.contains("JsonPOJOBuilder") && payload.contains("Category.BASIC"),
+        payload.contains("ValueInstantiators.Base") && payload.contains("Category.BASIC"),
         "{payload}"
     );
 }
@@ -195,6 +265,10 @@ fn config(root: &Path, output: PathBuf, lombok: bool) -> JvmValidationConfig {
     );
     cfg.kotlinc_args.extend(["-jvm-target".into(), "17".into()]);
     cfg.javac_args.extend(["--release".into(), "17".into()]);
+    // The vendored annotation API permits declaration annotations but not type
+    // uses. Casts must compile against this version as well as modern jars.
+    cfg.classpath
+        .push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/jetbrains-annotations.jar"));
     for name in [
         "NOTLIN_KOTLIN_STDLIB",
         "NOTLIN_KOTLIN_REFLECT",
@@ -250,7 +324,7 @@ fn runtime_preserves_split_edges_virtual_getters_and_json_presence() {
         .replace("\r\n", "\n");
     assert_eq!(
         expected,
-        "b//plain/./local\ntrue/kept/3\nmissing/BASIC/true/null\ngiven/PREMIUM/false/memo\nmap/BASIC/true/null\nnulls=true/true\nstrict=true\nPREMIUM\nsnake=kept\npoly=BASIC"
+        "b//plain/./local\ntrue/kept/3\nmissing/BASIC/true/null\ngiven/PREMIUM/false/memo\nmap/BASIC/true/null\nnulls=true/true\nstrict=true\nPREMIUM\nsnake=kept\npoly=BASIC\ndeferred=[seed]/{}/note/a!/1/items,note,suffix,\nsupplied=[x, y]/{k=v}/null/given/0/\nsummaries=a[seed]{}{x=1, y=2}/b[x, y]{k=v}{x=1, y=2}\nmissing=true/\nnull-list=true/\nfresh=[seed]/true/BASIC\nrecursive=root/leaf/null/null/7\ninitialized=note?/note,derived,init,\nconstructor=direct!/items,note,suffix,"
     );
     for lombok in [false, true] {
         let root = scratch.0.join(format!("migrated-{lombok}"));

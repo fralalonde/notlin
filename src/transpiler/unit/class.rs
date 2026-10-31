@@ -1929,8 +1929,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             );
             return;
         }
-        if let Some(builder) = self.jackson_default_builder_name(decl) {
-            annotations.push(format!("@com.fasterxml.jackson.databind.annotation.JsonDeserialize(builder = {name}.{builder}.class)"));
+        if let Some(deserializer) = self.jackson_default_deserializer_name(decl) {
+            annotations.push(format!("@com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = {name}.{deserializer}.class)"));
         }
         // primary constructor parameters -> fields + constructor
         // Class type parameters `class Gen<T : Bound>(...)` must be emitted or
@@ -2516,6 +2516,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 // ConstructorProperties is also an implicit Jackson creator.
                 // Route Jackson through the factory that applies defaults.
                 out.line("@com.fasterxml.jackson.annotation.JsonCreator(mode = com.fasterxml.jackson.annotation.JsonCreator.Mode.DISABLED)");
+            } else if self.jackson_default_deserializer_name(decl).is_some() {
+                out.line("@com.fasterxml.jackson.annotation.JsonCreator(mode = com.fasterxml.jackson.annotation.JsonCreator.Mode.PROPERTIES)");
             }
             out.open(format!("public {}({})", name, {
                 params
@@ -2663,6 +2665,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if is_data && !params.is_empty() {
             let as_record = !self.lombok && self.data_class_can_be_record(decl);
             let jackson_defaults = self.jackson_default_factory_supported(decl, &params);
+            let jackson_creator = self.jackson_default_deserializer_name(decl).is_some();
             let has_initialization = kt::child(decl, "class_body").is_some_and(|body| {
                 body.children(&mut body.walk()).any(|member| {
                     member.kind() == "anonymous_initializer"
@@ -2714,14 +2717,27 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 if has_initializers
                     || !self.primary_constructor_annotations(decl).is_empty()
                     || jackson_defaults
+                    || jackson_creator
                 {
                     for annotation in self.primary_constructor_annotations(decl) {
                         out.line(annotation);
                     }
                     if jackson_defaults {
                         out.line("@com.fasterxml.jackson.annotation.JsonCreator(mode = com.fasterxml.jackson.annotation.JsonCreator.Mode.DISABLED)");
+                    } else if jackson_creator {
+                        out.line("@com.fasterxml.jackson.annotation.JsonCreator(mode = com.fasterxml.jackson.annotation.JsonCreator.Mode.PROPERTIES)");
                     }
-                    out.open(format!("public {}({})", name, comps.join(", ")));
+                    let constructor_params = params
+                        .iter()
+                        .map(|(_, _, param, ty)| {
+                            self.java_constructor_parameter(decl, param, ty, "")
+                        })
+                        .collect::<Vec<_>>();
+                    out.open(format!(
+                        "public {}({})",
+                        name,
+                        constructor_params.join(", ")
+                    ));
                     for (_, _, field, _) in &params {
                         out.line(format!("this.{field} = {field};"));
                     }
@@ -2800,11 +2816,28 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 self.emit_constructor_property_contract(decl, &params, out);
                 if jackson_defaults {
                     out.line("@com.fasterxml.jackson.annotation.JsonCreator(mode = com.fasterxml.jackson.annotation.JsonCreator.Mode.DISABLED)");
+                } else if jackson_creator {
+                    out.line("@com.fasterxml.jackson.annotation.JsonCreator(mode = com.fasterxml.jackson.annotation.JsonCreator.Mode.PROPERTIES)");
                 }
                 if self.constructor_has_covariant_input(decl, &params) {
                     out.line("@SuppressWarnings(\"unchecked\")");
                 }
-                out.open(format!("public {}({})", name, comps.join(", ")));
+                let constructor_params = params
+                    .iter()
+                    .map(|(_, _, param, ty)| {
+                        self.java_constructor_parameter(
+                            decl,
+                            param,
+                            &self.constructor_parameter_java_type(decl, param, ty),
+                            "",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                out.open(format!(
+                    "public {}({})",
+                    name,
+                    constructor_params.join(", ")
+                ));
                 if let Some(args) = &super_ctor_args {
                     out.line(format!("super({args});"));
                 }
@@ -3838,7 +3871,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if !defaults.iter().any(Option::is_some) || kt::child(decl, "type_parameters").is_some() {
             return false;
         }
-        if self.jackson_default_builder_name(decl).is_some() {
+        if self.jackson_default_deserializer_name(decl).is_some() {
             return false;
         }
         // Only introduce a Jackson dependency where the same source set already
@@ -3916,8 +3949,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         params: &[(bool, bool, String, String)],
         out: &mut JavaOut,
     ) {
-        if let Some(builder) = self.jackson_default_builder_name(decl) {
-            self.emit_jackson_default_builder(decl, name, params, &builder, out);
+        if let Some(builder) = self.jackson_default_deserializer_name(decl) {
+            self.emit_jackson_constructor_defaults(decl, name, params, &builder, out);
             return;
         }
         if !self.jackson_default_factory_supported(decl, params) {
@@ -4053,7 +4086,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         }
     }
 
-    fn jackson_default_builder_name(&self, decl: tree_sitter::Node) -> Option<String> {
+    fn jackson_default_deserializer_name(&self, decl: tree_sitter::Node) -> Option<String> {
         let file = self.workspace_file.as_deref().unwrap_or(self.file);
         let supported = self.semantic_provider.is_some_and(|provider| {
             provider.symbols_in_file(file).iter().any(|symbol| {
@@ -4073,82 +4106,58 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         Some(name)
     }
 
-    /// Builder fields begin at their Kotlin defaults. Jackson calls a setter
-    /// only for a supplied property, so omission never becomes an explicit null.
-    /// Implicit setter names also preserve the mapper's naming strategy.
-    fn emit_jackson_default_builder(
+    /// Keep Jackson's creator-property binding intact. The instantiator hook
+    /// sees its presence buffer, supplies only omitted Kotlin defaults, then
+    /// invokes the ordinary constructor. Parameter annotations and mapper
+    /// deserializers remain attached to that constructor's real arguments.
+    fn emit_jackson_constructor_defaults(
         &mut self,
         decl: tree_sitter::Node,
         name: &str,
         params: &[(bool, bool, String, String)],
-        builder: &str,
+        deserializer: &str,
         out: &mut JavaOut,
     ) {
         let defaults = self.class_param_default_nodes(decl);
+        let values = format!("{deserializer}Values");
+        let present = format!("{deserializer}Present");
+        let create = format!("{deserializer}Create");
         out.blank();
-        let file = self.workspace_file.as_deref().unwrap_or(self.file);
-        if self.semantic_provider.is_some_and(|provider| {
-            provider.symbols_in_file(file).iter().any(|symbol| {
-                symbol.location.start_byte == decl.start_byte()
-                    && symbol.location.end_byte == decl.end_byte()
-                    && provider.jackson_ignores_unknown_properties(&symbol.id)
-            })
-        }) {
-            out.line(
-                "@com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)",
-            );
-        }
-        out.line("@com.fasterxml.jackson.databind.annotation.JsonPOJOBuilder(withPrefix = \"\")");
-        out.open(format!("public static final class {builder}"));
-        for ((_, _, param, ty), default) in params.iter().zip(&defaults) {
-            let ty = self.constructor_parameter_java_type(decl, param, ty);
-            let initial = default.map(|value| Expr { unit: self }.transpile(value));
-            out.line(format!(
-                "private {ty} {param}{};",
-                initial
-                    .map(|value| format!(" = {value}"))
-                    .unwrap_or_default()
-            ));
-        }
-        for (_, _, param, ty) in params {
-            out.blank();
-            if let Some(node) = self.param_node(decl, param) {
-                for (_, annotation) in self.parameter_annotations(node) {
-                    if matches!(
-                        annotation_simple_name(&annotation),
-                        "JsonProperty" | "JsonAlias"
-                    ) {
-                        out.line(annotation);
-                    }
-                }
-            }
-            let ty = self.constructor_parameter_java_type(decl, param, ty);
-            out.open(format!("public {builder} {param}({ty} value)"));
-            if crate::transpiler::types::boxed_name(&ty).is_none()
-                && self
-                    .param_node(decl, param)
-                    .is_some_and(|node| kt::child(node, "nullable_type").is_none())
-            {
-                out.line(format!(
-                    "java.util.Objects.requireNonNull(value, \"{param}\");"
-                ));
-            }
-            out.line(format!("this.{param} = value;"));
-            out.line("return this;");
-            out.close();
-        }
-        out.blank();
-        out.open(format!("public {name} build()"));
-        for (_, _, param, ty) in params {
+        out.line("@SuppressWarnings(\"unchecked\")");
+        out.open(format!(
+            "private static {name} {create}(Object[] {values}, boolean[] {present})"
+        ));
+        // Validate supplied non-null values and missing required references
+        // before default expressions, just as Kotlin's argument binding does.
+        for (index, ((_, _, param, ty), default)) in params.iter().zip(&defaults).enumerate() {
             if crate::transpiler::types::boxed_name(ty).is_none()
                 && self
                     .param_node(decl, param)
                     .is_some_and(|node| kt::child(node, "nullable_type").is_none())
             {
-                out.line(format!(
-                    "java.util.Objects.requireNonNull({param}, \"{param}\");"
-                ));
+                let check =
+                    format!("java.util.Objects.requireNonNull({values}[{index}], \"{param}\");");
+                if default.is_some() {
+                    out.line(format!("if ({present}[{index}]) {{ {check} }}"));
+                } else {
+                    out.line(check);
+                }
             }
+        }
+        let previous = std::mem::take(&mut self.var_types);
+        for (index, ((_, _, param, ty), default)) in params.iter().zip(&defaults).enumerate() {
+            let ty = self.constructor_parameter_java_type(decl, param, ty);
+            let cast = crate::transpiler::types::cast_type(&ty);
+            let cast = crate::transpiler::types::boxed_name(&cast).unwrap_or(&cast);
+            let provided = format!("({cast}) {values}[{index}]");
+            let value = if let Some(default) = default {
+                let expression = Expr { unit: self }.transpile(*default);
+                format!("{present}[{index}] ? {provided} : {expression}")
+            } else {
+                provided
+            };
+            out.line(format!("{ty} {param} = {value};"));
+            self.var_types.insert(param.clone(), ty);
         }
         out.line(format!(
             "return new {name}({});",
@@ -4158,8 +4167,95 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+        self.var_types = previous;
         out.close();
-        out.close();
+        out.blank();
+        // Annotation deserializers resolve before Jackson's incomplete-cache
+        // registration. Share recursive resolution only on this thread and
+        // context, then clear it in finally. Prefetch contexts have no per-call
+        // attribute storage, so DeserializationContext attributes cannot hold it.
+        let helper = r#"public static final class __DESER__ extends com.fasterxml.jackson.databind.JsonDeserializer<__DTO__> implements com.fasterxml.jackson.databind.deser.ResolvableDeserializer, com.fasterxml.jackson.databind.deser.ContextualDeserializer {
+    private static final ThreadLocal<java.util.IdentityHashMap<com.fasterxml.jackson.databind.DeserializationContext, com.fasterxml.jackson.databind.JsonDeserializer<Object>>> RESOLVING = new ThreadLocal<>();
+    private com.fasterxml.jackson.databind.JsonDeserializer<Object> delegate;
+    private boolean cacheable;
+    public __DESER__() {}
+    private __DESER__(com.fasterxml.jackson.databind.JsonDeserializer<Object> delegate) { this.delegate = delegate; }
+    @Override
+    public Class<?> handledType() { return __DTO__.class; }
+    @Override
+    public boolean isCachable() { return cacheable; }
+    @Override
+    public void resolve(com.fasterxml.jackson.databind.DeserializationContext context) throws com.fasterxml.jackson.databind.JsonMappingException {
+        if (delegate != null) return;
+        var resolving = RESOLVING.get();
+        com.fasterxml.jackson.databind.JsonDeserializer<Object> active = resolving == null ? null : resolving.get(context);
+        if (active != null) { delegate = active; return; }
+        com.fasterxml.jackson.databind.JavaType type = context.constructType(__DTO__.class);
+        com.fasterxml.jackson.databind.deser.DeserializerFactory factory = context.getFactory().withValueInstantiators(new com.fasterxml.jackson.databind.deser.ValueInstantiators.Base() {
+            @Override
+            public com.fasterxml.jackson.databind.deser.ValueInstantiator findValueInstantiator(com.fasterxml.jackson.databind.DeserializationConfig config, com.fasterxml.jackson.databind.BeanDescription bean, com.fasterxml.jackson.databind.deser.ValueInstantiator original) {
+                return bean.getBeanClass() == __DTO__.class ? new __DESER__Instantiator(original) : original;
+            }
+        });
+        delegate = factory.createBeanDeserializer(context, type, context.getConfig().introspect(type));
+        if (resolving == null) { resolving = new java.util.IdentityHashMap<>(); RESOLVING.set(resolving); }
+        resolving.put(context, delegate);
+        try {
+            if (delegate instanceof com.fasterxml.jackson.databind.deser.ResolvableDeserializer resolvable) resolvable.resolve(context);
+            cacheable = true;
+        } finally {
+            resolving.remove(context);
+            if (resolving.isEmpty()) RESOLVING.remove();
+        }
+    }
+    @Override
+    @SuppressWarnings("unchecked")
+    public com.fasterxml.jackson.databind.JsonDeserializer<?> createContextual(com.fasterxml.jackson.databind.DeserializationContext context, com.fasterxml.jackson.databind.BeanProperty property) throws com.fasterxml.jackson.databind.JsonMappingException {
+        return new __DESER__((com.fasterxml.jackson.databind.JsonDeserializer<Object>) context.handleSecondaryContextualization(delegate, property, context.constructType(__DTO__.class)));
+    }
+    @Override
+    public __DTO__ deserialize(com.fasterxml.jackson.core.JsonParser parser, com.fasterxml.jackson.databind.DeserializationContext context) throws java.io.IOException {
+        return (__DTO__) delegate.deserialize(parser, context);
+    }
+    @Override
+    public __DTO__ deserialize(com.fasterxml.jackson.core.JsonParser parser, com.fasterxml.jackson.databind.DeserializationContext context, __DTO__ value) throws java.io.IOException {
+        return (__DTO__) delegate.deserialize(parser, context, value);
+    }
+    @Override
+    public Object deserializeWithType(com.fasterxml.jackson.core.JsonParser parser, com.fasterxml.jackson.databind.DeserializationContext context, com.fasterxml.jackson.databind.jsontype.TypeDeserializer type) throws java.io.IOException {
+        return delegate.deserializeWithType(parser, context, type);
+    }
+    @Override
+    public com.fasterxml.jackson.databind.deser.impl.ObjectIdReader getObjectIdReader() { return delegate == null ? null : delegate.getObjectIdReader(); }
+    @Override
+    public com.fasterxml.jackson.databind.deser.SettableBeanProperty findBackReference(String name) { return delegate.findBackReference(name); }
+}
+private static final class __DESER__Instantiator extends com.fasterxml.jackson.databind.deser.ValueInstantiator.Delegating {
+    private __DESER__Instantiator(com.fasterxml.jackson.databind.deser.ValueInstantiator delegate) { super(delegate); }
+    @Override
+    public Object createFromObjectWith(com.fasterxml.jackson.databind.DeserializationContext context, com.fasterxml.jackson.databind.deser.SettableBeanProperty[] properties, com.fasterxml.jackson.databind.deser.impl.PropertyValueBuffer buffer) throws java.io.IOException {
+        if (properties.length != __COUNT__) return super.createFromObjectWith(context, properties, buffer);
+        Object[] values = new Object[__COUNT__];
+        boolean[] present = new boolean[__COUNT__];
+        boolean[] defaulted = new boolean[] {__DEFAULTED__};
+        for (int index = 0; index < __COUNT__; index++) {
+            present[index] = buffer.hasParameter(properties[index]);
+            if (present[index] || !defaulted[index]) values[index] = buffer.getParameter(properties[index]);
+        }
+        return __CREATE__(values, present);
+    }
+    @Override
+    public Object createFromObjectWith(com.fasterxml.jackson.databind.DeserializationContext context, Object[] values) throws java.io.IOException {
+        boolean[] present = new boolean[__COUNT__];
+        java.util.Arrays.fill(present, true);
+        return __CREATE__(values, present);
+    }
+}"#.replace("__DESER__", deserializer).replace("__DTO__", name)
+            .replace("__CREATE__", &create).replace("__COUNT__", &params.len().to_string())
+            .replace("__DEFAULTED__", &defaults.iter().map(|default| default.is_some().to_string()).collect::<Vec<_>>().join(", "));
+        for line in helper.lines() {
+            out.line(line);
+        }
     }
 
     /// Kotlin read-only collections are covariant at call boundaries, but a
@@ -4199,10 +4295,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if parameter_type == field_type {
             name.to_string()
         } else {
-            let cast_type = field_type
-                .trim_start_matches("@Nullable ")
-                .trim_start_matches("@NotNull ")
-                .trim_start_matches("@NonNull ");
+            let cast_type = crate::transpiler::types::cast_type(field_type);
             format!("({cast_type}) (Object) {name}")
         }
     }
@@ -4370,10 +4463,24 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// by index (`None` where the parameter has no default). Used to fill
     /// enum-constant call sites, since Java has no default arguments.
     fn class_param_defaults(&mut self, decl: tree_sitter::Node) -> Vec<Option<String>> {
-        self.class_param_default_nodes(decl)
+        // All consumers (overloads, enum entries, JPA constructors and creators)
+        // lower defaults before an instance exists. Earlier parameters are
+        // local values, with their declared types, rather than member reads.
+        let parameters = self.class_params(decl);
+        let prior = std::mem::replace(
+            &mut self.var_types,
+            parameters
+                .into_iter()
+                .map(|(_, _, name, ty)| (name, ty))
+                .collect(),
+        );
+        let result = self
+            .class_param_default_nodes(decl)
             .into_iter()
             .map(|default| default.map(|ex| Expr { unit: self }.transpile(ex)))
-            .collect()
+            .collect();
+        self.var_types = prior;
+        result
     }
 
     /// `@JvmOverloads` on the primary constructor: the annotation that asks
@@ -4489,25 +4596,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if !has_defaults && !ladder_requested {
             return;
         }
-        // Kotlin primary-constructor default expressions run before an instance
-        // exists. Seed the constructor parameters as locals while lowering so
-        // `label` stays `label`, rather than becoming `this.getLabel()`.
-        let prior_var_types = std::mem::replace(
-            &mut self.var_types,
-            params
-                .iter()
-                .map(|(_, _, param_name, param_type)| (param_name.clone(), param_type.clone()))
-                .collect(),
-        );
         let defaults = self.class_param_defaults(decl);
-        self.var_types = prior_var_types;
         let mut patterns =
             Self::constructor_overload_patterns(&defaults, has_jvm_overloads, self.in_place);
-        let jvm_patterns = if has_jvm_overloads {
-            patterns.clone()
-        } else {
-            Vec::new()
-        };
+        let ladder_patterns = patterns.clone();
         let target = self.indexed_target(name);
         let secondary_arities = target
             .map(|target| {
@@ -4545,16 +4637,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            // Each @JvmOverloads rung supplies the next default in declaration
+            // Each trailing-default or @JvmOverloads rung supplies the next default in declaration
             // order, then delegates to the larger rung. A later default can
             // therefore use an earlier omitted parameter without evaluating it
             // twice or referencing a name absent from this overload.
-            let jvm_rung = jvm_patterns
+            let ladder_rung = ladder_patterns
                 .iter()
                 .position(|candidate| candidate == pattern);
-            let delegate_omissions = jvm_rung
+            let delegate_omissions = ladder_rung
                 .and_then(|index| index.checked_sub(1))
-                .map(|index| jvm_patterns[index].as_slice())
+                .map(|index| ladder_patterns[index].as_slice())
                 .unwrap_or_default();
             let delegate_arity = params.len() - delegate_omissions.len();
             let competing_constructor = patterns.iter().any(|candidate| {
@@ -4570,7 +4662,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             .unwrap_or_else(|| "null".to_string());
                         // Kotlin delegates to the primary constructor. A bare
                         // null can select several Java reference overloads.
-                        if jvm_rung.is_some() && competing_constructor {
+                        if ladder_rung.is_some() && competing_constructor {
                             // A default's expression can have a narrower type
                             // than the parameter. Anchor overload selection to
                             // the intended rung, including around secondary
@@ -4580,15 +4672,16 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                 &params[index].2,
                                 &params[index].3,
                             );
-                            format!("({cast_type}) ({value})")
+                            let cast_type = crate::transpiler::types::cast_type(&cast_type);
+                            if value.trim() == "null" {
+                                format!("({cast_type}) null")
+                            } else {
+                                format!("({cast_type}) ({value})")
+                            }
                         } else if value.trim() == "null"
                             && secondary_arities.contains(&params.len())
                         {
-                            let cast_type = params[index]
-                                .3
-                                .replace("@Nullable ", "")
-                                .replace("@NotNull ", "")
-                                .replace("@NonNull ", "");
+                            let cast_type = crate::transpiler::types::cast_type(&params[index].3);
                             format!("({cast_type}) null")
                         } else {
                             value

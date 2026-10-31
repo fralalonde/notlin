@@ -5,7 +5,7 @@
 //! syntax facts are collected from the workspace's existing parse snapshots,
 //! then joined to the stable type graph after inheritance is indexed.
 
-use super::{FactStatus, SemanticProvider, SymbolId, SyntaxSemanticProvider};
+use super::{SymbolId, SyntaxSemanticProvider};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
@@ -21,7 +21,7 @@ struct ClassFact {
     has_primary_defaults: bool,
     own_annotation: bool,
     custom_binding: bool,
-    factory_enums: Option<Vec<(String, String)>>,
+    factory_defaults: bool,
     ignores_unknown: bool,
 }
 
@@ -55,7 +55,7 @@ pub(super) fn collect(source: &str, file: &Path, root: Node<'_>) -> FileRelation
                     has_primary_defaults,
                     own_annotation,
                     custom_binding: custom_binding(source, node, &bindings),
-                    factory_enums: simple_factory_defaults(source, node, &bindings),
+                    factory_defaults: ordinary_factory_defaults(source, node, &bindings),
                     ignores_unknown,
                 });
             }
@@ -160,7 +160,8 @@ fn ignores_unknown(source: &str, declaration: Node<'_>, bindings: &AnnotationBin
 }
 
 /// An established constructor-default capability shared by planning and Java
-/// emission. Collect syntax once, then resolve enum identities after indexing.
+/// emission. Default expressions use the same binding and lowering checks as
+/// ordinary constructor expressions; this capability proves the creator shape.
 pub(super) fn resolve_factories(
     provider: &SyntaxSemanticProvider,
     files: &BTreeMap<PathBuf, FileRelations>,
@@ -177,16 +178,9 @@ pub(super) fn resolve_factories(
         let available = apis.entry(source_set(file).to_path_buf()).or_default();
         for import in imports {
             let path = import.split(" as ").next().unwrap_or(import);
-            available.0 |= matches!(
-                path,
-                "com.fasterxml.jackson.annotation.JsonCreator"
-                    | "com.fasterxml.jackson.annotation.*"
-            );
-            available.1 |= matches!(
-                path,
-                "com.fasterxml.jackson.databind.annotation.JsonDeserialize"
-                    | "com.fasterxml.jackson.databind.annotation.*"
-            );
+            // APIs in these packages share their respective Jackson artifacts.
+            available.0 |= path.starts_with("com.fasterxml.jackson.annotation.");
+            available.1 |= path.starts_with("com.fasterxml.jackson.databind.");
         }
     }
     let mut supported = BTreeSet::new();
@@ -205,23 +199,17 @@ pub(super) fn resolve_factories(
         if apis.get(source_set(file)) != Some(&(true, true)) {
             continue;
         }
-        let package = super::package_name(&provider.sources[file]);
         for fact in &relations.classes {
-            let Some(enums) = &fact.factory_enums else {
+            if !fact.factory_defaults {
                 continue;
-            };
+            }
             let Some(owner) = symbol_at(provider, file, fact.start) else {
                 continue;
             };
             if custom.contains(&owner) {
                 continue;
             }
-            if enums.iter().all(|(ty, entry)| {
-                let FactStatus::Established(ty) = provider.resolve_type_in_file(file, &package, ty) else { return false };
-                matches!(provider.enum_entries(&ty), FactStatus::Established(entries) if entries.iter().any(|value| value.name == *entry))
-            }) {
-                supported.insert(owner);
-            }
+            supported.insert(owner);
         }
     }
     supported
@@ -301,14 +289,18 @@ fn descendants(
     owners
 }
 
-/// The first supported family has ordinary data-class parameters and literal
-/// or enum-entry defaults. Custom Jackson binding and nullable non-null defaults
-/// need different presence handling and remain Kotlin.
-fn simple_factory_defaults(
+/// Creator binding can defer omitted defaults until construction, in declaration order.
+/// The ordinary constructor keeps ownership of instance initialization and
+/// property binding; no second model of the class body is needed here.
+fn ordinary_factory_defaults(source: &str, class: Node<'_>, bindings: &AnnotationBindings) -> bool {
+    ordinary_factory_shape(source, class, bindings).is_some()
+}
+
+fn ordinary_factory_shape(
     source: &str,
     class: Node<'_>,
     bindings: &AnnotationBindings,
-) -> Option<Vec<(String, String)>> {
+) -> Option<()> {
     let modifiers = named_children(class)
         .into_iter()
         .find(|node| node.kind() == "modifiers")?;
@@ -326,23 +318,12 @@ fn simple_factory_defaults(
     if custom_binding(source, class, bindings) {
         return None;
     }
-    let mut pending = vec![class];
-    while let Some(node) = pending.pop() {
-        if matches!(
-            node.kind(),
-            "property_declaration" | "anonymous_initializer" | "secondary_constructor"
-        ) {
-            return None;
-        }
-        pending.extend(named_children(node));
-    }
     let constructor = named_children(class)
         .into_iter()
         .find(|node| node.kind() == "primary_constructor")?;
     let parameters = named_children(constructor)
         .into_iter()
         .find(|node| node.kind() == "class_parameters")?;
-    let mut entries = Vec::new();
     let mut default_count = 0;
     for parameter in named_children(parameters)
         .into_iter()
@@ -355,34 +336,9 @@ fn simple_factory_defaults(
             continue;
         };
         default_count += 1;
-        let default = children[equals + 1..].iter().find(|node| node.is_named())?;
-        let text = default.utf8_text(source.as_bytes()).ok()?;
-        if named_children(parameter)
-            .iter()
-            .any(|node| node.kind() == "nullable_type")
-            && text != "null"
-        {
-            return None;
-        }
-        match default.kind() {
-            "number_literal" | "float_literal" | "character_literal" => {}
-            "string_literal" if super::safe_java_string_literal(text) => {}
-            "identifier" if matches!(text, "true" | "false" | "null") => {}
-            "navigation_expression" => {
-                let (ty, entry) = text.rsplit_once('.')?;
-                if !ty
-                    .chars()
-                    .all(|c| c == '.' || c == '_' || c.is_alphanumeric())
-                    || !entry.chars().all(|c| c == '_' || c.is_alphanumeric())
-                {
-                    return None;
-                }
-                entries.push((ty.to_owned(), entry.to_owned()));
-            }
-            _ => return None,
-        }
+        children[equals + 1..].iter().find(|node| node.is_named())?;
     }
-    (default_count != 0).then_some(entries)
+    (default_count != 0).then_some(())
 }
 
 pub(super) fn resolve(

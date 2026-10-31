@@ -1,6 +1,66 @@
 # Translation frontier
 
-## Current checkpoint � 2026-10-30
+## Current checkpoint — 2026-10-31
+
+The standard fresh conversion of reference commit `179bb912` produces
+**3,954 Java files**, retaining 2,417 of 6,371 original Kotlin owners:
+**+10 / -0** against the accepted 3,944-output baseline. The gains are
+`APIKeyAuthenticationDto`, `BasicAuthenticationDto`, `LightDeviceInstruction`,
+`ItemLocationDto`, `ItemPositionDto`, `ItemUnitPositionDto`, `FacilityDto`,
+`OrganizationDto`, `UIAPIKeyCredentialsDto`, and `UIOAuthCredentialsDto`.
+Both conversions gain the same ten owners. Three assignment DTOs have existing
+context-dependent Lombok annotation and getter-qualification differences;
+their final fields, constructors and default-instantiation helpers agree.
+Both complete variants pass their respective full builds.
+
+Jackson constructor defaults use the ordinary constructor's property binding
+through a generated instantiator. Omitted defaults evaluate once, in declaration
+order, while supplied values and explicit nullable nulls remain distinct.
+Parameter deserializers, mapper naming, aliases, inherited contracts and
+polymorphism stay attached to Jackson's standard binding. The constructor owns
+body-property and init-block execution. Recursive DTOs reuse the incomplete
+binding delegate per thread and deserialization context, including
+ObjectReader prefetch before per-call attributes exist. The registry is cleared
+after resolution. The former literal/enum
+builder restriction is removed; ordinary lowerings establish default expressions.
+Custom binding and generic DTOs retain their existing guards.
+
+Constructor overloads evaluate successive defaults through the next larger
+constructor, so dependent expressions never read absent arguments or run twice.
+String concatenation selects the left receiver before right-hand collection or
+custom-class operators. Cast types omit declaration-only nullability annotations;
+the rejected candidate's full Gradle build exposed that incompatibility, which
+now has native coverage using the older vendored JetBrains annotation API.
+
+The baseline full Gradle build passes in 7m 51s;
+the fresh full Gradle build passes in 4m 42s:
+**110 actionable tasks: 55 executed, 55 from cache**. Hastings imports all **9,113 records** (50 + 9,063),
+followed by **105.8 seconds** without errors or stack traces after
+`Done loading dev resources [customers/hastings/hastings-dev.csv]`.
+The disposable application is stopped after observation. No application source
+or runtime configuration was hand-fixed.
+
+All seven fixture checks pass with the frozen executable, including native
+Kotlin-versus-Java comparisons in both Lombok modes. Coverage includes mutable
+collection defaults, dependent defaults, nullable values,
+required-value rejection, side effects, recursion, instance initialization,
+custom parameter handling and constructor calls from retained Kotlin.
+All four standalone samples compile. Formatting and default-target clippy pass.
+The Rust sweep remains red: **1,571 pass, 73 fail,
+137 ignored**, with no previously unseen failing names. The known
+Windows vanished-source deletion race resurfaced in this sweep; its isolated
+rerun passes. The other 72 failing names match the accepted baseline.
+
+Evidence is under `target/defaults-frontier-v3-20261031/`, using
+`notlin-defaults.exe`, `incremental-final`, and fresh `clean`. Its SHA256 is
+`ac4ba6cc72d268fdd49c9df9b7d762d874d9deb9a8c0b5b7fb9ae93cdb105cf2`. `acceptance.json` records the frozen source,
+input identities, ownership comparison, builds and runtime results. The rejected
+annotation-cast candidate remains under `target/defaults-frontier-20261031/`;
+the prefetch-context failure is under `target/defaults-frontier-v2-20261031/`.
+Work continues on the retained frontier, including effective custom-deserializer
+contracts and established map algebra.
+
+## Previous checkpoint — 2026-10-30
 
 The standard fresh conversion of reference commit `179bb912` produces
 **3,944 Java files**, retaining 2,427 of 6,371 original Kotlin owners:

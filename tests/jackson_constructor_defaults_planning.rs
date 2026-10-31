@@ -202,7 +202,7 @@ data class CustomCreator @JsonCreator constructor(val enabled: Boolean = true)
     let index = provider(&[("Defaults.kt", source)]);
     for (name, supported) in [
         ("Simple", true),
-        ("Nullable", false),
+        ("Nullable", true),
         ("Generic", false),
         ("Inherited", false),
         ("CustomCreator", false),

@@ -371,6 +371,21 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 } else {
                     java_op
                 };
+                // Kotlin String.plus accepts any right-hand value. Operator
+                // dispatch belongs to the left receiver; a right-hand user
+                // class must not turn string concatenation into its plus().
+                if op == "+"
+                    && self.known_expression_type(l).is_some_and(|ty| {
+                        matches!(
+                            ty.trim().trim_end_matches('?'),
+                            "String" | "java.lang.String" | "kotlin.String"
+                        )
+                    })
+                {
+                    let left = self.transpile(l);
+                    let right = self.transpile(r);
+                    return format!("{left} + {right}");
+                }
                 // `mapOf(...) + other` and `other + mapOf(...)` are Kotlin
                 // Map.plus calls. A map factory's result type is syntactically
                 // known even when workspace inference cannot resolve the

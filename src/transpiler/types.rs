@@ -19,6 +19,15 @@ impl AnnotationSet {
     }
 }
 
+/// Nullability markers describe declarations. Older annotation jars do not
+/// permit them in Java cast expressions, even when the declaration is nullable.
+pub(crate) fn cast_type(java_type: &str) -> String {
+    java_type
+        .replace("@Nullable ", "")
+        .replace("@NotNull ", "")
+        .replace("@NonNull ", "")
+}
+
 /// Map a Kotlin type name to its Java equivalent where they differ.
 ///
 /// Kotlin's `Mutable*` collections are the same JVM types as the read-only

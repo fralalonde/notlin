@@ -2437,8 +2437,20 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         false
     }
 
-    fn known_expression_type(&self, node: tree_sitter::Node) -> Option<String> {
+    pub(super) fn known_expression_type(&self, node: tree_sitter::Node) -> Option<String> {
         if node.kind() == "string_literal" {
+            return Some("String".to_string());
+        }
+        if node.kind() == "binary_expression"
+            && kt::field(node, "operator").is_some_and(|operator| self.unit.text(operator) == "+")
+            && let Some(left) = kt::field(node, "left")
+            && self.known_expression_type(left).is_some_and(|ty| {
+                matches!(
+                    ty.trim().trim_end_matches('?'),
+                    "String" | "java.lang.String" | "kotlin.String"
+                )
+            })
+        {
             return Some("String".to_string());
         }
         let raw = self.unit.text(node).trim();

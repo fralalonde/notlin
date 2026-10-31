@@ -182,7 +182,9 @@ public final class ContextString extends com.fasterxml.jackson.databind.deser.st
 }
 
 fn translate(root: &Path, lombok_enabled: bool) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_notlin"));
+    let binary = std::env::var_os("NOTLIN_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into());
+    let mut command = Command::new(binary);
     command
         .arg("--root")
         .arg(root)
@@ -253,21 +255,18 @@ fn cli_preserves_jackson_constructor_defaults_in_both_lombok_modes() {
             "{}",
             String::from_utf8_lossy(&translated.stderr)
         );
-        let kotlin = fs::read_to_string(root.join("Payload.kt")).unwrap_or_default();
+        let java = fs::read_to_string(root.join("Payload.java")).unwrap_or_default();
         assert!(
-            !root.join("Payload.java").exists() && kotlin.contains("data class Payload"),
-            "Jackson defaults require Kotlin metadata: {}",
+            java.contains("ValueInstantiators.Base"),
+            "Jackson defaults should use the generated presence-aware creator: {}",
             String::from_utf8_lossy(&translated.stderr)
         );
-        assert!(
-            kotlin.contains("IdentifierDto(\"${reference}-auto\")"),
-            "{kotlin}"
-        );
+        assert!(java.contains("new IdentifierDto"), "{java}");
     }
 }
 
 #[test]
-fn unannotated_data_defaults_use_a_boxed_jackson_factory() {
+fn unannotated_data_defaults_use_a_presence_aware_jackson_instantiator() {
     let scratch = Scratch::new();
     populate_unannotated(&scratch.0);
     let translated = translate(&scratch.0, true);
@@ -278,17 +277,13 @@ fn unannotated_data_defaults_use_a_boxed_jackson_factory() {
     );
     let java =
         fs::read_to_string(scratch.0.join("Payload.java")).expect("unannotated DTO translates");
+    assert!(java.contains("ValueInstantiators.Base"), "{java}");
     assert!(
-        java.contains("@com.fasterxml.jackson.annotation.JsonCreator"),
-        "{java}"
-    );
-    assert!(java.contains("Boolean enabled"), "{java}");
-    assert!(
-        java.contains("if (tags == null) { tags = new Tags(); }"),
+        java.contains("new Tags()") && java.contains("buffer.hasParameter"),
         "{java}"
     );
     assert!(
-        java.contains("if (enabled == null) { enabled = true; }"),
+        java.contains("? (Boolean)") && java.contains(": true"),
         "{java}"
     );
     assert!(
@@ -415,10 +410,9 @@ fn jackson_uses_defaults_for_missing_constructor_properties_in_both_lombok_modes
             String::from_utf8_lossy(&translated.stderr)
         );
         assert!(migrated.join("Runner.kt").is_file());
-        let kotlin = fs::read_to_string(migrated.join("Payload.kt")).unwrap_or_default();
         assert!(
-            !migrated.join("Payload.java").exists() && kotlin.contains("data class Payload"),
-            "Jackson constructor defaults require retaining the Kotlin data class"
+            migrated.join("Payload.java").exists(),
+            "presence-aware defaults should migrate this DTO"
         );
         let after = validate_jvm_sources(&config(
             &migrated,

@@ -174,13 +174,20 @@ explicit capability proof; recognizing an annotation is insufficient.
   instantiated type graph to check every inherited getter against the child's
   own methods/properties and accepted bridges. Extra defaults with arguments,
   unresolved type substitutions and unsupported JVM shapes still retain Kotlin.
-- Jackson-observed data classes with literal or enum-entry constructor defaults
-  can use generated builders when the source set proves the Jackson API is
-  available. Omitted properties retain defaults; explicit inputs use setters,
-  with the original nullability checks. Implicit setter names respect mapper
-  naming strategies; explicit JSON names and aliases are preserved. Inherited
-  `JsonIgnoreProperties(ignoreUnknown = true)` is forwarded to the builder.
-  Custom binding, nullable non-null defaults and generic data classes remain Kotlin.
+- Jackson-observed data classes can supply ordinary constructor defaults through
+  a generated creator instantiator when the source set proves the Jackson API
+  is available. Jackson binds the canonical constructor's parameters, including
+  parameter annotations, aliases and mapper naming; the instantiator distinguishes
+  omitted values from explicit nulls. Defaults run once in declaration order,
+  then the ordinary constructor performs property and instance initialization.
+  Recursive DTO resolution shares the incomplete delegate per thread and context;
+  it also works during ObjectReader prefetch, before per-call attributes exist.
+  Custom binding and generic data classes remain Kotlin. Declaration nullability
+  annotations are omitted from cast types for compatibility with older jars.
+- Constructor overloads delegate through successive default arguments, so a
+  later default can read an earlier argument without re-evaluating its expression.
+  String concatenation dispatch follows the left receiver even when the right
+  operand is a custom class or collection.
 - Kotlin stdlib member mapping (`kotlin_member_to_java` in expr.rs +
   property-read table): `uppercase`→`toUpperCase`, `keys`→`keySet()`, etc.
   Unmapped stdlib members warn N002 and pass through verbatim.
