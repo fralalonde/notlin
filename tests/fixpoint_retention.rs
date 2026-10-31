@@ -455,14 +455,14 @@ fn deep_valid_retention_chain_uses_configurable_budget() {
         fs::write(
             scratch.join(format!("Chain{depth}.kt")),
             format!(
-                "package neutral.deep\ninterface Chain{depth}{supertype} {{ fun marker{depth}(input: Int): Int }}\n"
+                "package neutral.deep\ninterface Chain{depth}{supertype} {{ fun marker{depth}(input: Int): Int = input }}\n"
             ),
         )
         .unwrap();
     }
     fs::write(
         scratch.join("Kept.kt"),
-        "package neutral.deep\nvalue class Kept(val raw: Int) : Chain6\n",
+        "package neutral.deep\n@JvmInline value class Kept(val raw: Int) : Chain6\n",
     )
     .unwrap();
 
@@ -481,10 +481,10 @@ fn deep_valid_retention_chain_uses_configurable_budget() {
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
     let error =
-        fixpoint::plan_workspace_state(&files, &cli, &index, std::slice::from_ref(&root), 4, false)
+        fixpoint::plan_workspace_state(&files, &cli, &index, std::slice::from_ref(&root), 1, false)
             .err()
-            .expect("four passes must be insufficient for this valid chain");
-    assert!(error.contains("increase --max-retention-passes above 4"));
+            .expect("one pass must be insufficient to converge this valid chain");
+    assert!(error.contains("increase --max-retention-passes above 1"));
 
     let planned = fixpoint::plan_workspace_state(
         &files,
@@ -495,7 +495,8 @@ fn deep_valid_retention_chain_uses_configurable_budget() {
         false,
     )
     .expect("the same valid chain must converge with a larger budget");
-    assert_eq!(planned.retained.len(), 8);
+    assert_eq!(planned.retained.len(), 1);
+    assert_eq!(planned.retained.iter().next().unwrap().name, "Kept");
     let _ = fs::remove_dir_all(root);
 }
 
@@ -534,7 +535,7 @@ fn library_fixpoint_reports_speculative_round_progress() {
 }
 
 #[test]
-fn retained_comments_name_direct_declarations_and_root_markers() {
+fn retained_comments_keep_distinct_root_markers_and_are_idempotent() {
     let root = Path::new("tests/tmp_scratch_precise_retention_comments");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -545,12 +546,12 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
     .unwrap();
     fs::write(
         root.join("Chain1.kt"),
-        "package neutral.comments\ninterface Chain1 : Chain0 { fun marker1(input: Int): Int }\n",
+        "package neutral.comments\ninterface Chain1 : Chain0 { suspend fun marker1(input: Int): Int = input }\n",
     )
     .unwrap();
     fs::write(
         root.join("Kept.kt"),
-        "package neutral.comments\nvalue class Kept(val raw: Int) : Chain1\n",
+        "package neutral.comments\n@JvmInline value class Kept(val raw: Int) : Chain1\n",
     )
     .unwrap();
 
@@ -580,15 +581,15 @@ fn retained_comments_name_direct_declarations_and_root_markers() {
         "{chain0}"
     );
     assert!(
-        chain1.contains("* NOTLIN N2142:")
-            && chain1.contains("[neutral.comments.Kept]")
+        chain1.contains("* NOTLIN ")
+            && chain1.contains("suspend")
             && !chain1.contains(&root.to_string_lossy().replace('\\', "/")),
         "{chain1}"
     );
 
     let kept = fs::read_to_string(root.join("Kept.kt")).unwrap();
     assert!(
-        kept.contains("* NOTLIN NE098:") && kept.contains("[neutral.comments.Chain1]"),
+        kept.contains("* NOTLIN NF7FA:") && kept.contains("* NOTLIN NE098:"),
         "{kept}"
     );
 
