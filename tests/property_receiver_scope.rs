@@ -446,3 +446,28 @@ fn java_synthetic_property_requires_a_unique_physical_public_getter() {
         );
     }
 }
+
+#[test]
+fn metadata_getter_receivers_distinguish_platform_nonnull_and_nullable_results() {
+    let consumer = "package consumer\nimport model.Holder\nfun run(other: Holder): Int = other.item.compareToken(other.item)\n";
+    let token = "package model\nclass RankToken { fun compareToken(other: RankToken): Int = 1 }\n";
+    for (annotation, readable) in [
+        ("", true),
+        ("@org.jetbrains.annotations.NotNull", true),
+        ("@org.jetbrains.annotations.Nullable", false),
+    ] {
+        let java = format!(
+            "package model;\n@com.fasterxml.jackson.annotation.JsonIgnoreProperties(\"unused\") public class Holder {{ @com.fasterxml.jackson.annotation.JsonIgnore {annotation} public RankToken getItem() {{ return new RankToken(); }} }}"
+        );
+        let target = compare_target_files(&[
+            ("Contracts.kt", consumer),
+            ("Holder.java", &java),
+            ("Token.kt", token),
+        ]);
+        assert_eq!(
+            matches!(target, FactStatus::Established(_)),
+            readable,
+            "{annotation}"
+        );
+    }
+}

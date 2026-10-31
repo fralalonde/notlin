@@ -19,6 +19,7 @@ pub(super) struct GetterShape {
     pub jvm_primitive: bool,
     boxed_simple_name: Option<String>,
     annotation_bindings: Vec<(String, String)>,
+    metadata_bindings: Vec<super::java_metadata::Binding>,
 }
 
 /// An annotation may introduce an accessor that has no source method symbol.
@@ -48,7 +49,11 @@ pub(super) fn may_have_generated_getters(owner: Node<'_>) -> bool {
     })
 }
 
-pub(super) fn collect(source: &str, node: Node<'_>) -> Option<GetterShape> {
+pub(super) fn collect(
+    source: &str,
+    node: Node<'_>,
+    metadata: &super::java_metadata::Scope<'_>,
+) -> Option<GetterShape> {
     let name = node
         .child_by_field_name("name")?
         .utf8_text(source.as_bytes())
@@ -100,8 +105,10 @@ pub(super) fn collect(source: &str, node: Node<'_>) -> Option<GetterShape> {
     );
     // Validate annotations even on primitives; an unknown annotation may be a
     // processor contract rather than a harmless nullness marker.
-    let reference_nullability = source_calls::java_method_return_nullability(source, node)?;
-    let mut annotation_bindings = enclosing_annotation_bindings(source, node)?;
+    let EnclosingAnnotations {
+        legacy: mut annotation_bindings,
+        metadata: mut metadata_bindings,
+    } = enclosing_annotation_bindings(source, node, metadata)?;
     if let Some(modifiers) = node
         .named_children(&mut node.walk())
         .find(|child| child.kind() == "modifiers")
@@ -110,6 +117,13 @@ pub(super) fn collect(source: &str, node: Node<'_>) -> Option<GetterShape> {
             .named_children(&mut modifiers.walk())
             .filter(|child| matches!(child.kind(), "annotation" | "marker_annotation"))
         {
+            if let Some(binding) = metadata.binding(annotation)
+                && binding.neutral_for_nullness()
+                && binding.canonical != "java.lang.Override"
+            {
+                metadata_bindings.push(binding);
+                continue;
+            }
             let name = annotation
                 .child_by_field_name("name")?
                 .utf8_text(source.as_bytes())
@@ -126,6 +140,11 @@ pub(super) fn collect(source: &str, node: Node<'_>) -> Option<GetterShape> {
             annotation_bindings.push((name.to_owned(), canonical.to_owned()));
         }
     }
+    let reference_nullability = source_calls::java_method_return_nullability_with_metadata(
+        source,
+        node,
+        &metadata_bindings,
+    )?;
     let nullability = if jvm_primitive {
         ReferenceReturnNullability::NonNull
     } else {
@@ -167,6 +186,7 @@ pub(super) fn collect(source: &str, node: Node<'_>) -> Option<GetterShape> {
         jvm_primitive,
         boxed_simple_name,
         annotation_bindings,
+        metadata_bindings,
     })
 }
 
@@ -234,8 +254,18 @@ fn canonical_annotation_import(
     exact
 }
 
-fn enclosing_annotation_bindings(source: &str, node: Node<'_>) -> Option<Vec<(String, String)>> {
+struct EnclosingAnnotations {
+    legacy: Vec<(String, String)>,
+    metadata: Vec<super::java_metadata::Binding>,
+}
+
+fn enclosing_annotation_bindings(
+    source: &str,
+    node: Node<'_>,
+    metadata: &super::java_metadata::Scope<'_>,
+) -> Option<EnclosingAnnotations> {
     let mut bindings = Vec::new();
+    let mut metadata_bindings = Vec::new();
     let mut ancestor = node.parent();
     while let Some(owner) = ancestor {
         ancestor = owner.parent();
@@ -258,6 +288,12 @@ fn enclosing_annotation_bindings(source: &str, node: Node<'_>) -> Option<Vec<(St
             .named_children(&mut modifiers.walk())
             .filter(|child| matches!(child.kind(), "annotation" | "marker_annotation"))
         {
+            if let Some(binding) = metadata.binding(annotation)
+                && binding.neutral_for_nullness()
+            {
+                metadata_bindings.push(binding);
+                continue;
+            }
             let name = annotation
                 .child_by_field_name("name")?
                 .utf8_text(source.as_bytes())
@@ -287,7 +323,10 @@ fn enclosing_annotation_bindings(source: &str, node: Node<'_>) -> Option<Vec<(St
             bindings.push((name.to_owned(), canonical));
         }
     }
-    Some(bindings)
+    Some(EnclosingAnnotations {
+        legacy: bindings,
+        metadata: metadata_bindings,
+    })
 }
 
 impl SyntaxSemanticProvider {
@@ -609,7 +648,9 @@ impl SyntaxSemanticProvider {
             })
             .collect::<Vec<_>>();
         if candidates.is_empty() && generated.is_none() {
-            if self.java_uncertain_getter_owners.contains(owner) {
+            if self.java_uncertain_getter_owners.contains(owner)
+                && !self.java_metadata_preserves_members(owner)
+            {
                 return None;
             }
             return Some(None);
@@ -641,6 +682,15 @@ impl SyntaxSemanticProvider {
         let shape = self
             .java_property_read_shapes
             .get(&(owner.file.clone(), symbol.location.start_byte))?;
+        if !shape.metadata_bindings.is_empty()
+            && (!self.java_metadata_preserves_members(owner)
+                || shape
+                    .metadata_bindings
+                    .iter()
+                    .any(|binding| !binding.valid(&owner.file, &owner.package, self)))
+        {
+            return None;
+        }
         for (annotation, canonical) in &shape.annotation_bindings {
             match self.resolve_type_in_file(&owner.file, &owner.package, annotation) {
                 FactStatus::Unknown => {}

@@ -3,6 +3,59 @@
 ## Current checkpoint — 2026-10-31
 
 The standard fresh conversion of reference commit `179bb912` produces
+**4,380 Java files**, retaining 1,991 of 6,371 original Kotlin
+owners: **+6 / -0** against the accepted 4,374-output baseline.
+The baseline trial gains 6 owners. All 6,371 original
+owner identities are compared. New owners: `IJobAssetInfo`, `IOrderAssetInfo`, `IWorkAssetInfo`, `IWorkflowAwareAssetInfo`, `IWorkflowAwareStorageAssetInfo`, `EmptyWorkerInfo`.
+
+Java source facts now distinguish resolved member-neutral library metadata from
+annotations with unknown effects. The shared fact supports declared getter reads
+and field-absence checks. Jackson metadata on a Java ancestor therefore no longer
+prevents a proven standard `TODO()` from becoming `throw new NotImplementedError`.
+Non-null and Java platform getter results feed ordinary receiver chains.
+Explicitly nullable results retain their guard; the nullness contract distinguishes
+them from platform results even though both have a nullable `TypeRef` bit.
+
+Annotation identities are checked against imports, source packages, lexical and
+inherited nested types. Java annotation declarations join the semantic type index.
+Unknown wildcard packages, conflicting classifiers, custom processors, nullness
+defaults and callable fields keep their independent guards. Serialization metadata
+never establishes nullability or waives constructor/Kotlin-metadata contracts.
+The source package query is indexed; the index cache version advances to 33.
+
+The native fixture independently compiles original Kotlin/Java, then compares it
+with both Lombok modes using the frozen executable and actual Jackson libraries.
+Getter values and evaluation counts, polymorphic JSON serialization and
+deserialization, standard TODO exception classes/messages and an explicitly bound
+callable field match. Unit checks cover nullness, unknown effects, source wildcard
+conflicts and an inherited annotation type that shadows an imported library type.
+
+Both full Gradle builds pass: baseline **4m**
+(110 actionable tasks: 44 executed, 66 from cache), fresh **4m 20s**
+(110 actionable tasks: 80 executed, 30 from cache). Both Hastings runs import **9,113 records**,
+then remain free of errors and stack traces for **105.6** and
+**105.9 seconds** after the complete dataset marker. Both
+disposable applications are stopped. No generated application source is patched.
+
+All **6,527 Java files match as text** between baseline and fresh
+conversion.
+Formatting, required lint, four standalone samples and frozen native checks pass.
+The permissions-matched Windows Rust sweep is **1,603 pass,
+63 fail, 141 ignored**, with no new unrecorded failure names against
+the preceding accepted checkpoint. The previously recorded source-deletion
+timing test fails in the full sweep and passes its isolated rerun. Final-head Linux CI is required before install.
+
+Evidence: `target/java-metadata-frontier-v2-20261031/acceptance.json`.
+Frozen SHA256: `057ba2d1e77012816087c1fec7ffa551788a761c262f925a047792c603e63e74`.
+A separate original-Kotlin probe reproduces the pre-existing Unicode `trim()`
+difference in both the preceding executable and this candidate; its code-point
+outputs are in `next-trim-characterization/results.json` beside the evidence.
+That is the next behavior correction; wildcard type binding also remains open.
+The translation frontier remains active.
+
+## Previous checkpoint — 2026-10-31
+
+The standard fresh conversion of reference commit `179bb912` produces
 **4,374 Java files**, retaining 1,997 of 6,371 original Kotlin owners:
 **+12 / -0** against the accepted 4,362-output baseline. The baseline trial gains
 the same twelve owners: five classes and seven interfaces. Gains include

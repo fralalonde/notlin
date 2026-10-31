@@ -28,7 +28,7 @@ pub(crate) mod profile;
 // 29: method-generic and inline-bound header facts reuse the indexing parse.
 // 31: setter_name_renamed indexes @JvmName presence on properties.
 // 32: method type parameters prevent source classifiers from capturing returns.
-const CACHE_VERSION: u32 = 32;
+const CACHE_VERSION: u32 = 33;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;

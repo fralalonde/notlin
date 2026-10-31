@@ -113,6 +113,17 @@ and its effect on the JVM contract. A new annotation name is not itself a new
 translation rule. Library behavior that observes Kotlin metadata requires an
 explicit capability proof; recognizing an annotation is insufficient.
 
+- Java member-neutral metadata has a shared, source-bound annotation fact.
+  Resolved Jackson and standard metadata can preserve declared getters and field
+  absence; custom processors, conflicting/nested annotation types, unknown star
+  packages and nullness defaults still block those proofs. Nullness is separate:
+  Java platform and established non-null getter results permit an ordinary
+  dereference; an explicitly nullable result requires a guard.
+  Kotlin metadata/constructor requirements remain independent. Source packages
+  are indexed, Java annotation types participate in binding, and the index cache
+  advances to version 33. See `tests/java_annotation_effects.rs` and the native
+  original-vs-converted fixture in `tests/java_metadata_jvm.rs`, plus the platform
+  and nullable receiver matrix in `tests/property_receiver_scope.rs`.
 - Explicit method overrides share the default-getter planner's source reference
   subtype proof. Retained Kotlin ancestors do not block ordinary reference
   covariance: javac supplies bridges for the wider JVM return. Generic return

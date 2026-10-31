@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod java_metadata;
 pub(crate) mod map_algebra;
 mod map_alias;
 
@@ -121,6 +122,7 @@ pub fn declaration_node_kind(kind: &str) -> bool {
             | "enum_declaration"
             | "interface_declaration"
             | "record_declaration"
+            | "annotation_type_declaration"
             | "method_declaration"
             | "primary_constructor"
             | "secondary_constructor"
@@ -1223,6 +1225,7 @@ pub fn symbol_id_for_node(source: &str, node: tree_sitter::Node, file: &Path) ->
         "type_alias" => "typealias",
         "enum_declaration" => "enum",
         "interface_declaration" => "interface",
+        "annotation_type_declaration" => "annotation",
         "class_declaration" if prefix.split_whitespace().any(|w| w == "interface") => "interface",
         _ if is_recovered_interface => "interface",
         _ if is_recovered_annotation => "annotation",
@@ -1524,6 +1527,7 @@ fn node_symbol_kind(kind: &str) -> &'static str {
         "enum_declaration" => "enum",
         "interface_declaration" => "interface",
         "record_declaration" => "record",
+        "annotation_type_declaration" => "annotation",
         _ => "class",
     }
 }
@@ -2065,6 +2069,11 @@ pub struct MapAliasTypeArguments {
 pub trait SemanticProvider: Send + Sync {
     fn resolve(&self, name: &str) -> FactStatus<SymbolId>;
     fn symbols(&self) -> &[SemanticSymbol];
+    fn has_source_package(&self, package: &str) -> bool {
+        self.symbols()
+            .iter()
+            .any(|symbol| symbol.id.package == package)
+    }
     /// Whether this run has a fact source beyond the syntax index and the
     /// static fallback table (currently the JVM helper). Callers use this as a
     /// cheap gate before asking for [`Self::classpath_member_facts`], so a
@@ -2340,6 +2349,7 @@ pub struct SyntaxSemanticProvider {
     symbols: Vec<SemanticSymbol>,
     by_name: BTreeMap<String, Vec<usize>>,
     by_file: BTreeMap<PathBuf, Vec<usize>>,
+    source_packages: BTreeSet<String>,
     type_symbols_by_location: BTreeMap<(PathBuf, usize), usize>,
     aliases: BTreeMap<(String, String), TypeAliasDefinition>,
     sources: BTreeMap<PathBuf, String>,
@@ -2357,6 +2367,7 @@ pub struct SyntaxSemanticProvider {
     annotated_java_packages: BTreeSet<String>,
     java_visible_fields: BTreeSet<(PathBuf, Vec<String>, String)>,
     java_field_lookup_locations: BTreeSet<(PathBuf, usize)>,
+    java_member_metadata: BTreeMap<(PathBuf, usize), Vec<java_metadata::Binding>>,
     public_kotlin_callable_locations: BTreeSet<(PathBuf, usize)>,
     explicit_nongeneric_kotlin_return_locations: BTreeSet<(PathBuf, usize)>,
     checked_throws_kotlin_callable_locations: BTreeSet<(PathBuf, usize)>,
@@ -2394,6 +2405,7 @@ struct FileSemanticFacts {
     reference_return_nullability_locations: BTreeMap<(PathBuf, usize), ReferenceReturnNullability>,
     java_visible_fields: BTreeSet<(PathBuf, Vec<String>, String)>,
     java_field_lookup_locations: BTreeSet<(PathBuf, usize)>,
+    java_member_metadata: BTreeMap<(PathBuf, usize), Vec<java_metadata::Binding>>,
     public_kotlin_callable_locations: BTreeSet<(PathBuf, usize)>,
     explicit_nongeneric_kotlin_return_locations: BTreeSet<(PathBuf, usize)>,
     checked_throws_kotlin_callable_locations: BTreeSet<(PathBuf, usize)>,
@@ -2424,6 +2436,10 @@ impl FileSemanticFacts {
         let Some(tree) = parse_source(file, source) else {
             return (facts, relations);
         };
+        let java_metadata = file
+            .extension()
+            .is_some_and(|extension| extension == "java")
+            .then(|| java_metadata::Scope::new(source, tree.root_node()));
         if file.extension().and_then(|extension| extension.to_str()) != Some("java") {
             relations.constructor_metadata =
                 constructor_metadata::collect(source, tree.root_node());
@@ -2582,11 +2598,20 @@ impl FileSemanticFacts {
                 ) && file
                     .extension()
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("java"))
-                    && ordinary_java_field_lookup(node)
                 {
-                    facts
-                        .java_field_lookup_locations
-                        .insert((file.to_path_buf(), node.start_byte()));
+                    if ordinary_java_field_lookup(node) {
+                        facts
+                            .java_field_lookup_locations
+                            .insert((file.to_path_buf(), node.start_byte()));
+                    }
+                    if let Some(bindings) = java_metadata
+                        .as_ref()
+                        .and_then(|scope| scope.owner_bindings(node))
+                    {
+                        facts
+                            .java_member_metadata
+                            .insert((file.to_path_buf(), node.start_byte()), bindings);
+                    }
                 }
                 if id.kind == "enum" {
                     let entries = enum_entry_names(source, node);
@@ -2734,7 +2759,9 @@ impl FileSemanticFacts {
                         .extension()
                         .is_some_and(|extension| extension == "java")
                 {
-                    if let Some(shape) = java_property_reads::collect(source, node) {
+                    if let Some(shape) =
+                        java_property_reads::collect(source, node, java_metadata.as_ref().unwrap())
+                    {
                         facts
                             .java_property_read_shapes
                             .insert((file.to_path_buf(), node.start_byte()), shape);
@@ -3272,6 +3299,7 @@ impl SyntaxSemanticProvider {
             reference_return_nullability_locations,
             java_visible_fields,
             java_field_lookup_locations,
+            java_member_metadata,
             public_kotlin_callable_locations,
             explicit_nongeneric_kotlin_return_locations,
             checked_throws_kotlin_callable_locations,
@@ -3288,6 +3316,7 @@ impl SyntaxSemanticProvider {
             callable_shapes,
         } = facts;
         for symbol in symbols {
+            self.source_packages.insert(symbol.id.package.clone());
             let index = self.symbols.len();
             self.by_name
                 .entry(symbol.id.name.clone())
@@ -3318,6 +3347,7 @@ impl SyntaxSemanticProvider {
         self.java_visible_fields.extend(java_visible_fields);
         self.java_field_lookup_locations
             .extend(java_field_lookup_locations);
+        self.java_member_metadata.extend(java_member_metadata);
         self.public_kotlin_callable_locations
             .extend(public_kotlin_callable_locations);
         self.explicit_nongeneric_kotlin_return_locations
@@ -3800,9 +3830,10 @@ impl SemanticProvider for SyntaxSemanticProvider {
         let [symbol] = matches.as_slice() else {
             return FactStatus::Unknown;
         };
-        if !self
+        if (!self
             .java_field_lookup_locations
             .contains(&(owner.file.clone(), symbol.location.start_byte))
+            && !self.java_metadata_preserves_members(owner))
             || self.source_for_file(&owner.file).is_none_or(|source| {
                 *blake3::hash(source.as_bytes()).as_bytes() != symbol.location.snapshot_hash
             })
@@ -4223,6 +4254,9 @@ impl SemanticProvider for SyntaxSemanticProvider {
     }
     fn symbols(&self) -> &[SemanticSymbol] {
         &self.symbols
+    }
+    fn has_source_package(&self, package: &str) -> bool {
+        self.source_packages.contains(package)
     }
     fn symbols_in_file(&self, file: &Path) -> Vec<&SemanticSymbol> {
         self.by_file
@@ -6887,18 +6921,25 @@ fn direct_property_classifier_with_nullability<P: SemanticProvider + ?Sized>(
     provider: &P,
     allow_nullable: bool,
 ) -> Option<String> {
-    if allow_nullable
-        && owner
-            .file
-            .extension()
-            .is_some_and(|extension| extension == "java")
+    if owner
+        .file
+        .extension()
+        .is_some_and(|extension| extension == "java")
         && let Some(read) = provider.java_property_read(owner, property)
     {
-        return match read.result_type.ty {
-            KotlinType::Named { name, .. } => Some(name),
-            KotlinType::Primitive(name) => Some(format!("kotlin.{name}")),
-            _ => None,
-        };
+        // Java platform results permit an ordinary Kotlin dereference. An
+        // explicit nullable contract does not. TypeRef's nullable bit covers
+        // both shapes, so the nullness contract must settle this distinction.
+        if read.nullability == ReferenceReturnNullability::Nullable && !allow_nullable {
+            return None;
+        }
+        match read.result_type.ty {
+            KotlinType::Named { name, arguments } if arguments.is_empty() || allow_nullable => {
+                return Some(name);
+            }
+            KotlinType::Primitive(name) => return Some(format!("kotlin.{name}")),
+            _ => {}
+        }
     }
     let mut owner_path = owner.owner_path.clone();
     owner_path.push(owner.name.clone());
@@ -8765,10 +8806,7 @@ fn source_wildcard_allows_factory<P: SemanticProvider + ?Sized>(
     let Some(package) = path.strip_suffix(".*") else {
         return false;
     };
-    provider
-        .symbols()
-        .iter()
-        .any(|symbol| symbol.id.package == package)
+    provider.has_source_package(package)
         && !provider
             .symbols_named(name)
             .iter()

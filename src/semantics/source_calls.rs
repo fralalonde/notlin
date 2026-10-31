@@ -278,6 +278,14 @@ pub(super) fn java_method_return_nullability(
     source: &str,
     node: tree_sitter::Node<'_>,
 ) -> Option<super::ReferenceReturnNullability> {
+    java_method_return_nullability_with_metadata(source, node, &[])
+}
+
+pub(super) fn java_method_return_nullability_with_metadata(
+    source: &str,
+    node: tree_sitter::Node<'_>,
+    metadata: &[super::java_metadata::Binding],
+) -> Option<super::ReferenceReturnNullability> {
     use super::ReferenceReturnNullability;
 
     let modifiers = node
@@ -301,7 +309,17 @@ pub(super) fn java_method_return_nullability(
                     .find(|child| matches!(child.kind(), "identifier" | "scoped_identifier"))
             })
             .and_then(|name| name.utf8_text(source.as_bytes()).ok())?;
-        match java_nullness_annotation(source, name.trim())? {
+        let annotation_kind = match java_nullness_annotation(source, name.trim()) {
+            Some(kind) => kind,
+            None if metadata
+                .iter()
+                .any(|binding| binding.at(annotation) && binding.neutral_for_nullness()) =>
+            {
+                continue;
+            }
+            None => return None,
+        };
+        match annotation_kind {
             JavaNullnessAnnotation::Override => {}
             JavaNullnessAnnotation::NonNull if !has_nullness => {
                 result = ReferenceReturnNullability::NonNull;
