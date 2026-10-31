@@ -252,3 +252,96 @@ fn inherited_ignore_unknown_uses_the_annotation_binding_not_its_spelling() {
     assert!(index.jackson_ignores_unknown_properties(real));
     assert!(!index.jackson_ignores_unknown_properties(other));
 }
+
+#[test]
+fn whole_type_decoders_replace_creator_defaults_and_nearer_annotations_override_them() {
+    let source = r#"package sample
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize as Decode
+import com.fasterxml.jackson.databind.JsonDeserializer.None as NoDecoder
+import sample.CustomDecoder as Codec
+@Decode(using = Codec::class)
+interface Contract
+interface Middle : Contract
+data class Inherited(val value: String = "default") : Middle
+@Decode(using = Codec::class)
+data class Direct(val value: String = "default")
+@Decode(using = NoDecoder::class)
+data class Reset(val value: String = "default") : Contract
+@Decode
+data class ResetImplicit(val value: String = "default") : Contract
+data class JavaInherited(val value: String = "default") : JavaContract
+data class JavaReset(val value: String = "default") : JavaResetContract
+data class FieldOnly(@field:Decode(using = Codec::class) val value: String = "default")
+data class ParameterOnly(@param:Decode(using = Codec::class) val value: String = "default")
+typealias Alias = CustomDecoder
+@Decode(using = Alias::class)
+data class AliasBound(val value: String = "default")
+"#;
+    let index = provider(&[
+        ("Dtos.kt", source),
+        (
+            "CustomDecoder.java",
+            "package sample; public class CustomDecoder {}",
+        ),
+        (
+            "JavaContract.java",
+            "package sample; import com.fasterxml.jackson.databind.annotation.JsonDeserialize; @JsonDeserialize(using = CustomDecoder.class) public interface JavaContract {}",
+        ),
+        (
+            "JavaResetContract.java",
+            "package sample; import com.fasterxml.jackson.databind.annotation.JsonDeserialize; import com.fasterxml.jackson.databind.JsonDeserializer; @JsonDeserialize(using = JsonDeserializer.None.class) public interface JavaResetContract extends JavaContract {}",
+        ),
+    ]);
+    for (name, custom) in [
+        ("Inherited", true),
+        ("Direct", true),
+        ("JavaInherited", true),
+        ("Reset", false),
+        ("ResetImplicit", false),
+        ("JavaReset", false),
+        ("FieldOnly", false),
+        ("ParameterOnly", false),
+        ("AliasBound", false),
+    ] {
+        let owner = &index.symbols_named(name)[0].id;
+        assert_eq!(
+            index.has_jackson_custom_deserializer(owner),
+            custom,
+            "{name}"
+        );
+        assert_eq!(
+            index.has_jackson_default_constructor_semantics(owner),
+            !custom,
+            "{name}"
+        );
+        assert!(!index.has_jackson_default_factory(owner), "{name}");
+        if !custom {
+            assert_retained(&index, "Dtos.kt", name);
+        }
+    }
+}
+
+#[test]
+fn foreign_same_name_annotations_do_not_replace_inherited_jackson_decoders() {
+    let index = provider(&[
+        (
+            "Contract.java",
+            "package sample; @com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = sample.CustomDecoder.class) public interface Contract {}",
+        ),
+        (
+            "CustomDecoder.java",
+            "package sample; public class CustomDecoder {}",
+        ),
+        (
+            "Foreign.kt",
+            "package sample\nimport foreign.JsonDeserialize\n@JsonDeserialize\ndata class Child(val value: String = \"default\") : Contract\n",
+        ),
+        (
+            "Fake.kt",
+            "package foreign\nannotation class JsonDeserialize\n",
+        ),
+    ]);
+    let owner = &index.symbols_named("Child")[0].id;
+    assert!(index.has_jackson_custom_deserializer(owner));
+    assert!(!index.has_jackson_default_constructor_semantics(owner));
+}

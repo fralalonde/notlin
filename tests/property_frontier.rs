@@ -124,6 +124,129 @@ public class DefaultsTrace {
 "#,
     ),
     (
+        "Bags.kt",
+        r#"package sample
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize as Decode
+interface TaggedBag : Bag { val kind: Category }
+data class BagOne(@JvmField val values: Map<String, String> = BagDefaults.values()) : TaggedBag {
+    override fun getValues(): Map<String, String> = values
+    override val kind: Category get() = Category.BASIC
+}
+@Decode(using = BagDecoder::class)
+data class BagTwo(@JvmField val values: Map<String, String> = BagDefaults.values()) : TaggedBag {
+    override fun getValues(): Map<String, String> = values
+    override val kind: Category get() = Category.PREMIUM
+}
+"#,
+    ),
+    (
+        "Bag.java",
+        "package sample; @com.fasterxml.jackson.databind.annotation.JsonDeserialize(using=BagDecoder.class) @com.fasterxml.jackson.databind.annotation.JsonSerialize(using=BagEncoder.class) public interface Bag { java.util.Map<String,String> getValues(); }\n",
+    ),
+    (
+        "BagDefaults.java",
+        "package sample; public class BagDefaults { public static int calls; public static java.util.Map<String,String> values() { calls++; return java.util.Map.of(\"seed\", \"base\"); } }\n",
+    ),
+    (
+        "BagDecoder.java",
+        r#"package sample;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.deser.ContextualDeserializer;
+public class BagDecoder extends JsonDeserializer<Bag> implements ContextualDeserializer {
+    private final Class<? extends Bag> target;
+    public BagDecoder() { this(Bag.class); }
+    private BagDecoder(Class<? extends Bag> target) { this.target = target; }
+    @Override public JsonDeserializer<?> createContextual(DeserializationContext context, BeanProperty property) {
+        JavaType type = context.getContextualType();
+        if (type == null && property != null) type = property.getType();
+        return new BagDecoder(type == null ? Bag.class : type.getRawClass().asSubclass(Bag.class));
+    }
+    @Override public Bag deserialize(JsonParser parser, DeserializationContext context) throws java.io.IOException {
+        JsonNode node = parser.getCodec().readTree(parser);
+        Class<? extends Bag> actual = target.isInterface() ? ("two".equals(node.path("_kind").asText()) ? BagTwo.class : BagOne.class) : target;
+        try {
+            Bag result = actual.getConstructor().newInstance();
+            var merged = new java.util.LinkedHashMap<>(result.getValues());
+            JsonNode entries = node.get("entries");
+            if (entries != null && !entries.isNull()) {
+                var fields = entries.properties().iterator();
+                while (fields.hasNext()) { var field = fields.next(); merged.put(field.getKey(), field.getValue().isNull() ? null : field.getValue().asText()); }
+            }
+            return actual.getConstructor(java.util.Map.class).newInstance(merged);
+        } catch (ReflectiveOperationException error) { throw new java.io.IOException(error); }
+    }
+}
+"#,
+    ),
+    (
+        "BagEncoder.java",
+        r#"package sample;
+public class BagEncoder extends com.fasterxml.jackson.databind.JsonSerializer<Bag> {
+    @Override public void serialize(Bag value, com.fasterxml.jackson.core.JsonGenerator writer, com.fasterxml.jackson.databind.SerializerProvider provider) throws java.io.IOException {
+        writer.writeStartObject();
+        writer.writeStringField("_kind", value instanceof BagTwo ? "two" : "one");
+        writer.writeObjectField("entries", value.getValues());
+        writer.writeEndObject();
+    }
+}
+"#,
+    ),
+    (
+        "Facets.kt",
+        r#"package sample
+@Deprecated("retain the property owner")
+interface Facet<T> {
+    val value: T
+    var label: String
+    fun describe(prefix: String): String = prefix + label
+    suspend fun keepRoot() {}
+}
+interface FacetMarker<T> : Facet<T> {
+    companion object { const val PREFIX: String = "tag:" }
+}
+class FacetImpl(override val value: String, override var label: String) : FacetMarker<String> {
+    suspend fun retained() {}
+}
+@Deprecated("retain the default getter")
+interface DefaultFacet { val label: String get() = "default"; suspend fun keepRoot() {} }
+interface DefaultFacetMarker : DefaultFacet
+class DefaultFacetImpl : DefaultFacetMarker { suspend fun retained() {} }
+"#,
+    ),
+    (
+        "EnumDefaultRoot.java",
+        "package sample; public interface EnumDefaultRoot { EnumCode getCode(); }\n",
+    ),
+    (
+        "EnumDefaults.kt",
+        r#"package sample
+enum class EnumCode { FIRST, SECOND }
+interface FirstDefault : EnumDefaultRoot {
+    override fun getCode(): EnumCode = EnumCode.FIRST
+    fun getRank(): Int = 1
+    fun getLabel(): String? = null
+    fun valuesByName(): Map<String, String> = mapOf()
+}
+interface SecondDefault : EnumDefaultRoot {
+    override fun getCode(): EnumCode = EnumCode.SECOND
+    fun getRank(): Int = 2
+    fun getLabel(): String? = "second"
+    fun valuesByName(): Map<String, String> = mapOf()
+}
+interface FirstHop : FirstDefault
+interface SecondHop : SecondDefault
+enum class FirstChoice : FirstHop, SecondHop {
+    VALUE;
+    suspend fun retained() {}
+}
+enum class SecondChoice : SecondHop, FirstHop {
+    VALUE;
+    suspend fun retained() {}
+}
+"#,
+    ),
+    (
         "Runner.java",
         r#"package sample;
 import java.util.Map;
@@ -178,6 +301,26 @@ public class Runner {
         System.out.println("initialized=" + initialized.getDerived() + "/" + DefaultsTrace.trace);
         DefaultsTrace.trace = "";
         System.out.println("constructor=" + DirectCalls.make() + "/" + DefaultsTrace.trace);
+        BagDefaults.calls = 0;
+        BagOne emptyBag = mapper.readerFor(BagOne.class).readValue("{}");
+        BagOne providedBag = mapper.readValue("{\"entries\":{\"seed\":\"new\",\"given\":\"v\"}}", BagOne.class);
+        BagTwo nullBag = mapper.readValue("{\"entries\":null}", BagTwo.class);
+        Bag polyBag = mapper.readValue("{\"_kind\":\"two\",\"entries\":{\"z\":\"9\"}}", Bag.class);
+        System.out.println("bags=" + emptyBag.getValues().get("seed") + "/" + providedBag.getValues().get("seed") + "/" + nullBag.getValues().get("seed") + "/" + ((TaggedBag) polyBag).getKind() + "/" + BagDefaults.calls);
+        System.out.println("bag-serialized=" + mapper.valueToTree(providedBag).path("entries").path("seed").asText());
+        emptyBag.getValues().put("changed", "yes");
+        BagOne anotherBag = mapper.readValue("{}", BagOne.class);
+        System.out.println("bag-fresh=" + anotherBag.getValues().get("seed") + "/" + anotherBag.getValues().containsKey("changed") + "/" + BagDefaults.calls);
+        FacetImpl facet = new FacetImpl("v", "a");
+        FacetMarker<String> facetView = facet;
+        facetView.setLabel("b");
+        facetView.keepRoot(null);
+        System.out.println("facet=" + facetView.getValue() + "/" + facetView.getLabel() + "/" + facetView.describe("p:") + "/" + FacetMarker.PREFIX);
+        System.out.println("default-facet=" + new DefaultFacetImpl().getLabel());
+        EnumDefaultRoot firstChoice = FirstChoice.VALUE;
+        EnumDefaultRoot secondChoice = SecondChoice.VALUE;
+        System.out.println("enum-defaults=" + firstChoice.getCode() + "/" + secondChoice.getCode());
+        System.out.println("enum-types=" + FirstChoice.VALUE.getRank() + "/" + SecondChoice.VALUE.getRank() + "/" + FirstChoice.VALUE.getLabel() + "/" + SecondChoice.VALUE.getLabel() + "/" + FirstChoice.VALUE.valuesByName().size());
     }
 }
 "#,
@@ -189,6 +332,41 @@ fn populate(root: &Path) {
     for (name, source) in SOURCES {
         fs::write(root.join(name), source).unwrap();
     }
+    configure_fixture_build(root, None);
+}
+
+fn configure_fixture_build(root: &Path, jvm_default: Option<&str>) {
+    if jvm_default == Some("all") {
+        // Kotlin's no-compatibility mode already fails these implicit enum
+        // defaults before translation (ICCE). Use valid explicit selections in
+        // that mode; default/disable exercise the implicit-default repair.
+        let path = root.join("EnumDefaults.kt");
+        let mut source = fs::read_to_string(&path).unwrap();
+        for (name, provider) in [("FirstChoice", "FirstHop"), ("SecondChoice", "SecondHop")] {
+            let start = source.find(&format!("enum class {name}")).unwrap();
+            let insertion = start + source[start..].find("VALUE;").unwrap() + "VALUE;".len();
+            let overrides = ["getCode", "getRank", "getLabel", "valuesByName"]
+                .into_iter()
+                .map(|method| {
+                    format!("\n    override fun {method}() = super<{provider}>.{method}()")
+                })
+                .collect::<String>();
+            source.insert_str(insertion, &overrides);
+        }
+        fs::write(path, source).unwrap();
+    }
+    let setting = match jvm_default {
+        Some("disable") => "kotlin { compilerOptions { jvmDefault = JvmDefaultMode.DISABLE } }",
+        Some("all") => {
+            "kotlin { compilerOptions { jvmDefault = JvmDefaultMode.NO_COMPATIBILITY } }"
+        }
+        _ => "",
+    };
+    fs::write(
+        root.join("build.gradle.kts"),
+        format!("plugins {{ kotlin(\"jvm\") version \"2.3.21\" }}\n{setting}\n"),
+    )
+    .unwrap();
 }
 fn translate(root: &Path, lombok: bool) -> std::process::Output {
     let binary = std::env::var_os("NOTLIN_TEST_BINARY")
@@ -209,6 +387,10 @@ fn translate(root: &Path, lombok: bool) -> std::process::Output {
     command.arg(root).output().unwrap()
 }
 fn assert_migrated(root: &Path, output: &std::process::Output) {
+    assert_migrated_with_mode(root, output, true);
+}
+
+fn assert_migrated_with_mode(root: &Path, output: &std::process::Output, modern: bool) {
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{diagnostics}");
     for name in [
@@ -219,6 +401,8 @@ fn assert_migrated(root: &Path, output: &std::process::Output) {
         "DeferredPayload",
         "RecursivePayload",
         "InitializedPayload",
+        "BagOne",
+        "BagTwo",
     ] {
         assert!(
             root.join(format!("{name}.java")).is_file(),
@@ -228,12 +412,25 @@ fn assert_migrated(root: &Path, output: &std::process::Output) {
                 .unwrap_or_default()
         );
     }
+    assert_eq!(
+        root.join("FacetMarker.java").exists(),
+        modern,
+        "the facade requires a known modern JVM default-method mode: {diagnostics}"
+    );
     let reader = fs::read_to_string(root.join("Reader.java")).unwrap();
     assert!(
         reader.contains("StringsKt.split") && reader.contains("CollectionsKt.last"),
         "{reader}"
     );
     assert!(root.join("Bridge.kt").exists(), "provider must stay Kotlin");
+    assert!(
+        root.join("Facets.kt").exists(),
+        "facet implementations stay Kotlin"
+    );
+    assert!(
+        !root.join("DefaultFacetMarker.java").exists(),
+        "an inherited getter body still requires the existing bridge proof"
+    );
     let subject = fs::read_to_string(root.join("Subject.java")).unwrap();
     assert!(
         subject.contains("return this.getIdentifier();"),
@@ -244,6 +441,21 @@ fn assert_migrated(root: &Path, output: &std::process::Output) {
         payload.contains("ValueInstantiators.Base") && payload.contains("Category.BASIC"),
         "{payload}"
     );
+    for name in ["BagOne", "BagTwo"] {
+        let java = fs::read_to_string(root.join(format!("{name}.java"))).unwrap();
+        assert!(
+            !java.contains("__notlinDefaults") && !java.contains("JsonCreator"),
+            "custom decoder must own construction: {java}"
+        );
+    }
+    let enum_source = fs::read_to_string(root.join("EnumDefaults.kt")).unwrap();
+    for provider in ["FirstHop", "SecondHop"] {
+        assert!(
+            enum_source.contains(&format!("super<sample.{provider}>.getCode()"))
+                || enum_source.contains(&format!("super<{provider}>.getCode()")),
+            "retained enum must select its original default: {enum_source}"
+        );
+    }
 }
 
 #[test]
@@ -311,10 +523,33 @@ fn config(root: &Path, output: PathBuf, lombok: bool) -> JvmValidationConfig {
 #[test]
 #[ignore = "requires JVM tools, Kotlin, Lombok, and Jackson jars in NOTLIN_* variables"]
 fn runtime_preserves_split_edges_virtual_getters_and_json_presence() {
+    compare_runtime(None);
+}
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin, Lombok, and Jackson jars in NOTLIN_* variables"]
+fn runtime_preserves_abstract_property_facades_in_both_jvm_default_modes() {
+    for mode in ["disable", "all"] {
+        compare_runtime(Some(mode));
+    }
+}
+
+fn compare_runtime(jvm_default: Option<&str>) {
+    eprintln!("native property frontier JVM mode: {jvm_default:?}");
     let scratch = Scratch::new();
     let original = scratch.0.join("original");
     populate(&original);
-    let before = validate_jvm_sources(&config(&original, scratch.0.join("before"), false)).unwrap();
+    configure_fixture_build(&original, jvm_default);
+    let configured = |root: &Path, output: PathBuf, lombok: bool| {
+        let mut cfg = config(root, output, lombok);
+        if let Some(mode) = jvm_default {
+            cfg.kotlinc_args
+                .push(format!("-Xjvm-default={mode}").into());
+        }
+        cfg
+    };
+    let before =
+        validate_jvm_sources(&configured(&original, scratch.0.join("before"), false)).unwrap();
     let expected = before
         .commands
         .last()
@@ -324,13 +559,18 @@ fn runtime_preserves_split_edges_virtual_getters_and_json_presence() {
         .replace("\r\n", "\n");
     assert_eq!(
         expected,
-        "b//plain/./local\ntrue/kept/3\nmissing/BASIC/true/null\ngiven/PREMIUM/false/memo\nmap/BASIC/true/null\nnulls=true/true\nstrict=true\nPREMIUM\nsnake=kept\npoly=BASIC\ndeferred=[seed]/{}/note/a!/1/items,note,suffix,\nsupplied=[x, y]/{k=v}/null/given/0/\nsummaries=a[seed]{}{x=1, y=2}/b[x, y]{k=v}{x=1, y=2}\nmissing=true/\nnull-list=true/\nfresh=[seed]/true/BASIC\nrecursive=root/leaf/null/null/7\ninitialized=note?/note,derived,init,\nconstructor=direct!/items,note,suffix,"
+        "b//plain/./local\ntrue/kept/3\nmissing/BASIC/true/null\ngiven/PREMIUM/false/memo\nmap/BASIC/true/null\nnulls=true/true\nstrict=true\nPREMIUM\nsnake=kept\npoly=BASIC\ndeferred=[seed]/{}/note/a!/1/items,note,suffix,\nsupplied=[x, y]/{k=v}/null/given/0/\nsummaries=a[seed]{}{x=1, y=2}/b[x, y]{k=v}{x=1, y=2}\nmissing=true/\nnull-list=true/\nfresh=[seed]/true/BASIC\nrecursive=root/leaf/null/null/7\ninitialized=note?/note,derived,init,\nconstructor=direct!/items,note,suffix,\nbags=base/new/base/PREMIUM/4\nbag-serialized=new\nbag-fresh=base/false/5\nfacet=v/b/p:b/tag:\ndefault-facet=default\nenum-defaults=FIRST/SECOND\nenum-types=1/2/null/second/0"
     );
     for lombok in [false, true] {
         let root = scratch.0.join(format!("migrated-{lombok}"));
         populate(&root);
-        assert_migrated(&root, &translate(&root, lombok));
-        let after = validate_jvm_sources(&config(
+        configure_fixture_build(&root, jvm_default);
+        assert_migrated_with_mode(
+            &root,
+            &translate(&root, lombok),
+            jvm_default != Some("disable"),
+        );
+        let after = validate_jvm_sources(&configured(
             &root,
             scratch.0.join(format!("after-{lombok}")),
             lombok,

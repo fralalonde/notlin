@@ -2130,6 +2130,10 @@ pub trait SemanticProvider: Send + Sync {
     fn has_jackson_default_factory(&self, _owner: &SymbolId) -> bool {
         false
     }
+    /// A whole-type decoder supplies construction instead of Jackson creators.
+    fn has_jackson_custom_deserializer(&self, _owner: &SymbolId) -> bool {
+        false
+    }
     fn jackson_ignores_unknown_properties(&self, _owner: &SymbolId) -> bool {
         false
     }
@@ -2362,6 +2366,7 @@ pub struct SyntaxSemanticProvider {
     constructor_metadata_dependencies: BTreeMap<SymbolId, KotlinConstructorMetadataDependency>,
     jackson_default_constructor_classes: BTreeSet<SymbolId>,
     jackson_default_factory_classes: BTreeSet<SymbolId>,
+    jackson_custom_deserializer_classes: BTreeSet<SymbolId>,
     jackson_ignore_unknown_classes: BTreeSet<SymbolId>,
     workspace_builtin_types: BTreeMap<PathBuf, BTreeMap<String, &'static str>>,
     generated_java_property_reads: BTreeMap<(SymbolId, String), Vec<JavaPropertyRead>>,
@@ -3142,6 +3147,8 @@ impl SyntaxSemanticProvider {
         p.index_companion_members(&relations);
         p.constructor_metadata_dependencies =
             constructor_metadata::resolve(&p, &metadata_relations);
+        p.jackson_custom_deserializer_classes =
+            jackson_defaults::resolve_custom_decoders(&p, &jackson_relations);
         p.jackson_default_constructor_classes = jackson_defaults::resolve(&p, &jackson_relations);
         p.jackson_default_factory_classes =
             jackson_defaults::resolve_factories(&p, &jackson_relations);
@@ -3155,6 +3162,7 @@ impl SyntaxSemanticProvider {
         self.constructor_metadata_dependencies.clear();
         self.jackson_default_constructor_classes.clear();
         self.jackson_default_factory_classes.clear();
+        self.jackson_custom_deserializer_classes.clear();
         self.jackson_ignore_unknown_classes.clear();
         self.index_file_relations(file, source);
     }
@@ -3561,6 +3569,9 @@ impl SemanticProvider for SyntaxSemanticProvider {
     }
     fn has_jackson_default_factory(&self, owner: &SymbolId) -> bool {
         self.jackson_default_factory_classes.contains(owner)
+    }
+    fn has_jackson_custom_deserializer(&self, owner: &SymbolId) -> bool {
+        self.jackson_custom_deserializer_classes.contains(owner)
     }
     fn jackson_ignores_unknown_properties(&self, owner: &SymbolId) -> bool {
         self.jackson_ignore_unknown_classes.contains(owner)

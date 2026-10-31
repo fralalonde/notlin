@@ -3,6 +3,78 @@
 ## Current checkpoint — 2026-10-31
 
 The standard fresh conversion of reference commit `179bb912` produces
+**4,357 Java files**, retaining 2,014 of 6,371 original Kotlin owners:
+**+403 / -0** against the accepted 3,954-output baseline. The gains include
+146 interfaces, 245 classes and 12 enums.
+Examples include `EthernetIPPLCProperties`, `ModbusPLCProperties`, `PickOrderConsolidationProperties`, `IntegrationState`, `IIntegrationState`, `EquipmentStateEnum`, `AgvState`.
+The ownership comparison checks all 6,371 original declarations.
+
+Type-level Jackson deserializers now have an effective inherited contract.
+A custom whole-type decoder owns construction; its ordinary no-argument and
+map constructors can translate without introducing automatic Jackson creator
+binding. A nearer `JsonDeserialize` annotation replaces the inherited binding,
+including omitted `using` and `JsonDeserializer.None`. Parameter and field
+deserializers remain part of automatic constructor binding. Import aliases,
+foreign annotations and unresolved type aliases retain distinct handling.
+The native fixture exercises the actual reflective construction pattern,
+defaults copied from an immutable map, input merging, null policy, fresh mutable
+maps and serialization.
+
+Memberless interfaces can forward inherited abstract Kotlin property accessors
+when declared Gradle settings establish modern JVM defaults. Mutable accessors
+and generic properties work without copying getter bodies. Legacy or unresolved
+settings and inherited concrete getters keep their existing guards. Compiler
+configuration files and absent alternative files participate in migration write
+snapshot verification. Native Kotlin/Java comparisons exercise default,
+`disable` and `all` JVM modes in both Lombok modes, including retained Kotlin
+callers and the concrete-getter negative case.
+
+Retained Kotlin enums now use the same explicit default selection as emitted
+Java enums: the first direct interface branch providing the implementation.
+This prevents conflicting JVM defaults after providers move to Java. Return
+inference preserves primitive, nullable, platform and generic return shapes.
+Still-Kotlin property contracts keep their existing safeguard. Native comparisons
+reverse provider order and exercise inherited branches. In no-compatibility mode,
+the original Kotlin implicit enum case already fails; that fixture uses explicit
+source selections so the comparison starts from a working application.
+Both reference passes add the same five explicit selections: the equipment
+`getTypeClass` default and four integration enum `getCategory` defaults.
+
+The baseline full Gradle build passes in 10m 7s;
+the fresh full Gradle build passes in 5m 21s:
+**110 actionable tasks: 80 executed, 30 from cache**. Hastings imports all **9,113 records** (50 + 9,063),
+followed by **105.8 seconds** without errors or stack traces after
+`Done loading dev resources [customers/hastings/hastings-dev.csv]`.
+The uniquely marked disposable application is stopped after observation.
+No application source was hand-fixed.
+The baseline variant independently imports all 9,113 records and completes
+105.7 seconds of clean observation before it is stopped.
+
+All eight focused fixture checks pass with the frozen executable. All four
+standalone samples compile; formatting and default-target clippy pass.
+The Rust sweep remains red: **1,578 pass, 72 fail,
+138 ignored**, with no previously unseen failing names.
+There are 35 new-owner Java variants between the baseline and fresh
+passes; their raw diffs are recorded in `baseline-vs-fresh-java.json`.
+The 37 changed files are audited: generated temporary names, declaration
+annotations, same-package interface-super qualification, and an existing DTO's
+Lombok Value/Data choice. That DTO has 17 explicit final fields and an explicit
+constructor; its remaining behavioral source agrees. Both complete outputs
+pass their respective builds.
+
+Evidence is under `target/custom-decoder-frontier-v3-20261031/`, using
+`notlin-custom.exe`, `incremental`, and fresh `clean`. Its SHA256 is
+`ee460f96f50ed10abf89ffc8c5e13872f470211f8f0d9e2a03e1673cb504efd5`. `acceptance.json` records frozen source and input identities,
+coverage, builds, tests, output comparisons and runtime observation.
+The rejected runtime candidate is preserved under
+`target/custom-decoder-frontier-v2-20261031/`: both builds passed, but Hastings
+exposed the retained enum's conflicting default getters. The earlier rejected coverage candidate is preserved under
+`target/custom-decoder-frontier-20261031/`; it lost one previously translated
+interface. Work continues on established map algebra and the retained frontier.
+
+## Previous checkpoint — 2026-10-31
+
+The standard fresh conversion of reference commit `179bb912` produces
 **3,954 Java files**, retaining 2,417 of 6,371 original Kotlin owners:
 **+10 / -0** against the accepted 3,944-output baseline. The gains are
 `APIKeyAuthenticationDto`, `BasicAuthenticationDto`, `LightDeviceInstruction`,

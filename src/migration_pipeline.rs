@@ -25,7 +25,7 @@ pub struct GeneratedJava {
 pub struct WorkspaceMigrationPlan {
     pub original_sources: Vec<(PathBuf, String)>,
     /// Byte-exact snapshots of every Kotlin and Java input consulted by the
-    /// plan, including indexed supporting Java files.
+    /// plan, including supporting Java and declared Kotlin compiler settings.
     pub original_snapshots: Vec<(PathBuf, Option<Vec<u8>>)>,
     /// Deleted sources are absent from this map.
     pub final_kotlin_sources: HashMap<PathBuf, String>,
@@ -1004,6 +1004,7 @@ where
     }
     original_snapshots.extend(observed_output_snapshots.values().cloned());
     original_snapshots.extend(lombok_configuration.snapshots());
+    original_snapshots.extend(index.kotlin_compiler_configuration_snapshots());
     if cli.out_dir.is_none() {
         for (source, _) in &sources {
             let Some(directory) = source.parent() else {

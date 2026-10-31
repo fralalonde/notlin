@@ -872,6 +872,59 @@ pub(crate) fn retained_kotlin_property_ancestor(
     None
 }
 
+/// With a known modern JVM-default configuration, a memberless Java interface
+/// can forward abstract Kotlin accessors without taking ownership of a getter
+/// body. Legacy DefaultImpls calls and concrete/default property getters still
+/// need the existing bridge proof.
+pub(crate) fn forwards_abstract_kotlin_properties(
+    index: &SourceIndex,
+    target: &Declaration,
+) -> bool {
+    if !index.has_modern_kotlin_interface_defaults()
+        || target.kind != DeclarationKind::Interface
+        || target.members.iter().any(|member| !member.is_static)
+    {
+        return false;
+    }
+    let mut pending = vec![target];
+    let mut visited = HashSet::new();
+    let mut has_property = false;
+    while let Some(declaration) = pending.pop() {
+        if !visited.insert(crate::semantics::workspace_symbol(index, declaration)) {
+            continue;
+        }
+        let Some(file) = index.declaration_source_file(declaration) else {
+            return false;
+        };
+        if declaration.kind != DeclarationKind::Interface {
+            return false;
+        }
+        for property in declaration
+            .members
+            .iter()
+            .filter(|member| !member.is_static && member.kind == MemberKind::Property)
+        {
+            if property.has_body
+                || property.has_custom_accessor
+                || property.is_jvm_field
+                || property.has_unsupported_property_annotations
+                || property.type_name.is_none()
+            {
+                return false;
+            }
+            has_property = true;
+        }
+        for supertype in &declaration.supertypes {
+            if let Some(parent) = index.resolve_type(file, supertype) {
+                pending.push(parent);
+            } else if !index.canonical_methodless_external_marker(file, supertype) {
+                return false;
+            }
+        }
+    }
+    has_property
+}
+
 /// Whether every retained Kotlin subtype can be repaired before this simple
 /// property interface is translated. A missing declaration, unselected file,
 /// custom accessor, or property shape we cannot rewrite keeps the old ABI.

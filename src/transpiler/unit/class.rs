@@ -1295,6 +1295,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             if self.retained_hint.is_some()
                 && retained_property_boundary
                 && !proven_java_property_contracts
+                && !crate::property_abi::forwards_abstract_kotlin_properties(workspace, target)
             {
                 return Some((
                     RetentionKind::RetainedPropertyInterface,
@@ -3872,6 +3873,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return false;
         }
         if self.jackson_default_deserializer_name(decl).is_some() {
+            return false;
+        }
+        let file = self.workspace_file.as_deref().unwrap_or(self.file);
+        if self.semantic_provider.is_some_and(|provider| {
+            provider.symbols_in_file(file).iter().any(|symbol| {
+                symbol.location.start_byte == decl.start_byte()
+                    && symbol.location.end_byte == decl.end_byte()
+                    && symbol.location.snapshot_hash == self.source_hash
+                    && provider.has_jackson_custom_deserializer(&symbol.id)
+            })
+        }) {
             return false;
         }
         // Only introduce a Jackson dependency where the same source set already

@@ -96,6 +96,23 @@ pub(crate) fn repair_virtual_sources(
         }
         let mut candidates = Vec::new();
         for declaration in &file.declarations {
+            if declaration.kind == DeclarationKind::Enum {
+                let owner = crate::semantics::workspace_symbol(index, declaration);
+                for bridge in index.retained_enum_default_method_bridges(path, &declaration.name) {
+                    candidates.push((
+                        owner.clone(),
+                        RetainedGetterBridge {
+                            method_name: bridge.method_name,
+                            // Kotlin infers the selected super method's exact
+                            // type, including platform nullability and generics.
+                            return_type: None,
+                            provider: bridge.provider,
+                            kind: "enum-default-getter",
+                        },
+                    ));
+                }
+                continue;
+            }
             if declaration.kind != DeclarationKind::Class {
                 continue;
             }
@@ -116,7 +133,25 @@ pub(crate) fn repair_virtual_sources(
                 {
                     continue;
                 }
-                candidates.push((owner.clone(), bridge));
+                let crate::semantics::KotlinType::Named { name, arguments } =
+                    &bridge.return_type_ref.ty
+                else {
+                    return Err("accepted Kotlin getter bridge has a non-reference return".into());
+                };
+                if bridge.return_type_ref.nullable || !arguments.is_empty() {
+                    return Err(
+                        "accepted Kotlin getter bridge has an unsupported return contract".into(),
+                    );
+                }
+                candidates.push((
+                    owner.clone(),
+                    RetainedGetterBridge {
+                        method_name: bridge.method_name,
+                        return_type: Some(name.clone()),
+                        provider: qualified_name(&bridge.provider_owner),
+                        kind: "covariant-default-getter",
+                    },
+                ));
             }
         }
         if candidates.is_empty() {
@@ -145,35 +180,34 @@ pub(crate) fn repair_virtual_sources(
             if !bridges.is_empty() {
                 let body = node
                     .named_children(&mut node.walk())
-                    .find(|child| child.kind() == "class_body");
+                    .find(|child| matches!(child.kind(), "class_body" | "enum_class_body"));
                 let insertion = body.map_or(node.end_byte(), |body| body.end_byte() - 1);
                 let mut replacement = if body.is_some() {
                     String::new()
                 } else {
                     " {".to_owned()
                 };
+                if owner.kind == "enum"
+                    && body.is_none_or(|body| {
+                        !body
+                            .children(&mut body.walk())
+                            .any(|child| child.kind() == ";")
+                    })
+                {
+                    replacement.push_str("\n    ;");
+                }
                 for (_, bridge) in bridges {
-                    let provider = qualified_name(&bridge.provider_owner);
-                    let crate::semantics::KotlinType::Named {
-                        name: return_type,
-                        arguments,
-                    } = &bridge.return_type_ref.ty
-                    else {
-                        return Err(
-                            "accepted Kotlin getter bridge has a non-reference return".into()
-                        );
-                    };
-                    if bridge.return_type_ref.nullable || !arguments.is_empty() {
-                        return Err(
-                            "accepted Kotlin getter bridge has an unsupported return contract"
-                                .into(),
-                        );
-                    }
+                    let provider = &bridge.provider;
+                    let return_type = bridge
+                        .return_type
+                        .as_ref()
+                        .map(|ty| format!(": {ty}"))
+                        .unwrap_or_default();
                     replacement.push_str(&format!(
-                        "\n    override fun {}(): {} = super<{provider}>.{}()\n",
+                        "\n    override fun {}(){} = super<{provider}>.{}()\n",
                         bridge.method_name, return_type, bridge.method_name
                     ));
-                    record_bridge(&mut report, &owner, &bridge.method_name);
+                    record_bridge(&mut report, &owner, &bridge.method_name, bridge.kind);
                     matched += 1;
                 }
                 if body.is_none() {
@@ -197,6 +231,13 @@ pub(crate) fn repair_virtual_sources(
     Ok(report)
 }
 
+struct RetainedGetterBridge {
+    method_name: String,
+    return_type: Option<String>,
+    provider: String,
+    kind: &'static str,
+}
+
 fn qualified_name(symbol: &SymbolId) -> String {
     std::iter::once(symbol.package.as_str())
         .filter(|part| !part.is_empty())
@@ -206,8 +247,13 @@ fn qualified_name(symbol: &SymbolId) -> String {
         .join(".")
 }
 
-fn record_bridge(report: &mut PlannedAccessorRepairs, owner: &SymbolId, method_name: &str) {
-    let kind = format!("covariant-default-getter:{method_name}");
+fn record_bridge(
+    report: &mut PlannedAccessorRepairs,
+    owner: &SymbolId,
+    method_name: &str,
+    repair_kind: &str,
+) {
+    let kind = format!("{repair_kind}:{method_name}");
     let id = SymbolId::generated(owner, &kind);
     report.bridges.push(PlannedBridge {
         id: id.clone(),
@@ -222,7 +268,7 @@ fn record_bridge(report: &mut PlannedAccessorRepairs, owner: &SymbolId, method_n
     report.provenance.push(OriginMap {
         generated: id,
         origin: owner.clone(),
-        reason: "stable identity of a retained covariant getter bridge".into(),
+        reason: "stable identity of a retained default getter bridge".into(),
     });
     report.provenance.push(OriginMap {
         generated,
@@ -231,7 +277,7 @@ fn record_bridge(report: &mut PlannedAccessorRepairs, owner: &SymbolId, method_n
     });
     report.repairs.push(PlannedRepair {
         target: owner.clone(),
-        kind: "covariant-default-getter".into(),
+        kind: repair_kind.into(),
         detail: format!("preserve concrete accessor `{method_name}` on retained Kotlin"),
     });
     report.count += 1;
@@ -306,6 +352,66 @@ mod tests {
                     .starts_with(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
             );
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn retained_enums_select_the_first_default_and_add_a_missing_entry_separator() {
+        for (parents, provider) in [("Step, Other", "Step"), ("Other, Step", "Other")] {
+            let fixture = Fixture::new(&format!(
+                "package sample\nenum class Child : {parents} {{ ONE }}\n"
+            ));
+            fs::write(fixture.0.join("Other.java"), "package sample; public interface Other { default StoredId getOwner() { return new StoredId(); } }\n").unwrap();
+            let (index, mut sources) = fixture.indexed_sources();
+            let report = repair_virtual_sources(&index, &mut sources, &HashSet::new()).unwrap();
+            assert_eq!(report.count, 1);
+            assert_eq!(report.repairs[0].kind, "enum-default-getter");
+            assert!(
+                sources[0].1.contains(&format!(
+                    "override fun getOwner() = super<sample.{provider}>.getOwner()"
+                )),
+                "{}",
+                sources[0].1
+            );
+            assert!(sources[0].1.contains(';'));
+            assert!(
+                !crate::transpiler::parse_tree(&sources[0].1)
+                    .root_node()
+                    .has_error()
+            );
+            let next = index
+                .with_overlays(&[SourceOverlay::Replace {
+                    path: sources[0].0.clone(),
+                    language: SourceLanguage::Kotlin,
+                    source: sources[0].1.clone(),
+                }])
+                .unwrap();
+            assert_eq!(
+                repair_virtual_sources(&next, &mut sources, &HashSet::new())
+                    .unwrap()
+                    .count,
+                0
+            );
+
+            let mut property_source = vec![(
+                fixture.0.join("Child.kt"),
+                format!(
+                    "package sample\ninterface PropertyRoot {{ val owner: StoredId }}\nenum class Child : {parents}, PropertyRoot {{ ONE }}\n"
+                ),
+            )];
+            let property_index = index
+                .with_overlays(&[SourceOverlay::Replace {
+                    path: property_source[0].0.clone(),
+                    language: SourceLanguage::Kotlin,
+                    source: property_source[0].1.clone(),
+                }])
+                .unwrap();
+            assert_eq!(
+                repair_virtual_sources(&property_index, &mut property_source, &HashSet::new())
+                    .unwrap()
+                    .count,
+                0
+            );
         }
     }
 

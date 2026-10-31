@@ -5,7 +5,7 @@
 //! syntax facts are collected from the workspace's existing parse snapshots,
 //! then joined to the stable type graph after inheritance is indexed.
 
-use super::{SymbolId, SyntaxSemanticProvider};
+use super::{FactStatus, SemanticProvider, SymbolId, SyntaxSemanticProvider};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
@@ -23,6 +23,13 @@ struct ClassFact {
     custom_binding: bool,
     factory_defaults: bool,
     ignores_unknown: bool,
+    decoder: Option<Decoder>,
+}
+
+#[derive(Clone)]
+enum Decoder {
+    Using(String),
+    Other,
 }
 
 pub(super) fn collect(source: &str, file: &Path, root: Node<'_>) -> FileRelations {
@@ -49,7 +56,8 @@ pub(super) fn collect(source: &str, file: &Path, root: Node<'_>) -> FileRelation
             let own_annotation =
                 may_have_jackson && has_jackson_annotation(source, node, &bindings);
             let ignores_unknown = ignores_unknown(source, node, &bindings);
-            if has_primary_defaults || own_annotation || ignores_unknown {
+            let decoder = root_decoder(source, node, &bindings);
+            if has_primary_defaults || own_annotation || ignores_unknown || decoder.is_some() {
                 relations.classes.push(ClassFact {
                     start: node.start_byte(),
                     has_primary_defaults,
@@ -57,6 +65,7 @@ pub(super) fn collect(source: &str, file: &Path, root: Node<'_>) -> FileRelation
                     custom_binding: custom_binding(source, node, &bindings),
                     factory_defaults: ordinary_factory_defaults(source, node, &bindings),
                     ignores_unknown,
+                    decoder,
                 });
             }
         }
@@ -85,7 +94,7 @@ pub(super) fn resolve_ignored_unknown(
 /// The common class-level ignore-unknown contract can be copied unchanged to
 /// a generated builder. Parse tokens so comments/string contents cannot create
 /// a setting. Other JsonIgnoreProperties forms keep their custom-binding guard.
-fn plain_ignore_unknown(source: &str, annotation: Node<'_>) -> bool {
+fn annotation_tokens<'a>(source: &'a str, annotation: Node<'_>) -> Vec<&'a str> {
     let mut leaves = Vec::new();
     let mut pending = vec![annotation];
     while let Some(node) = pending.pop() {
@@ -99,14 +108,171 @@ fn plain_ignore_unknown(source: &str, annotation: Node<'_>) -> bool {
         }
     }
     leaves.sort_by_key(|node| node.start_byte());
-    let tokens = leaves
+    leaves
         .iter()
         .filter_map(|node| node.utf8_text(source.as_bytes()).ok())
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn plain_ignore_unknown(source: &str, annotation: Node<'_>) -> bool {
+    let tokens = annotation_tokens(source, annotation);
     let Some(start) = tokens.iter().position(|token| *token == "(") else {
         return false;
     };
     tokens[start..] == ["(", "ignoreUnknown", "=", "true", ")"]
+}
+
+/// Only a type-level decoder replaces automatic creator binding. Parameter,
+/// field and getter deserializers still participate in that binding.
+fn root_decoder(source: &str, class: Node<'_>, bindings: &AnnotationBindings) -> Option<Decoder> {
+    let canonical = "com.fasterxml.jackson.databind.annotation.JsonDeserialize";
+    let mut pending = named_children(class)
+        .into_iter()
+        .filter(|node| node.kind() == "modifiers" || is_annotation_node(node.kind()))
+        .collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        if is_annotation_node(node.kind()) {
+            let Some(name) = annotation_name(source, node) else {
+                continue;
+            };
+            if !bindings.is_exact(&name, canonical) {
+                // An unresolved same-name annotation might override an inherited
+                // decoder. A proven foreign annotation cannot override Jackson.
+                if name == "JsonDeserialize"
+                    && !bindings.local_names.contains(&name)
+                    && bindings.imported_name(&name).is_none()
+                {
+                    return Some(Decoder::Other);
+                }
+                continue;
+            }
+            let tokens = annotation_tokens(source, node);
+            let start = tokens.iter().position(|token| *token == "(");
+            let Some(start) = start else {
+                return Some(Decoder::Other);
+            };
+            let mut depth = 1;
+            for index in start + 1..tokens.len() {
+                match tokens[index] {
+                    "(" => depth += 1,
+                    ")" => depth -= 1,
+                    "using" if depth == 1 && tokens.get(index + 1) == Some(&"=") => {
+                        let value = tokens[index + 2..]
+                            .iter()
+                            .take_while(|token| !matches!(**token, "," | ")"))
+                            .copied()
+                            .collect::<String>();
+                        let reference = value
+                            .strip_suffix("::class")
+                            .or_else(|| value.strip_suffix(".class"));
+                        return Some(
+                            reference
+                                .filter(|path| {
+                                    !path.is_empty()
+                                        && path.chars().all(|c| {
+                                            c.is_alphanumeric() || matches!(c, '_' | '.' | '$')
+                                        })
+                                })
+                                .map(|path| {
+                                    Decoder::Using(
+                                        bindings
+                                            .imported_name(path)
+                                            .unwrap_or_else(|| path.to_owned()),
+                                    )
+                                })
+                                .unwrap_or(Decoder::Other),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            return Some(Decoder::Other);
+        }
+        pending.extend(named_children(node));
+    }
+    None
+}
+
+/// A nearer JsonDeserialize annotation replaces the inherited annotation,
+/// including when `using` is omitted or explicitly JsonDeserializer.None.
+pub(super) fn resolve_custom_decoders(
+    provider: &SyntaxSemanticProvider,
+    files: &BTreeMap<PathBuf, FileRelations>,
+) -> BTreeSet<SymbolId> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Binding {
+        Missing,
+        Custom,
+        Other,
+    }
+    let mut own = BTreeMap::new();
+    for (file, relations) in files {
+        for fact in &relations.classes {
+            let (Some(decoder), Some(owner)) =
+                (&fact.decoder, symbol_at(provider, file, fact.start))
+            else {
+                continue;
+            };
+            let custom = match decoder {
+                Decoder::Other => false,
+                Decoder::Using(path) => {
+                    let (package, name) = path.rsplit_once('.').unwrap_or((&owner.package, path));
+                    path != "com.fasterxml.jackson.databind.JsonDeserializer.None"
+                        && !provider.has_type_alias_in_package(package, name)
+                        && (path.contains('.')
+                            || matches!(provider.resolve_type_in_file(file, &owner.package, path), FactStatus::Established(id) if id.kind != "typealias"))
+                }
+            };
+            own.insert(
+                owner,
+                if custom {
+                    Binding::Custom
+                } else {
+                    Binding::Other
+                },
+            );
+        }
+    }
+    fn effective(
+        owner: &SymbolId,
+        provider: &SyntaxSemanticProvider,
+        own: &BTreeMap<SymbolId, Binding>,
+        memo: &mut BTreeMap<SymbolId, Binding>,
+        visiting: &mut BTreeSet<SymbolId>,
+    ) -> Binding {
+        if let Some(binding) = memo.get(owner).or_else(|| own.get(owner)) {
+            return *binding;
+        }
+        if !visiting.insert(owner.clone()) {
+            return Binding::Other;
+        }
+        let mut result = Binding::Missing;
+        for parent in provider.parents.get(owner).into_iter().flatten() {
+            match effective(parent, provider, own, memo, visiting) {
+                Binding::Other => {
+                    result = Binding::Other;
+                    break;
+                }
+                Binding::Custom => result = Binding::Custom,
+                Binding::Missing => {}
+            }
+        }
+        visiting.remove(owner);
+        memo.insert(owner.clone(), result);
+        result
+    }
+    let mut memo = BTreeMap::new();
+    provider
+        .by_file
+        .values()
+        .flatten()
+        .map(|index| &provider.symbols[*index].id)
+        .filter(|owner| super::is_type_symbol(owner))
+        .filter(|owner| {
+            effective(owner, provider, &own, &mut memo, &mut BTreeSet::new()) == Binding::Custom
+        })
+        .cloned()
+        .collect()
 }
 
 fn ignores_unknown(source: &str, declaration: Node<'_>, bindings: &AnnotationBindings) -> bool {
@@ -367,6 +533,7 @@ pub(super) fn resolve(
     candidates
         .into_iter()
         .filter(|owner| annotated_ancestors.contains(owner))
+        .filter(|owner| !provider.has_jackson_custom_deserializer(owner))
         .collect()
 }
 
@@ -482,6 +649,35 @@ struct AnnotationBindings {
 }
 
 impl AnnotationBindings {
+    fn imported_name(&self, spelling: &str) -> Option<String> {
+        let root = spelling.split('.').next()?;
+        let candidates = self
+            .imports
+            .iter()
+            .filter(|(path, alias)| {
+                !path.ends_with(".*")
+                    && alias
+                        .as_deref()
+                        .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path))
+                        == root
+            })
+            .collect::<Vec<_>>();
+        let [(path, _)] = candidates.as_slice() else {
+            return None;
+        };
+        Some(format!("{path}{}", &spelling[root.len()..]))
+    }
+
+    fn is_exact(&self, spelling: &str, canonical: &str) -> bool {
+        if let Some(imported) = self.imported_name(spelling) {
+            return imported == canonical;
+        }
+        spelling == canonical
+            || (!spelling.contains('.')
+                && spelling == canonical.rsplit('.').next().unwrap_or(canonical)
+                && self.is_jackson(spelling))
+    }
+
     fn collect(source: &str, root: Node<'_>) -> Self {
         let imports = root
             .named_children(&mut root.walk())

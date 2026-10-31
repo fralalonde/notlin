@@ -9,6 +9,7 @@ use std::time::UNIX_EPOCH;
 
 mod default_getters;
 pub(crate) mod header_facts;
+mod jvm_defaults;
 pub(crate) mod profile;
 
 // 5: `Declaration::constructor_param_count` (primary-constructor arity, not a
@@ -447,6 +448,7 @@ impl SourceFile {
 #[derive(Debug, Default)]
 pub struct SourceIndex {
     pub files: Vec<SourceFile>,
+    kotlin_jvm_defaults: jvm_defaults::Configuration,
     /// Accepted generated-member facts, never inferred from arbitrary Java text.
     generated_getters: Vec<crate::lombok_getter_contracts::GeneratedGetterContract>,
     /// Java paths with an explicitly enabled, snapshot-checked default Lombok profile.
@@ -682,6 +684,20 @@ fn flatten_sources(root: &CachedDirectory) -> Vec<CachedPathSource> {
 }
 
 impl SourceIndex {
+    pub(crate) fn has_modern_kotlin_interface_defaults(&self) -> bool {
+        self.kotlin_jvm_defaults.modern
+    }
+
+    pub(crate) fn kotlin_compiler_configuration_snapshots(
+        &self,
+    ) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        if self.kotlin_jvm_defaults.modern {
+            self.kotlin_jvm_defaults.inputs.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
     pub(crate) fn set_default_lombok_accessors(
         &mut self,
         paths: impl IntoIterator<Item = PathBuf>,
@@ -846,7 +862,8 @@ impl SourceIndex {
         )?;
         files.sort_by(|left, right| left.path.cmp(&right.path));
 
-        let index = Self::from_files(files);
+        let mut index = Self::from_files(files);
+        index.kotlin_jvm_defaults = jvm_defaults::discover(&root, &index.files);
 
         let new_cache = IndexCache {
             version: CACHE_VERSION,
@@ -883,6 +900,7 @@ impl SourceIndex {
             .collect();
         let mut index = Self {
             files,
+            kotlin_jvm_defaults: jvm_defaults::Configuration::default(),
             generated_getters: Vec::new(),
             default_lombok_accessors: HashSet::new(),
             getter_bridge_cache: default_getters::BridgeCache::default(),
@@ -1143,6 +1161,7 @@ impl SourceIndex {
             );
         }
         let mut index = Self::from_files(files);
+        index.kotlin_jvm_defaults = self.kotlin_jvm_defaults.clone();
         index.set_generated_getters(cache_source.generated_getters.iter().cloned());
         index.set_default_lombok_accessors(cache_source.default_lombok_accessors.iter().cloned());
         let (changed_files, changed_names) =
@@ -2337,6 +2356,66 @@ impl SourceIndex {
                             .to_string(),
                     })
                 })
+            })
+            .collect()
+    }
+
+    /// Retained enums need the same explicit default selection as emitted Java
+    /// enums. A Kotlin property contract must first become a method contract:
+    /// `override fun getX()` cannot implement a still-Kotlin `val x`.
+    pub(crate) fn retained_enum_default_method_bridges(
+        &self,
+        declaring: &Path,
+        name: &str,
+    ) -> Vec<EnumDefaultBridge> {
+        let Some(file) = self.source_file(declaring) else {
+            return Vec::new();
+        };
+        let Some(owner) = file
+            .declarations
+            .iter()
+            .find(|owner| owner.name == name && owner.kind == DeclarationKind::Enum)
+        else {
+            return Vec::new();
+        };
+        let mut properties = HashSet::new();
+        let mut pending = owner
+            .supertypes
+            .iter()
+            .map(|ty| (file, ty))
+            .collect::<Vec<_>>();
+        let mut visited = HashSet::new();
+        while let Some((context, ty)) = pending.pop() {
+            let Some(parent) = self.resolve_type(context, ty) else {
+                if self.canonical_methodless_external_marker(context, ty) {
+                    continue;
+                }
+                return Vec::new();
+            };
+            if !visited.insert(crate::semantics::workspace_symbol(self, parent)) {
+                continue;
+            }
+            let Some(context) = self.declaration_source_file(parent) else {
+                return Vec::new();
+            };
+            if parent.language == SourceLanguage::Kotlin {
+                properties.extend(
+                    parent
+                        .members
+                        .iter()
+                        .filter(|member| member.kind == MemberKind::Property && !member.is_static)
+                        .map(|member| property_accessor_name(&member.name)),
+                );
+            }
+            pending.extend(parent.supertypes.iter().map(|ty| (context, ty)));
+        }
+        self.enum_default_property_bridges(declaring, name)
+            .into_iter()
+            .filter(|bridge| !properties.contains(&bridge.method_name))
+            .filter_map(|mut bridge| {
+                let provider = self.resolve_type(file, &bridge.provider)?;
+                bridge.provider = declaration_key(provider);
+                Some(bridge)
             })
             .collect()
     }

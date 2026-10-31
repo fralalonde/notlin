@@ -182,8 +182,21 @@ explicit capability proof; recognizing an annotation is insufficient.
   then the ordinary constructor performs property and instance initialization.
   Recursive DTO resolution shares the incomplete delegate per thread and context;
   it also works during ObjectReader prefetch, before per-call attributes exist.
-  Custom binding and generic data classes remain Kotlin. Declaration nullability
-  annotations are omitted from cast types for compatibility with older jars.
+  Generic data classes and unproved custom creator binding remain Kotlin.
+  Type-level custom deserializers own construction instead: direct and inherited
+  `using` contracts allow ordinary constructors without automatic creator helpers.
+  A nearer annotation resets inherited binding, including `JsonDeserializer.None`;
+  parameter/field deserializers retain ordinary constructor-binding safeguards.
+  Declaration nullability annotations are omitted from cast types for older jars.
+- Memberless interfaces can forward abstract Kotlin getters/setters under declared
+  modern JVM defaults, including generic and mutable properties. Concrete getters,
+  legacy `DefaultImpls` modes and unproved compiler settings retain existing guards.
+  Gradle configuration snapshots are verified before migration writes. Native
+  fixtures compare default, legacy and interface-only modes with retained callers.
+  Retained enums also receive explicit selections through the same first default
+  branch used by Java enum emission. Inferred Kotlin returns preserve platform
+  nullability, primitives and generic results; remaining Kotlin property contracts
+  still prevent method bridges. Native cases reverse provider order.
 - Constructor overloads delegate through successive default arguments, so a
   later default can read an earlier argument without re-evaluating its expression.
   String concatenation dispatch follows the left receiver even when the right
