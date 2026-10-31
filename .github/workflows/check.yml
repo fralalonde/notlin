@@ -15,6 +15,13 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Hundreds of integration binaries otherwise duplicate the compiler's
+      # debug symbols until the hosted runner runs out of disk while linking.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
         with:
