@@ -27,7 +27,8 @@ pub(crate) mod profile;
 // 28: value-class identity excludes unboxed getters from reference covariance.
 // 29: method-generic and inline-bound header facts reuse the indexing parse.
 // 31: setter_name_renamed indexes @JvmName presence on properties.
-const CACHE_VERSION: u32 = 31;
+// 32: method type parameters prevent source classifiers from capturing returns.
+const CACHE_VERSION: u32 = 32;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -48,6 +49,10 @@ pub struct MemberConflict {
     pub kind: MemberKind,
     pub supertype: String,
     pub inherited_type: String,
+    /// Source scope of a substituted return, including arguments introduced by
+    /// an earlier inheritance edge rather than the method's declaring file.
+    pub inherited_type_source: PathBuf,
+    inherited_type_substituted: bool,
     pub implementation_type: String,
     pub parameter_types: Vec<String>,
     pub classification: MemberConflictClass,
@@ -182,6 +187,9 @@ pub struct Member {
     pub type_name: Option<String>,
     #[serde(default)]
     pub parameter_types: Vec<String>,
+    /// Method-scoped names take precedence over source classifiers in returns.
+    #[serde(default)]
+    pub type_parameters: Vec<String>,
     /// Source-level argument counts accepted by a parsed method signature.
     /// `None` means the signature shape is unsupported or could not be read.
     #[serde(default)]
@@ -1715,6 +1723,59 @@ impl SourceIndex {
         )
     }
 
+    /// A source reference return can override a retained Kotlin method: javac
+    /// supplies the covariant JVM bridge. Properties have separate ownership
+    /// rules and are deliberately excluded from this method contract proof.
+    pub(crate) fn reference_method_return_is_safe(
+        &self,
+        declaring: &Path,
+        owner: &Declaration,
+        conflict: &MemberConflict,
+    ) -> bool {
+        if conflict.kind != MemberKind::Method {
+            return false;
+        }
+        let Some(own_file) = self.source_file(declaring) else {
+            return false;
+        };
+        let Some(parent) = self
+            .qualified_declarations
+            .get(&conflict.supertype)
+            .filter(|candidates| candidates.len() == 1)
+            .and_then(|_| self.find_qualified(&conflict.supertype))
+        else {
+            return false;
+        };
+        let Some(parent_file) = self.source_file(&conflict.inherited_type_source) else {
+            return false;
+        };
+        let shadows = |declaration: &Declaration, ty: &str| {
+            declaration_type_parameter_shadows(declaration, ty)
+                || declaration.members.iter().any(|member| {
+                    member.kind == MemberKind::Method
+                        && member.name == conflict.member_name
+                        && member
+                            .type_parameters
+                            .iter()
+                            .any(|parameter| parameter == ty.trim().trim_end_matches('?').trim())
+                })
+        };
+        if shadows(owner, &conflict.implementation_type)
+            || !conflict.inherited_type_substituted && shadows(parent, &conflict.inherited_type)
+            || conflict.implementation_type.trim().ends_with('?')
+                && !conflict.inherited_type.trim().ends_with('?')
+        {
+            return false;
+        }
+        source_reference_return_is_subtype(
+            self,
+            own_file,
+            &conflict.implementation_type,
+            parent_file,
+            &conflict.inherited_type,
+        )
+    }
+
     /// Return a descriptor only for a proven nonnullable builtin getter type.
     /// Reuse source-scoped identity resolution: aliases, source collisions and
     /// explicit imports take precedence over the provider's builtin facts.
@@ -2111,12 +2172,13 @@ impl SourceIndex {
                     own_file,
                     supertype.clone(),
                     HashMap::<String, String>::new(),
+                    HashMap::<String, PathBuf>::new(),
                 )
             })
             .collect();
         let mut visited = HashSet::new();
         let mut conflicts = Vec::new();
-        while let Some((context, sup, inherited_bindings)) = pending.pop() {
+        while let Some((context, sup, inherited_bindings, inherited_sources)) = pending.pop() {
             let resolved_sup = substitute_type_parameters(&sup, &inherited_bindings);
             let Some(sup_decl) = self.resolve_type(context, &resolved_sup) else {
                 continue;
@@ -2128,14 +2190,31 @@ impl SourceIndex {
                 .zip(supplied_args.unwrap_or_default())
                 .map(|(parameter, argument)| (parameter.clone(), argument.to_string()))
                 .collect();
+            let (_, raw_arguments) = split_generic(sup.trim().trim_end_matches("()"));
+            let binding_sources: HashMap<String, PathBuf> = sup_decl
+                .type_params
+                .iter()
+                .zip(raw_arguments.unwrap_or_default())
+                .map(|(parameter, argument)| {
+                    let origin = inherited_sources
+                        .get(argument.trim().trim_end_matches('?'))
+                        .unwrap_or(&context.path);
+                    (parameter.clone(), origin.clone())
+                })
+                .collect();
             let visit_key = format!(
                 "{}<{}>",
                 declaration_key(sup_decl),
                 sup_decl
                     .type_params
                     .iter()
-                    .filter_map(|parameter| bindings.get(parameter))
-                    .cloned()
+                    .filter_map(|parameter| {
+                        Some(format!(
+                            "{}@{}",
+                            bindings.get(parameter)?,
+                            binding_sources.get(parameter)?.display()
+                        ))
+                    })
                     .collect::<Vec<_>>()
                     .join(",")
             );
@@ -2147,7 +2226,12 @@ impl SourceIndex {
             // its OWN supertypes still widen the conflict transitively
             // (ImportContainer extends IImportContainer, IBarcodeAware).
             for sup_sup in &sup_decl.supertypes {
-                pending.push((sup_file, sup_sup.clone(), bindings.clone()));
+                pending.push((
+                    sup_file,
+                    sup_sup.clone(),
+                    bindings.clone(),
+                    binding_sources.clone(),
+                ));
             }
             if sup_decl.language != SourceLanguage::Kotlin {
                 continue;
@@ -2177,6 +2261,12 @@ impl SourceIndex {
                         kind: m.kind,
                         supertype: declaration_key(sup_decl),
                         inherited_type: sup_ty.clone(),
+                        inherited_type_source: binding_sources
+                            .get(raw_sup_ty.trim().trim_end_matches('?'))
+                            .cloned()
+                            .unwrap_or_else(|| sup_file.path.clone()),
+                        inherited_type_substituted: binding_sources
+                            .contains_key(raw_sup_ty.trim().trim_end_matches('?')),
                         implementation_type: own_ty.to_string(),
                         parameter_types,
                         classification: classify_member_conflict(
@@ -3559,84 +3649,13 @@ impl SourceIndex {
         };
         let provider_type = provider_bound.as_deref().unwrap_or(provider_type);
 
-        let Some(provider_decl) = exact_source_reference_type(self, provider_file, provider_type)
-        else {
-            return false;
-        };
-        if provider_decl.is_jvm_value_class || !provider_decl.type_params.is_empty() {
-            return false;
-        }
-        // Ordinary source reference types have java.lang.Object as a JVM
-        // supertype. Keep the name proof scoped: an imported/custom Any,
-        // an alias, or an unknown wildcard cannot establish this contract.
-        let inherited_base = inherited_type.trim().trim_end_matches('?');
-        if canonical_getter_named_identity(self, parent_file, inherited_base).as_deref()
-            == Some("kotlin.Any")
-            && (inherited_base.contains('.')
-                || parent_file
-                    .imports
-                    .iter()
-                    .any(|import| matches!(import.as_str(), "kotlin.Any" | "java.lang.Object"))
-                || !parent_file
-                    .imports
-                    .iter()
-                    .any(|import| import.ends_with(".*")))
-        {
-            return true;
-        }
-        let Some(parent_decl) = exact_source_reference_type(self, parent_file, inherited_type)
-        else {
-            return false;
-        };
-        if !matches!(
-            provider_decl.kind,
-            DeclarationKind::Class
-                | DeclarationKind::Interface
-                | DeclarationKind::Enum
-                | DeclarationKind::Object
-        ) || !matches!(
-            parent_decl.kind,
-            DeclarationKind::Class
-                | DeclarationKind::Interface
-                | DeclarationKind::Enum
-                | DeclarationKind::Object
-        ) || !provider_decl.type_params.is_empty()
-            || !parent_decl.type_params.is_empty()
-        {
-            return false;
-        }
-
-        let target = crate::semantics::workspace_symbol(self, parent_decl).stable_key();
-        let mut pending = vec![provider_decl];
-        let mut visited = HashSet::new();
-        let mut explored = 0usize;
-        while let Some(current) = pending.pop() {
-            explored += 1;
-            if explored > 256 {
-                return false;
-            }
-            let current_key = crate::semantics::workspace_symbol(self, current).stable_key();
-            if current_key == target {
-                return true;
-            }
-            if !visited.insert(current_key) {
-                continue;
-            }
-            let Some(current_file) = self.declaration_source_file(current) else {
-                continue;
-            };
-            for supertype in &current.supertypes {
-                // This proof does not perform generic substitution. Other
-                // non-generic source edges can still prove the path.
-                if supertype.contains(['<', '>', '?', '&', '(', ')', '[', ']']) {
-                    continue;
-                }
-                if let Some(next) = exact_source_reference_type(self, current_file, supertype) {
-                    pending.push(next);
-                }
-            }
-        }
-        false
+        source_reference_return_is_subtype(
+            self,
+            provider_file,
+            provider_type,
+            parent_file,
+            inherited_type,
+        )
     }
 
     /// An actual Kotlin default method returning its owner's type parameter
@@ -6067,7 +6086,7 @@ fn optional_element_type(type_name: &str) -> Option<String> {
 }
 
 /// Type-parameter names of a declaration (`class Foo<T, I : Bar>` ->
-/// `["T", "I"]`), from the `type_parameters` AST child. Java only.
+/// `["T", "I"]`), from the `type_parameters` AST child in either language.
 fn type_param_names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
     let Some(params) = node
         .children(&mut node.walk())
@@ -6154,6 +6173,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 has_inline_getter: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
                 parameter_types: Vec::new(),
+                type_parameters: Vec::new(),
                 callable_arity: None,
                 is_nullable: false,
                 has_body: false,
@@ -6225,6 +6245,7 @@ fn members(node: tree_sitter::Node<'_>, language: SourceLanguage, source: &str) 
                 has_inline_getter: false,
                 type_name: type_node.and_then(|node| node_text(node, source).ok()),
                 parameter_types: Vec::new(),
+                type_parameters: Vec::new(),
                 callable_arity: None,
                 is_nullable: type_node.is_some_and(|node| node.kind() == "nullable_type"),
                 has_body: true,
@@ -6670,6 +6691,7 @@ fn member_from_node(
                 .is_some_and(|line| line.contains("get()")),
         type_name,
         parameter_types: member_parameter_types(node, language, source),
+        type_parameters: type_param_names(node, source),
         callable_arity: (kind == MemberKind::Method)
             .then(|| member_callable_arity(node, language))
             .flatten(),
@@ -7732,6 +7754,79 @@ fn exact_source_reference_type<'a>(
             .iter()
             .any(|import| import.strip_suffix(".*") == declaration.package.as_deref()))
     .then_some(declaration)
+}
+
+/// Prove ordinary reference covariance in each declaration's source scope.
+/// Shared by default-getter bridge planning and explicit method overrides.
+fn source_reference_return_is_subtype(
+    index: &SourceIndex,
+    own_file: &SourceFile,
+    own_type: &str,
+    super_file: &SourceFile,
+    super_type: &str,
+) -> bool {
+    let Some(own_decl) = exact_source_reference_type(index, own_file, own_type) else {
+        return false;
+    };
+    if own_decl.is_jvm_value_class || !own_decl.type_params.is_empty() {
+        return false;
+    }
+    // Ordinary source reference types have java.lang.Object as a JVM
+    // supertype. Keep the name proof scoped: an imported/custom Any,
+    // an alias, or an unknown wildcard cannot establish this contract.
+    let inherited_base = super_type.trim().trim_end_matches('?');
+    if canonical_getter_named_identity(index, super_file, inherited_base).as_deref()
+        == Some("kotlin.Any")
+        && (inherited_base.contains('.')
+            || super_file
+                .imports
+                .iter()
+                .any(|import| matches!(import.as_str(), "kotlin.Any" | "java.lang.Object"))
+            || !super_file
+                .imports
+                .iter()
+                .any(|import| import.ends_with(".*")))
+    {
+        return true;
+    }
+    let Some(super_decl) = exact_source_reference_type(index, super_file, super_type) else {
+        return false;
+    };
+    if !super_decl.type_params.is_empty() {
+        return false;
+    }
+
+    let target = crate::semantics::workspace_symbol(index, super_decl).stable_key();
+    let mut pending = vec![own_decl];
+    let mut visited = HashSet::new();
+    let mut explored = 0usize;
+    while let Some(current) = pending.pop() {
+        explored += 1;
+        if explored > 256 {
+            return false;
+        }
+        let current_key = crate::semantics::workspace_symbol(index, current).stable_key();
+        if current_key == target {
+            return true;
+        }
+        if !visited.insert(current_key) {
+            continue;
+        }
+        let Some(current_file) = index.declaration_source_file(current) else {
+            continue;
+        };
+        for supertype in &current.supertypes {
+            // This proof does not perform generic substitution. Other
+            // non-generic source edges can still prove the path.
+            if supertype.contains(['<', '>', '?', '&', '(', ')', '[', ']']) {
+                continue;
+            }
+            if let Some(next) = exact_source_reference_type(index, current_file, supertype) {
+                pending.push(next);
+            }
+        }
+    }
+    false
 }
 
 fn scoped_type_parameter_bindings(

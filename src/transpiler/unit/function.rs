@@ -41,10 +41,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     /// Detects an `override fun f` whose return differs from a Kotlin
-    /// supertype. Java-compatible covariance is allowed only when that
-    /// supertype is selected and will translate in the same fixpoint; retaining
-    /// the Kotlin interface beside a Java implementation can crash kotlinc's
-    /// fake-override lowering.
+    /// supertype. Ordinary source reference returns use javac's covariant
+    /// bridges even through a retained Kotlin ancestor. Other JVM shapes need
+    /// the coordinated translation or collection contract proof below.
     fn covariant_iface_return_conflict(&self, decl: tree_sitter::Node) -> Option<String> {
         let workspace = self.workspace?;
         let class_name = self.enclosing_class_name(decl)?;
@@ -76,6 +75,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 && conflict.parameter_types == parameter_types
                 && conflict.inherited_type != conflict.implementation_type
         }) {
+            if workspace.reference_method_return_is_safe(declaring, owner, &conflict) {
+                continue;
+            }
             if workspace.selected_covariant_property_conflict_is_safe(
                 declaring,
                 &conflict,
@@ -171,11 +173,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     ) {
         // Covariant-override guard: a Kotlin data class often narrows an
         // interface function's return type (`override fun with(...): Impl`).
-        // The translated Java class then overrides the Kotlin interface
-        // member with a different JVM descriptor family, and kotlinc's
-        // fake-override synthesis can crash resolving it. If a known
-        // supertype declares this member with a different type, keep the
-        // declaration in Kotlin.
+        // Ordinary reference returns can use javac's bridges. Unproven
+        // descriptor or generic changes keep the declaration in Kotlin.
         self.current_function_name = None;
         self.check_builtin_annotation_contracts(decl);
         self.current_function_returns_value = false;

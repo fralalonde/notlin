@@ -3,6 +3,60 @@
 ## Current checkpoint — 2026-10-31
 
 The standard fresh conversion of reference commit `179bb912` produces
+**4,374 Java files**, retaining 1,997 of 6,371 original Kotlin owners:
+**+12 / -0** against the accepted 4,362-output baseline. The baseline trial gains
+the same twelve owners: five classes and seven interfaces. Gains include
+`IWorkerInfo`, `IWorkerPoolInfo`, `IEquipmentInfo`, `IAgentEquipmentInfo`,
+`WorkerInfo` and `AgentEquipmentInfo`. All 6,371 original owner identities are
+compared; the complete owner list is in the evidence.
+
+Ordinary source reference returns can override methods on retained Kotlin
+ancestors through javac's covariant bridges. The override guard now shares the
+source-scoped subtype proof already used by default-getter bridge planning.
+It follows source inheritance across Kotlin and Java, keeps primitive and value
+class JVM shapes outside this path, and distinguishes method-scoped type
+parameters from same-named source classifiers. Other generic return shapes and
+property ownership continue to use their separate contract proofs.
+
+Generic inheritance carries the source file where each concrete return argument
+was introduced. For example, `Root<T>.getId(): T` may acquire its actual `Id`
+binding from a Java intermediate in another package. Resolving `Id` in Root's
+file loses that binding; the conflict planner now records its actual source
+scope and includes it in traversal identities. Cached method metadata records
+type parameters, so the index cache version advances to 32.
+
+The native fixture independently compiles original Kotlin, then compares mixed
+Java/Kotlin behavior in both Lombok modes with the frozen executable. It covers
+class and enum implementations, interface defaults, overloads, a cross-package
+generic ancestor, retained Kotlin descendants and callers, and evaluation
+effects. Primitive/value-class and method-type-parameter guards execute too.
+The actual compiled `WorkerInfo.getId(): IObjectId` bridge delegates directly
+to its narrower `IResourceWorkerId` getter.
+
+Both full Gradle builds pass: baseline **11m 4s**
+(110 actionable tasks: 80 executed, 30 from cache), fresh **7m 18s**
+(110 actionable tasks: 70 executed, 40 from cache). Both Hastings runs import all **9,113
+records**, followed by **105.2** and **105.9 seconds**,
+respectively, without errors or stack traces after the complete dataset marker.
+Both disposable applications are stopped. Application sources receive no manual
+fixes.
+
+Each conversion produces 6,521 Java files. Of these, 6,519 match as text; the
+remaining two differ only by explicit `this` qualifiers on instance getters.
+Their complete `javap -p -s -c` outputs match exactly. Formatting, lint, four
+standalone samples and the frozen native checks pass. The permissions-matched
+Windows Rust sweep is **1,597 pass, 62 fail, 140 ignored**,
+with exactly the preceding checkpoint's failure names and no new failures.
+The initial sandbox run's additional permission/helper failures are preserved
+separately in the evidence.
+
+Evidence: `target/reference-method-covariance-frontier-20261031/acceptance.json`.
+Frozen SHA256: `1be29b3111e0fbcdd62b192a7425ccbe6d5ace682f015a5d467ece363c9e2801`.
+The translation frontier remains active.
+
+## Previous checkpoint — 2026-10-31
+
+The standard fresh conversion of reference commit `179bb912` produces
 **4,362 Java files**, retaining 2,009 of 6,371 original Kotlin owners:
 **+5 / -0** against the accepted 4,357-output baseline.
 

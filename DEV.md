@@ -113,6 +113,13 @@ and its effect on the JVM contract. A new annotation name is not itself a new
 translation rule. Library behavior that observes Kotlin metadata requires an
 explicit capability proof; recognizing an annotation is insufficient.
 
+- Explicit method overrides share the default-getter planner's source reference
+  subtype proof. Retained Kotlin ancestors do not block ordinary reference
+  covariance: javac supplies bridges for the wider JVM return. Generic return
+  substitutions carry the source file where each concrete argument was bound;
+  method type parameters cannot be mistaken for same-named source classifiers.
+  Primitive/value-class representations and property ownership keep their
+  separate checks. The index cache records method type parameters (version 32).
 - Standard Map+Map operators and explicit `plus` calls share source-bound operand
   proof and lower to `kotlin.collections.MapsKt.plus`. An explicit Map argument
   selects the overload for collector expressions. Preserve key order, right-hand
