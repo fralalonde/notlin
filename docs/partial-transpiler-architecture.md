@@ -33,6 +33,13 @@ shadowing standard collection names do not use this rule.
 
 ## Identity and facts
 
+All Kotlin parser consumers share the pinned local tree-sitter dependency.
+Its scanner accepts a class member immediately before a closing brace, including
+compact properties, without rewriting source text or changing byte offsets.
+The normal parse-error flag is authoritative; the former nullable-property
+recovery exception has been removed. Upstream provenance, original file hashes
+and the sole scanner change are recorded under `vendor/tree-sitter-kotlin-ng`.
+
 `SymbolId` contains module, declaring file, package, enclosing declarations, kind, name, receiver and normalized parameter types. Bodies, whitespace and snapshot locations are separate. `DeclarationId` and `SourceLocation` carry source hashes and byte ranges; stale snapshots cannot authorize edits. Generated symbols have explicit mappings to their origins.
 
 `SemanticProvider` supplies structured Kotlin types and explicit confidence: established, inferred, ambiguous or unknown. The syntax provider uses source declarations and the existing workspace facts. It is not Kotlin compiler analysis. Required unknown facts and ambiguous bindings retain their owner. The serializable version-1 analysis contract describes sources, module configuration, symbols, types, references, JVM signatures, diagnostics and capabilities for a subsequent JVM provider.

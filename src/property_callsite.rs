@@ -420,7 +420,7 @@ pub(crate) fn private_storage_accesses_supported(
     let [declaration] = declarations.as_slice() else {
         return false;
     };
-    if crate::translation_plan::has_unclassified_parse_error(*declaration, source) {
+    if declaration.has_error() {
         return false;
     }
     let Some(body) = kt::child(*declaration, "class_body") else {

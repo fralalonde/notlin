@@ -424,7 +424,78 @@ fn sealed_provider_preserves_a_buildable_mixed_hierarchy() {
 #[test]
 #[ignore = "requires JVM tools, Kotlin stdlib, Lombok and its Kotlin plugin"]
 fn complete_property_and_method_contracts_match_kotlin() {
-    fn populate_contracts(root: &Path) {
+    property_and_method_contracts_match_kotlin(false);
+}
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin stdlib, Lombok and its Kotlin plugin"]
+fn compact_property_and_method_contracts_match_kotlin() {
+    property_and_method_contracts_match_kotlin(true);
+}
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin stdlib, Lombok and its Kotlin plugin"]
+fn redundant_nullable_property_has_the_same_java_contract() {
+    fn populate_nullable(root: &Path) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("Model.kt"), "package sample\ninterface Has<T>{val item:T??}\nclass Example(override val item:String?):Has<String>\n").unwrap();
+        fs::write(
+            root.join("Runner.kt"),
+            r#"package sample
+fun main() {
+ val absent = Example(null)
+ val present = Example("value")
+ val typed: Has<String> = absent
+ println("${absent.item == null}|${present.item}|${typed.item == null}")
+}
+"#,
+        )
+        .unwrap();
+    }
+    let scratch = Scratch::new();
+    let original = scratch.0.join("original");
+    populate_nullable(&original);
+    let before = validate_jvm_sources(&config(
+        &original,
+        scratch.0.join("original-classes"),
+        "enable",
+        false,
+    ))
+    .unwrap();
+    let expected = before.commands.last().unwrap().stdout.trim();
+    assert_eq!(expected, "true|value|true");
+    for lombok in [false, true] {
+        let migrated = scratch.0.join(format!("translated-{lombok}"));
+        populate_nullable(&migrated);
+        let binary = std::env::var_os("NOTLIN_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into());
+        let mut command = std::process::Command::new(binary);
+        command.current_dir(&migrated).arg("--in-place");
+        if lombok {
+            command.arg("--lombok");
+        }
+        let result = command.arg("Model.kt").output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for owner in ["Has", "Example"] {
+            assert!(migrated.join(format!("{owner}.java")).exists());
+        }
+        let after = validate_jvm_sources(&config(
+            &migrated,
+            scratch.0.join(format!("mixed-classes-{lombok}")),
+            "enable",
+            lombok,
+        ))
+        .unwrap();
+        assert_eq!(after.commands.last().unwrap().stdout.trim(), expected);
+    }
+}
+
+fn property_and_method_contracts_match_kotlin(compact: bool) {
+    fn populate_contracts(root: &Path, compact: bool) {
         fs::create_dir_all(root).unwrap();
         fs::write(
             root.join("Contracts.kt"),
@@ -478,11 +549,46 @@ fun main() {
  println("${exact.label}|${root.label}|${diamond.category}|${category.category}|${method.key()}|${constant.id}|${value.id}|${boxed.id}")
 }
 "#).unwrap();
+        if compact {
+            for name in ["Contracts.kt", "Owners.kt"] {
+                let path = root.join(name);
+                let source = fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("{\n", "{")
+                    .replace("\n}", "}");
+                fs::write(path, source).unwrap();
+            }
+        }
+        let index = notlin::workspace::SourceIndex::discover(root).unwrap();
+        let names = index
+            .declarations()
+            .map(|declaration| declaration.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "Kind",
+                "PropertyRoot",
+                "Defaulted",
+                "Combined",
+                "ExactRoot",
+                "MethodRoot",
+                "ConstantRoot",
+                "MethodConsumer",
+                "ConstantConsumer",
+                "ValueConsumer",
+                "Exact",
+                "Diamond",
+                "OverrideChild",
+                "ConstantChild",
+            ]),
+            "all fourteen type owners must remain visible"
+        );
     }
     let scratch = Scratch::new();
     for mode in ["disable", "enable", "no-compatibility"] {
         let original = scratch.0.join(format!("original-{mode}"));
-        populate_contracts(&original);
+        populate_contracts(&original, compact);
         let before = validate_jvm_sources(&config(
             &original,
             scratch.0.join(format!("original-classes-{mode}")),
@@ -497,7 +603,8 @@ fun main() {
         );
         for lombok in [false, true] {
             let migrated = scratch.0.join(format!("translated-{mode}-{lombok}"));
-            populate_contracts(&migrated);
+            populate_contracts(&migrated, compact);
+            let contracts_before = fs::read_to_string(migrated.join("Contracts.kt")).unwrap();
             let binary = std::env::var_os("NOTLIN_TEST_BINARY")
                 .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into());
             let mut command = std::process::Command::new(binary);
@@ -518,6 +625,16 @@ fun main() {
                     String::from_utf8_lossy(&result.stderr)
                 );
             }
+            let child = fs::read_to_string(migrated.join("ConstantChild.java")).unwrap();
+            assert!(
+                child.contains("default java.lang.String getId()"),
+                "{child}"
+            );
+            assert_eq!(
+                fs::read_to_string(migrated.join("Contracts.kt")).unwrap(),
+                contracts_before,
+                "the Java implementations need no additional Kotlin bridges"
+            );
             let after = validate_jvm_sources(&config(
                 &migrated,
                 scratch.0.join(format!("mixed-classes-{mode}-{lombok}")),

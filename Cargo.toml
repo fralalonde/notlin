@@ -20,5 +20,8 @@ rayon = "1"
 [dev-dependencies]
 filetime = "0.2"
 
+[patch.crates-io]
+tree-sitter-kotlin-ng = { path = "vendor/tree-sitter-kotlin-ng" }
+
 [profile.release]
 lto = "off"

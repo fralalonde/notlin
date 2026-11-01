@@ -1,6 +1,56 @@
 # Translation frontier
 
-## Current checkpoint — 2026-11-01 (retained constant defaults)
+## Current checkpoint — 2026-11-01 (compact member parsing)
+
+One shared scanner rule now lets a closing brace terminate a Kotlin class member
+without a trailing newline or semicolon. For example,
+`interface Root { val alias: String }` no longer hides the declarations that
+follow it. The same rule covers classes, objects, enum members, block accessors,
+nested comments and declarations with no whitespace before the brace. Source
+bytes and offsets remain unchanged. The old nullable-property parser recovery
+and its error-classification wrapper have been removed; consumers use the normal
+tree-sitter error flag.
+
+The pinned tree-sitter-kotlin-ng 1.1.0 sources are vendored with their upstream
+commit, hashes and MIT license. Only the external scanner differs from upstream;
+the generated parser and grammar are unchanged. Every existing parser consumer
+uses the same dependency patch. The workspace index cache is invalidated.
+
+This corrects a demonstrated translation failure, with **zero reference ownership
+changes**. Both baseline and fresh standard conversions translate **4,491** and
+retain **1,880** of **6,371 original owners**. All identities match. Both preserve
+all **6,638 Java files byte for byte** and every code token in the **510 retained
+Kotlin files**; differing diagnostic comments are audited separately. **Zero
+Kotlin function bridges** are added. No reference application code is patched.
+
+Formatting, clippy, **393 library tests**, **174 focused tests** and
+**22 native cases** pass. The compact contract control compares original
+Kotlin and converted Java in all three JVM-default modes and both Lombok modes,
+including property diamonds, inherited defaults and a Kotlin value-class
+consumer. All type owners remain indexed and the retained Kotlin contract is
+byte-identical. Another native control verifies Kotlin's accepted redundant
+nullable spelling (`T??`). Malformed source remains rejected.
+
+The full Windows Rust sweep is **1,632 pass / 62 known fail /
+150 ignored**, with no new failure names. Both full Gradle builds pass
+(4m10s baseline, 2m04s fresh). Both Hastings runs load
+all **9,113 records**, then remain free of errors and stack traces for
+**105.0** and **105.9 seconds** after the complete dataset
+marker. Both disposable applications are stopped. Original I/O files still match
+`d096ed8`. Exact-head Linux CI must pass before installing the frozen executable.
+
+Evidence: `target/compact-members-20261101/acceptance.json`.
+Frozen SHA256:
+`d61198e4543335f6e3df986f635ba918e659c7dfd405ff48700a79aca7bf296f`.
+
+The frontier remains active. Valid adjacent function or nested-class declarations
+without line separators still expose a distinct grammar limitation; Kotlin's
+rejected adjacent-property forms are counterexamples for that next rule.
+Receiver-dependent ordinary zero-argument method chains remain another candidate
+for extending the existing accessor-chain proof. Neither requires speculative
+Kotlin scaffolding.
+
+## Previous checkpoint — 2026-11-01 (retained constant defaults)
 
 The fresh standard conversion translates **4,491** and retains 1,880 of
 **6,371 original owners**: **+10 / -0** against the accepted baseline. All original

@@ -876,7 +876,7 @@ pub fn analyze(source: &str, root: Node, file: &Path) -> TranslationPlan {
         });
         let syntax_node = recovered_node.unwrap_or(node);
         let mut reasons = Vec::new();
-        if has_unclassified_parse_error(syntax_node, source) {
+        if syntax_node.has_error() {
             reasons.push(RetentionReason::ParseError {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
@@ -1013,107 +1013,6 @@ fn is_declaration_boundary(kind: &str) -> bool {
             | "type_alias"
             | "ERROR"
     )
-}
-
-/// Tree-sitter's Kotlin grammar can insert this separator after a valid
-/// expression-bodied member at the end of a class. It is recovery metadata,
-/// not evidence that the declaration is unsafe. Other ERROR or missing nodes
-/// remain blockers.
-pub(crate) fn has_unclassified_parse_error(node: Node, source: &str) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.is_error() {
-            if !is_interface_property_recovery(current, node, source) {
-                return true;
-            }
-            continue;
-        }
-        if current.is_missing() && current.kind() != "_class_member_semi" {
-            return true;
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.children(&mut cursor));
-    }
-    false
-}
-
-/// This grammar version represents a valid abstract interface property as an
-/// ERROR when the member's nullable generic type follows a type parameter
-/// (for example `interface Has<T> { val item: T? }`). Accept only that narrow
-/// shape; malformed properties and errors in other declarations still block.
-fn is_interface_property_recovery(error: Node, declaration: Node, source: &str) -> bool {
-    if declaration.kind() != "class_declaration"
-        || !declaration
-            .utf8_text(source.as_bytes())
-            .ok()
-            .is_some_and(|text| text.trim_start().starts_with("interface "))
-    {
-        return false;
-    }
-    let Some(body) = error.parent() else {
-        return false;
-    };
-    let Some(owner) = body.parent() else {
-        return false;
-    };
-    if !matches!(body.kind(), "class_body" | "enum_class_body")
-        || owner.start_byte() != declaration.start_byte()
-        || owner.end_byte() != declaration.end_byte()
-    {
-        return false;
-    }
-    let Ok(text) = error.utf8_text(source.as_bytes()) else {
-        return false;
-    };
-    let text = text.trim();
-    let Some(rest) = text
-        .strip_prefix("val ")
-        .or_else(|| text.strip_prefix("var "))
-    else {
-        return false;
-    };
-    let Some((name, ty)) = rest.split_once(':') else {
-        return false;
-    };
-    let name = name.trim();
-    let ty = ty.trim();
-    let mut type_parameters = Vec::new();
-    let mut stack = vec![declaration];
-    while let Some(current) = stack.pop() {
-        if current.kind() == "type_parameter" {
-            let mut cursor = current.walk();
-            if let Some(identifier) = current
-                .named_children(&mut cursor)
-                .find(|child| child.kind() == "identifier")
-                && let Ok(name) = identifier.utf8_text(source.as_bytes())
-            {
-                type_parameters.push(name.to_string());
-            }
-            continue;
-        }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
-    }
-    let nullable_parameter = ty.strip_suffix('?').unwrap_or_default();
-    !name.is_empty()
-        && name
-            .chars()
-            .next()
-            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
-        && name
-            .chars()
-            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        && !nullable_parameter.is_empty()
-        && nullable_parameter
-            .chars()
-            .next()
-            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
-        && nullable_parameter
-            .chars()
-            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        && type_parameters
-            .iter()
-            .any(|parameter| parameter == nullable_parameter)
 }
 
 /// A parser-recovery `annotated_expression` is a declaration boundary only
@@ -1403,7 +1302,7 @@ val wording = "expect actual"
 
     #[test]
     fn nullable_generic_property_boundary_is_eligible() {
-        let source = "package selected.nullablegeneric\nclass Item\ninterface Has<T> { val item: T? }\nclass Impl(override val item: Item) : Has<Item?>\n";
+        let source = "package selected.nullablegeneric\nclass Item\ninterface Has<T> { val item: T? }\ninterface Redundant<T> { val item: T?? }\nclass Impl(override val item: Item) : Has<Item?>\n";
         let tree = parse(source);
         let plan = analyze(source, tree.root_node(), Path::new("sample.kt"));
         assert!(
@@ -1414,11 +1313,11 @@ val wording = "expect actual"
     }
 
     #[test]
-    fn interface_property_recovery_does_not_hide_unrelated_errors() {
+    fn malformed_interface_properties_still_block_translation() {
         for source in [
-            "interface Has<T> { val item: T?? }\n",
             "interface Has<T> { val item T? }\n",
             "interface Has<T> { val item: = }\n",
+            "interface Has<T> { val item: }\n",
         ] {
             let tree = parse(source);
             let plan = analyze(source, tree.root_node(), Path::new("sample.kt"));

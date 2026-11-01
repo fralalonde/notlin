@@ -29,8 +29,12 @@ Behavior contract:
   alone do not block conversion. Preserve values, relevant order, overloads,
   null/duplicate handling and evaluation effects. Keep explicitly mutable
   collections mutable.
-- **Current work.** See `docs/translation-handoff.md` for accepted cases, exact
-  verification provenance and parked constructor/empty-enum work.
+- **Kotlin bridges.** Add them only for actual callers or concrete mixed-build
+  obligations. Prefer implementing the required body in Java; the goal is to
+  remove the remaining Kotlin.
+- **Current work.** See `docs/translation-frontier.md` for the current accepted
+  conversion, gates and remaining candidates. `docs/translation-handoff.md`
+  records the historical 2026-10-26 delivery.
 
 - **Compiler-style diagnostics.** Parse errors → N003, untranslatable constructs
   → N001 (error or warn per `--untranslatable`), lossy/approximated translation
@@ -73,6 +77,10 @@ and must never run from automation.
 
 Things that have bitten us. Check here before guessing AST shape:
 
+- All parser consumers use the pinned local dependency patch under
+  `vendor/tree-sitter-kotlin-ng`. A closing brace terminates a class member
+  without requiring a newline or semicolon. Preserve original source bytes;
+  do not reintroduce per-consumer nullable-property recovery exceptions.
 - `if` statement conditions live in the **`condition` field** (`kt::field(stmt, "condition")`);
   the parenthesized-expression sibling is NOT the condition.
 - `= default` values and `parameter_modifiers` (`vararg`) are **SIBLINGS** of

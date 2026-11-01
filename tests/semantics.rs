@@ -466,7 +466,7 @@ fn annotations_defaults_lambdas_and_interfaces_are_identity_safe() {
 }
 
 #[test]
-fn recovered_annotated_interface_keeps_its_name_and_kind_across_reparse() {
+fn compact_preceding_declarations_preserve_annotated_interface_identity() {
     let original = r#"
 interface Earlier { val id: String }
 enum class Reader { FIRST }
@@ -505,18 +505,20 @@ interface Contract {
     }
 
     let original_tree = parse(original);
-    let recovered = descendants(original_tree.root_node())
+    assert!(!original_tree.root_node().has_error());
+    let original_interface = descendants(original_tree.root_node())
         .into_iter()
         .find(|node| {
-            matches!(node.kind(), "annotated_expression" | "ERROR")
+            matches!(node.kind(), "interface_declaration" | "class_declaration")
                 && node
                     .utf8_text(original.as_bytes())
                     .is_ok_and(|text| text.contains("interface Contract"))
         })
-        .expect("the original fixture should expose parser recovery around Contract");
-    let original_id = symbol_id_for_node(original, recovered, Path::new("sample.kt"));
+        .expect("Contract must parse normally after the compact property interface");
+    let original_id = symbol_id_for_node(original, original_interface, Path::new("sample.kt"));
 
     let residual_tree = parse(&residual);
+    assert!(!residual_tree.root_node().has_error());
     let residual_interface = descendants(residual_tree.root_node())
         .into_iter()
         .find(|node| {

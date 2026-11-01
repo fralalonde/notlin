@@ -417,7 +417,7 @@ fn accessor_methods_have_plain_source_shapes(index: &SourceIndex, target: &Decla
     let [declaration] = declarations.as_slice() else {
         return false;
     };
-    if crate::translation_plan::has_unclassified_parse_error(*declaration, source)
+    if declaration.has_error()
         || !declaration
             .children(&mut declaration.walk())
             .any(|child| !child.is_named() && node_text(child, source).trim() == "interface")

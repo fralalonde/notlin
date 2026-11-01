@@ -410,7 +410,7 @@ fn opaque_top_level_parse_region_is_not_deleted_with_translated_declarations() {
     let root = scratch.0.join("workspace");
     fs::create_dir_all(&root).unwrap();
     let kt = root.join("Features.kt");
-    let source = "package gate\ndata class Measurement(val amount: Int, val label: String = \"unit\")\nclass Device(val id: Int) { companion object { fun create(id: Int): Device = Device(id) } }\n";
+    let source = "package gate\ndata class Measurement(val amount: Int, val label: String = \"unit\")\nclass Device(val id: Int) { companion object { fun create( } }\n";
     fs::write(&kt, source).unwrap();
     let cli =
         notlin::cli::Cli::parse_from(["notlin", "--annotations", "none", kt.to_str().unwrap()]);

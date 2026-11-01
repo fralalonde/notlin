@@ -31,7 +31,8 @@ pub(crate) mod profile;
 // 31: setter_name_renamed indexes @JvmName presence on properties.
 // 32: method type parameters prevent source classifiers from capturing returns.
 // 34: enum method headers use the same nongeneric signature facts as classes.
-const CACHE_VERSION: u32 = 34;
+// 35: compact class members terminate at `}` without hiding following declarations.
+const CACHE_VERSION: u32 = 35;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -8915,7 +8916,14 @@ interface SiblingContext {
                 );
                 let retained = HashSet::from([direct.clone()]);
                 assert!(index.declaration_retained(declaration, &retained));
-                assert!(!index.declaration_retained(declaration, &HashSet::new()));
+                assert_eq!(
+                    index.declaration_retained(declaration, &HashSet::new()),
+                    direct.kind.starts_with("ambiguous:"),
+                    "ambiguous identities remain retained without an explicit membership"
+                );
+                if declaration.name == "Duplicate" {
+                    assert!(direct.kind.starts_with("ambiguous:"));
+                }
             }
         }
         let _ = fs::remove_dir_all(root);
