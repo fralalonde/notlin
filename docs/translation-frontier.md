@@ -3,6 +3,63 @@
 ## Current checkpoint — 2026-10-31
 
 The standard fresh conversion of reference commit `179bb912` produces
+**4,449 Java files**, retaining 1,922 of 6,371 original Kotlin owners:
+**+32 / -0** against the accepted 4,417-output baseline. Gains comprise
+23 interfaces and nine classes, including `IItemQuantityEntry`,
+`IItemEntryEntityDto`, `InventoryItemDto`, `AutomaticJobTypeProperties`,
+`LGAmrPickingProperties` and `ResourceTaskMessage`. The baseline trial gains
+31 owners; the fresh pass additionally translates `ResourceTaskMessage`.
+Every original owner identity is compared.
+
+Calls to retained companion factories can use the instance method preserved
+by `@JvmStatic`. Parallel property repair follows already-generated Java
+descendants, so translating a connecting implementation earlier cannot erase
+its inherited getter evidence. Storage-free computed getters move proven Java
+method annotations onto their explicit methods, including on all-open entities.
+Annotation targets, import aliases, visibility and virtual dispatch retain
+their independent checks.
+
+Getter chains use the established physical Java getter return, including
+covariant Lombok returns, rather than a broader inherited interface return.
+Non-null retained Kotlin property projections remain direct expressions during
+repair. Native fixtures compare original Kotlin with both Lombok modes and
+check annotations, Java subclass overrides, evaluation counts and values.
+
+Ordinary classes coalesce uniform constructor-property setters into one
+class-level `@Setter`. Final fields remain read-only; body storage keeps
+selective field setters. Ordinary classes retain identity equality. Data classes
+continue to use `@Data` or `@Value`. The original I/O implementations remain
+unchanged.
+
+Both full Gradle builds pass: baseline **6m**
+(110 actionable tasks: 70 executed, 40 from cache), fresh **4m 3s**
+(110 actionable tasks: 80 executed, 30 from cache). Both Hastings runs load
+**9,113 records**, then remain free of errors and stack traces for **105.6**
+and **105.9 seconds** after the complete dataset marker. Both disposable apps
+are stopped. No generated application source is patched.
+
+The baseline has 6,595 Java files and the fresh tree has 6,596, with one addition
+and no removals. Of 263 changed common sources, 216 have matching normalized
+compiled instructions and contracts. The remaining 47 are mechanically reviewed:
+44 original readonly data classes choose between `@Data` and `@Value`, changing
+class finality and a pure, redundant `canEqual` check; six getter calls across
+four classes name a different declaring interface while retaining the same
+effective implementation. Instance fields remain final, and equality instructions
+match after removing that check. The strict comparison and the explicit semantic
+review are preserved separately; no unexplained differences remain.
+
+Formatting, lint, four standalone samples and seven frozen native checks pass.
+The Windows Rust sweep is **1,617 pass, 62 known fail, 143 ignored**, with no
+new failure names. The existing lockfile upgrades are included in validation.
+Exact-head Linux CI is required before installing the frozen executable.
+
+Evidence: `target/companion-static-frontier-v4-20261031/acceptance.json`.
+Frozen SHA256: `e009bf3b1fa0d6c2ede6afcfb1ce43fcafbcc0e787ba29a0fd5cc2ae7cdaf871`.
+The translation frontier remains active.
+
+## Previous checkpoint — 2026-10-31
+
+The standard fresh conversion of reference commit `179bb912` produces
 **4,417 Java files**, retaining 1,954 of 6,371 original Kotlin owners:
 **+37 / -0** against the accepted 4,380-output baseline. The baseline trial
 gains the same 37 owners; all original owner identities are compared. Gains

@@ -345,7 +345,11 @@ pub fn rewrite_file(
                 .any(|edit| edit.start < node.end_byte() && edit.end > node.start_byte())
                 && receiver_property_fallback_is_safe(&context, node, receiver_node, &property)
                 && let Some(operator) = safe_navigation_operator(source, receiver_node, member)
+                && operator == "?."
             {
+                // An ordinary qualified property read already keeps the other
+                // receiver's Kotlin property binding. Do not add an unrelated
+                // scope-function call to the non-null path.
                 let receiver = kt::text(receiver_node, source);
                 edits.push(Edit {
                     start: node.start_byte(),

@@ -148,6 +148,25 @@ explicit capability proof; recognizing an annotation is insufficient.
   `tests/text_whitespace_jvm.rs` compares original Kotlin against both Lombok
   modes, including Unicode, receiver effects, record getters, parent selection,
   producer-scope type binding and primitive/boxed return types.
+- `@JvmStatic` on a companion function preserves its ordinary instance method,
+  so established calls to retained owners can use `Owner.Companion.method`.
+  Annotation aliases share the same rule. Object static methods, renamed or
+  synthetic methods, visibility and value-class name mangling keep their guards.
+- Ordinary Lombok classes coalesce uniform constructor-property setters into
+  one class-level `@Setter`; final fields remain read-only. Classes with body
+  storage retain selective field setters. Data classes continue to use `@Data`
+  or `@Value`, while ordinary classes retain their identity object methods.
+- Parallel Kotlin property contracts follow already-generated Java descendants
+  as well as Kotlin descendants. Translating a connecting class earlier must
+  not erase the inherited getter evidence needed to repair the interface.
+- Storage-free computed getters can move Java getter annotations onto their
+  explicit methods, including on all-open entities. Source annotation targets
+  and import aliases are checked; recognized Java library annotations keep
+  their bindings. Kotlin-only and unknown targets retain their guards.
+- Getter call chains use the same established Java return contract as property
+  reads, preserving a concrete Lombok return over a broader interface method.
+  Ordinary retained Kotlin property projections stay direct instead of gaining
+  an unnecessary `let` call during getter repair.
 - An explicit getter reading its own `@JvmField` property uses the backing field
   directly, avoiding a recursive call to itself. Other methods retain ordinary
   accessor dispatch. Property order, explicit `this` and local shadowing are

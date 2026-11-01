@@ -2970,8 +2970,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             // that one), so relying on the synthesized all-args ctor would
             // silently DELETE it and break every call site — the explicit ctor
             // has to be written beside the no-arg one.
+            let body_has_instance_fields = self.class_body_declares_instance_fields(decl);
             let lombok_supplies_all_args = !jpa_no_arg
-                && !self.class_body_declares_instance_fields(decl)
+                && !body_has_instance_fields
                 && !self.constructor_has_covariant_input(decl, &params)
                 && params
                     .iter()
@@ -2979,11 +2980,22 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             let lombok_accessors = self.lombok
                 && !params.is_empty()
                 && !self.class_body_defines_lombok_generated(decl);
+            // Type-level @Setter skips final and static fields. It covers the
+            // same mutable constructor properties when the body adds no other
+            // storage; otherwise keep the selective field annotations.
+            let lombok_class_setters = lombok_accessors
+                && !self.class_body_has_backing_fields(decl)
+                && params
+                    .iter()
+                    .any(|(property, mutable, _, _)| *property && *mutable);
             if lombok_accessors {
                 // Ordinary Kotlin classes inherit identity equality unless
                 // they explicitly override it. @Data would introduce value
                 // equality, hashing, and toString as an unintended side effect.
                 out.line("@Getter");
+                if lombok_class_setters {
+                    out.line("@Setter");
+                }
                 // @AllArgsConstructor's synthesized ctor collides with the
                 // explicit super-forwarding ctor emitted below — only
                 // annotate when the explicit one is not being written.
@@ -3004,7 +3016,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 "{}{}{}{} {}{}{}{}",
                 visibility, final_kw, modifiers, kind_word, name, tp, extends, permits
             ));
-            // fields (final for val: @Data skips the setter on a final field)
+            // Fields remain final for val; Lombok skips their setters.
             for (is_property, is_mutable, fname, ftype) in &params {
                 if !*is_property {
                     continue;
@@ -3014,12 +3026,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 // constructor property; the Java side must carry them on the
                 // FIELD, which is the element the ORM reads.
                 // The getter below is emitted only when this is NOT --lombok
-                // (`accessors (skipped under --lombok: @Data generates
+                // (`accessors (skipped under --lombok: @Getter generates
                 // them)`), so under Lombok a `@get:` annotation has nowhere
                 // to land and must stay on the field it is written on:
                 // dropping it would lose the very metadata the ORM reads.
                 let mut annotations = self.param_annotations(decl, fname);
-                if lombok_accessors && *is_mutable {
+                if lombok_accessors && *is_mutable && !lombok_class_setters {
                     annotations.push("@Setter".into());
                 }
                 let lombok_needs_kotlin_boolean_getter = lombok_accessors
@@ -4338,6 +4350,17 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             return Vec::new();
         };
         self.property_repair_bridge_annotations(&owner, property_node, &name, false)
+    }
+
+    fn class_body_has_backing_fields(&self, decl: tree_sitter::Node) -> bool {
+        kt::child(decl, "class_body").is_some_and(|body| {
+            body.named_children(&mut body.walk())
+                .any(|member| match member.kind() {
+                    "property_declaration" => self.property_emits_backing_field(member),
+                    "variable_declaration" => true,
+                    _ => false,
+                })
+        })
     }
 
     fn class_body_declares_instance_fields(&self, decl: tree_sitter::Node) -> bool {

@@ -1323,8 +1323,8 @@ impl SourceIndex {
         file
     }
 
-    /// Whether a resolved Java annotation may be written on `ElementType.FIELD`
-    /// or `ElementType.PARAMETER`. `None` means the annotation is unresolved,
+    /// Whether a resolved Java annotation permits the requested `ElementType`.
+    /// `None` means the annotation is unresolved,
     /// Kotlin-defined, or its Java declaration could not be inspected.
     pub fn java_annotation_allows(
         &self,
@@ -6754,10 +6754,10 @@ fn constructor_property_annotations_unsupported(text: &str) -> bool {
         })
 }
 
-/// Exact structural evidence for replacing a readonly computed property with
-/// its accessor method. Annotation targets need their own proof; leave those
-/// properties on the existing bridge path. In particular, an initializer plus
-/// a getter still owns storage even when the getter never mentions `field`.
+/// Structural evidence for replacing a readonly computed property with its
+/// accessor method. The plain query rejects annotations; callers with target
+/// evidence can use the general query. An initializer plus a getter still owns
+/// storage even when the getter never mentions `field`.
 pub(crate) struct PlainComputedGetter<'tree> {
     pub body: tree_sitter::Node<'tree>,
     pub return_type: tree_sitter::Node<'tree>,
@@ -6768,6 +6768,14 @@ pub(crate) struct PlainComputedGetter<'tree> {
 pub(crate) fn plain_computed_property_getter<'tree>(
     node: tree_sitter::Node<'tree>,
     source: &str,
+) -> Option<PlainComputedGetter<'tree>> {
+    computed_property_getter(node, source, |_| false)
+}
+
+pub(crate) fn computed_property_getter<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &str,
+    annotation_supported: impl Fn(tree_sitter::Node<'tree>) -> bool,
 ) -> Option<PlainComputedGetter<'tree>> {
     if node.kind() != "property_declaration" || node.has_error() {
         return None;
@@ -6792,6 +6800,9 @@ pub(crate) fn plain_computed_property_getter<'tree>(
         if matches!(modifier.kind(), "line_comment" | "multiline_comment") {
             continue;
         }
+        if modifier.kind() == "annotation" && annotation_supported(modifier) {
+            continue;
+        }
         match modifier.utf8_text(source.as_bytes()).ok()?.trim() {
             "override" => is_override = true,
             "public" => is_public = true,
@@ -6814,7 +6825,10 @@ pub(crate) fn plain_computed_property_getter<'tree>(
         .find(|child| child.kind() == "function_body")?;
     let mut pending = vec![node];
     while let Some(current) = pending.pop() {
-        if current.start_byte() < body.start_byte() && current.kind() == "annotation" {
+        if current.start_byte() < body.start_byte()
+            && current.kind() == "annotation"
+            && !annotation_supported(current)
+        {
             return None;
         }
         if current.kind() == "identifier" && current.utf8_text(source.as_bytes()).ok()? == "field" {

@@ -655,6 +655,19 @@ fn declaration_has_modifier(source: &str, node: tree_sitter::Node<'_>, wanted: &
 }
 
 fn public_kotlin_callable(source: &str, node: tree_sitter::Node<'_>) -> bool {
+    let companion_member = std::iter::successors(node.parent(), |owner| owner.parent())
+        .find(|owner| {
+            matches!(
+                owner.kind(),
+                "companion_object"
+                    | "object_declaration"
+                    | "class_declaration"
+                    | "interface_declaration"
+                    | "function_declaration"
+                    | "lambda_literal"
+            )
+        })
+        .is_some_and(|owner| owner.kind() == "companion_object");
     let mut stack = node
         .named_children(&mut node.walk())
         .filter(|child| child.kind() == "modifiers")
@@ -680,11 +693,13 @@ fn public_kotlin_callable(source: &str, node: tree_sitter::Node<'_>) -> bool {
                 .split(|character: char| character == '(' || character.is_whitespace())
                 .next()
                 .unwrap_or("");
-            let changes_name = |name: &str| {
-                matches!(
-                    name.rsplit('.').next(),
-                    Some("JvmName" | "JvmStatic" | "JvmSynthetic")
-                )
+            let changes_name = |name: &str| match name.rsplit('.').next() {
+                // A companion's @JvmStatic adds an outer static bridge and
+                // preserves its instance method. An object's @JvmStatic
+                // replaces the instance method, so it cannot use this proof.
+                Some("JvmStatic") => !companion_member,
+                Some("JvmName" | "JvmSynthetic") => true,
+                _ => false,
             };
             if changes_name(annotation)
                 || kotlin_import_lines(source).any(|import| {
@@ -7428,7 +7443,9 @@ pub(crate) fn declared_source_call_return_type<P: SemanticProvider + ?Sized>(
                 .any(|child| child.kind() == "?.")
         })
     });
-    if let Some(read) = provider.declared_java_method_return(&target) {
+    if let Some(read) = java_getter_call_return(source, file, call, callee, provider)
+        .or_else(|| provider.declared_java_method_return(&target))
+    {
         let mut ty = read.result_type;
         if !read.jvm_primitive
             && let KotlinType::Primitive(name) = &ty.ty
@@ -7494,6 +7511,21 @@ fn indexed_call_return_classifier<P: SemanticProvider + ?Sized>(
     else {
         return None;
     };
+    if let Some(read) = java_getter_call_return(source, file, call, callee, provider) {
+        let safe = explicit_receiver_node(call, callee).is_some_and(|receiver| {
+            source
+                .get(receiver.end_byte()..callee.start_byte())
+                .is_some_and(|text| text.trim() == "?.")
+        });
+        if (safe || read.nullability == ReferenceReturnNullability::Nullable) && !allow_nullable {
+            return None;
+        }
+        return match read.result_type.ty {
+            KotlinType::Named { name, .. } => Some(name),
+            KotlinType::Primitive(name) => Some(format!("kotlin.{name}")),
+            _ => None,
+        };
+    }
     let symbol = provider
         .symbols_named(name)
         .into_iter()
@@ -7541,6 +7573,44 @@ fn indexed_call_return_classifier<P: SemanticProvider + ?Sized>(
             standard_external_type(producer_source, provider, name, java_source)
         }
     }
+}
+
+/// Use the selected physical getter's return, including established Lombok
+/// getters, before falling back to a broader inherited method declaration.
+fn java_getter_call_return<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: tree_sitter::Node<'_>,
+    callee: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<JavaPropertyRead> {
+    if provider.source_for_file(file)? != source
+        || call_argument_count(call) != 0
+        || direct_trailing_lambda(call).is_some()
+        || call
+            .named_children(&mut call.walk())
+            .any(|node| node.kind() == "type_arguments")
+        || explicit_receiver_node(call, callee).is_none()
+        || explicit_receiver_is_type_qualifier(source, call, callee, file, provider)
+    {
+        return None;
+    }
+    let name = callee.utf8_text(source.as_bytes()).ok()?.trim();
+    let suffix = name.strip_prefix("get")?;
+    let mut chars = suffix.chars();
+    let first = chars.next().filter(char::is_ascii_uppercase)?;
+    let property = format!("{}{}", first.to_ascii_lowercase(), chars.as_str());
+    let receiver_type = explicit_receiver_type(source, call, callee, file, provider)?;
+    let FactStatus::Established(owner) =
+        provider.resolve_type_in_file(file, &package_name(source), &receiver_type)
+    else {
+        return None;
+    };
+    if owner.file.extension().is_none_or(|ext| ext != "java") {
+        return None;
+    }
+    let read = provider.java_property_read(&owner, &property)?;
+    (read.method_name == name).then_some(read)
 }
 
 fn qualified_source_type_name(id: &SymbolId) -> String {

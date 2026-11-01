@@ -2190,7 +2190,7 @@ fn subtype_covers_properties(
                 ) || !member.has_custom_accessor
                     || member.is_constructor_property
                     || member.has_plain_computed_getter
-                    || computed_class_property_bridgeable(index, subtype))
+                    || computed_class_property_bridgeable(index, subtype, member))
                 && !member.has_unsupported_property_annotations
                 && !member.has_unsupported_property_shape
                 && member.visibility.as_deref() != Some("private")
@@ -2264,16 +2264,53 @@ fn persisted_class_property_bridge(
         && property_type_matches(index, contract_owner, subtype, getter, contract)
 }
 
-fn computed_class_property_bridgeable(index: &SourceIndex, owner: &Declaration) -> bool {
+fn computed_class_property_bridgeable(
+    index: &SourceIndex,
+    owner: &Declaration,
+    member: &crate::workspace::Member,
+) -> bool {
     let Some(file) = index.declaration_source_file(owner) else {
         return false;
     };
-    // Kotlin all-open plugins reject @JvmName on the virtual accessor. Until
-    // component-wide call-site rewriting replaces computed properties with
-    // methods, keep those annotated classes on the Kotlin side of the ABI.
+    // All-open rejects @JvmName on a virtual accessor. Storage-free getters
+    // whose annotations can move to a method avoid that renamed-accessor ABI.
     !["@Entity", "@MappedSuperclass", "@Embeddable"]
         .iter()
         .any(|annotation| file.source_text().contains(annotation))
+        || annotated_computed_member_is_method(index, owner, member)
+}
+
+fn annotated_computed_member_is_method(
+    index: &SourceIndex,
+    owner: &Declaration,
+    member: &crate::workspace::Member,
+) -> bool {
+    if !member.has_custom_accessor {
+        return false;
+    }
+    let Some(file) = index.declaration_source_file(owner) else {
+        return false;
+    };
+    let source = file.source_text();
+    let tree = crate::transpiler::parse_tree(source);
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if declaration_node(node) && declaration_name(node, source) == owner.name {
+            let Some(body) = node
+                .named_children(&mut node.walk())
+                .find(|n| n.kind() == "class_body")
+            else {
+                return false;
+            };
+            return body.named_children(&mut body.walk()).any(|property| {
+                property.kind() == "property_declaration"
+                    && property_name(property, source) == member.name
+                    && computed_getter_shape(index, owner, property, source).is_some()
+            });
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    false
 }
 
 fn property_type_matches(
@@ -3892,6 +3929,34 @@ pub(crate) fn repaired_callsite_contracts_with_persisted(
     contracts
 }
 
+fn parallel_property_has_unrepairable_computed_descendant(
+    index: &SourceIndex,
+    owner: &Declaration,
+    property: &str,
+) -> bool {
+    let mut pending = index.direct_subtypes(owner);
+    let mut visited = HashSet::new();
+    while let Some(descendant) = pending.pop() {
+        if !visited.insert(crate::semantics::workspace_symbol(index, descendant)) {
+            continue;
+        }
+        pending.extend(index.direct_subtypes(descendant));
+        if descendant.language == SourceLanguage::Kotlin
+            && descendant.kind == DeclarationKind::Class
+            && descendant.members.iter().any(|member| {
+                member.kind == MemberKind::Property
+                    && member.name == property
+                    && member.has_custom_accessor
+                    && !member.has_plain_computed_getter
+                    && !computed_class_property_bridgeable(index, descendant, member)
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn java_owner_inherits_repaired_contract(
     index: &SourceIndex,
     source_file: &SourceFile,
@@ -4439,6 +4504,7 @@ fn contracts_for_repair_inner(
         return contracts;
     }
 
+    let mut unrepairable_computed = HashMap::new();
     let mut pending = index.direct_subtypes(declaration);
     let mut visited = HashSet::new();
     while let Some(descendant) = pending.pop() {
@@ -4449,7 +4515,13 @@ fn contracts_for_repair_inner(
             continue;
         }
         pending.extend(index.direct_subtypes(descendant));
-        if descendant.language != SourceLanguage::Kotlin {
+        // A connecting implementation may translate before this parallel
+        // interface. Its generated Java still carries the same inheritance
+        // edges; dropping it would lose the contract as soon as translation
+        // succeeds. Ordinary Java declarations do not establish provenance.
+        if descendant.language != SourceLanguage::Kotlin
+            && !is_generated_notlin_java(file, generated_java)
+        {
             continue;
         }
         let Some(descendant_file) = index.declaration_source_file(descendant) else {
@@ -4485,6 +4557,19 @@ fn contracts_for_repair_inner(
             else {
                 continue;
             };
+            if descendant.language == SourceLanguage::Java
+                && *unrepairable_computed
+                    .entry(member.name.clone())
+                    .or_insert_with(|| {
+                        parallel_property_has_unrepairable_computed_descendant(
+                            index,
+                            declaration,
+                            &member.name,
+                        )
+                    })
+            {
+                continue;
+            }
             if retained_descendant_inherits_kotlin_property(index, declaration, member) {
                 // This getter was imported from a parallel descendant, so no
                 // Java getter is inherited by this interface itself. Keep the
@@ -4933,7 +5018,7 @@ fn repair_declaration(
                 }
                 let property_text = node_text(child, source);
                 if is_interface
-                    || local_property.is_some_and(|member| member.has_plain_computed_getter)
+                    || computed_getter_shape(index, declaration, child, source).is_some()
                 {
                     let setter_override = has_inherited_setter(index, declaration, &contract.name);
                     let replacement = if is_interface {
@@ -5266,15 +5351,140 @@ fn plain_computed_property_method(
     if contract.setter.is_some() {
         return None;
     }
-    let getter = crate::workspace::plain_computed_property_getter(property, source)?;
+    let getter = computed_getter_shape(index, declaration, property, source)?;
     let ty = node_text(getter.return_type, source);
+    let mut annotations = Vec::new();
+    let mut pending = vec![property];
+    while let Some(node) = pending.pop() {
+        if node.start_byte() >= getter.body.start_byte() {
+            continue;
+        }
+        if node.kind() == "annotation" {
+            let text = node_text(node, source);
+            annotations.push((
+                node.start_byte(),
+                text.strip_prefix("@get:")
+                    .map_or_else(|| text.to_string(), |tail| format!("@{tail}")),
+            ));
+            continue;
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    annotations.sort_by_key(|(start, _)| *start);
+    let annotations = annotations
+        .into_iter()
+        .map(|(_, text)| format!("{text}\n"))
+        .collect::<String>();
     Some(format!(
-        "{}{}override fun {}(): {ty} {}",
+        "{annotations}{}{}override fun {}(): {ty} {}",
         if getter.is_public { "public " } else { "" },
         if getter.is_final { "final " } else { "" },
         contract.getter,
         rewrite_super_property_access(index, declaration, contract, node_text(getter.body, source)),
     ))
+}
+
+fn computed_getter_shape<'tree>(
+    index: &SourceIndex,
+    owner: &Declaration,
+    property: Node<'tree>,
+    source: &str,
+) -> Option<crate::workspace::PlainComputedGetter<'tree>> {
+    let file = index.declaration_source_file(owner)?;
+    crate::workspace::computed_property_getter(property, source, |annotation| {
+        let text = node_text(annotation, source).trim();
+        let name = if let Some(tail) = text.strip_prefix("@get:") {
+            tail
+        } else if std::iter::successors(annotation.parent(), |n| n.parent())
+            .take_while(|n| *n != property)
+            .any(|n| n.kind() == "getter")
+        {
+            text.trim_start_matches('@')
+        } else {
+            return false;
+        };
+        let name = name
+            .split(['(', ' ', '\n', '\r', '\t'])
+            .next()
+            .unwrap_or("");
+        let head = name.split('.').next().unwrap_or("");
+        if index
+            .type_aliases_for(&file.path)
+            .iter()
+            .any(|(alias, _)| alias == head)
+        {
+            return false;
+        }
+        if let Some(binding) = crate::workspace::canonical_type_binding(index, file, name) {
+            return index.java_annotation_allows(file, &binding.qualified, "METHOD") == Some(true);
+        }
+        if index.resolve_type(file, name).is_some()
+            || name
+                .split_once('.')
+                .is_some_and(|(head, _)| index.resolve_type(file, head).is_some())
+        {
+            return false;
+        }
+        // These standard libraries define Java annotations. A legal Kotlin
+        // getter use already establishes METHOD applicability; preserve the
+        // annotation text and binding when moving it to the explicit method.
+        // Other external or Kotlin-only annotation targets remain unproved.
+        let java_package = |path: &str| {
+            matches!(
+                path,
+                "jakarta.persistence"
+                    | "javax.persistence"
+                    | "com.fasterxml.jackson.annotation"
+                    | "org.hibernate.annotations"
+                    | "org.jetbrains.annotations"
+                    | "java.lang"
+            )
+        };
+        let tree = crate::transpiler::parse_tree(source);
+        let mut nodes = vec![tree.root_node()];
+        let mut explicit = HashSet::new();
+        let mut stars = HashSet::new();
+        while let Some(node) = nodes.pop() {
+            if node.kind() != "import" {
+                nodes.extend(node.named_children(&mut node.walk()));
+                continue;
+            }
+            let Some(header) = crate::semantics::java_member_calls::import_header(source, node)
+            else {
+                return false;
+            };
+            if header.wildcard {
+                stars.insert(header.path.trim_end_matches(".*").to_string());
+            } else if header
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| header.path.rsplit('.').next().unwrap_or(""))
+                == name
+            {
+                explicit.insert(header.path);
+            }
+        }
+        if name.contains('.') {
+            return name
+                .rsplit_once('.')
+                .is_some_and(|(package, _)| java_package(package));
+        }
+        if !explicit.is_empty() {
+            return explicit.len() == 1
+                && explicit.iter().all(|path| {
+                    path.rsplit_once('.')
+                        .is_some_and(|(package, _)| java_package(package))
+                });
+        }
+        stars.iter().filter(|path| java_package(path)).count() == 1
+            && stars.iter().all(|path| {
+                java_package(path)
+                    || index
+                        .files
+                        .iter()
+                        .any(|file| file.package.as_ref() == Some(path))
+            })
+    })
 }
 
 fn interface_property_methods(
@@ -7255,6 +7465,44 @@ mod tests {
     }
 
     #[test]
+    fn parallel_property_repair_survives_early_translation_of_the_connecting_class() {
+        for (generated_descendant, inherits_generated_root) in
+            [(false, true), (true, false), (true, true)]
+        {
+            let fixture = Fixture::new();
+            let parallel = fixture.write(
+                "Parallel.kt",
+                "package sample\ninterface Parallel {\n    val name: String\n}\n",
+            );
+            let root = fixture.write(
+                "Root.java",
+                "// NOTLIN: generated from Root.kt\npackage sample;\npublic interface Root { String getName(); }\n",
+            );
+            let descendant = fixture.write(
+                "Connected.java",
+                &format!(
+                    "{}package sample;\npublic final class Connected implements {}Parallel {{ public String getName() {{ return \"connected\"; }} }}\n",
+                    if generated_descendant { "// NOTLIN: generated from Connected.kt\n" } else { "" },
+                    if inherits_generated_root { "Root, " } else { "" }
+                ),
+            );
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let mut generated = HashSet::from([root]);
+            if generated_descendant {
+                generated.insert(descendant);
+            }
+            let mut sources = vec![(parallel.clone(), fs::read_to_string(parallel).unwrap())];
+            let report = repair_virtual_sources_planned(&index, &mut sources, &generated);
+            assert_eq!(
+                sources[0].1.contains("fun getName(): String"),
+                generated_descendant && inherits_generated_root,
+                "generated descendant: {generated_descendant}, {report:?}, {}",
+                sources[0].1
+            );
+        }
+    }
+
+    #[test]
     fn planner_rejects_shadowed_readonly_collection_name_in_parallel_contract() {
         let fixture = Fixture::new();
         fixture.write(
@@ -7767,6 +8015,143 @@ mod tests {
                 pending.extend(node.named_children(&mut node.walk()));
             }
             assert!(found, "missing property AST: {property}");
+        }
+    }
+
+    #[test]
+    fn computed_methods_preserve_java_getter_annotations_with_proven_targets() {
+        for (imports, annotation, accepted) in [
+            ("", "@get:MethodOnly(\"with spaces\")", true),
+            (
+                "import sample.MethodOnly as Meta\n",
+                "@get:Meta(\"aliases\")",
+                true,
+            ),
+            ("", "@get:FieldOnly", false),
+            ("", "@get:GetterOnly", false),
+            ("", "@get:kotlin.jvm.JvmName(\"renamed\")", false),
+            ("", "@get:unknown.GetterOnly", false),
+            ("", "@get:jakarta.persistence.Transient", true),
+            ("import jakarta.persistence.*\n", "@get:Transient", true),
+            (
+                "import jakarta.persistence.*\ntypealias Transient = GetterOnly\n",
+                "@get:Transient",
+                false,
+            ),
+            (
+                "import jakarta.persistence.Transient as Skip\n",
+                "@get:Skip",
+                true,
+            ),
+            (
+                "import jakarta.persistence.*\nimport foreign.*\n",
+                "@get:Transient",
+                false,
+            ),
+            (
+                "import jakarta.persistence.*\nimport foreign.Transient\n",
+                "@get:Transient",
+                false,
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write("Api.java", "// NOTLIN: generated from Api.kt\npackage sample; public interface Api { String getName(); }\n");
+            fixture.write("MethodOnly.java", "package sample; @java.lang.annotation.Target(java.lang.annotation.ElementType.METHOD) public @interface MethodOnly { String value(); }\n");
+            fixture.write("FieldOnly.java", "package sample; @java.lang.annotation.Target(java.lang.annotation.ElementType.FIELD) public @interface FieldOnly {}\n");
+            fixture.write("GetterOnly.kt", "package sample\n@Target(AnnotationTarget.PROPERTY_GETTER)\nannotation class GetterOnly\n");
+            let source = format!(
+                "package sample\n{imports}@Entity class Impl : Api {{\n    {annotation}\n    override val name: String get() = \"value\"\n}}\n"
+            );
+            let path = fixture.write("Impl.kt", &source);
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let owner = index.declarations_named("Impl").next().unwrap();
+            let tree = crate::transpiler::parse_tree(&source);
+            let mut pending = vec![tree.root_node()];
+            let property = loop {
+                let node = pending.pop().unwrap();
+                if node.kind() == "property_declaration" {
+                    break node;
+                }
+                pending.extend(node.named_children(&mut node.walk()));
+            };
+            let method = plain_computed_property_method(
+                &index,
+                owner,
+                property,
+                &source,
+                &PropertyContract {
+                    name: "name".into(),
+                    type_name: "String".into(),
+                    type_source: path,
+                    getter: "getName".into(),
+                    setter: None,
+                },
+            );
+            assert_eq!(method.is_some(), accepted, "{source}: {method:?}");
+            if let Some(method) = method {
+                assert!(
+                    method.contains("override fun getName(): String = \"value\""),
+                    "{method}"
+                );
+                assert!(
+                    method.contains(&annotation.replacen("@get:", "@", 1)),
+                    "{method}"
+                );
+                assert!(!method.contains("JvmName"), "{method}");
+            }
+        }
+    }
+
+    #[test]
+    fn generated_descendant_does_not_bypass_all_open_accessor_guards() {
+        for (annotation_source, accepted) in [
+            (
+                "package sample; @java.lang.annotation.Target(java.lang.annotation.ElementType.METHOD) public @interface GetterOnly {}",
+                true,
+            ),
+            (
+                "package sample\n@Target(AnnotationTarget.PROPERTY_GETTER)\nannotation class GetterOnly\n",
+                false,
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let parallel = fixture.write(
+                "Parallel.kt",
+                "package sample\ninterface Parallel {\n    val name: String\n}\n",
+            );
+            let root = fixture.write("Root.java", "// NOTLIN: generated from Root.kt\npackage sample; public interface Root { String getName(); }\n");
+            let connected = fixture.write("Connected.java", "// NOTLIN: generated from Connected.kt\npackage sample; public class Connected implements Root, Parallel { public String getName() { return \"connected\"; } }\n");
+            fixture.write(
+                if accepted {
+                    "GetterOnly.java"
+                } else {
+                    "GetterOnly.kt"
+                },
+                annotation_source,
+            );
+            let implementation = fixture.write("Impl.kt", "package sample\n@Entity class Impl : Parallel {\n    @get:GetterOnly\n    override val name: String get() = \"value\"\n}\n");
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let mut sources = vec![
+                (parallel.clone(), fs::read_to_string(&parallel).unwrap()),
+                (
+                    implementation.clone(),
+                    fs::read_to_string(&implementation).unwrap(),
+                ),
+            ];
+            repair_virtual_sources_planned(&index, &mut sources, &HashSet::from([root, connected]));
+            assert_eq!(
+                sources[0].1.contains("fun getName()"),
+                accepted,
+                "{:?}",
+                sources
+            );
+            assert_eq!(
+                sources[1].1.contains("override fun getName()"),
+                accepted,
+                "{:?}",
+                sources
+            );
+            assert!(!sources[1].1.contains("JvmName"), "{:?}", sources);
         }
     }
 

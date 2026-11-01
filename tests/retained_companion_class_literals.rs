@@ -34,8 +34,8 @@ import kotlin.reflect.KClass
 class Factory {
     companion object {
         suspend fun retainedMarker() {}
-        fun of(type: Class<out Enum<*>>): String = "one:${type.simpleName}"
-        fun of(type: Class<out Enum<*>>, defaultValue: Any?): String = "two:${type.simpleName}:$defaultValue"
+        @JvmStatic fun of(type: Class<out Enum<*>>): String = "one:${type.simpleName}"
+        @kotlin.jvm.JvmStatic fun of(type: Class<out Enum<*>>, defaultValue: Any?): String = "two:${type.simpleName}:$defaultValue"
         fun note(value: String): String = value
         fun accept(type: KClass<*>): String = type.toString()
         fun acceptClass(type: Class<*>): String = type.name

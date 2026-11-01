@@ -192,6 +192,57 @@ fn provider_for(index: &SourceIndex) -> SyntaxSemanticProvider {
     )
 }
 
+#[test]
+fn getter_call_chains_keep_established_covariant_lombok_returns() {
+    for (enabled, explicit_broad_getter, nullable, type_arguments, translated) in [
+        (true, false, false, false, true),
+        (false, false, false, false, false),
+        (true, true, false, false, false),
+        (true, false, true, false, false),
+        (true, false, false, true, false),
+    ] {
+        let sources = [
+            ("Broad.java", "package sample; public interface Broad { Base getChild(); }".to_owned()),
+            ("Base.java", "package sample; public interface Base {}".to_owned()),
+            ("Child.java", "package sample; public class Child implements Base { public String getLabel() { return \"child\"; } }".to_owned()),
+            ("Entry.java", format!("package sample; import lombok.Getter; @Getter public class Entry implements Broad {{ {} private final Child child; public Entry(Child child) {{ this.child = child; }} {} }}", if nullable { "@org.jetbrains.annotations.Nullable" } else { "@lombok.NonNull" }, if explicit_broad_getter { "public Base getChild() { return child; }" } else { "" })),
+            ("Consumer.kt", format!("package sample\nclass Consumer {{\n    fun read(value: Entry): String = value.getChild{}().getLabel()\n}}\n", if type_arguments { "<Child>" } else { "" })),
+        ];
+        let overlays = sources
+            .iter()
+            .map(|(name, source)| SourceOverlay::Replace {
+                path: virtual_path(name),
+                language: if name.ends_with(".java") {
+                    SourceLanguage::Java
+                } else {
+                    SourceLanguage::Kotlin
+                },
+                source: source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut index = SourceIndex::default().with_overlays(&overlays).unwrap();
+        if enabled {
+            index.set_default_lombok_accessors([virtual_path("Entry.java")]);
+        }
+        let mut provider = provider_for(&index);
+        provider.enrich_workspace_type_facts(&index);
+        let plan = plan_consumer_source(&sources[4].1, &index, &provider);
+        assert_eq!(
+            !plan.java_files.is_empty(),
+            translated,
+            "enabled={enabled}, explicit={explicit_broad_getter}, nullable={nullable}, generic={type_arguments}: {:?}",
+            plan.plan.diagnostics
+        );
+        if translated {
+            assert!(
+                plan.java_files[0].1.contains("value.getChild().getLabel()"),
+                "{:?}",
+                plan.java_files
+            );
+        }
+    }
+}
+
 fn plan_consumer(
     index: &SourceIndex,
     provider: &SyntaxSemanticProvider,
