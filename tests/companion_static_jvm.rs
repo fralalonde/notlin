@@ -40,6 +40,9 @@ const SOURCES: &[(&str, &str)] = &[
     (
         "Factory.kt",
         r#"package sample
+import kotlin.Enum
+import kotlin.Number
+import kotlin.Comparable
 class Factory private constructor(val value: String) {
     companion object {
         suspend fun retainedMarker() {}
@@ -51,6 +54,24 @@ class Factory private constructor(val value: String) {
             Effects.mark("of($value)")
             return Factory(value)
         }
+        @JvmStatic fun enumValue(value: Enum<*>): Enum<*> {
+            Effects.mark("enum")
+            return value
+        }
+        @JvmStatic fun number(value: Number): Number {
+            Effects.mark("number")
+            return value
+        }
+        @JvmStatic fun comparable(value: Comparable<*>): Comparable<*> {
+            Effects.mark("comparable")
+            return value
+        }
+        @JvmStatic fun javaClass(value: Class<*>): Class<*> {
+            Effects.mark("class")
+            return value
+        }
+        fun qualified(value: kotlin.Enum<*>): kotlin.Enum<*> = value
+        fun qualifiedInt(value: kotlin.Int): kotlin.Int = value
     }
 }
 "#,
@@ -72,7 +93,11 @@ interface Api {
     ),
     (
         "Decoy.kt",
-        "package other\nclass Decoy {\n companion object {\n  @JvmStatic fun empty(): String = \"decoy\"\n }\n}\n",
+        "package other\nclass Decoy {\n companion object {\n  @JvmStatic fun empty(): kotlin.String = \"decoy\"\n }\n}\n",
+    ),
+    (
+        "EnumShadow.kt",
+        "package other\nclass Enum\nclass Number\nclass Comparable\nclass Class\nclass String\n",
     ),
     (
         "Effects.java",
@@ -80,6 +105,8 @@ interface Api {
 public class Effects {
     public static String events = "";
     public static int projections;
+    public static int enumReads;
+    public static Enum<?> nextEnum() { enumReads++; mark("readEnum"); return FactoryToken.FIRST; }
     public static ProjectionResource project(ProjectionResource value) { projections++; return value; }
     private static int sequence;
     public static void mark(String event) { events += event + "|"; }
@@ -121,6 +148,23 @@ class FactoryCalls {
 enum class FactoryChoice(val label: String) {
     A(Api.label("a")), B(Api.label("b"))
 }
+enum class FactoryToken { FIRST, SECOND }
+enum class EnumRequest(val value: Enum<*>) {
+    A(Factory.enumValue(FactoryToken.FIRST))
+}
+class BuiltinCalls {
+    fun enumeration(value: Enum<*>): Enum<*> = Factory.enumValue(value)
+    fun number(value: Number): Number = Factory.number(value)
+    fun comparable(value: Comparable<*>): Comparable<*> = Factory.comparable(value)
+    fun javaClass(value: Class<*>): Class<*> = Factory.javaClass(value)
+    fun qualified(value: kotlin.Enum<*>): kotlin.Enum<*> = Factory.qualified(value)
+    fun qualifiedString(value: kotlin.String): kotlin.String = value
+    fun qualifiedInt(value: kotlin.Int): kotlin.Int = Factory.qualifiedInt(value)
+    fun qualifiedAny(value: kotlin.Any): kotlin.Any = value
+    fun qualifiedArray(value: kotlin.Array<kotlin.String>): kotlin.Array<kotlin.String> = value
+    fun qualifiedIntArray(value: kotlin.IntArray): kotlin.IntArray = value
+    fun effect(): Enum<*> = Factory.enumValue(Effects.nextEnum())
+}
 "#,
     ),
     (
@@ -149,6 +193,16 @@ fun main() {
     println("ANNOTATED|${readEntity(ComputedEntity())}|${readEntity(EntityChild())}|${Effects.metadata(ComputedEntity::class.java)}")
     val projection = ProjectionOwner(ProjectionContext(ProjectionResource("value")))
     println("PROJECTION|${ProjectionCalls().read(projection)}|${Effects.projections}")
+    val enumeration = FactoryToken.FIRST
+    val number: Number = 1000
+    val comparable: Comparable<*> = "comparable"
+    val type = FactoryToken::class.java
+    val builtins = BuiltinCalls()
+    val text = "identity"
+    val array = arrayOf("value")
+    val ints = intArrayOf(7)
+    println("JVMREF|${builtins.enumeration(enumeration) === enumeration}|${builtins.number(number) === number}|${builtins.comparable(comparable) === comparable}|${builtins.javaClass(type) === type}|${builtins.qualified(enumeration) === enumeration}|${EnumRequest.A.value === enumeration}|${builtins.effect() === enumeration}|${Effects.enumReads}|${builtins.qualifiedString(text) === text}|${builtins.qualifiedInt(7) == 7}|${builtins.qualifiedAny(enumeration) === enumeration}|${builtins.qualifiedArray(array) === array}|${builtins.qualifiedIntArray(ints) === ints}")
+    println(Effects.events)
 }
 "#,
     ),
@@ -218,6 +272,9 @@ fn translate(root: &Path, lombok: bool) {
         "ProjectionResource",
         "ProjectionApi",
         "ProjectionCalls",
+        "BuiltinCalls",
+        "FactoryToken",
+        "EnumRequest",
     ] {
         assert!(
             root.join(format!("{name}.java")).exists(),
@@ -421,6 +478,86 @@ fn static_companion_factories_translate_defaults_and_enum_initializers() {
 }
 
 #[test]
+fn builtin_reference_signatures_have_scoped_plain_jvm_names() {
+    let cases = [
+        ("Enum<*>", ""),
+        ("kotlin.Enum<*>", ""),
+        ("java.lang.Enum<*>", ""),
+        ("Enum<*>", "import kotlin.Enum\n"),
+        ("Number", ""),
+        ("kotlin.Number", ""),
+        ("java.lang.Number", ""),
+        ("Number", "import kotlin.Number\n"),
+        ("Comparable<*>", ""),
+        ("kotlin.Comparable<*>", ""),
+        ("java.lang.Comparable<*>", ""),
+        ("Comparable<*>", "import kotlin.Comparable\n"),
+        ("Class<*>", ""),
+        ("java.lang.Class<*>", ""),
+        ("kotlin.Int", ""),
+        ("kotlin.Boolean", ""),
+    ];
+    for (ty, imports) in cases {
+        let source = format!(
+            "package sample\n{imports}class Factory {{\n companion object {{\n  @JvmStatic fun read(value: {ty}): {ty} = value\n }}\n}}\n"
+        );
+        let provider = SyntaxSemanticProvider::new([
+            (PathBuf::from("Factory.kt"), source.clone()),
+            (
+                PathBuf::from("Other.kt"),
+                "package other\nclass Enum\nclass Number\nclass Comparable\nclass Class\n"
+                    .to_owned(),
+            ),
+        ]);
+        let members = provider.symbols_named("read");
+        let [member] = members.as_slice() else {
+            panic!("expected one callable: {source}");
+        };
+        assert!(
+            provider.has_default_companion_jvm_abi(&member.id),
+            "{source}"
+        );
+    }
+
+    for (declarations, ty) in [
+        ("@JvmInline value class Number(val raw: String)\n", "Number"),
+        (
+            "@JvmInline value class Wrapped(val raw: String)\ntypealias Number = Wrapped\n",
+            "Number",
+        ),
+        ("import dependency.Number\n", "Number"),
+        ("import dependency.*\n", "Enum<*>"),
+    ] {
+        let source = format!(
+            "package sample\n{declarations}class Factory {{\n companion object {{\n  @JvmStatic fun read(value: {ty}): Factory = Factory()\n }}\n}}\n"
+        );
+        let provider = SyntaxSemanticProvider::new([(PathBuf::from("Factory.kt"), source.clone())]);
+        let members = provider.symbols_named("read");
+        let [member] = members.as_slice() else {
+            panic!("expected one callable: {source}");
+        };
+        assert!(
+            !provider.has_default_companion_jvm_abi(&member.id),
+            "{source}"
+        );
+    }
+
+    let source = "package sample\nclass Factory {\n companion object {\n  @JvmStatic fun read(value: kotlin.Enum<*>): kotlin.Enum<*> = value\n }\n}\n";
+    let provider = SyntaxSemanticProvider::new([
+        (PathBuf::from("Factory.kt"), source.to_owned()),
+        (
+            PathBuf::from("Other.kt"),
+            "package other\nclass Enum\n".to_owned(),
+        ),
+    ]);
+    let members = provider.symbols_named("read");
+    let [member] = members.as_slice() else {
+        panic!("expected one callable");
+    };
+    assert!(provider.has_default_companion_jvm_abi(&member.id));
+}
+
+#[test]
 #[ignore = "requires JVM tools, Kotlin stdlib, Lombok and its Kotlin plugin"]
 fn retained_static_companion_factories_match_original_behavior_and_effects() {
     let scratch = Scratch::new();
@@ -435,7 +572,7 @@ fn retained_static_companion_factories_match_original_behavior_and_effects() {
     let expected = before.commands.last().unwrap().stdout.trim().to_owned();
     assert_eq!(
         expected.replace('\r', ""),
-        "empty|v1|x|api:v2|api:a|api:b\nempty|next(1)|of(v1)|of(x)|next(2)|label(v2)|label(a)|label(b)|\nSETTERS|after|2|token|false|false|changed|1|2|false|after2|6\nBRIDGE|connected\nANNOTATED|entity|child|true|body\nPROJECTION|value|1"
+        "empty|v1|x|api:v2|api:a|api:b\nempty|next(1)|of(v1)|of(x)|next(2)|label(v2)|label(a)|label(b)|\nSETTERS|after|2|token|false|false|changed|1|2|false|after2|6\nBRIDGE|connected\nANNOTATED|entity|child|true|body\nPROJECTION|value|1\nJVMREF|true|true|true|true|true|true|true|1|true|true|true|true|true\nempty|next(1)|of(v1)|of(x)|next(2)|label(v2)|label(a)|label(b)|enum|number|comparable|class|enum|readEnum|enum|"
     );
     for lombok in [false, true] {
         let migrated = scratch.0.join(format!("migrated-{lombok}"));

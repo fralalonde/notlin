@@ -179,6 +179,14 @@ explicit capability proof; recognizing an annotation is insufficient.
   callable-reference node. Explicit imports retain their qualified Java spelling,
   including when a local classifier has the same name. Bare Kotlin KClass values
   keep their separate conversion rules.
+- Mapped JVM reference signatures use shared scoped bindings for `Enum`, `Number`,
+  `Comparable` and `Class`, including qualified names and explicit Kotlin imports.
+  Unrelated declarations in other packages cannot shadow them. Source-package
+  classifiers, aliases, opaque wildcard imports and value classes keep their
+  binding checks. Generic types reuse the bare classifier mapping, preserving
+  rendered arguments instead of maintaining a separate generic prefix table.
+  Qualified Kotlin value types and arrays use their JVM types too; reference
+  names stay qualified so a source `String` or `Object` cannot capture them.
 - Shared default-getter analysis supports retained enums, while Java enums keep
   one specialized emission path. An existing inferred getter prevents another
   override from being inserted. Generic arguments alone do not require a JVM

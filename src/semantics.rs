@@ -2892,6 +2892,25 @@ struct CompanionLocation {
 }
 
 impl SyntaxSemanticProvider {
+    fn standard_type_has_plain_jvm_name(&self, source: &str, name: &str) -> bool {
+        standard_external_type(source, self, name, false).is_some_and(|canonical| {
+            canonical.starts_with("java.")
+                || matches!(
+                    canonical.as_str(),
+                    "kotlin.Any"
+                        | "kotlin.Unit"
+                        | "kotlin.Boolean"
+                        | "kotlin.Byte"
+                        | "kotlin.Short"
+                        | "kotlin.Int"
+                        | "kotlin.Long"
+                        | "kotlin.Float"
+                        | "kotlin.Double"
+                        | "kotlin.Char"
+                )
+        })
+    }
+
     fn parameters_have_plain_jvm_names(&self, member: &SymbolId) -> bool {
         member.parameters.iter().all(|signature| {
             let ty = TypeRef::parse(signature.strip_prefix("vararg:").unwrap_or(signature));
@@ -2906,10 +2925,10 @@ impl SyntaxSemanticProvider {
             match self.resolve_type_in_file(&member.file, &member.package, name) {
                 FactStatus::Established(owner) => !self.is_jvm_value_class(&owner),
                 FactStatus::Unknown => {
-                    if self.source_for_file(&member.file).is_some_and(|source| {
-                        standard_external_type(source, self, name, false)
-                            .is_some_and(|canonical| canonical.starts_with("java."))
-                    }) {
+                    if self
+                        .source_for_file(&member.file)
+                        .is_some_and(|source| self.standard_type_has_plain_jvm_name(source, name))
+                    {
                         return true;
                     }
                     let canonical = match name {
@@ -2969,9 +2988,7 @@ impl SyntaxSemanticProvider {
                 // value-class name mangling. Resolve it in the declaration's
                 // scope, including its import/shadowing checks, rather than
                 // guessing from the simple spelling at the call site.
-                if standard_external_type(source, self, name, false)
-                    .is_some_and(|canonical| canonical.starts_with("java."))
-                {
+                if self.standard_type_has_plain_jvm_name(source, name) {
                     return true;
                 }
                 let canonical = match name {
@@ -8329,6 +8346,12 @@ pub(crate) fn standard_external_type<P: SemanticProvider + ?Sized>(
         "CharSequence" | "java.lang.CharSequence" | "kotlin.CharSequence" => {
             ("CharSequence", "java.lang.CharSequence", true)
         }
+        "Enum" | "java.lang.Enum" | "kotlin.Enum" => ("Enum", "java.lang.Enum", true),
+        "Number" | "java.lang.Number" | "kotlin.Number" => ("Number", "java.lang.Number", true),
+        "Comparable" | "java.lang.Comparable" | "kotlin.Comparable" => {
+            ("Comparable", "java.lang.Comparable", true)
+        }
+        "Class" | "java.lang.Class" => ("Class", "java.lang.Class", true),
         "Any" | "kotlin.Any" if !java_source => ("Any", "kotlin.Any", true),
         "Object" | "java.lang.Object" => ("Object", "java.lang.Object", true),
         "Int" | "kotlin.Int" => ("Int", "kotlin.Int", true),
@@ -8399,21 +8422,28 @@ pub(crate) fn standard_external_type<P: SemanticProvider + ?Sized>(
         "Array" | "kotlin.Array" => ("Array", "kotlin.Array", true),
         _ => return None,
     };
-    if provider
-        .symbols_named(simple)
-        .iter()
-        .any(|symbol| is_type_symbol(&symbol.id))
+    let qualified = spelling.contains('.');
+    if let Some((namespace, name)) = spelling.rsplit_once('.')
+        && provider.has_type_alias_in_package(namespace, name)
     {
         return None;
     }
-    if spelling.contains('.') {
+    if provider.symbols_named(simple).iter().any(|symbol| {
+        is_type_symbol(&symbol.id)
+            && (!qualified && provider.source_for_file(&symbol.id.file) == Some(source)
+                || symbol.id.owner_path.is_empty()
+                    && [spelling, canonical]
+                        .contains(&format!("{}.{}", symbol.id.package, symbol.id.name).as_str()))
+    }) {
+        return None;
+    }
+    if qualified {
         return (spelling == canonical
             || (!java_source && intrinsic && spelling == format!("kotlin.{simple}")))
         .then(|| canonical.to_owned());
     }
-    if canonical == "java.math.BigDecimal"
-        && provider.has_type_alias_in_package(&package_name(source), simple)
-    {
+    let package = package_name(source);
+    if canonical == "java.math.BigDecimal" && provider.has_type_alias_in_package(&package, simple) {
         return None;
     }
     let mut explicit_imports = Vec::new();
@@ -8446,8 +8476,22 @@ pub(crate) fn standard_external_type<P: SemanticProvider + ?Sized>(
         {
             return Some((*path).to_owned());
         }
-        return (explicit_imports.len() == 1 && explicit_imports[0] == canonical)
-            .then(|| canonical.to_owned());
+        return (explicit_imports.len() == 1
+            && (explicit_imports[0] == canonical
+                || (!java_source
+                    && intrinsic
+                    && explicit_imports[0] == format!("kotlin.{simple}"))))
+        .then(|| canonical.to_owned());
+    }
+    // Explicit imports take precedence over same-package classifiers. Without
+    // one, only a classifier in the current package can shadow a default import;
+    // wildcard imports retain their separate package-level binding checks below.
+    if provider
+        .symbols_named(simple)
+        .iter()
+        .any(|symbol| is_type_symbol(&symbol.id) && symbol.id.package == package)
+    {
+        return None;
     }
     if source
         .lines()

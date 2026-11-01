@@ -1,6 +1,68 @@
 # Translation frontier
 
-## Current checkpoint — 2026-10-31 (projected returns and enum defaults)
+## Current checkpoint — 2026-10-31 (mapped JVM signatures)
+
+The standard fresh conversion of reference commit `179bb912` produces
+**4,481 Java files**, retaining 1,890 of 6,371 original Kotlin owners:
+**+21 / -0** against the accepted 4,460-output baseline. Every original owner
+identity is compared. The baseline trial and fresh pass gain the same 21
+owners: 16 classes, four interfaces and one enum. Gains include
+`PositionProperty`, `IBinTypeProperties`, `IWallLightDeviceProperties`,
+`IG2PWorkstationProperties`, `IPropertyFilterProperties`, `FloorBinTypeProperties`,
+`RackBinTypeProperties` and the order/task property filter implementations.
+The baseline trial takes **4m 57s** in four passes; the fresh conversion takes
+**16m 57s** across 14 planning passes.
+
+Retained companion factory calls can prove plain JVM signatures containing
+`Enum`, `Number`, `Comparable` and `Class`, including qualified names and
+explicit Kotlin imports. Parameters and return values share the binding proof.
+Same-file declarations and actual source-package shadows retain ownership;
+unrelated declarations in another package cannot change intrinsic literal
+types or qualified references. Existing alias, value-class, visibility,
+renaming and reified-call guards remain independent. Proven aliases to the
+builtin String keep their established path.
+
+Generic references reuse the bare classifier mapper, removing the separate
+generic prefix table. Qualified Kotlin reference values, primitives and arrays
+lower to their JVM types; qualified Java names preserve identity around source
+classes named `String` or `Object`. Native comparisons cover original Kotlin
+and both Lombok modes, including mapped factory arguments/results, enum
+initializers, primitive values, array/reference identity and evaluation order.
+Both native helpers honor the frozen executable selector.
+
+Both full Gradle builds pass: baseline **4m 52s**, fresh **3m 47s**;
+each has 110 actionable tasks, 80 executed and 30 from cache. Both Hastings
+runs load **9,113 records**, then remain free of errors and stack traces for
+**105.5** and **105.9 seconds** after the complete dataset marker. Both
+disposable applications are stopped. Generated application sources are not
+patched manually. The original I/O implementations remain unchanged.
+
+Both resulting trees have 6,628 Java files, with no additions or removals
+between them. Of 21 changed common sources, five have matching normalized
+compiled instructions and contracts. The remaining 16 are original,
+unannotated readonly Kotlin data classes: baseline `@Value` becomes fresh
+`@Data`. Their instance fields remain final. The sole equality difference is
+a pure, redundant `canEqual(this)` check for the original final type; all
+remaining instructions, control flow and other members match. The immutable
+original archive establishes each class's data/final status. Strict results
+and the complete semantic review are preserved separately, with no unexplained
+differences. Ordinary classes retain identity equality and the accepted
+class-level setter coalescing.
+
+Formatting, lint, 390 library tests, 171 focused tests, the constructor
+ownership guard, four standalone samples and eight frozen native checks pass.
+The Windows Rust sweep is **1,623 pass, 62 known fail, 143 ignored**, with no
+new failure names. Exact-head Linux CI is required before installing the
+frozen executable.
+
+Evidence: `target/enum-jvm-frontier-v2-20261101/acceptance.json`.
+Frozen SHA256: `1d863f3d051eabf132bc43b156b3feebddc003c4f80b0aea0ca166b0b0527637`.
+The translation frontier remains active. The next concrete default-body case
+is `WmsContainerIntegration.getCategory()`: its retained provider simply returns
+`IntegrationCategory.CONTAINER`, but the explicit Kotlin interface super call
+is still blocked by its JVM-default compatibility boundary.
+
+## Previous checkpoint — 2026-10-31 (projected returns and enum defaults)
 
 The standard fresh conversion of reference commit `179bb912` produces
 **4,460 Java files**, retaining 1,911 of 6,371 original Kotlin owners:

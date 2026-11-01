@@ -263,6 +263,21 @@ fn syntax_reuse_never_reuses_old_binding_or_source_snapshot_proofs() {
     let rebound = checked_provider(files);
     assert!(matches!(
         selected_type(consumer, &rebound),
+        FactStatus::Established(_)
+    ));
+    // A literal keeps its intrinsic Kotlin type despite an unrelated source
+    // classifier. A spelling-bound parameter must observe a real scope change.
+    let scoped_consumer = "package overloads\nfun use(value: String) = JavaFactory.create(value)\n";
+    let scoped = checked_provider(vec![
+        (PathBuf::from("JavaFactory.java"), java_factory().to_owned()),
+        (PathBuf::from("Consumer.kt"), scoped_consumer.to_owned()),
+        (
+            PathBuf::from("Shadow.kt"),
+            "package overloads\nclass String\n".to_owned(),
+        ),
+    ]);
+    assert!(matches!(
+        selected_type(scoped_consumer, &scoped),
         FactStatus::Unknown
     ));
     let stale = consumer.replace("\"value\"", "\"changed\"");

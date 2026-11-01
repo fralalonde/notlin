@@ -84,7 +84,9 @@ fn write_sources(root: &Path) {
 }
 
 fn translate(root: &Path, lombok_enabled: bool) -> std::process::Output {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"));
+    let binary = std::env::var_os("NOTLIN_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into());
+    let mut command = std::process::Command::new(binary);
     command
         .arg("--root")
         .arg(root)

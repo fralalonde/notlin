@@ -379,24 +379,15 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                     out.push_str(text(child, source));
                 }
             }
-            // `KClass<T>` is Java `Class<T>` through interop; the bare-name
-            // map can't fire because the full text includes type args.
             let whole = out.trim();
-            for (kt_name, j_name) in [
-                ("KClass<", "Class<"),
-                // Kotlin's Mutable* collections ARE the java.util interfaces
-                // at the JVM level; see `map_type_name`.
-                ("MutableList<", "List<"),
-                ("MutableMap<", "Map<"),
-                ("MutableSet<", "Set<"),
-                ("MutableCollection<", "Collection<"),
-                ("MutableIterable<", "Iterable<"),
-                ("MutableIterator<", "Iterator<"),
-                ("MutableListIterator<", "ListIterator<"),
-                ("MutableMap.MutableEntry<", "Map.Entry<"),
-            ] {
-                if let Some(stripped) = whole.strip_prefix(kt_name) {
-                    return format!("{}{}", j_name, stripped);
+            // Generic references use the same classifier mapping as bare
+            // references. Arguments have already been rendered and boxed.
+            // Array/Triple sentinels retain their separate lowering paths.
+            if let Some(open) = whole.find('<') {
+                let name = &whole[..open];
+                let mapped = crate::transpiler::types::map_type_name(name);
+                if mapped != name && !mapped.starts_with("__NOTLIN_") {
+                    return format!("{mapped}{}", &whole[open..]);
                 }
             }
             let mapped = match whole {
@@ -405,7 +396,10 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                 _ if is_canonical_unit_type(node, source) => "kotlin.Unit",
                 _ => crate::transpiler::types::map_type_name(whole),
             };
-            if mapped == "__NOTLIN_ARRAY__" || out.trim().starts_with("Array<") {
+            if mapped == "__NOTLIN_ARRAY__"
+                || whole.starts_with("Array<")
+                || whole.starts_with("kotlin.Array<")
+            {
                 // `Array<T>` -> `T[]`; rebuild from the type_arguments child
                 let mut cursor = node.walk();
                 let inner = node
@@ -421,11 +415,6 @@ pub fn java_type(node: tree_sitter::Node, source: &str) -> String {
                 // Triple has no JDK equivalent (JDK lacks a 3-tuple); the
                 // caller taints the declaration. Type erases to Object.
                 return "Object".to_string();
-            }
-            // Parameterized `Pair<A, B>`: the plain-name map only fires on
-            // bare "Pair"; generic forms rewrite on prefix.
-            if let Some(rest) = mapped.strip_prefix("Pair<") {
-                return format!("java.util.AbstractMap.SimpleImmutableEntry<{}", rest);
             }
             mapped.to_string()
         }
