@@ -167,6 +167,23 @@ explicit capability proof; recognizing an annotation is insufficient.
   reads, preserving a concrete Lombok return over a broader interface method.
   Ordinary retained Kotlin property projections stay direct instead of gaining
   an unnecessary `let` call during getter repair.
+- Read-only List contract repairs accept `java.util.*` and indexed source-package
+  stars that declare no `List` classifier or alias. Unknown packages and actual
+  shadows keep their guards; speculative contract edits remain atomic.
+- Explicit method return projections can preserve Java wildcard covariance over
+  retained Kotlin ancestors. Invariant arguments, type-parameter shadows,
+  nullable widening and wildcard-suppression annotations keep their guards.
+  Qualified and short references to the same source classifier share an
+  override contract.
+- A complete `Type::class.java` projection lowers before visiting its nested
+  callable-reference node. Explicit imports retain their qualified Java spelling,
+  including when a local classifier has the same name. Bare Kotlin KClass values
+  keep their separate conversion rules.
+- Shared default-getter analysis supports retained enums, while Java enums keep
+  one specialized emission path. An existing inferred getter prevents another
+  override from being inserted. Generic arguments alone do not require a JVM
+  covariant bridge when the erased reference is unchanged; nullable, value-class,
+  array and type-variable specialization checks remain independent.
 - An explicit getter reading its own `@JvmField` property uses the backing field
   directly, avoiding a recursive call to itself. Other methods retain ordinary
   accessor dispatch. Property order, explicit `this` and local shadowing are

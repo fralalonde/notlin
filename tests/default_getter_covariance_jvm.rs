@@ -27,7 +27,7 @@ impl Drop for Scratch {
     }
 }
 
-const SOURCES: [(&str, &str); 11] = [
+const SOURCES: [(&str, &str); 15] = [
     (
         "Identifier.java",
         r#"package sample;
@@ -63,13 +63,25 @@ public interface NarrowView { Key getKey(); }
 "#,
     ),
     (
+        "GenericWide.java",
+        "package sample; public interface GenericWide { java.util.List<? extends Identifier> getItems(); }\n",
+    ),
+    (
+        "GenericNarrow.java",
+        "package sample; public interface GenericNarrow extends GenericWide { default java.util.List<Key> getItems() { return Counter.items(); } }\n",
+    ),
+    (
         "Counter.java",
         r#"package sample;
 public final class Counter {
     private static int value;
+    private static int itemCalls;
+    private static final java.util.List<Key> ITEMS = java.util.List.of(new JavaKey("item"));
     public static Key next() { return new JavaKey(Integer.toString(++value)); }
     public static int value() { return value; }
-    public static void reset() { value = 0; }
+    public static java.util.List<Key> items() { itemCalls++; return ITEMS; }
+    public static int itemCalls() { return itemCalls; }
+    public static void reset() { value = 0; itemCalls = 0; }
 }
 "#,
     ),
@@ -82,7 +94,7 @@ public final class JavaChild implements CombinedView {}
     (
         "CombinedView.kt",
         r#"package sample
-interface CombinedView : WideView, NarrowView {
+interface CombinedView : WideView, NarrowView, GenericNarrow {
     override fun getKey(): Key = Counter.next()
 }
 "#,
@@ -102,12 +114,23 @@ class RetainedChild : CombinedView {
 "#,
     ),
     (
+        "KotlinEnum.kt",
+        "package sample\nenum class KotlinEnum : CombinedView { ONLY }\n",
+    ),
+    (
+        "RetainedEnum.kt",
+        "package sample\nenum class RetainedEnum : CombinedView {\n ONLY;\n override fun getKey() = super<CombinedView>.getKey()\n suspend fun retainedMarker() {}\n}\n",
+    ),
+    (
         "Runner.kt",
         r#"package sample
 fun inspect(label: String, value: CombinedView) {
     val wide: WideView = value
     val narrow: NarrowView = value
-    println("$label=${wide.getKey().value()},${narrow.getKey().value()},${value.getKey().value()}")
+    val generic: GenericWide = value
+    val first = generic.getItems()
+    val second = value.getItems()
+    println("$label=${wide.getKey().value()},${narrow.getKey().value()},${value.getKey().value()}|items=${second[0].value()}:${first === second}")
 }
 fun main() {
     suspend fun retainedHarness() {}
@@ -115,12 +138,14 @@ fun main() {
     inspect("kotlin", KotlinChild())
     inspect("retained", RetainedChild())
     inspect("java", JavaChild())
+    inspect("enum", KotlinEnum.ONLY)
+    inspect("retained-enum", RetainedEnum.ONLY)
     val descriptors = CombinedView::class.java.declaredMethods
         .filter { it.name == "getKey" }
         .map { "${it.returnType.simpleName}:${it.isBridge}" }
         .sorted()
         .joinToString(",")
-    println("calls=${Counter.value()}|bridge=$descriptors")
+    println("calls=${Counter.value()}|item-calls=${Counter.itemCalls()}|bridge=$descriptors")
 }
 "#,
     ),
@@ -141,7 +166,10 @@ fn translate(root: &Path, lombok_enabled: bool) -> std::process::Output {
         .filter(|path| path.extension().is_some_and(|extension| extension == "kt"))
         .collect::<Vec<_>>();
     kotlin.sort();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_notlin"));
+    let mut command = Command::new(
+        std::env::var_os("NOTLIN_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into()),
+    );
     command
         .arg("--root")
         .arg(root)
@@ -205,8 +233,14 @@ fn covariant_default_getter_translates_with_a_jvm_bridge() {
         "{}",
         String::from_utf8_lossy(&translated.stderr)
     );
-    assert!(root.join("CombinedView.java").is_file());
+    assert!(
+        root.join("CombinedView.java").is_file(),
+        "{}",
+        fs::read_to_string(root.join("CombinedView.kt")).unwrap_or_default()
+    );
     assert!(root.join("KotlinChild.java").is_file());
+    assert!(root.join("KotlinEnum.java").is_file());
+    assert!(root.join("RetainedEnum.kt").is_file());
     assert!(root.join("RetainedChild.kt").is_file());
     assert!(!root.join("RetainedChild.java").exists());
     let java = fs::read_to_string(root.join("CombinedView.java")).unwrap();
@@ -240,7 +274,7 @@ fn real_toolchain_preserves_covariant_default_getter_dispatch() {
         .replace("\r\n", "\n");
     assert_eq!(
         expected,
-        "kotlin=1,2,3\nretained=4,5,6\njava=7,8,9\ncalls=9|bridge=Identifier:true,Key:false"
+        "kotlin=1,2,3|items=item:true\nretained=4,5,6|items=item:true\njava=7,8,9|items=item:true\nenum=10,11,12|items=item:true\nretained-enum=13,14,15|items=item:true\ncalls=15|item-calls=10|bridge=Identifier:true,Key:false"
     );
 
     for lombok_enabled in [false, true] {
@@ -254,6 +288,8 @@ fn real_toolchain_preserves_covariant_default_getter_dispatch() {
         );
         assert!(migrated.join("CombinedView.java").is_file());
         assert!(migrated.join("KotlinChild.java").is_file());
+        assert!(migrated.join("KotlinEnum.java").is_file());
+        assert!(migrated.join("RetainedEnum.kt").is_file());
         assert!(migrated.join("RetainedChild.kt").is_file());
         let java = fs::read_to_string(migrated.join("CombinedView.java")).unwrap();
         assert!(

@@ -4888,13 +4888,14 @@ fn real_toolchain_preserves_readonly_list_contract_identity_and_getter_annotatio
     for root in [&original, &migrated] {
         fs::create_dir_all(root).unwrap();
         fs::write(root.join("GetterTag.java"), "package boundary; @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @java.lang.annotation.Target(java.lang.annotation.ElementType.METHOD) public @interface GetterTag {}\n").unwrap();
+        fs::write(root.join("Marker.kt"), "package supporting\nclass Marker\n").unwrap();
         fs::write(
             root.join("Definitions.kt"),
             "package boundary\ninterface Base {}\nclass Derived : Base {}\n",
         )
         .unwrap();
-        fs::write(root.join("Parent.kt"), "package boundary\ninterface Parent {\n @get:GetterTag\n val items: List<Base>\n companion object {\n  suspend fun remainKotlin() {}\n }\n}\n").unwrap();
-        fs::write(root.join("Child.kt"), "package boundary\nclass Child(@get:GetterTag override val items: List<Derived>) : Parent {}\n").unwrap();
+        fs::write(root.join("Parent.kt"), "package boundary\nimport java.util.*\nimport supporting.*\ninterface Parent {\n @get:GetterTag\n val items: List<Base>\n companion object {\n  suspend fun remainKotlin() {}\n }\n}\n").unwrap();
+        fs::write(root.join("Child.kt"), "package boundary\nimport java.util.*\nimport supporting.*\nclass Child(@get:GetterTag override val items: List<Derived>) : Parent {}\nenum class Variant(override val items: List<Derived>) : Parent {\n INSTANCE(listOf(Derived()));\n}\n").unwrap();
         fs::write(root.join("Sibling.kt"), "package boundary\nclass Sibling(override val items: List<Derived>) : Parent {\n suspend fun remainKotlin() {}\n}\n").unwrap();
         fs::write(root.join("Runner.kt"), r#"package boundary
 fun main() {
@@ -4903,10 +4904,12 @@ fun main() {
  val child = Child(items)
  val parent: Parent = child
  val sibling: Parent = Sibling(items)
+ val variant = Variant.INSTANCE
+ val enumParent: Parent = variant
  val getter = Parent::class.java.getDeclaredMethod("getItems")
  val childGetter = Child::class.java.getDeclaredMethod("getItems")
  val physical = Parent::class.java.declaredMethods.count { it.name == "getItems" }
- println("${child.items === items}|${parent.items === items}|${sibling.items === items}|${getter.isAnnotationPresent(GetterTag::class.java)}|${childGetter.isAnnotationPresent(GetterTag::class.java)}|$physical")
+ println("${child.items === items}|${parent.items === items}|${sibling.items === items}|${getter.isAnnotationPresent(GetterTag::class.java)}|${childGetter.isAnnotationPresent(GetterTag::class.java)}|$physical|${enumParent.items === variant.items}")
 }
 
 
@@ -4928,15 +4931,18 @@ fun main() {
     let before = validate_jvm_sources(&baseline).expect("original list contracts compile");
     assert_eq!(
         before.commands.last().unwrap().stdout.trim(),
-        "true|true|true|true|true|1"
+        "true|true|true|true|true|1|true"
     );
-    let translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .arg("--root")
-        .arg(&migrated)
-        .args(["--annotations", "none", "--in-place"])
-        .arg(&migrated)
-        .output()
-        .unwrap();
+    let translation = std::process::Command::new(
+        std::env::var_os("NOTLIN_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into()),
+    )
+    .arg("--root")
+    .arg(&migrated)
+    .args(["--annotations", "none", "--in-place"])
+    .arg(&migrated)
+    .output()
+    .unwrap();
     assert!(
         translation.status.success(),
         "{}",
@@ -4947,6 +4953,7 @@ fun main() {
         "{}",
         String::from_utf8_lossy(&translation.stderr)
     );
+    assert!(migrated.join("Variant.java").is_file());
     let parent = fs::read_to_string(migrated.join("Parent.kt")).unwrap();
     assert!(
         parent.contains("List<@kotlin.jvm.JvmWildcard Base>"),

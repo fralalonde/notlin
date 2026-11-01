@@ -44,7 +44,7 @@ pub(crate) mod text_operations;
 mod todo;
 pub(crate) use class_literals::{
     annotation_reference_class, contains_unlowerable_class_literal,
-    established_default_companion_call,
+    established_default_companion_call, java_reference_class_projection,
 };
 pub use container_calls::{ContainerMemberCall, ContainerResultType};
 pub(crate) use container_types::qualify_type as qualify_type_in_file;

@@ -2,7 +2,7 @@
 //!
 //! Kotlin metadata can make a concrete covariant accessor visible to annotation
 //! processors even when source Java method resolution would inherit it. Preserve
-//! that accessor on retained Kotlin classes before accepting a mixed migration.
+//! that accessor on retained Kotlin classes and enums before accepting a mixed migration.
 
 use crate::property_abi::PlannedAccessorRepairs;
 use crate::semantics::{OriginMap, SymbolId};
@@ -111,9 +111,11 @@ pub(crate) fn repair_virtual_sources(
                         },
                     ));
                 }
-                continue;
             }
-            if declaration.kind != DeclarationKind::Class {
+            if !matches!(
+                declaration.kind,
+                DeclarationKind::Class | DeclarationKind::Enum
+            ) {
                 continue;
             }
             let Ok(bridges) = index.covariant_default_getter_bridges(path, &declaration.name)
@@ -124,6 +126,11 @@ pub(crate) fn repair_virtual_sources(
             };
             let owner = crate::semantics::workspace_symbol(index, declaration);
             for bridge in bridges {
+                if candidates.iter().any(|(candidate, existing)| {
+                    candidate == &owner && existing.method_name == bridge.method_name
+                }) {
+                    continue;
+                }
                 if !(is_java_file(&bridge.target.file)
                     || kotlin_method_default(index, &bridge.target, &bridge.method_name))
                     || !bridge
@@ -352,6 +359,20 @@ mod tests {
                     .starts_with(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
             );
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn existing_inferred_getter_is_not_duplicated_on_a_class_or_enum() {
+        for source in [
+            "package sample\nclass Child : Step, Output {\n override fun getOwner() = super<Step>.getOwner()\n}\n",
+            "package sample\nenum class Child : Step, Output {\n ONE;\n override fun getOwner() = super<Step>.getOwner()\n}\n",
+        ] {
+            let fixture = Fixture::new(source);
+            let (index, mut sources) = fixture.indexed_sources();
+            let report = repair_virtual_sources(&index, &mut sources, &HashSet::new()).unwrap();
+            assert_eq!(report.count, 0, "{}", sources[0].1);
+            assert_eq!(sources[0].1, source);
         }
     }
 

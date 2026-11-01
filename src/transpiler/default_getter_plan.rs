@@ -139,6 +139,12 @@ pub(super) fn plan_default_getters(
         }
 
         let indexed = matching[0];
+        if indexed.kind == crate::workspace::DeclarationKind::Enum {
+            // Enum emission already selects and writes its default bridges.
+            // Keep one emission path; shared analysis still serves retained
+            // enum repairs and prospective provider eligibility.
+            continue;
+        }
         let owner = crate::semantics::workspace_symbol(index, indexed);
         let result = index
             .covariant_default_getter_bridges(file, &indexed.name)

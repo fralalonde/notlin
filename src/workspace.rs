@@ -1723,9 +1723,9 @@ impl SourceIndex {
         )
     }
 
-    /// A source reference return can override a retained Kotlin method: javac
-    /// supplies the covariant JVM bridge. Properties have separate ownership
-    /// rules and are deliberately excluded from this method contract proof.
+    /// Source references and explicit Java wildcard projections can override
+    /// retained Kotlin methods. Properties have separate ownership rules and
+    /// are deliberately excluded from this method contract proof.
     pub(crate) fn reference_method_return_is_safe(
         &self,
         declaring: &Path,
@@ -1762,12 +1762,38 @@ impl SourceIndex {
         };
         if shadows(owner, &conflict.implementation_type)
             || !conflict.inherited_type_substituted && shadows(parent, &conflict.inherited_type)
+            || [
+                (&conflict.implementation_type, owner),
+                (&conflict.inherited_type, parent),
+            ]
+            .iter()
+            .any(|(ty, declaration)| {
+                split_generic(ty.trim().trim_end_matches('?'))
+                    .1
+                    .is_some_and(|arguments| {
+                        arguments.iter().any(|argument| {
+                            let bound = argument
+                                .trim()
+                                .strip_prefix("out ")
+                                .or_else(|| argument.trim().strip_prefix("in "))
+                                .unwrap_or(argument)
+                                .trim();
+                            shadows(declaration, bound)
+                        })
+                    })
+            })
             || conflict.implementation_type.trim().ends_with('?')
                 && !conflict.inherited_type.trim().ends_with('?')
         {
             return false;
         }
         source_reference_return_is_subtype(
+            self,
+            own_file,
+            &conflict.implementation_type,
+            parent_file,
+            &conflict.inherited_type,
+        ) || projected_reference_return_is_subtype(
             self,
             own_file,
             &conflict.implementation_type,
@@ -2277,7 +2303,9 @@ impl SourceIndex {
                                 .type_params
                                 .iter()
                                 .any(|param| param == sup_ty.trim_end_matches('?').trim())
-                            && !is_java_compatible_narrow(self, own_file, &sup_ty, own_ty)
+                            && !is_java_compatible_narrow(
+                                self, own_file, sup_file, &sup_ty, own_ty,
+                            )
                             && !projected_return_is_subtype(
                                 self, own_file, own_ty, sup_file, &sup_ty,
                             ),
@@ -6966,12 +6994,17 @@ fn node_text(node: tree_sitter::Node<'_>, source: &str) -> Result<String, String
 fn is_java_compatible_narrow(
     index: &SourceIndex,
     source_file: &SourceFile,
+    super_file: &SourceFile,
     super_ty: &str,
     own_ty: &str,
 ) -> bool {
     let super_ty = super_ty.trim().trim_end_matches('?').trim();
     let own_ty = own_ty.trim().trim_end_matches('?').trim();
-    if super_ty == own_ty || super_ty == "Object" || super_ty == "Any" {
+    if super_ty == own_ty
+        || super_ty == "Object"
+        || super_ty == "Any"
+        || same_source_reference_type(index, source_file, own_ty, super_file, super_ty)
+    {
         return true;
     }
     let (super_base, super_args) = split_generic(super_ty);
@@ -7009,6 +7042,14 @@ fn classify_member_conflict(
     }
     if super_decl.type_params.iter().any(|param| param == super_ty) {
         return MemberConflictClass::SupertypeTypeParameter;
+    }
+    if index
+        .declaration_source_file(super_decl)
+        .is_some_and(|super_file| {
+            same_source_reference_type(index, source_file, own_ty, super_file, super_ty)
+        })
+    {
+        return MemberConflictClass::Exact;
     }
     if projected_return_is_subtype(
         index,
@@ -7289,7 +7330,27 @@ fn readonly_kotlin_list_base_is_proven(
             import
                 .split_once(" as ")
                 .is_some_and(|(_, alias)| alias.trim() == "List")
-                || import.ends_with(".*") && import != "kotlin.collections.*"
+                || import.strip_suffix(".*").is_some_and(|package| {
+                    if matches!(package, "kotlin.collections" | "java.util") {
+                        return false;
+                    }
+                    // An indexed package star cannot shadow the default List
+                    // when that package declares neither a classifier nor an
+                    // alias with that name. Opaque library/member stars still
+                    // need a binding proof.
+                    !index
+                        .files
+                        .iter()
+                        .any(|candidate| candidate.package.as_deref() == Some(package))
+                        || index
+                            .declarations_named("List")
+                            .any(|declaration| declaration.package.as_deref() == Some(package))
+                        || index.alias_names.get("List").is_some_and(|files| {
+                            files
+                                .iter()
+                                .any(|&i| index.files[i].package.as_deref() == Some(package))
+                        })
+                })
         })
     {
         return false;
@@ -7775,6 +7836,25 @@ fn exact_source_reference_type<'a>(
 
 /// Prove ordinary reference covariance in each declaration's source scope.
 /// Shared by default-getter bridge planning and explicit method overrides.
+fn same_source_reference_type(
+    index: &SourceIndex,
+    own_file: &SourceFile,
+    own_type: &str,
+    super_file: &SourceFile,
+    super_type: &str,
+) -> bool {
+    match (
+        exact_source_reference_type(index, own_file, own_type),
+        exact_source_reference_type(index, super_file, super_type),
+    ) {
+        (Some(own), Some(inherited)) => {
+            crate::semantics::workspace_symbol(index, own)
+                == crate::semantics::workspace_symbol(index, inherited)
+        }
+        _ => false,
+    }
+}
+
 fn source_reference_return_is_subtype(
     index: &SourceIndex,
     own_file: &SourceFile,
@@ -7844,6 +7924,54 @@ fn source_reference_return_is_subtype(
         }
     }
     false
+}
+
+/// Explicit use-site projections also describe Java wildcards on retained
+/// Kotlin method returns. Declaration-site collection covariance still needs
+/// its coordinated JVM contract repair; an invariant argument is never widened.
+fn projected_reference_return_is_subtype(
+    index: &SourceIndex,
+    own_file: &SourceFile,
+    own_type: &str,
+    super_file: &SourceFile,
+    super_type: &str,
+) -> bool {
+    if [own_file, super_file]
+        .iter()
+        .any(|file| file.source_text().contains("JvmSuppressWildcards"))
+    {
+        return false;
+    }
+    let (own_base, Some(own_args)) = split_generic(own_type.trim().trim_end_matches('?')) else {
+        return false;
+    };
+    let (super_base, Some(super_args)) = split_generic(super_type.trim().trim_end_matches('?'))
+    else {
+        return false;
+    };
+    let Some(identity) = canonical_getter_named_identity(index, own_file, own_base) else {
+        return false;
+    };
+    if canonical_getter_named_identity(index, super_file, super_base).as_ref() != Some(&identity)
+        || own_args.len() != super_args.len()
+    {
+        return false;
+    }
+    own_args.iter().zip(super_args).all(|(own, inherited)| {
+        if let Some(bound) = inherited.strip_prefix("out ") {
+            let own = own.strip_prefix("out ").unwrap_or(own);
+            return !own.starts_with("in ")
+                && !(own.ends_with('?') && !bound.ends_with('?'))
+                && source_reference_return_is_subtype(index, own_file, own, super_file, bound);
+        }
+        if let Some(bound) = inherited.strip_prefix("in ") {
+            let own = own.strip_prefix("in ").unwrap_or(own);
+            return !own.starts_with("out ")
+                && !(bound.ends_with('?') && !own.ends_with('?'))
+                && source_reference_return_is_subtype(index, super_file, bound, own_file, own);
+        }
+        source_types_have_same_identity(index, own_file, own, super_file, inherited)
+    })
 }
 
 fn scoped_type_parameter_bindings(
@@ -7936,8 +8064,8 @@ fn canonical_getter_type(
     Some(CanonicalGetterType::Named(identity, arguments))
 }
 
-// Legacy getter ABI inference stays byte-compatible with the accepted path.
-// New receiver evidence uses canonical_type_binding below, never this adapter.
+// Getter ABI inference uses its established source identity adapter. New
+// receiver evidence uses canonical_type_binding below, never this adapter.
 fn canonical_getter_named_identity(
     index: &SourceIndex,
     file: &SourceFile,
@@ -8040,6 +8168,7 @@ fn canonical_getter_named_identity(
         "Char" | "char" => Some("kotlin.Char"),
         "String" => Some("kotlin.String"),
         "Comparable" => Some("external:java.lang.Comparable"),
+        "Class" => Some("external:java.lang.Class"),
         "List" | "Set" | "Collection" | "Iterable" | "Iterator" | "Sequence" | "Map"
             if collection_base_is_unshadowed(index, file, simple) =>
         {

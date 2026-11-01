@@ -300,8 +300,10 @@ impl BridgeCache {
 fn unique_class_by_id<'a>(index: &'a SourceIndex, owner: &SymbolId) -> Option<&'a Declaration> {
     let file = index.source_file(Path::new(&owner.file))?;
     let mut declarations = file.declarations.iter().filter(|declaration| {
-        declaration.kind == DeclarationKind::Class
-            && semantics::workspace_symbol(index, declaration) == *owner
+        matches!(
+            declaration.kind,
+            DeclarationKind::Class | DeclarationKind::Enum
+        ) && semantics::workspace_symbol(index, declaration) == *owner
     });
     let declaration = declarations.next()?;
     declarations.next().is_none().then_some(declaration)
@@ -560,7 +562,16 @@ fn erased_return(
         };
         canonical_return(index, owner, &bound, &BTreeMap::new())?
     } else {
-        canonical_return(index, owner, raw, &BTreeMap::new())?
+        let (outer, arguments) = super::split_generic(base);
+        // Erasure depends on the outer reference, not whether Java wildcard
+        // arguments can be interpreted as Kotlin source types. Arrays still
+        // carry their element type in the JVM descriptor.
+        let erased_spelling = if arguments.is_some() && !matches!(outer, "Array" | "kotlin.Array") {
+            outer
+        } else {
+            raw
+        };
+        canonical_return(index, owner, erased_spelling, &BTreeMap::new())?
     };
     match canonical {
         C::Named(identity, _) => Some(C::Named(identity, Vec::new())),
@@ -1476,7 +1487,7 @@ impl SourceIndex {
         outcome
     }
 
-    /// Find concrete covariant getter bridges for a source class. Unknown
+    /// Find concrete covariant getter bridges for a source class or enum. Unknown
     /// relevant inheritance returns `Err`, allowing planning to retain the
     /// class rather than emit a guessed JVM contract.
     pub(crate) fn covariant_default_getter_bridges(
@@ -1503,7 +1514,7 @@ impl SourceIndex {
         if matching.next().is_some() {
             return Err(format!("declaration `{name}` is ambiguous in this file"));
         }
-        if owner.kind != DeclarationKind::Class {
+        if !matches!(owner.kind, DeclarationKind::Class | DeclarationKind::Enum) {
             return Ok(Vec::new());
         }
         let owner_id = semantics::workspace_symbol(self, owner);
@@ -1621,13 +1632,13 @@ impl SourceIndex {
         let own_getters = owner
             .members
             .iter()
-            .filter_map(|member| source_getter(self, owner, member))
-            .map(|getter| {
-                if getter.member.kind == MemberKind::Property {
-                    property_accessor_name(&getter.member.name)
-                } else {
-                    getter.member.name.clone()
+            .filter(|member| !member.is_static)
+            .filter_map(|member| match member.kind {
+                MemberKind::Property => Some(property_accessor_name(&member.name)),
+                MemberKind::Method if member.parameter_types.is_empty() => {
+                    Some(member.name.clone())
                 }
+                _ => None,
             })
             .collect::<HashSet<_>>();
 
@@ -1685,6 +1696,28 @@ impl SourceIndex {
                 return Err(format!(
                     "mutable getter contract `{method_name}` cannot be repaired with a getter bridge"
                 ));
+            }
+            // Generic arguments do not create a different JVM return
+            // descriptor. Leave their compatibility to override planning;
+            // only a change in the erased reference needs this bridge pass.
+            // Keep type-variable specialization and nullable contracts on
+            // their existing paths.
+            if let Some(super::CanonicalGetterType::Named(identity, _)) =
+                contracts[0].erased_return.as_ref()
+                && contracts.iter().all(|contract| {
+                    !contract.member.is_nullable
+                        && getter_return_type(self, contract.owner, contract.member)
+                            .is_some_and(|ty| ty.contains('<'))
+                        && contract.erased_return.as_ref()
+                            == Some(&super::CanonicalGetterType::Named(
+                                identity.clone(),
+                                Vec::new(),
+                            ))
+                })
+                && source_declaration_for_identity(self, identity)
+                    .is_none_or(|declaration| !declaration.is_jvm_value_class)
+            {
+                continue;
             }
             let direct_interfaces = owner
                 .supertypes

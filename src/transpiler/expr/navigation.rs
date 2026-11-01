@@ -7,6 +7,17 @@ use crate::transpiler::unit::capitalize;
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     pub(crate) fn navigation(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(java) = crate::semantics::java_reference_class_projection(
+            self.unit.source,
+            self.unit
+                .workspace_file
+                .as_deref()
+                .unwrap_or(self.unit.file),
+            node,
+            self.unit.semantic_provider,
+        ) {
+            return java;
+        }
         if let (Some(receiver), Some(member)) = (node.named_child(0), node.named_child(1))
             && self.unit.text(receiver).trim() == "this"
             && self

@@ -82,6 +82,13 @@ fn public_nonnull_source_return_covariant_with_inherited_getter() {
 }
 
 #[test]
+fn retained_enum_uses_the_same_proven_covariant_default_as_a_class() {
+    assert!(!conflicts(
+        "package sample\ninterface Wide {}\nenum class Narrow : Wide { VALUE }\ninterface Root {\n fun getValue(): Wide\n}\ninterface Provider : Root {\n override fun getValue(): Narrow = Narrow.VALUE\n}\nenum class Child : Provider { ONE }\n"
+    ));
+}
+
+#[test]
 fn every_inherited_getter_branch_must_be_proven_compatible() {
     assert!(!conflicts(
         "package sample\n\

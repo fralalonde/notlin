@@ -1,6 +1,65 @@
 # Translation frontier
 
-## Current checkpoint — 2026-10-31
+## Current checkpoint — 2026-10-31 (projected returns and enum defaults)
+
+The standard fresh conversion of reference commit `179bb912` produces
+**4,460 Java files**, retaining 1,911 of 6,371 original Kotlin owners:
+**+11 / -0** against the accepted 4,449-output baseline. Every original
+owner identity is compared. Gains comprise six enums, two interfaces and
+three classes, including `SolochainTOHContainerIntegration`,
+`SolochainTOHOrderIntegration`, `SolochainTOHWorkRequestIntegration`,
+`LiddConnectOrderIntegration`, both process query interfaces, both picking
+query enums, `WorkStorageAssetInfo`, `WorkflowOrderBatch` and
+`WorkflowStepOrderInput`. The baseline trial gains four owners; the fresh
+pass gains seven more. Fresh conversion takes 17m 23s across 14 planning passes.
+
+Readonly List contract repair accepts proven source-package wildcard imports
+and `java.util.*`, while retaining guards for real shadows and opaque imports.
+Explicit generic method-return projections preserve Java wildcard covariance
+over retained Kotlin ancestors. Qualified and short references to the same
+source classifier share an override contract. A complete `Type::class.java`
+projection lowers before its nested callable reference, retaining explicit
+import identity even when a local classifier has the same name.
+
+Shared default-getter analysis covers retained enums. An existing inferred
+getter prevents duplicate insertion; Java enums retain one specialized
+emission path. Generic arguments alone do not require a covariant JVM bridge
+when the erased reference is unchanged. Type-variable specialization,
+nullable returns, value classes and arrays retain their independent checks.
+Native comparisons cover original Kotlin and both Lombok modes, including
+generic defaults, retained siblings, list identity and getter evaluation counts.
+
+Both full Gradle builds pass: baseline **4m 52s**, fresh **3m 54s**;
+each has 110 actionable tasks, 80 executed and 30 from cache. Both Hastings
+runs load **9,113 records**, then remain free of errors and stack traces for
+**105.5** and **105.9 seconds** after the complete dataset marker. Both
+disposable applications are stopped. Generated application sources are not
+patched manually. The original I/O implementations remain unchanged.
+
+The baseline trial has 6,600 Java files and the fresh tree has 6,607, with
+seven additions and no removals. Of 30 changed common sources, 13 have matching
+normalized compiled instructions and contracts. The remaining 17 are
+mechanically reviewed: 15 enums gain an explicit default forwarding getter
+and its synthetic bridge, each resolving to the same inherited enum constant;
+two getter chains change their declaring interface while reaching the same
+unchanged own getter implementation. Existing enum members remain unchanged.
+The strict comparison and semantic review are preserved separately, with
+no unexplained differences.
+
+Formatting, lint, four standalone samples and seven frozen native checks pass.
+The Windows Rust sweep is **1,622 pass, 62 known fail, 143 ignored**, with no
+new failure names. Exact-head Linux CI is required before installing the
+frozen executable. Ordinary classes retain the accepted class-level `@Setter`
+coalescing; data classes continue to use `@Data` or `@Value`.
+
+Evidence: `target/list-wildcard-frontier-v4-20261101/acceptance.json`.
+Frozen SHA256: `dbdf5cccdc0d433a001cf303c6e104ff54c8681264a31cdd9fe22309c9e72661`.
+The translation frontier remains active. The next isolated candidate is
+retained companion factory applicability to an enum argument through an
+`Enum<*>` parameter; equivalent `Any` and concrete-enum parameter controls
+already translate.
+
+## Previous checkpoint — 2026-10-31
 
 The standard fresh conversion of reference commit `179bb912` produces
 **4,449 Java files**, retaining 1,922 of 6,371 original Kotlin owners:

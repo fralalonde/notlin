@@ -140,3 +140,67 @@ fn a_later_java_parent_consumes_the_kotlin_variance_marker() {
     assert!(!java.contains("JvmWildcard"), "{java}");
     assert!(!java.contains("? extends ? extends"), "{java}");
 }
+
+#[test]
+fn readonly_list_repairs_bind_standard_and_indexed_package_star_imports() {
+    for (case, imports, shadow, accepted) in [
+        ("jdk", "import java.util.*\n", "", true),
+        ("source", "import supporting.*\n", "class Marker", true),
+        ("opaque", "import external.*\n", "", false),
+        (
+            "class-shadow",
+            "import supporting.*\n",
+            "class List<T>",
+            false,
+        ),
+        (
+            "alias-shadow",
+            "import supporting.*\n",
+            "typealias List<T> = kotlin.collections.List<T>",
+            false,
+        ),
+    ] {
+        let root =
+            std::env::temp_dir().join(format!("notlin-list-star-{case}-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut sources = Vec::new();
+        for (name, source) in [
+            ("Supporting.kt", format!("package supporting\n{shadow}\n")),
+            (
+                "Model.kt",
+                format!(
+                    "package sample\n{imports}interface Base {{}}\nclass Derived : Base {{}}\ninterface Parent {{\n val items: List<Base>\n companion object {{ suspend fun remainKotlin() {{}} }}\n}}\nenum class Child(override val items: List<Derived>) : Parent {{\n INSTANCE(emptyList());\n}}\n"
+                ),
+            ),
+        ] {
+            let path = root.join(name);
+            fs::write(&path, &source).unwrap();
+            sources.push((path, source));
+        }
+        let index = SourceIndex::discover(&root).unwrap();
+        let cli = Cli::parse_from(["notlin", "--in-place", root.to_str().unwrap()]);
+        let plan =
+            plan_workspace_migration(sources, &cli, &index, std::slice::from_ref(&root), |_| {})
+                .unwrap();
+        assert_eq!(
+            plan.generated_java
+                .iter()
+                .any(|output| output.name == "Child.java"),
+            accepted,
+            "{case}: {:?}",
+            plan.translation_plans
+                .values()
+                .flat_map(|plan| &plan.declarations)
+                .map(|decision| (&decision.symbol_id.name, &decision.retention_reasons))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan.final_kotlin_sources
+                .values()
+                .any(|source| source.contains("List<@kotlin.jvm.JvmWildcard Base>")),
+            accepted,
+            "{case}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

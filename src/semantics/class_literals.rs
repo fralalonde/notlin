@@ -132,6 +132,48 @@ pub(crate) fn contains_unlowerable_class_literal(
     })
 }
 
+/// Consume the whole Java projection before expression emission visits its
+/// nested callable-reference node. A bare `T::class` remains a Kotlin KClass.
+pub(crate) fn java_reference_class_projection(
+    source: &str,
+    file: &Path,
+    node: tree_sitter::Node<'_>,
+    provider: Option<&dyn SemanticProvider>,
+) -> Option<String> {
+    if node.kind() != "navigation_expression" {
+        return None;
+    }
+    let children = node
+        .children(&mut node.walk())
+        .filter(|child| !child.is_extra())
+        .collect::<Vec<_>>();
+    let [literal, dot, java] = children.as_slice() else {
+        return None;
+    };
+    if dot.utf8_text(source.as_bytes()).ok()? != "."
+        || java.utf8_text(source.as_bytes()).ok()? != "java"
+        || contains_unlowerable_class_literal(source, file, node, provider)
+    {
+        return None;
+    }
+    let receiver = class_literal_receiver(unparenthesized(*literal), source)?;
+    let mut name = annotation_reference_class(
+        source,
+        file,
+        receiver,
+        receiver.utf8_text(source.as_bytes()).ok()?.trim(),
+        provider,
+    )?;
+    // Kotlin's explicit import wins over a same-package classifier. Keep its
+    // qualified Java spelling even when the output import list omits it.
+    if let Some(imported) = super::kotlin_import_lines(source)
+        .find(|import| import.rsplit('.').next() == Some(name.as_str()))
+    {
+        name = imported.to_owned();
+    }
+    Some(format!("{name}.class"))
+}
+
 fn unparenthesized(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
     while node.kind() == "parenthesized_expression" {
         let Some(inner) = node

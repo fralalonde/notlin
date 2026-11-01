@@ -78,6 +78,39 @@ fn workspace_selection_detects_when_every_kotlin_file_is_selected() {
 }
 
 #[test]
+fn qualified_and_short_source_returns_share_the_same_override_contract() {
+    for (case, contract, implementation) in [
+        (
+            "method",
+            "fun getCategory(): Category",
+            "override fun getCategory(): sample.Category = Category.VALUE",
+        ),
+        (
+            "property",
+            "val category: Category",
+            "override val category: sample.Category get() = Category.VALUE",
+        ),
+    ] {
+        let root = std::env::temp_dir().join(format!(
+            "notlin-qualified-return-{case}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Model.kt"), format!("package sample\nenum class Category {{ VALUE }}\ninterface Contract {{\n {contract}\n}}\nenum class Impl : Contract {{\n ONE;\n {implementation}\n}}\n")).unwrap();
+        let index = SourceIndex::discover(&root).unwrap();
+        let child = index
+            .declarations()
+            .find(|decl| decl.name == "Impl")
+            .unwrap();
+        let conflicts = index.retained_supertype_member_conflicts(&child.supertypes, "Impl");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].classification, MemberConflictClass::Exact);
+        assert!(!conflicts[0].blocks_java_override());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn retained_supertype_mismatch_reports_conflicting_member_names() {
     let root = std::env::temp_dir().join(format!("notlin-member-mismatch-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);

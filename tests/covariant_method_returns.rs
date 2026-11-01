@@ -20,6 +20,7 @@ const SOURCES: &[(&str, &str)] = &[
         r#"package sample
 interface Wide
 enum class Narrow : Wide { VALUE }
+class Holder<T>(val value: T)
 "#,
     ),
     (
@@ -75,12 +76,51 @@ class GenericProvider : JavaGenericMiddle {
 "#,
     ),
     (
+        "Projections.kt",
+        r#"package sample
+interface ProjectionRoot {
+    fun getType(): Class<out Wide>
+    fun boxed(): Holder<out Wide>
+    companion object { suspend fun keepRoot() {} }
+}
+class ProjectionProvider : JavaProjectionMiddle {
+    override fun getType(): Class<out Narrow> = Narrow::class.java
+    override fun boxed(): Holder<out Narrow> = Holder(Narrow.VALUE)
+}
+enum class ProjectionEnum : JavaProjectionMiddle {
+    ONLY;
+    override fun getType(): Class<out Narrow> = Narrow::class.java
+    override fun boxed(): Holder<out Narrow> = Holder(Narrow.VALUE)
+}
+"#,
+    ),
+    (
+        "Exact.kt",
+        "package sample\ninterface ExactRoot {\n fun exact(): Narrow\n companion object { suspend fun keepRoot() {} }\n}\nenum class ExactEnum : JavaExactMiddle {\n ONLY;\n override fun exact(): sample.Narrow = Narrow.VALUE\n}\n",
+    ),
+    (
+        "JavaExactMiddle.java",
+        "package sample; public interface JavaExactMiddle extends ExactRoot {}\n",
+    ),
+    (
+        "external/ExternalToken.java",
+        "package external; public final class ExternalToken {}\n",
+    ),
+    (
+        "Literal.kt",
+        "package sample\nimport external.ExternalToken\nclass ClassLiteralOwner {\n fun reference(): Class<*> = ExternalToken::class.java\n}\nclass ExternalToken\n",
+    ),
+    (
         "Retained.kt",
         r#"package sample
 class Kept : DefaultProvider {
     suspend fun keepChild() {}
 }
 "#,
+    ),
+    (
+        "JavaProjectionMiddle.java",
+        "package sample; public interface JavaProjectionMiddle extends ProjectionRoot {}\n",
     ),
     (
         "JavaMiddle.java",
@@ -121,6 +161,7 @@ fun main() {
     println(generic.item() === Narrow.VALUE)
     println(direct.result() === Narrow.VALUE)
     println(Trace.calls())
+    println("${ProjectionProvider().getType() === Narrow::class.java}|${ProjectionEnum.ONLY.boxed().value === Narrow.VALUE}|${ClassLiteralOwner().reference() === external.ExternalToken::class.java}|${ExactEnum.ONLY.exact() === Narrow.VALUE}")
 }
 "#,
     ),
@@ -129,6 +170,7 @@ fun main() {
 fn populate(root: &Path) {
     fs::create_dir_all(root).unwrap();
     for (name, source) in SOURCES {
+        fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
         fs::write(root.join(name), source).unwrap();
     }
 }
@@ -164,12 +206,19 @@ fn config(root: &Path, output: PathBuf, lombok: bool) -> JvmValidationConfig {
     } else {
         config.javac_args.push("-proc:none".into());
     }
-    for entry in fs::read_dir(root).unwrap() {
-        let file = entry.unwrap().path();
-        match file.extension().and_then(|ext| ext.to_str()) {
-            Some("kt") => config.kotlin_sources.push(file),
-            Some("java") => config.java_sources.push(file),
-            _ => {}
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let file = entry.unwrap().path();
+            if file.is_dir() {
+                pending.push(file);
+            } else {
+                match file.extension().and_then(|ext| ext.to_str()) {
+                    Some("kt") => config.kotlin_sources.push(file),
+                    Some("java") => config.java_sources.push(file),
+                    _ => {}
+                }
+            }
         }
     }
     config.run_main_class = Some("sample.RunnerKt".into());
@@ -198,12 +247,21 @@ fn translate(root: &Path, lombok: bool) {
         "DefaultProvider",
         "GenericProvider",
         "UsesDefault",
+        "ProjectionProvider",
+        "ProjectionEnum",
+        "ClassLiteralOwner",
+        "ExactEnum",
     ] {
         assert!(
             root.join(format!("{name}.java")).exists(),
             "{name} must translate: {}\n{}",
             String::from_utf8_lossy(&output.stderr),
-            fs::read_to_string(root.join("Providers.kt")).unwrap_or_default()
+            fs::read_to_string(root.join(if name.starts_with("Projection") {
+                "Projections.kt"
+            } else {
+                "Providers.kt"
+            }))
+            .unwrap_or_default()
         );
     }
     for name in ["Roots", "GenericRoot", "Retained", "Runner"] {
@@ -305,6 +363,76 @@ fn method_type_parameter_does_not_bind_to_a_same_named_source_enum() {
 }
 
 #[test]
+fn projected_returns_keep_invariance_suppression_and_type_parameter_guards() {
+    for (imports, annotation, inherited, own, generic, argument, body) in [
+        (
+            "",
+            "",
+            "Holder<Wide>",
+            "Holder<Narrow>",
+            "",
+            "",
+            "Holder(Narrow.VALUE)",
+        ),
+        (
+            "",
+            "@JvmSuppressWildcards",
+            "Class<out Wide>",
+            "Class<out Narrow>",
+            "",
+            "",
+            "Narrow::class.java",
+        ),
+        (
+            "import kotlin.jvm.JvmSuppressWildcards as Hide\n",
+            "@Hide",
+            "Class<out Wide>",
+            "Class<out Narrow>",
+            "",
+            "",
+            "Narrow::class.java",
+        ),
+        (
+            "",
+            "",
+            "Class<out Wide>",
+            "Class<out Narrow>",
+            "<Narrow : Wide>",
+            "value: Class<Narrow>",
+            "value",
+        ),
+    ] {
+        let scratch = scratch();
+        fs::create_dir_all(&scratch.0).unwrap();
+        fs::write(scratch.0.join("Root.kt"), format!(
+            "package sample\n{imports}interface Wide {{}}\nenum class Narrow : Wide {{ VALUE }}\nclass Holder<T>(val value: T)\ninterface Root {{\n {annotation}\n fun {generic} result({argument}): {inherited}\n companion object {{ suspend fun keepRoot() {{}} }}\n}}\n"
+        )).unwrap();
+        fs::write(
+            scratch.0.join("JavaMiddle.java"),
+            "package sample; public interface JavaMiddle extends Root {}\n",
+        )
+        .unwrap();
+        fs::write(scratch.0.join("Provider.kt"), format!(
+            "package sample\nclass Provider : JavaMiddle {{\n override fun {generic} result({argument}): {own} = {body}\n}}\n"
+        )).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_notlin"))
+            .current_dir(&scratch.0)
+            .args(["--in-place", "--annotations", "none", "."])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !scratch.0.join("Provider.java").exists(),
+            "{annotation}: {inherited} -> {own}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires JVM tools, Kotlin stdlib, Lombok and its Kotlin plugin"]
 fn retained_kotlin_callers_dispatch_through_covariant_jvm_bridges() {
     let scratch = scratch();
@@ -325,7 +453,7 @@ fn retained_kotlin_callers_dispatch_through_covariant_jvm_bridges() {
         .replace("\r\n", "\n");
     assert_eq!(
         expected,
-        "true|true|text\ntrue|true|text\ntrue|true|text\ntrue|true|text\ntrue\ntrue\n2"
+        "true|true|text\ntrue|true|text\ntrue|true|text\ntrue|true|text\ntrue\ntrue\n2\ntrue|true|true|true"
     );
     for lombok in [false, true] {
         let root = scratch.0.join(format!("candidate-{lombok}"));
