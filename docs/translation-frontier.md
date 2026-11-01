@@ -1,6 +1,45 @@
 # Translation frontier
 
-## Current checkpoint — 2026-10-31 (mapped JVM signatures)
+## Current checkpoint — 2026-11-01 (generalized JVM primitive rules)
+
+Primitive names, wrappers, arrays and JVM descriptors now share one internal
+vocabulary across rendering, semantic facts, constructor/overload checks and
+Lombok getter contracts. Separate cast-boxing, function-argument-boxing and
+receipt-descriptor implementations were removed. Including the shared module,
+this removes **118 production lines**. Import, alias, visibility and shadowing
+proofs retain their existing boundaries. `Unit`/`void`, unsigned values and
+reference types keep their separate semantics.
+
+This is a refactor with **zero ownership changes**: the fresh standard conversion
+still translates **4,481** and retains 1,890 of **6,371 original owners**.
+All complete owner identities match. Both the accepted-baseline rerun and fresh
+conversion preserve all **6,628 Java files byte for byte** and every retained
+Kotlin code token. The only source differences are generated diagnostic comments:
+25 retained files in the rerun, ten in the fresh tree. Parsed comment-node audits
+keep those separate from application code. No generated application code is
+patched manually.
+
+Formatting, clippy, **390 library tests**, **193 focused tests**, and the constructor
+binding guard pass. Eight existing native test cases pass, including the two
+original-versus-converted toolchain fixtures. A further original Kotlin control
+checks all eight primitives as values, nullable getter/setter contracts, primitive
+arrays, generic arguments and casts in both Lombok modes. The full Windows Rust
+sweep matches accepted main exactly: **1,623 pass / 62 known fail / 143 ignored**,
+with no new or resolved failure names.
+
+Both full Gradle builds pass. Baseline Hastings imports all **9,113 records** and
+remains free of errors and stack traces for **105.9 seconds**
+after the dataset marker; fresh Hastings does the same for
+**105.9 seconds**. Both disposable applications are stopped.
+The original I/O files still match `d096ed8`. Exact-head Linux CI must pass before
+the frozen executable is installed in either CLI location.
+
+Evidence: `target/generalization-20261101/acceptance.json`.
+Frozen SHA256: `f0d827fea7517204cc5ed9c812583341357a05045e019ae143197faab3b4e719`.
+The translation frontier remains active; retained constant interface defaults
+remain the next feature under investigation.
+
+## Previous checkpoint — 2026-10-31 (mapped JVM signatures)
 
 The standard fresh conversion of reference commit `179bb912` produces
 **4,481 Java files**, retaining 1,890 of 6,371 original Kotlin owners:

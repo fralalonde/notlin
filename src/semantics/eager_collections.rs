@@ -9,6 +9,7 @@ use super::{
     is_proven_constructor_property_shadow, is_proven_local_shadow, package_name,
     standard_external_type,
 };
+use crate::jvm_primitive::JvmPrimitive;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -776,17 +777,12 @@ fn projection_types_compatible<P: SemanticProvider + ?Sized>(
         return false;
     }
     let actual_name = match &actual.ty {
-        KotlinType::Primitive(name) => match name.as_str() {
-            "Boolean" => "kotlin.Boolean",
-            "Byte" => "kotlin.Byte",
-            "Char" => "kotlin.Char",
-            "Short" => "kotlin.Short",
-            "Int" => "kotlin.Int",
-            "Long" => "kotlin.Long",
-            "Float" => "kotlin.Float",
-            "Double" => "kotlin.Double",
-            _ => return false,
-        },
+        KotlinType::Primitive(name) => {
+            let Some(ty) = JvmPrimitive::kotlin(name) else {
+                return false;
+            };
+            ty.kotlin_qualified
+        }
         KotlinType::Named { name, arguments } if arguments.is_empty() => name,
         _ => return false,
     };

@@ -4,6 +4,7 @@
 //! source marker alone does not establish the active Lombok accessor profile.
 
 use crate::java_ir::{JavaElement, JavaSyntaxNode, render};
+use crate::jvm_primitive::JvmPrimitive;
 use crate::planning::AcceptedJavaFile;
 use crate::semantics::{
     FactStatus, JvmSignature, KotlinType, ReferenceReturnNullability, SemanticProvider, SymbolId,
@@ -698,17 +699,7 @@ fn field_descriptor(
     }
     if let KotlinType::Primitive(name) = &result_type.ty {
         if result_type.nullable {
-            let boxed = match name.as_str() {
-                "Boolean" => "java.lang.Boolean",
-                "Byte" => "java.lang.Byte",
-                "Short" => "java.lang.Short",
-                "Int" => "java.lang.Integer",
-                "Long" => "java.lang.Long",
-                "Char" => "java.lang.Character",
-                "Float" => "java.lang.Float",
-                "Double" => "java.lang.Double",
-                _ => return None,
-            };
+            let boxed = JvmPrimitive::kotlin(name)?.boxed_qualified;
             return Some(format!("L{};", boxed.replace('.', "/")));
         }
         return None;
@@ -719,25 +710,22 @@ fn field_descriptor(
     if !arguments.is_empty() {
         return None;
     }
-    let canonical = match name.as_str() {
-        "String" | "kotlin.String" | "java.lang.String" => "java.lang.String".to_owned(),
-        "java.math.BigDecimal" => "java.math.BigDecimal".to_owned(),
-        "java.math.BigInteger" => "java.math.BigInteger".to_owned(),
-        "java.util.UUID" => "java.util.UUID".to_owned(),
-        "java.lang.Boolean" | "Boolean" => "java.lang.Boolean".to_owned(),
-        "java.lang.Byte" | "Byte" => "java.lang.Byte".to_owned(),
-        "java.lang.Short" | "Short" => "java.lang.Short".to_owned(),
-        "java.lang.Integer" | "Int" => "java.lang.Integer".to_owned(),
-        "java.lang.Long" | "Long" => "java.lang.Long".to_owned(),
-        "java.lang.Character" | "Char" => "java.lang.Character".to_owned(),
-        "java.lang.Float" | "Float" => "java.lang.Float".to_owned(),
-        "java.lang.Double" | "Double" => "java.lang.Double".to_owned(),
-        _ => match provider.resolve_type_in_file(&origin.file, &origin.package, name) {
-            FactStatus::Established(symbol) => symbol_qualified_name(&symbol),
-            FactStatus::Unknown | FactStatus::Inferred(_) | FactStatus::Ambiguous(_) => {
-                return None;
-            }
-        },
+    let primitive = JvmPrimitive::kotlin(name).or_else(|| JvmPrimitive::qualified_boxed(name));
+    let canonical = if let Some(ty) = primitive {
+        ty.boxed_qualified.to_owned()
+    } else {
+        match name.as_str() {
+            "String" | "kotlin.String" | "java.lang.String" => "java.lang.String".to_owned(),
+            "java.math.BigDecimal" => "java.math.BigDecimal".to_owned(),
+            "java.math.BigInteger" => "java.math.BigInteger".to_owned(),
+            "java.util.UUID" => "java.util.UUID".to_owned(),
+            _ => match provider.resolve_type_in_file(&origin.file, &origin.package, name) {
+                FactStatus::Established(symbol) => symbol_qualified_name(&symbol),
+                FactStatus::Unknown | FactStatus::Inferred(_) | FactStatus::Ambiguous(_) => {
+                    return None;
+                }
+            },
+        }
     };
     Some(format!("L{};", canonical.replace('.', "/")))
 }
@@ -961,16 +949,11 @@ fn imported_type_matches(imported: &str, symbol: &SymbolId) -> bool {
 }
 
 fn known_external_java_type(name: &str) -> Option<&'static str> {
+    if let Some(ty) = JvmPrimitive::qualified_boxed(name) {
+        return Some(ty.boxed_qualified);
+    }
     match name {
         "java.lang.String" => Some("java.lang.String"),
-        "java.lang.Boolean" => Some("java.lang.Boolean"),
-        "java.lang.Byte" => Some("java.lang.Byte"),
-        "java.lang.Short" => Some("java.lang.Short"),
-        "java.lang.Integer" => Some("java.lang.Integer"),
-        "java.lang.Long" => Some("java.lang.Long"),
-        "java.lang.Character" => Some("java.lang.Character"),
-        "java.lang.Float" => Some("java.lang.Float"),
-        "java.lang.Double" => Some("java.lang.Double"),
         "java.math.BigDecimal" => Some("java.math.BigDecimal"),
         "java.math.BigInteger" => Some("java.math.BigInteger"),
         "java.util.UUID" => Some("java.util.UUID"),
@@ -987,16 +970,11 @@ fn known_external_java_type(name: &str) -> Option<&'static str> {
 }
 
 fn java_lang_type(name: &str) -> Option<&'static str> {
+    if let Some(ty) = JvmPrimitive::boxed(name) {
+        return Some(ty.boxed_qualified);
+    }
     match name {
         "String" => Some("java.lang.String"),
-        "Boolean" => Some("java.lang.Boolean"),
-        "Byte" => Some("java.lang.Byte"),
-        "Short" => Some("java.lang.Short"),
-        "Integer" => Some("java.lang.Integer"),
-        "Long" => Some("java.lang.Long"),
-        "Character" => Some("java.lang.Character"),
-        "Float" => Some("java.lang.Float"),
-        "Double" => Some("java.lang.Double"),
         "Object" => Some("java.lang.Object"),
         _ => None,
     }
@@ -1013,35 +991,14 @@ fn symbol_qualified_name(symbol: &SymbolId) -> String {
 }
 
 fn java_primitive_descriptor(name: &str) -> Option<&'static str> {
-    match name {
-        "boolean" => Some("Z"),
-        "byte" => Some("B"),
-        "char" => Some("C"),
-        "short" => Some("S"),
-        "int" => Some("I"),
-        "long" => Some("J"),
-        "float" => Some("F"),
-        "double" => Some("D"),
-        _ => None,
-    }
+    JvmPrimitive::java(name).map(|ty| ty.descriptor)
 }
 
 fn java_primitive_matches_type(field_type: &str, ty: &TypeRef) -> bool {
     let KotlinType::Primitive(source_name) = &ty.ty else {
         return false;
     };
-    let expected = match source_name.as_str() {
-        "Boolean" => "boolean",
-        "Byte" => "byte",
-        "Char" => "char",
-        "Short" => "short",
-        "Int" => "int",
-        "Long" => "long",
-        "Float" => "float",
-        "Double" => "double",
-        _ => return false,
-    };
-    field_type == expected
+    JvmPrimitive::kotlin(source_name).is_some_and(|ty| field_type == ty.java)
 }
 
 fn has_token(node: &JavaSyntaxNode, expected: &str) -> bool {

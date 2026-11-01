@@ -39,6 +39,7 @@
 //! memo, or widens the broad receiver fallbacks used by platform rows.
 use super::*;
 use crate::facts::protocol::{MemberFacts, SiteStatus};
+use crate::jvm_primitive::JvmPrimitive;
 
 /// Sign the shared lowering receipt for `call`, or `None` when this slice has
 /// no proof.
@@ -580,18 +581,13 @@ fn full_row_descriptor(row: &MemberFacts) -> Option<String> {
 }
 
 fn jvm_type_descriptor(name: &str) -> Option<String> {
-    match name {
-        "<void>" => Some("V".to_string()),
-        "int" => Some("I".to_string()),
-        "long" => Some("J".to_string()),
-        "double" => Some("D".to_string()),
-        "float" => Some("F".to_string()),
-        "boolean" => Some("Z".to_string()),
-        "char" => Some("C".to_string()),
-        "byte" => Some("B".to_string()),
-        "short" => Some("S".to_string()),
-        other => reference_descriptor(other),
+    if name == "<void>" {
+        return Some("V".to_owned());
     }
+    if let Some(ty) = JvmPrimitive::java(name) {
+        return Some(ty.descriptor.to_owned());
+    }
+    reference_descriptor(name)
 }
 
 /// `Class.getName()` reference spelling as a JVM field descriptor.

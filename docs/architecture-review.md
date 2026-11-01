@@ -28,6 +28,51 @@ from enum default-method selection, rather than creating another enum-specific
 resolver. Kotlin interface properties use accessor methods; companion instances
 use ordinary Java singleton objects.
 
+## Generalization pass — 2026-11-01
+
+Primitive spelling, boxing and descriptor knowledge now live in one internal
+`jvm_primitive` vocabulary. The previous primitive mapping blocks in type
+rendering, casts, generic arguments, lambda inputs, Java method facts, overload
+checks, constructor checks and Lombok getter contracts all consume that model.
+Primitive-array names and factories derive their element type from it too.
+The separate cast-boxing, function-argument-boxing and receipt-descriptor helpers
+have been removed. This removes 118 production lines overall, including the
+new shared module.
+
+For example, Kotlin `Int` consistently supplies Java `int`, boxed `Integer`,
+`java.lang.Integer`, `int[]` and JVM descriptor `I`; nullable values and generic
+arguments choose the boxed representation in their existing context. A physical
+Java `Integer` method still remains a reference return even when the semantic
+provider represents its logical Kotlin type as `Int`. `Unit`/`void`, unsigned
+values and reference classifiers retain their own rules.
+
+The shared table describes established types; it does not grant permission to
+rewrite a source spelling. Import, alias, owner and shadowing checks remain in
+their callers. The exact accepted inputs of each replaced mapping are preserved:
+for example, a helper that formerly accepted only bare Kotlin names does not
+start accepting qualified names or Java wrappers.
+
+Other overlaps were reviewed and deliberately left separate:
+
+- Getter-free external parents and methodless marker interfaces are different
+  contracts. `Comparable` has no getters but still requires `compareTo`; it
+  cannot use the marker-only rule.
+- Declared generic method returns and Kotlin property accessor contracts share
+  type facts, but have different physical JVM variance requirements. A shared
+  spelling cannot replace either contract check.
+- Default-method selection, Java super delegation and recreating a retained
+  Kotlin body are separate proofs. A Kotlin interface can compile through
+  `DefaultImpls`; changing its child to Java requires every inherited body that
+  the resulting hierarchy needs. The unfinished constant-default implementation
+  is preserved separately while this refactor is validated.
+- An intrinsic literal's type is independent of an unrelated user declaration;
+  a type spelled in source must resolve through its lexical/import scope.
+  Combining those binding rules would regress the last accepted type fixes.
+
+Validation evidence is kept under `target/generalization-20261101`. This pass
+is intended to preserve the accepted 4,481-owner conversion and generated
+Java bytes and retained Kotlin code tokens exactly; it does not claim new translation coverage.
+
 ## Commit relevance
 
 | Commit | Assessment for this work |

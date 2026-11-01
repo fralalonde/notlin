@@ -1,3 +1,4 @@
+use crate::jvm_primitive::JvmPrimitive;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
@@ -1819,17 +1820,10 @@ impl SourceIndex {
         }
         let file = self.source_file(declaring)?;
         let identity = canonical_getter_named_identity(self, file, type_name)?;
-        match identity.as_str() {
-            "kotlin.String" => Some("()Ljava/lang/String;"),
-            "kotlin.Boolean" => Some("()Z"),
-            "kotlin.Byte" => Some("()B"),
-            "kotlin.Short" => Some("()S"),
-            "kotlin.Int" => Some("()I"),
-            "kotlin.Long" => Some("()J"),
-            "kotlin.Float" => Some("()F"),
-            "kotlin.Double" => Some("()D"),
-            "kotlin.Char" => Some("()C"),
-            _ => None,
+        if identity == "kotlin.String" {
+            Some("()Ljava/lang/String;")
+        } else {
+            JvmPrimitive::kotlin(identity.strip_prefix("kotlin.")?).map(|ty| ty.getter_descriptor)
         }
     }
 

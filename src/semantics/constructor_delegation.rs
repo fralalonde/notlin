@@ -9,6 +9,7 @@ use super::{
     FactStatus, SemanticProvider, SourceLocation, SymbolId, declaration_has_modifier,
     is_type_symbol, package_name, standard_external_type, symbol_id_for_node,
 };
+use crate::jvm_primitive::JvmPrimitive;
 use crate::translation_plan::{PlannedConstructorDelegation, TranslationPlan};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -445,18 +446,8 @@ fn primitive_type<P: SemanticProvider + ?Sized>(
     spelling: &str,
     provider: &P,
 ) -> Option<bool> {
-    let canonical = match spelling {
-        "kotlin.Boolean" => "Boolean",
-        "kotlin.Byte" => "Byte",
-        "kotlin.Short" => "Short",
-        "kotlin.Int" => "Int",
-        "kotlin.Long" => "Long",
-        "kotlin.Float" => "Float",
-        "kotlin.Double" => "Double",
-        "kotlin.Char" => "Char",
-        "Boolean" | "Byte" | "Short" | "Int" | "Long" | "Float" | "Double" | "Char" => spelling,
-        _ => return None,
-    };
+    let canonical =
+        JvmPrimitive::kotlin(spelling.strip_prefix("kotlin.").unwrap_or(spelling))?.kotlin;
     if spelling.starts_with("kotlin.") {
         return Some(true);
     }

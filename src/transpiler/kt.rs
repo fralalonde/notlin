@@ -81,22 +81,11 @@ pub fn java_parameter_type(node: tree_sitter::Node, source: &str, annots: Annota
 pub fn java_type_ann(node: tree_sitter::Node, source: &str, annots: AnnotationSet) -> String {
     let java = java_type(node, source);
     if node.kind() == "nullable_type" {
-        let java = match java.as_str() {
-            "int" => "Integer",
-            "long" => "Long",
-            "short" => "Short",
-            "byte" => "Byte",
-            "double" => "Double",
-            "float" => "Float",
-            "boolean" => "Boolean",
-            "char" => "Character",
-            other => other,
-        }
-        .to_string();
+        let java = crate::transpiler::types::boxed_name(&java).unwrap_or(&java);
         if let Some(a) = annots.nullable() {
             return format!("{} {}", a, java);
         }
-        return java;
+        return java.to_owned();
     }
     java
 }

@@ -1,6 +1,7 @@
 //! Best-effort type inference and receiver-type helpers.
 
 use super::Unit;
+use crate::jvm_primitive::JvmPrimitive;
 use crate::transpiler::kt;
 
 impl<'src, 'tree> Unit<'src, 'tree> {
@@ -690,18 +691,10 @@ pub(crate) fn instance_property_count(decl: &crate::workspace::Declaration) -> u
 
 /// Kotlin primitive-array factories -> Java array type.
 pub(crate) fn primitive_array_factory(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "intArrayOf" => "int[]",
-        "longArrayOf" => "long[]",
-        "shortArrayOf" => "short[]",
-        "byteArrayOf" => "byte[]",
-        "doubleArrayOf" => "double[]",
-        "floatArrayOf" => "float[]",
-        "booleanArrayOf" => "boolean[]",
-        "charArrayOf" => "char[]",
-        "arrayOf" => "Object[]",
-        _ => return None,
-    })
+    if name == "arrayOf" {
+        return Some("Object[]");
+    }
+    JvmPrimitive::java(name.strip_suffix("ArrayOf")?).map(|ty| ty.array)
 }
 
 /// The nth type argument of a generic Java type text

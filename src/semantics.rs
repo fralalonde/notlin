@@ -3,6 +3,7 @@
 //! This layer deliberately reports uncertainty instead of inventing compiler
 //! answers. In particular, an unresolved type is never silently Object.
 use crate::facts::protocol::{CallSite, MemberFacts, SiteStatus};
+use crate::jvm_primitive::JvmPrimitive;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1621,34 +1622,16 @@ impl TypeRef {
                 nullable: false,
             };
         }
-        let primitive = match value {
-            "boolean" => Some("Boolean"),
-            "byte" => Some("Byte"),
-            "short" => Some("Short"),
-            "int" => Some("Int"),
-            "long" => Some("Long"),
-            "char" => Some("Char"),
-            "float" => Some("Float"),
-            "double" => Some("Double"),
-            _ => None,
-        };
-        if let Some(name) = primitive {
+        if let Some(ty) = JvmPrimitive::java(value) {
             return Self {
-                ty: KotlinType::Primitive(name.into()),
+                ty: KotlinType::Primitive(ty.kotlin.into()),
                 nullable: false,
             };
         }
-        let canonical = match value {
-            "java.lang.String" => "String",
-            "java.lang.Boolean" => "Boolean",
-            "java.lang.Byte" => "Byte",
-            "java.lang.Short" => "Short",
-            "java.lang.Integer" => "Int",
-            "java.lang.Long" => "Long",
-            "java.lang.Character" => "Char",
-            "java.lang.Float" => "Float",
-            "java.lang.Double" => "Double",
-            _ => value,
+        let canonical = if value == "java.lang.String" {
+            "String"
+        } else {
+            JvmPrimitive::qualified_boxed(value).map_or(value, |ty| ty.kotlin)
         };
         Self::parse(canonical)
     }
@@ -2935,15 +2918,10 @@ impl SyntaxSemanticProvider {
                         "Class" | "java.lang.Class" => "java.lang.Class",
                         "String" | "kotlin.String" | "java.lang.String" => "kotlin.String",
                         "Any" | "kotlin.Any" => "kotlin.Any",
-                        "Boolean" => "kotlin.Boolean",
-                        "Byte" => "kotlin.Byte",
-                        "Short" => "kotlin.Short",
-                        "Int" => "kotlin.Int",
-                        "Long" => "kotlin.Long",
-                        "Float" => "kotlin.Float",
-                        "Double" => "kotlin.Double",
-                        "Char" => "kotlin.Char",
-                        _ => return false,
+                        _ => match JvmPrimitive::kotlin(name) {
+                            Some(ty) => ty.kotlin_qualified,
+                            None => return false,
+                        },
                     };
                     self.source_for_file(&member.file).is_some_and(|source| {
                         !kotlin_import_lines(source).any(|import| {
@@ -2995,20 +2973,15 @@ impl SyntaxSemanticProvider {
                     "String" => "kotlin.String",
                     "Any" => "kotlin.Any",
                     "Unit" => "kotlin.Unit",
-                    "Boolean" => "kotlin.Boolean",
-                    "Byte" => "kotlin.Byte",
-                    "Short" => "kotlin.Short",
-                    "Int" => "kotlin.Int",
-                    "Long" => "kotlin.Long",
-                    "Float" => "kotlin.Float",
-                    "Double" => "kotlin.Double",
-                    "Char" => "kotlin.Char",
                     "List" | "MutableList" => "kotlin.collections.List",
                     "Set" | "MutableSet" => "kotlin.collections.Set",
                     "Map" | "MutableMap" => "kotlin.collections.Map",
                     "Collection" | "MutableCollection" => "kotlin.collections.Collection",
                     "Iterable" | "MutableIterable" => "kotlin.collections.Iterable",
-                    _ => return false,
+                    _ => match JvmPrimitive::kotlin(name) {
+                        Some(ty) => ty.kotlin_qualified,
+                        None => return false,
+                    },
                 };
                 !kotlin_import_lines(source).any(|import| {
                     import.ends_with(".*") && import != "java.util.*"
@@ -7467,19 +7440,9 @@ pub(crate) fn declared_source_call_return_type<P: SemanticProvider + ?Sized>(
         if !read.jvm_primitive
             && let KotlinType::Primitive(name) = &ty.ty
         {
-            let boxed = match name.as_str() {
-                "Boolean" => "Boolean",
-                "Byte" => "Byte",
-                "Short" => "Short",
-                "Int" => "Integer",
-                "Long" => "Long",
-                "Char" => "Character",
-                "Float" => "Float",
-                "Double" => "Double",
-                _ => return None,
-            };
+            let boxed = JvmPrimitive::kotlin(name)?.boxed_qualified;
             ty.ty = KotlinType::Named {
-                name: format!("java.lang.{boxed}"),
+                name: boxed.to_owned(),
                 arguments: vec![],
             };
         }
@@ -8337,6 +8300,7 @@ pub(crate) fn standard_external_type<P: SemanticProvider + ?Sized>(
         .next()
         .unwrap_or("")
         .trim();
+    let primitive = JvmPrimitive::kotlin(spelling.strip_prefix("kotlin.").unwrap_or(spelling));
     let (simple, canonical, intrinsic) = match spelling {
         "BigDecimal" | "java.math.BigDecimal" => ("BigDecimal", "java.math.BigDecimal", false),
         "UUID" | "java.util.UUID" => ("UUID", "java.util.UUID", false),
@@ -8354,14 +8318,10 @@ pub(crate) fn standard_external_type<P: SemanticProvider + ?Sized>(
         "Class" | "java.lang.Class" => ("Class", "java.lang.Class", true),
         "Any" | "kotlin.Any" if !java_source => ("Any", "kotlin.Any", true),
         "Object" | "java.lang.Object" => ("Object", "java.lang.Object", true),
-        "Int" | "kotlin.Int" => ("Int", "kotlin.Int", true),
-        "Long" | "kotlin.Long" => ("Long", "kotlin.Long", true),
-        "Short" | "kotlin.Short" => ("Short", "kotlin.Short", true),
-        "Byte" | "kotlin.Byte" => ("Byte", "kotlin.Byte", true),
-        "Double" | "kotlin.Double" => ("Double", "kotlin.Double", true),
-        "Float" | "kotlin.Float" => ("Float", "kotlin.Float", true),
-        "Boolean" | "kotlin.Boolean" => ("Boolean", "kotlin.Boolean", true),
-        "Char" | "kotlin.Char" => ("Char", "kotlin.Char", true),
+        _ if primitive.is_some() => {
+            let ty = primitive?;
+            (ty.kotlin, ty.kotlin_qualified, true)
+        }
         "StringBuilder" | "java.lang.StringBuilder" => {
             ("StringBuilder", "java.lang.StringBuilder", true)
         }

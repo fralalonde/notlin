@@ -9,6 +9,7 @@ use super::{
     KotlinType, SemanticProvider, SymbolId, TypeRef, call_callee_node, declaration_type_parameters,
     lexical_parameter_type, object_calls, standard_external_type,
 };
+use crate::jvm_primitive::JvmPrimitive;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -387,17 +388,7 @@ fn canonical_type<P: SemanticProvider + ?Sized>(
 }
 
 fn primitive(name: &str) -> Option<ExactType> {
-    Some(ExactType::Primitive(match name {
-        "Boolean" => "Boolean",
-        "Byte" => "Byte",
-        "Short" => "Short",
-        "Int" => "Int",
-        "Long" => "Long",
-        "Char" => "Char",
-        "Float" => "Float",
-        "Double" => "Double",
-        _ => return None,
-    }))
+    JvmPrimitive::kotlin(name).map(|ty| ExactType::Primitive(ty.kotlin))
 }
 
 fn candidate_parameter_types<P: SemanticProvider + ?Sized>(

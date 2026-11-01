@@ -12,6 +12,7 @@ mod eager_collection_helpers;
 pub mod facts;
 pub mod function_callsite;
 pub mod java_ir;
+mod jvm_primitive;
 pub mod jvm_validation;
 mod lombok_configuration;
 pub mod lombok_getter_contracts;

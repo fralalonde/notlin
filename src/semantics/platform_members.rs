@@ -5,6 +5,7 @@
 //! a declaration does not add a new translation algorithm.
 use super::*;
 use crate::facts::classpath::{intern, intern_alternatives};
+use crate::jvm_primitive::JvmPrimitive;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Dispatch {
@@ -585,18 +586,13 @@ fn member_rows(
 
 /// JVM classifier name as the resolver's argument types spell it.
 fn classifier(name: &str) -> String {
-    match name {
-        "<void>" => "kotlin.Unit".to_string(),
-        "int" | "java.lang.Integer" => "kotlin.Int".to_string(),
-        "long" | "java.lang.Long" => "kotlin.Long".to_string(),
-        "double" | "java.lang.Double" => "kotlin.Double".to_string(),
-        "float" | "java.lang.Float" => "kotlin.Float".to_string(),
-        "boolean" | "java.lang.Boolean" => "kotlin.Boolean".to_string(),
-        "short" | "java.lang.Short" => "kotlin.Short".to_string(),
-        "byte" | "java.lang.Byte" => "kotlin.Byte".to_string(),
-        "char" | "java.lang.Character" => "kotlin.Char".to_string(),
-        other => other.to_string(),
+    if name == "<void>" {
+        return "kotlin.Unit".to_owned();
     }
+    JvmPrimitive::java(name)
+        .or_else(|| JvmPrimitive::qualified_boxed(name))
+        .map_or(name, |ty| ty.kotlin_qualified)
+        .to_owned()
 }
 
 /// The owner a classpath fact source may be asked about for `spelling`.

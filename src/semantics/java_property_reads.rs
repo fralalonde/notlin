@@ -8,6 +8,7 @@ use super::{
     SymbolId, SyntaxSemanticProvider, TypeRef, declaration_type_node, has_java_modifier,
     own_type_parameters, source_calls,
 };
+use crate::jvm_primitive::JvmPrimitive;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use tree_sitter::Node;
@@ -148,17 +149,7 @@ pub(super) fn collect(
     // Keep their reference status separately, including @NotNull boxed values.
     let mut boxed_simple_name = None;
     if !jvm_primitive {
-        let boxed = match spelling {
-            "Boolean" => Some("Boolean"),
-            "Byte" => Some("Byte"),
-            "Short" => Some("Short"),
-            "Integer" => Some("Int"),
-            "Long" => Some("Long"),
-            "Character" => Some("Char"),
-            "Float" => Some("Float"),
-            "Double" => Some("Double"),
-            _ => None,
-        };
+        let boxed = JvmPrimitive::boxed(spelling).map(|ty| ty.kotlin);
         if let Some(name) = boxed {
             if !plain_java_lang_binding(source, node, spelling) {
                 return None;

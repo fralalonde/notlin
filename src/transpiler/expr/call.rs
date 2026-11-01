@@ -1050,7 +1050,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                 substitute_type_parameters(comps[index].0.trim(), &substitutions);
                             captured_args.push((
                                 temp.clone(),
-                                java_function_type_arg(&arg_ty),
+                                crate::transpiler::types::boxed_java_type(&arg_ty),
                                 value.clone(),
                             ));
                             slots[index] = Some(temp);
@@ -2735,20 +2735,6 @@ fn substitute_type_parameters(
     }
     output.push_str(&java_type[cursor..]);
     output
-}
-
-fn java_function_type_arg(ty: &str) -> String {
-    match ty {
-        "boolean" => "Boolean".into(),
-        "byte" => "Byte".into(),
-        "short" => "Short".into(),
-        "int" => "Integer".into(),
-        "long" => "Long".into(),
-        "char" => "Character".into(),
-        "float" => "Float".into(),
-        "double" => "Double".into(),
-        _ => ty.to_string(),
-    }
 }
 
 fn capitalize_copy_name(name: &str) -> String {

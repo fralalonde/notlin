@@ -2,6 +2,7 @@ use super::{
     FactStatus, KotlinType, MapAliasTypeArguments, SemanticProvider, SymbolId, TypeAliasDefinition,
     Variance,
 };
+use crate::jvm_primitive::JvmPrimitive;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -202,17 +203,9 @@ fn scalar_java_name<P: SemanticProvider + ?Sized>(
     let (name, nullable) = flatten_nullable(argument.ty.as_ref()?)?;
     let java = match name {
         "String" | "kotlin.String" => "java.lang.String",
-        "Boolean" | "kotlin.Boolean" => "java.lang.Boolean",
-        "Byte" | "kotlin.Byte" => "java.lang.Byte",
-        "Short" | "kotlin.Short" => "java.lang.Short",
-        "Int" | "kotlin.Int" => "java.lang.Integer",
-        "Long" | "kotlin.Long" => "java.lang.Long",
-        "Float" | "kotlin.Float" => "java.lang.Float",
-        "Double" | "kotlin.Double" => "java.lang.Double",
-        "Char" | "kotlin.Char" => "java.lang.Character",
         "Any" | "kotlin.Any" => "java.lang.Object",
         "Number" | "kotlin.Number" => "java.lang.Number",
-        _ => return None,
+        _ => JvmPrimitive::kotlin(name.strip_prefix("kotlin.").unwrap_or(name))?.boxed_qualified,
     };
     if !name.starts_with("kotlin.") {
         let source = provider.source_for_file(file)?;

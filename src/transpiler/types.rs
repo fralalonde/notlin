@@ -1,5 +1,6 @@
 //! Shared type-name and annotation helpers.
 
+use crate::jvm_primitive::JvmPrimitive;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AnnotationSet {
     Jetbrains,
@@ -40,6 +41,13 @@ pub(crate) fn cast_type(java_type: &str) -> String {
 /// into every emitted API. `MutableCollection`/`MutableIterator` had no entry
 /// at all and reached Java as Kotlin names, which does not compile.
 pub fn map_type_name(kotlin_type: &str) -> &str {
+    let builtin = kotlin_type.strip_prefix("kotlin.").unwrap_or(kotlin_type);
+    if let Some(primitive) = JvmPrimitive::kotlin(builtin) {
+        return primitive.java;
+    }
+    if let Some(primitive) = builtin.strip_suffix("Array").and_then(JvmPrimitive::kotlin) {
+        return primitive.array;
+    }
     match kotlin_type {
         "Any" => "Object",
         "kotlin.Any" => "java.lang.Object",
@@ -65,22 +73,6 @@ pub fn map_type_name(kotlin_type: &str) -> &str {
         // Function declarations map an explicit Unit result to Java `void`
         // in the return-type context instead.
         "Unit" => "kotlin.Unit",
-        "Int" | "kotlin.Int" => "int",
-        "Long" | "kotlin.Long" => "long",
-        "Short" | "kotlin.Short" => "short",
-        "Byte" | "kotlin.Byte" => "byte",
-        "Double" | "kotlin.Double" => "double",
-        "Float" | "kotlin.Float" => "float",
-        "Boolean" | "kotlin.Boolean" => "boolean",
-        "Char" | "kotlin.Char" => "char",
-        "IntArray" | "kotlin.IntArray" => "int[]",
-        "LongArray" | "kotlin.LongArray" => "long[]",
-        "ShortArray" | "kotlin.ShortArray" => "short[]",
-        "ByteArray" | "kotlin.ByteArray" => "byte[]",
-        "DoubleArray" | "kotlin.DoubleArray" => "double[]",
-        "FloatArray" | "kotlin.FloatArray" => "float[]",
-        "BooleanArray" | "kotlin.BooleanArray" => "boolean[]",
-        "CharArray" | "kotlin.CharArray" => "char[]",
         "Array" | "kotlin.Array" => "__NOTLIN_ARRAY__",
         "UByte" | "UShort" | "UInt" | "ULong" => "long",
         // stdlib container types have no JDK twin; `to` emits a
@@ -95,17 +87,12 @@ pub fn map_type_name(kotlin_type: &str) -> &str {
 /// Boxed names for generic type arguments: Java generics cannot hold
 /// primitives, so `List<Int>` must be `List<Integer>`.
 pub fn boxed_name(java_primitive: &str) -> Option<&'static str> {
-    match java_primitive {
-        "int" => Some("Integer"),
-        "long" => Some("Long"),
-        "short" => Some("Short"),
-        "byte" => Some("Byte"),
-        "double" => Some("Double"),
-        "float" => Some("Float"),
-        "boolean" => Some("Boolean"),
-        "char" => Some("Character"),
-        _ => None,
-    }
+    JvmPrimitive::java(java_primitive).map(|ty| ty.boxed)
+}
+
+/// A Java type usable in a reference-only context such as a cast or generic.
+pub(crate) fn boxed_java_type(java_type: &str) -> String {
+    boxed_name(java_type).unwrap_or(java_type).to_owned()
 }
 
 /// Marker emitted for `() -> R` function types: the type itself can't map to
@@ -143,17 +130,7 @@ pub fn box_primitive_generics(targs: &str) -> String {
         if ch == ',' || ch == '<' || ch == '>' {
             if !tok.is_empty() {
                 let t = tok.trim();
-                out.push_str(match t {
-                    "Int" => "Integer",
-                    "Long" => "Long",
-                    "Short" => "Short",
-                    "Byte" => "Byte",
-                    "Double" => "Double",
-                    "Float" => "Float",
-                    "Boolean" => "Boolean",
-                    "Char" => "Character",
-                    _ => t,
-                });
+                out.push_str(JvmPrimitive::kotlin(t).map_or(t, |ty| ty.boxed));
                 tok.clear();
             }
             out.push(ch);
@@ -163,17 +140,7 @@ pub fn box_primitive_generics(targs: &str) -> String {
     }
     if !tok.is_empty() {
         let t = tok.trim();
-        out.push_str(match t {
-            "Int" => "Integer",
-            "Long" => "Long",
-            "Short" => "Short",
-            "Byte" => "Byte",
-            "Double" => "Double",
-            "Float" => "Float",
-            "Boolean" => "Boolean",
-            "Char" => "Character",
-            _ => t,
-        });
+        out.push_str(JvmPrimitive::kotlin(t).map_or(t, |ty| ty.boxed));
     }
     out
 }

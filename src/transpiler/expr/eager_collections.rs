@@ -1,6 +1,7 @@
 //! Preparation consumes proven eager call facts; helper loops are structured at acceptance.
 
 use super::Expr;
+use crate::jvm_primitive::JvmPrimitive;
 use crate::semantics::{KotlinType, SourceLocation, TypeRef};
 use tree_sitter::Node;
 
@@ -140,17 +141,7 @@ fn lambda_java_type(ty: &TypeRef) -> Option<String> {
     match &ty.ty {
         KotlinType::Primitive(name) => Some(
             if ty.nullable {
-                match name.as_str() {
-                    "Int" => "Integer",
-                    "Long" => "Long",
-                    "Short" => "Short",
-                    "Byte" => "Byte",
-                    "Double" => "Double",
-                    "Float" => "Float",
-                    "Boolean" => "Boolean",
-                    "Char" => "Character",
-                    _ => return None,
-                }
+                JvmPrimitive::kotlin(name)?.boxed
             } else {
                 crate::transpiler::types::map_type_name(name)
             }

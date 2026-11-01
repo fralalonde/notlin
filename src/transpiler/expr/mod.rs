@@ -1,5 +1,7 @@
 //! Expression translation: Kotlin expression tree -> Java expression text.
 
+use super::types::boxed_java_type;
+
 mod binary;
 mod call;
 mod container_lambdas;
@@ -334,7 +336,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     .iter()
                     .filter(|c| c.is_named())
                     .nth(1)
-                    .map(|t| box_primitive(&kt::java_type(*t, self.unit.source)))
+                    .map(|t| boxed_java_type(&kt::java_type(*t, self.unit.source)))
                     .unwrap_or_else(|| "Object".to_string());
                 match target {
                     Some(t) => {
@@ -1116,7 +1118,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .iter()
             .filter(|c| c.is_named())
             .nth(1)
-            .map(|t| box_primitive(&kt::java_type(*t, self.unit.source)))
+            .map(|t| boxed_java_type(&kt::java_type(*t, self.unit.source)))
             .unwrap_or_else(|| "Object".to_string());
         let nullable = kids.iter().any(|c| self.unit.text(*c).trim() == "as?");
         let Some(left) = left else {
@@ -1309,7 +1311,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 {
                     return None;
                 }
-                let ty = box_primitive(&kt::java_type(*children.get(1)?, self.unit.source));
+                let ty = boxed_java_type(&kt::java_type(*children.get(1)?, self.unit.source));
                 Some((name.to_string(), ty, self.unit.text(c).contains("!is")))
             });
         if let Some((name, ty, _)) = &narrowing
@@ -1385,19 +1387,4 @@ fn unwrap_paren_node(mut node: tree_sitter::Node) -> tree_sitter::Node {
         node = inner;
     }
     node
-}
-
-/// Map primitive Java types to their boxed forms (for instanceof/casts).
-fn box_primitive(ty: &str) -> String {
-    match ty {
-        "int" => "Integer".to_string(),
-        "long" => "Long".to_string(),
-        "short" => "Short".to_string(),
-        "byte" => "Byte".to_string(),
-        "double" => "Double".to_string(),
-        "float" => "Float".to_string(),
-        "boolean" => "Boolean".to_string(),
-        "char" => "Character".to_string(),
-        other => other.to_string(),
-    }
 }

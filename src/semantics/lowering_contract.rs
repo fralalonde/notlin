@@ -67,6 +67,7 @@
 //! that the operation is unsupported in principle.
 
 use super::*;
+use crate::jvm_primitive::JvmPrimitive;
 use serde::{Deserialize, Serialize};
 
 /// The one reference type a nullable exit may name structurally.
@@ -802,18 +803,13 @@ enum Builtin {
 }
 
 fn builtin_type(name: &str) -> Option<Builtin> {
+    if let Some(ty) = JvmPrimitive::kotlin(name) {
+        return Some(Builtin::Primitive(ty.java));
+    }
     Some(match name {
         "Unit" => Builtin::Void,
         "Any" => Builtin::Object,
         "String" => Builtin::Reference("java.lang.String"),
-        "Int" => Builtin::Primitive("int"),
-        "Long" => Builtin::Primitive("long"),
-        "Short" => Builtin::Primitive("short"),
-        "Byte" => Builtin::Primitive("byte"),
-        "Double" => Builtin::Primitive("double"),
-        "Float" => Builtin::Primitive("float"),
-        "Boolean" => Builtin::Primitive("boolean"),
-        "Char" => Builtin::Primitive("char"),
         _ => return None,
     })
 }
@@ -2688,7 +2684,7 @@ pub(crate) fn descriptor_result_matches(outcome: &JavaOutcome, descriptor: &str)
         JavaOutcome::Void => result == "V",
         JavaOutcome::Value(value) => match &value.kind {
             ReprKind::Primitive => {
-                primitive_descriptor(&value.erased).is_some_and(|code| result == code)
+                JvmPrimitive::java(&value.erased).is_some_and(|ty| result == ty.descriptor)
             }
             ReprKind::Array(_) => result.starts_with('['),
             ReprKind::ErasedReference | ReprKind::ParameterizedReference(_) => {
@@ -2702,20 +2698,6 @@ pub(crate) fn descriptor_result_matches(outcome: &JavaOutcome, descriptor: &str)
             }
         },
     }
-}
-
-fn primitive_descriptor(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "int" => "I",
-        "long" => "J",
-        "double" => "D",
-        "float" => "F",
-        "boolean" => "Z",
-        "char" => "C",
-        "byte" => "B",
-        "short" => "S",
-        _ => return None,
-    })
 }
 
 #[cfg(test)]
