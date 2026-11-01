@@ -24,6 +24,7 @@ pub(super) fn plan_default_getters(
     retained: &HashSet<SymbolId>,
     roots: &[std::path::PathBuf],
     plan: &mut TranslationPlan,
+    provider: Option<&dyn crate::semantics::SemanticProvider>,
 ) {
     let Some(source_file) = index.source_file(file) else {
         return;
@@ -105,6 +106,60 @@ pub(super) fn plan_default_getters(
             && boundary_decisions.get(&boundary) == Some(&BackendOwner::Java)
     };
 
+    // Materialize defaults whose JVM presence cannot be inherited from retained
+    // Kotlin. Selection is shared with explicit super calls; only the body
+    // representation differs from the existing Java-super bridge.
+    let mut constant_bridges = Vec::new();
+    let mut initialization_boundaries = HashSet::new();
+    if let Some(provider) = provider {
+        for class in &classes {
+            if boundary_decisions.get(&class.boundary) != Some(&BackendOwner::Java) {
+                continue;
+            }
+            let indexed = source_file
+                .declarations
+                .iter()
+                .filter(|declaration| {
+                    same_source_identity(
+                        &crate::semantics::workspace_symbol(index, declaration),
+                        &class.symbol,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let [indexed] = indexed.as_slice() else {
+                continue;
+            };
+            for body in index.inherited_constant_defaults(indexed, provider) {
+                if java_default_owner(&body.target) {
+                    continue;
+                }
+                if !index.interface_default_initialization_is_safe(indexed) {
+                    initialization_boundaries.insert(class.boundary.clone());
+                    break;
+                }
+                let location = SourceLocation {
+                    file: file.to_path_buf(),
+                    snapshot_hash: plan.source_hash,
+                    start_byte: class.start,
+                    end_byte: class.end,
+                };
+                constant_bridges.push((
+                    class.boundary.clone(),
+                    PlannedDefaultGetterBridge {
+                        owner: class.symbol.clone(),
+                        location,
+                        target: body.target.clone(),
+                        provider: body.target,
+                        method_name: body.method_name,
+                        return_type_ref: crate::semantics::TypeRef::parse(&body.return_type),
+                        return_type: body.return_type,
+                        body: PlannedDefaultGetterBody::SourceConstant { value: body.value },
+                    },
+                ));
+            }
+        }
+    }
+
     let mut results = Vec::new();
     let mut affected_ambiguous_boundaries = HashSet::<SymbolId>::new();
     for class in &classes {
@@ -162,13 +217,18 @@ pub(super) fn plan_default_getters(
                         accepted.push((bridge, PlannedDefaultGetterBody::JavaSuperDelegation));
                         continue;
                     }
-                    let accessors = bridge.body.as_ref().map(|body| {
-                        body.steps
-                            .iter()
-                            .map(|step| step.accessor.clone())
-                            .collect::<Vec<_>>()
+                    let body = bridge.body.as_ref().map(|body| PlannedDefaultGetterBody::SourceForwarding {
+                        accessors: body.steps.iter().map(|step| step.accessor.clone()).collect(),
+                    }).or_else(|| {
+                        let provider = provider?;
+                        let file = index.source_file(&bridge.target.file)?;
+                        let target = file.declarations.iter().find(|declaration| {
+                            crate::semantics::workspace_symbol(index, declaration) == bridge.target
+                        })?;
+                        let body = index.constant_interface_default(target, &bridge.method_name, provider)?;
+                        (body.target == bridge.target).then_some(PlannedDefaultGetterBody::SourceConstant { value: body.value })
                     });
-                    let Some(accessors) = accessors else {
+                    let Some(body) = body else {
                         let target = &bridge.target;
                         let mut path = target.owner_path.clone();
                         path.push(target.name.clone());
@@ -180,10 +240,7 @@ pub(super) fn plan_default_getters(
                         blocked.push(format!("`{owner}#{}`", bridge.method_name));
                         continue;
                     };
-                    accepted.push((
-                        bridge,
-                        PlannedDefaultGetterBody::SourceForwarding { accessors },
-                    ));
+                    accepted.push((bridge, body));
                 }
                 blocked.sort();
                 blocked.dedup();
@@ -207,6 +264,14 @@ pub(super) fn plan_default_getters(
 
     let ambiguous_boundaries = affected_ambiguous_boundaries;
     let mut failed_boundaries = ambiguous_boundaries.clone();
+    for boundary in initialization_boundaries {
+        failed_boundaries.insert(boundary.clone());
+        retain_boundary(
+            plan,
+            &boundary,
+            "materialized interface defaults would change observable companion initialization timing",
+        );
+    }
     let mut error_boundaries = HashSet::new();
     let mut successful = Vec::new();
     for (owner, boundary, start, end, result) in results {
@@ -254,6 +319,18 @@ pub(super) fn plan_default_getters(
                     body,
                 });
         }
+    }
+    for (boundary, bridge) in constant_bridges {
+        if failed_boundaries.contains(&boundary)
+            || plan.default_getter_bridges.iter().any(|existing| {
+                existing.owner == bridge.owner && existing.method_name == bridge.method_name
+            })
+        {
+            continue;
+        }
+        plan.record_generated_bridge(&bridge.owner, format!("constant-interface-default:{}", bridge.method_name),
+            "re-create the selected retained Kotlin constant default without JVM-default assumptions");
+        plan.default_getter_bridges.push(bridge);
     }
 }
 
@@ -456,7 +533,7 @@ mod tests {
             let (_fixture, file, index, mut plan) = fixture(&source);
             let roots = vec![file.parent().unwrap().to_path_buf()];
             let retained = HashSet::from([decision(&plan, "Middle").symbol_id.clone()]);
-            plan_default_getters(&index, &file, &retained, &roots, &mut plan);
+            plan_default_getters(&index, &file, &retained, &roots, &mut plan, None);
 
             if overrides_default {
                 assert_eq!(
@@ -502,7 +579,7 @@ mod tests {
         "#;
         let (_fixture, file, index, mut plan) = fixture(source);
         let roots = vec![file.parent().unwrap().to_path_buf()];
-        plan_default_getters(&index, &file, &HashSet::new(), &roots, &mut plan);
+        plan_default_getters(&index, &file, &HashSet::new(), &roots, &mut plan, None);
 
         assert_eq!(decision(&plan, "Outer").candidate_owner, BackendOwner::Java);
         assert_eq!(plan.default_getter_bridges.len(), 1);
@@ -534,7 +611,7 @@ mod tests {
         "#;
         let (_fixture, file, index, mut plan) = fixture(source);
         let roots = vec![file.parent().unwrap().to_path_buf()];
-        plan_default_getters(&index, &file, &HashSet::new(), &roots, &mut plan);
+        plan_default_getters(&index, &file, &HashSet::new(), &roots, &mut plan, None);
 
         assert_eq!(
             decision(&plan, "Outer").candidate_owner,
@@ -582,7 +659,7 @@ mod tests {
         let roots = vec![file.parent().unwrap().to_path_buf()];
         let retained = HashSet::from([symbol_of(&index, "Providers.kt", "Provider")]);
         assert!(index.is_selected(&file, &roots));
-        plan_default_getters(&index, &file, &retained, &roots, &mut plan);
+        plan_default_getters(&index, &file, &retained, &roots, &mut plan, None);
 
         assert_eq!(
             decision(&plan, "Child").candidate_owner,
@@ -641,7 +718,7 @@ mod tests {
             let (_fixture, file, index, mut plan) = fixture_files(&providers, child);
             let roots = vec![file.parent().unwrap().to_path_buf()];
             let retained = HashSet::from([symbol_of(&index, "Providers.kt", "Provider")]);
-            plan_default_getters(&index, &file, &retained, &roots, &mut plan);
+            plan_default_getters(&index, &file, &retained, &roots, &mut plan, None);
             assert_eq!(
                 decision(&plan, "Child").candidate_owner,
                 BackendOwner::Kotlin,

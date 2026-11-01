@@ -8,6 +8,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+mod constant_defaults;
 mod default_getters;
 pub(crate) mod header_facts;
 mod jvm_defaults;
@@ -29,7 +30,8 @@ pub(crate) mod profile;
 // 29: method-generic and inline-bound header facts reuse the indexing parse.
 // 31: setter_name_renamed indexes @JvmName presence on properties.
 // 32: method type parameters prevent source classifiers from capturing returns.
-const CACHE_VERSION: u32 = 33;
+// 34: enum method headers use the same nongeneric signature facts as classes.
+const CACHE_VERSION: u32 = 34;
 const CACHE_DIR: &str = ".notlin";
 const CACHE_FILE: &str = "index-v1.bin";
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;

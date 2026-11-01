@@ -316,6 +316,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 
     fn call_body(&mut self, node: tree_sitter::Node) -> String {
+        if let Some(value) = self.retained_constant_super_call(node) {
+            return value;
+        }
         if let Some((receiver, separator, string_elements)) =
             self.unit.semantic_provider.and_then(|provider| {
                 crate::semantics::string_join::establish(
@@ -2552,6 +2555,97 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 .children(&mut values[0].walk())
                 .find(|child| child.is_named())
                 .is_some_and(|argument| self.is_known_string_expression(argument))
+    }
+}
+
+impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
+    fn retained_constant_super_call(&self, call: tree_sitter::Node<'_>) -> Option<String> {
+        let children = call
+            .named_children(&mut call.walk())
+            .filter(|node| !node.is_extra())
+            .collect::<Vec<_>>();
+        let [navigation, arguments] = children.as_slice() else {
+            return None;
+        };
+        if navigation.kind() != "navigation_expression"
+            || arguments.kind() != "value_arguments"
+            || arguments
+                .named_children(&mut arguments.walk())
+                .any(|node| !node.is_extra())
+        {
+            return None;
+        }
+        let parts = navigation
+            .named_children(&mut navigation.walk())
+            .filter(|node| !node.is_extra())
+            .collect::<Vec<_>>();
+        let [base, member] = parts.as_slice() else {
+            return None;
+        };
+        if base.kind() != "super_expression" || member.kind() != "identifier" {
+            return None;
+        }
+        let index = self.unit.workspace?;
+        let provider = self.unit.semantic_provider?;
+        let declaring = self
+            .unit
+            .workspace_file
+            .as_deref()
+            .unwrap_or(self.unit.file);
+        let file = index.source_file(declaring)?;
+        let name = self.unit.text(*member);
+        let owner_name = self.enclosing_type_name()?;
+        let owners = file
+            .declarations
+            .iter()
+            .filter(|d| d.name == owner_name)
+            .collect::<Vec<_>>();
+        let [owner] = owners.as_slice() else {
+            return None;
+        };
+        let qualifier = kt::child(*base, "user_type")
+            .map(|node| self.unit.text(node).to_owned())
+            .or_else(|| index.direct_supertype_for_member(declaring, &owner_name, name))?;
+        let parent = index.resolve_type(file, &qualifier)?;
+        if parent.language != crate::workspace::SourceLanguage::Kotlin
+            || !owner.supertypes.iter().any(|ty| {
+                index.resolve_type(file, ty).is_some_and(|d| {
+                    crate::semantics::workspace_symbol(index, d)
+                        == crate::semantics::workspace_symbol(index, parent)
+                })
+            })
+        {
+            return None;
+        }
+        let retained = self.unit.retained_hint?;
+        if !index.declaration_retained(parent, retained)
+            && index.is_selected(
+                &index.declaration_source_file(parent)?.path,
+                self.unit.translation_roots,
+            )
+        {
+            return None;
+        }
+        if owner.kind == crate::workspace::DeclarationKind::Enum
+            && !index.has_modern_kotlin_interface_defaults()
+            && !owner
+                .supertypes
+                .iter()
+                .filter_map(|ty| index.resolve_type(file, ty))
+                .filter(|parent| parent.language == crate::workspace::SourceLanguage::Kotlin)
+                .all(|parent| {
+                    index.concrete_getters_cover_retained_interface(
+                        owner,
+                        parent,
+                        &self.unit.default_getter_bridges,
+                        provider,
+                    )
+                })
+        {
+            return None;
+        }
+        let body = index.constant_interface_default(parent, name, provider)?;
+        Some(body.value.java_expression())
     }
 }
 

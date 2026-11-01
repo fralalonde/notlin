@@ -322,6 +322,45 @@ pub enum PlannedDefaultGetterBody {
     /// of public zero-argument accessors rooted at `this`. The listed accessors
     /// are exactly the steps of that proven chain.
     SourceForwarding { accessors: Vec<String> },
+    /// A selected Kotlin default whose value is independent of its receiver.
+    SourceConstant { value: PlannedConstantValue },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlannedConstantValue {
+    Boolean(bool),
+    Integer { value: i64, long: bool },
+    StringLiteral(String),
+    EnumEntry(SymbolId),
+}
+
+impl PlannedConstantValue {
+    pub(crate) fn java_expression(&self) -> String {
+        match self {
+            Self::Boolean(value) => value.to_string(),
+            Self::Integer { value, long } => format!("{value}{}", if *long { "L" } else { "" }),
+            Self::StringLiteral(literal) => {
+                assert!(crate::semantics::safe_java_string_literal(literal));
+                literal.clone()
+            }
+            Self::EnumEntry(entry) => {
+                assert_eq!(entry.kind, "enum_entry");
+                let parts = entry
+                    .package
+                    .split('.')
+                    .filter(|part| !part.is_empty())
+                    .chain(entry.owner_path.iter().map(String::as_str))
+                    .chain(std::iter::once(entry.name.as_str()))
+                    .collect::<Vec<_>>();
+                assert!(
+                    parts
+                        .iter()
+                        .all(|part| crate::semantics::is_java_identifier(part))
+                );
+                parts.join(".")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,12 +369,12 @@ pub struct PlannedDefaultGetterBridge {
     pub location: crate::semantics::SourceLocation,
     /// Declaring interface of the effective default. A bridge either inherits
     /// that owner's Java method semantics (`JavaSuperDelegation`) or re-creates
-    /// the default's own proven body (`SourceForwarding`), so a Kotlin-retained
-    /// owner is only acceptable with the latter.
+    /// the default's own proven body (`SourceForwarding` or `SourceConstant`).
+    /// A retained Kotlin owner requires one of those body proofs.
     pub target: SymbolId,
     /// Direct interface qualifier for the super call. It may remain Kotlin
     /// when it inherits the selected Java default without overriding it. It is
-    /// unused by a source-forwarding body.
+    /// unused by a materialized source body.
     pub provider: SymbolId,
     pub method_name: String,
     pub return_type: String,

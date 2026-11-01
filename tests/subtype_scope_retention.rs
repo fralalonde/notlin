@@ -138,7 +138,7 @@ fn an_unselected_member_extension_override_keeps_the_interface_kotlin() {
 }
 
 #[test]
-fn memberless_interface_waits_for_retained_supertype() {
+fn memberless_interface_materializes_a_retained_constant_property() {
     let root = Path::new("tests/tmp_scratch_memberless_retained_parent");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -146,7 +146,7 @@ fn memberless_interface_waits_for_retained_supertype() {
         root.join("events.kt"),
         "package neutral.events.waiting\n\
          @com.example.Mapping(mapper = { it.toString() })\n\
-         interface IObjectEvent { val id: String get() = \"fixed\" }\n\
+         interface IObjectEvent {\n    val id: String get() = \"fixed\"\n}\n\
          interface AgentEvent : IObjectEvent\n\
          value class RetainedEvent(val raw: String) : AgentEvent\n",
     )
@@ -163,14 +163,12 @@ fn memberless_interface_waits_for_retained_supertype() {
         !root.join("IObjectEvent.java").exists(),
         "the annotation-blocked root interface must remain Kotlin"
     );
-    assert!(
-        !root.join("AgentEvent.java").exists(),
-        "a memberless interface over a retained Kotlin property must remain Kotlin"
-    );
+    let java = fs::read_to_string(root.join("AgentEvent.java")).unwrap();
+    assert!(java.contains("default java.lang.String getId()"), "{java}");
+    assert!(java.contains("return \"fixed\";"), "{java}");
     let kotlin = fs::read_to_string(root.join("events.kt")).unwrap();
     assert!(
-        kotlin.contains("NOTLIN N04DC")
-            && kotlin.contains("interface AgentEvent : IObjectEvent")
+        !kotlin.contains("interface AgentEvent")
             && kotlin.contains("interface IObjectEvent")
             && kotlin.contains("NOTLIN NF7FA")
             && kotlin.contains("class RetainedEvent"),

@@ -1084,7 +1084,7 @@ fn import_aliases_name(source: &str, name: &str) -> bool {
     })
 }
 
-pub(super) fn is_java_identifier(name: &str) -> bool {
+pub(crate) fn is_java_identifier(name: &str) -> bool {
     const KEYWORDS: &[&str] = &[
         "abstract",
         "assert",

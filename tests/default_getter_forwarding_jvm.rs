@@ -167,13 +167,22 @@ fn populate(root: &Path) {
     }
 }
 
+fn opaque_default(root: &Path) {
+    let reads = fs::read_to_string(root.join("Reads.java")).unwrap().replace(
+        "public final class Reads {",
+        "public final class Reads {\n    public static String opaqueDefault() { return \"base\"; }",
+    );
+    fs::write(root.join("Reads.java"), reads).unwrap();
+}
+
 fn overload_fixture(root: &Path) {
     populate(root);
+    opaque_default(root);
     let provider = fs::read_to_string(root.join("DefaultSource.kt"))
         .unwrap()
         .replace(
             "val envelope: Envelope",
-            "val envelope: Envelope\n    fun extra(): String = \"base\"",
+            "val envelope: Envelope\n    fun extra(): String = Reads.opaqueDefault()",
         );
     fs::write(root.join("DefaultSource.kt"), provider).unwrap();
     let child = fs::read_to_string(root.join("Subject.kt"))
@@ -187,11 +196,12 @@ fn overload_fixture(root: &Path) {
 
 fn inherited_obligation_fixture(root: &Path) {
     populate(root);
+    opaque_default(root);
     let provider = fs::read_to_string(root.join("DefaultSource.kt"))
         .unwrap()
         .replace(
             "@Deprecated",
-            "interface Ancestor { fun extra(): String = \"base\" }\n\n@Deprecated",
+            "@Deprecated(\"retained ancestor\")\ninterface Ancestor { fun extra(): String = Reads.opaqueDefault() }\n\n@Deprecated",
         )
         .replace(
             "DefaultSource : WideSource",

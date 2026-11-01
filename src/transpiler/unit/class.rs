@@ -1265,6 +1265,31 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 Vec::new(),
             ));
         }
+        // Kotlin's JVM permits list omits newly emitted Java children. Having
+        // every method implementation does not make a direct sealed edge legal.
+        // An indirect sealed ancestor is fine through a nonsealed direct parent.
+        if self.retained_hint.as_ref().is_some_and(|retained| {
+            self.semantic_provider.is_some_and(|provider| {
+                target.supertypes.iter().any(|spelling| {
+                    workspace
+                        .resolve_type(source_file, spelling)
+                        .is_some_and(|parent| {
+                            parent.language == crate::workspace::SourceLanguage::Kotlin
+                                && parent.kind == crate::workspace::DeclarationKind::Interface
+                                && workspace.declaration_retained(parent, retained)
+                                && !provider.is_nonsealed_interface(
+                                    &crate::semantics::workspace_symbol(workspace, parent),
+                                )
+                        })
+                })
+            })
+        }) {
+            return Some((
+                RetentionKind::RetainedSupertype,
+                vec!["direct Kotlin sealed interface must migrate before its Java children".into()],
+                self.retained_supertypes(workspace, target),
+            ));
+        }
         let retained_property_ancestor = self.retained_hint.as_ref().and_then(|retained| {
             crate::property_abi::retained_kotlin_property_ancestor(workspace, target, retained)
         });
@@ -1292,9 +1317,26 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     self.translation_roots,
                 );
             let proven_java_property_contracts = proven_property_interfaces.is_some();
+            // A complete physical Java implementation also closes this boundary
+            // for child interfaces. Inheriting a Kotlin default alone does not:
+            // it may exist only in DefaultImpls in the provider's JVM mode.
+            let proven_concrete_contracts = retained_property_boundary
+                && !proven_java_property_contracts
+                && !target.supertypes.is_empty()
+                && target.supertypes.iter().all(|spelling| {
+                    workspace
+                        .resolve_type(source_file, spelling)
+                        .is_some_and(|parent| {
+                            parent.kind == crate::workspace::DeclarationKind::Interface
+                                && self.forwarding_bridge_covers_retained_interface(
+                                    workspace, target, parent,
+                                )
+                        })
+                });
             if self.retained_hint.is_some()
                 && retained_property_boundary
                 && !proven_java_property_contracts
+                && !proven_concrete_contracts
                 && !crate::property_abi::forwards_abstract_kotlin_properties(workspace, target)
             {
                 return Some((
@@ -1359,9 +1401,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     /// A translated class may implement a retained Kotlin interface when the
-    /// accepted plan re-creates every method obligation with proven
-    /// source-forwarding bridges, and the class itself declares matching public
-    /// readonly properties for every property obligation. The class then
+    /// accepted plan and own public members implement every method and property
+    /// obligation. Planned bodies may forward accessors or return constants.
+    /// The class then
     /// *implements* the interface's JVM obligations instead of inheriting them
     /// from Kotlin metadata, which makes the retained provider harmless.
     ///
@@ -2396,6 +2438,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     }
                 }
             }
+            self.emit_planned_default_getters(decl, out);
             out.close();
             return;
         }
@@ -4962,13 +5005,52 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
         out: &mut JavaOut,
     ) {
         self.enum_types.insert(name.to_string());
-        let mut default_property_bridges = Vec::new();
+        let mut default_bridges = Vec::<(String, String, String)>::new();
+        let constant_bridges = self
+            .default_getter_bridges
+            .iter()
+            .filter(|bridge| {
+                bridge.location.start_byte == decl.start_byte()
+                    && matches!(
+                        bridge.body,
+                        crate::translation_plan::PlannedDefaultGetterBody::SourceConstant { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        for bridge in &constant_bridges {
+            assert_eq!(bridge.location.snapshot_hash, self.source_hash);
+            let crate::translation_plan::PlannedDefaultGetterBody::SourceConstant { value } =
+                &bridge.body
+            else {
+                unreachable!()
+            };
+            default_bridges.push((
+                bridge.method_name.clone(),
+                bridge.return_type.clone(),
+                format!("return {};", value.java_expression()),
+            ));
+        }
         if let Some(workspace) = self.workspace {
             let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
-            default_property_bridges = workspace.enum_default_property_bridges(declaring, name);
-            let bridged = default_property_bridges
+            for bridge in workspace.enum_default_property_bridges(declaring, name) {
+                if default_bridges
+                    .iter()
+                    .any(|(method, _, _)| method == &bridge.method_name)
+                {
+                    continue;
+                }
+                default_bridges.push((
+                    bridge.method_name.clone(),
+                    crate::transpiler::types::map_type_name(
+                        bridge.return_type.trim_end_matches('?'),
+                    )
+                    .to_owned(),
+                    format!("return {}.super.{}();", bridge.provider, bridge.method_name),
+                ));
+            }
+            let bridged = default_bridges
                 .iter()
-                .map(|bridge| bridge.method_name.as_str())
+                .map(|(name, _, _)| name.as_str())
                 .collect::<HashSet<_>>();
             let obligations = workspace
                 .enum_default_obligations(declaring, name)
@@ -4984,6 +5066,40 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                     ),
                 );
                 return;
+            }
+            if !constant_bridges.is_empty() && !workspace.has_modern_kotlin_interface_defaults() {
+                let complete = self.semantic_provider.is_some_and(|provider| {
+                    let Some(file) = workspace.source_file(declaring) else {
+                        return false;
+                    };
+                    let owners = file
+                        .declarations
+                        .iter()
+                        .filter(|owner| owner.name == name)
+                        .collect::<Vec<_>>();
+                    let [owner] = owners.as_slice() else {
+                        return false;
+                    };
+                    owner
+                        .supertypes
+                        .iter()
+                        .filter_map(|ty| workspace.resolve_type(file, ty))
+                        .filter(|parent| {
+                            parent.language == crate::workspace::SourceLanguage::Kotlin
+                        })
+                        .all(|parent| {
+                            workspace.concrete_getters_cover_retained_interface(
+                                owner,
+                                parent,
+                                &self.default_getter_bridges,
+                                provider,
+                            )
+                        })
+                });
+                if !complete {
+                    self.diag_untranslatable(decl, "constant default bridge does not cover the complete inherited Kotlin contract in an unknown JVM-default mode");
+                    return;
+                }
             }
         }
         // Only visibility + (implicitly final) enum is legal Java. Any other
@@ -5208,7 +5324,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             || !members.is_empty()
             || !params.is_empty()
             || emit_entries_bridge
-            || !default_property_bridges.is_empty()
+            || !default_bridges.is_empty()
         {
             out.line(";");
         }
@@ -5221,16 +5337,11 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             out.line("return kotlin.enums.EnumEntriesKt.enumEntries(values());");
             out.close();
         }
-        for bridge in &default_property_bridges {
+        for (method_name, return_type, body) in &default_bridges {
             out.blank();
-            let return_type =
-                crate::transpiler::types::map_type_name(bridge.return_type.trim_end_matches('?'));
             out.line("@Override");
-            out.open(format!("public {} {}()", return_type, bridge.method_name));
-            out.line(format!(
-                "return {}.super.{}();",
-                bridge.provider, bridge.method_name
-            ));
+            out.open(format!("public {return_type} {method_name}()"));
+            out.line(body);
             out.close();
         }
         // ctor params -> fields + accessors + private ctor
@@ -6699,11 +6810,20 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                     }
                     format!("return {call};")
                 }
+                crate::translation_plan::PlannedDefaultGetterBody::SourceConstant { value } => {
+                    format!("return {};", value.java_expression())
+                }
             };
             out.line("@Override");
             out.open(format!(
-                "public {} {}()",
-                bridge.return_type, bridge.method_name
+                "public {}{} {}()",
+                if bridge.owner.kind == "interface" {
+                    "default "
+                } else {
+                    ""
+                },
+                bridge.return_type,
+                bridge.method_name
             ));
             out.line(&body);
             out.close();

@@ -165,15 +165,22 @@ fn unresolved_parent_ancestry_does_not_use_forwarding_proof() {
 }
 
 #[test]
-fn child_override_does_not_use_forwarding_proof() {
+fn child_abstract_override_preserves_the_retained_method_contract() {
     let (outputs, untranslated) = probe(
         "package sample.forward\ninterface Forwarded : Contract { override fun key(): String }\n",
         "package sample.forward\ninterface Contract { fun key(): String\n companion object { suspend fun remainKotlin() {} }\n}\n",
         &[],
     );
+    assert!(forwards(&outputs), "{outputs:?}; retained={untranslated:?}");
+    let java = &outputs
+        .iter()
+        .find(|(name, _)| name.ends_with("Forwarded.java"))
+        .unwrap()
+        .1;
+    assert!(java.contains("String key();"), "{java}");
     assert!(
-        !forwards(&outputs),
-        "{outputs:?}; retained={untranslated:?}"
+        !java.contains("default "),
+        "an abstract override must remain abstract: {java}"
     );
 }
 

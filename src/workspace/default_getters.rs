@@ -769,7 +769,7 @@ fn source_declaration_for_identity<'a>(
     matching.next().is_none().then_some(declaration)
 }
 
-fn getter_return_type<'a>(
+pub(super) fn getter_return_type<'a>(
     index: &SourceIndex,
     owner: &Declaration,
     member: &'a Member,
@@ -786,17 +786,23 @@ fn source_getter<'a>(
     owner: &'a Declaration,
     member: &'a Member,
 ) -> Option<Getter<'a>> {
+    if member.kind == MemberKind::Method && !is_physical_zero_arg_getter(member, &member.name) {
+        return None;
+    }
+    source_value_member(index, owner, member)
+}
+
+fn source_value_member<'a>(
+    index: &SourceIndex,
+    owner: &'a Declaration,
+    member: &'a Member,
+) -> Option<Getter<'a>> {
     if member.is_static
         || member.visibility.as_deref() == Some("private")
         || !getter_is_public(member, owner)
     {
         return None;
     }
-    let method_name = if member.kind == MemberKind::Property {
-        property_accessor_name(&member.name)
-    } else {
-        member.name.clone()
-    };
     let return_type = getter_return_type(index, owner, member)?;
     match member.kind {
         MemberKind::Property => {
@@ -805,7 +811,13 @@ fn source_getter<'a>(
                 return None;
             }
         }
-        MemberKind::Method if !is_physical_zero_arg_getter(member, &method_name) => return None,
+        MemberKind::Method
+            if !member.parameter_types.is_empty()
+                || return_type.trim().is_empty()
+                || matches!(return_type.trim(), "Unit" | "kotlin.Unit" | "void") =>
+        {
+            return None;
+        }
         MemberKind::Method => {}
         _ => return None,
     }
@@ -917,7 +929,7 @@ fn proven_forwarding_getter_body(
 }
 
 /// The one class-like syntax node whose exact symbol identity is `symbol`.
-fn exact_declaration_node<'t>(
+pub(super) fn exact_declaration_node<'t>(
     root: Node<'t>,
     source: &str,
     file: &Path,
@@ -948,7 +960,11 @@ fn exact_declaration_node<'t>(
 
 /// The one member declaration node inside `declaration` that is exactly
 /// `member`. Nested types own their own members and are never searched.
-fn exact_member_node<'t>(declaration: Node<'t>, source: &str, member: &Member) -> Option<Node<'t>> {
+pub(super) fn exact_member_node<'t>(
+    declaration: Node<'t>,
+    source: &str,
+    member: &Member,
+) -> Option<Node<'t>> {
     let body = declaration
         .named_children(&mut declaration.walk())
         .find(|child| child.kind() == "class_body")?;
@@ -1014,7 +1030,7 @@ fn function_parameter_count(node: Node<'_>) -> usize {
 /// Any annotation on the declaring member keeps the body unproven: accessor
 /// renames (`@get:JvmName`), `@JvmField` storage and framework contracts that
 /// expect the annotated method must not be re-created without it.
-fn member_has_annotations(member: Node<'_>) -> bool {
+pub(super) fn member_has_annotations(member: Node<'_>) -> bool {
     let mut cursor = member.walk();
     member
         .children(&mut cursor)
@@ -1060,7 +1076,7 @@ fn step_declaration_has_annotations(
 
 /// The single expression a getter body `= expr` evaluates. Block bodies and
 /// non-value bodies are unproven: they may contain arbitrary statements.
-fn expression_body<'t>(member: Node<'t>, _source: &str) -> Option<Node<'t>> {
+pub(super) fn expression_body<'t>(member: Node<'t>, _source: &str) -> Option<Node<'t>> {
     let holder = if member.kind() == "property_declaration" {
         member
             .named_children(&mut member.walk())
@@ -1232,8 +1248,9 @@ fn imported_marker_alias(index: &SourceIndex, file: &SourceFile, base: &str) -> 
 
 impl SourceIndex {
     /// Check the complete retained interface after substituting the concrete
-    /// child's type arguments. Every instance obligation must be a getter
-    /// implemented by an own public member or an accepted forwarding bridge.
+    /// child's type arguments. Every instance obligation must be a zero-argument
+    /// value method or property implemented by an own public member or a planned
+    /// source body, independent of the provider's JVM-default mode.
     pub(crate) fn concrete_getters_cover_retained_interface(
         &self,
         child: &Declaration,
@@ -1241,6 +1258,9 @@ impl SourceIndex {
         bridges: &[crate::translation_plan::PlannedDefaultGetterBridge],
         provider: &dyn semantics::SemanticProvider,
     ) -> bool {
+        if !self.interface_default_initialization_is_safe(child) {
+            return false;
+        }
         let Some(file) = self.declaration_source_file(child) else {
             return false;
         };
@@ -1280,10 +1300,11 @@ impl SourceIndex {
                     && matches!(
                         bridge.body,
                         crate::translation_plan::PlannedDefaultGetterBody::SourceForwarding { .. }
+                            | crate::translation_plan::PlannedDefaultGetterBody::SourceConstant { .. }
                     )
             })
             .collect::<Vec<_>>();
-        if incomplete || bridges.is_empty() {
+        if incomplete {
             return false;
         }
         for route in routes {
@@ -1296,7 +1317,7 @@ impl SourceIndex {
                 .iter()
                 .filter(|member| !member.is_static)
             {
-                let Some(contract) = source_getter(self, route.declaration, member) else {
+                let Some(contract) = source_value_member(self, route.declaration, member) else {
                     return false;
                 };
                 if member.is_mutable || member.is_nullable || member.is_jvm_field {
@@ -1368,7 +1389,7 @@ impl SourceIndex {
                         {
                             return None;
                         }
-                        let getter = source_getter(self, child, own)?;
+                        let getter = source_value_member(self, child, own)?;
                         let own_name = if own.kind == MemberKind::Property {
                             property_accessor_name(&own.name)
                         } else {

@@ -24,7 +24,10 @@ impl HeaderFacts {
         let getter_owner = match language {
             SourceLanguage::Java => matches!(
                 node.kind(),
-                "class_declaration" | "interface_declaration" | "record_declaration"
+                "class_declaration"
+                    | "interface_declaration"
+                    | "record_declaration"
+                    | "enum_declaration"
             ),
             SourceLanguage::Kotlin => {
                 matches!(node.kind(), "class_declaration" | "object_declaration")
@@ -170,7 +173,7 @@ fn method_headers(
             .then(|| {
                 owner
                     .named_children(&mut owner.walk())
-                    .find(|node| node.kind() == "class_body")
+                    .find(|node| matches!(node.kind(), "class_body" | "enum_class_body"))
             })
             .flatten()
     });
@@ -178,7 +181,17 @@ fn method_headers(
         return HashMap::new();
     };
     let mut methods = HashMap::new();
-    for method in body.named_children(&mut body.walk()) {
+    let method_nodes = body
+        .named_children(&mut body.walk())
+        .flat_map(|node| {
+            if node.kind() == "enum_body_declarations" {
+                node.named_children(&mut node.walk()).collect::<Vec<_>>()
+            } else {
+                vec![node]
+            }
+        })
+        .collect::<Vec<_>>();
+    for method in method_nodes {
         let parameters = match language {
             SourceLanguage::Java if method.kind() == "method_declaration" => {
                 method.child_by_field_name("parameters")
@@ -363,6 +376,11 @@ mod tests {
                 fun getOverload(index: Int): String = "indexed"
             }
             class Constrained<T> where T : Runnable
+            enum class Choice {
+                ONE;
+                fun getPlain(): String = "plain"
+                fun <U> getGeneric(): U? = null
+            }
         "#,
             SourceLanguage::Kotlin,
         );
@@ -371,6 +389,8 @@ mod tests {
         assert!(ordinary(file, "Header", "getOverload"));
         assert!(!ordinary(file, "Header", "getGeneric"));
         assert!(!ordinary(file, "Header", "getExtension"));
+        assert!(ordinary(file, "Choice", "getPlain"));
+        assert!(!ordinary(file, "Choice", "getGeneric"));
         assert_eq!(
             file.header_facts
                 .inline_bound("Header", DeclarationKind::Class, "T"),
@@ -395,15 +415,22 @@ mod tests {
             }
             interface Contract { String getPlain(); }
             record RecordValue(String text) { public String getPlain() { return text; } }
+            enum Choice {
+                ONE { public String getEntryOnly() { return "entry"; } };
+                public String getPlain() { return "plain"; }
+                public <U> U getGeneric() { return null; }
+            }
         "#,
             SourceLanguage::Java,
         );
         let file = &index.files[0];
-        for owner in ["Header", "Contract", "RecordValue"] {
+        for owner in ["Header", "Contract", "RecordValue", "Choice"] {
             assert!(ordinary(file, owner, "getPlain"));
         }
         assert!(ordinary(file, "Header", "getOverload"));
         assert!(!ordinary(file, "Header", "getGeneric"));
+        assert!(!ordinary(file, "Choice", "getGeneric"));
+        assert!(!ordinary(file, "Choice", "getEntryOnly"));
         assert_eq!(
             file.header_facts
                 .inline_bound("Header", DeclarationKind::Class, "T"),

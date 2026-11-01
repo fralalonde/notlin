@@ -14,6 +14,12 @@ rewritten to explicit method overrides, including custom setter bodies. Companio
 members use a singleton and Java method bridges derived from emitted signatures.
 Ordinary interface methods with fixed arguments can move with these contracts.
 
+Kotlin compatibility bridges require an actual caller or a concrete inherited
+JVM contract that would otherwise fail the mixed build. Potential future uses
+do not justify adding Kotlin code. Prefer materializing an implementation in
+Java when its body can be established from source, so the remaining Kotlin can
+eventually be removed.
+
 A retained Kotlin interface's concrete `fun getX()` can still supply an explicit
 forwarding override on a retained descendant. The provider need not move merely
 to call a method it already declares; property contracts must still satisfy the
@@ -104,10 +110,19 @@ Java bound facts keep those bridge decisions available after a provider moves
 to Java in an earlier speculative round.
 
 A retained Kotlin interface may serve as the direct super-call qualifier when
-it inherits the exact accepted Java default. The declaring default must move to
-Java, while the qualifier may remain Kotlin for unrelated unsupported methods.
-Overrides, reabstraction and ambiguous default routes still fail the hierarchy
-proof; retained Kotlin property contracts still block a method-shaped repair.
+it inherits the exact accepted Java default. When the declaring implementation
+also remains Kotlin, Java can materialize a proven accessor chain or a typed
+boolean, integer, string or enum constant instead. Explicit super calls and
+inherited defaults share the constant-body proof. Java child interfaces receive
+their inherited implementations too; otherwise retained Kotlin descendants can
+still try to call a missing `DefaultImpls` class. Unknown JVM-default modes require
+complete physical implementations of the inherited contracts.
+
+Overrides, reabstraction and ambiguous default routes still fail the selection
+proof. New Java default methods cannot change observable companion initialization
+timing. A direct child of a retained Kotlin sealed interface must stay Kotlin
+until its parent migrates: Kotlin omits newly emitted Java children from the JVM
+permits list. Indirect children behind a nonsealed interface remain eligible.
 
 Eligibility and concrete bridge planning share the same getter-free external
 contract facts: `Comparable<T>` with one argument, and the supported marker

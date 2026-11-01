@@ -3,6 +3,8 @@
 //! Kotlin metadata can make a concrete covariant accessor visible to annotation
 //! processors even when source Java method resolution would inherit it. Preserve
 //! that accessor on retained Kotlin classes and enums before accepting a mixed migration.
+//! Generate repairs only for a demonstrated inherited JVM contract conflict;
+//! possible future callers alone do not justify adding Kotlin members.
 
 use crate::property_abi::PlannedAccessorRepairs;
 use crate::semantics::{OriginMap, SymbolId};
@@ -359,6 +361,24 @@ mod tests {
                     .starts_with(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
             );
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn unambiguous_inherited_defaults_need_no_kotlin_bridge() {
+        for child in [
+            "package sample\nclass Child : Step\n",
+            "package sample\nenum class Child : Step { ONE }\n",
+        ] {
+            let fixture = Fixture::new(child);
+            // One ordinary Java default, with no wider inherited descriptor
+            // or sibling declaration requiring an explicit implementation.
+            fs::write(fixture.0.join("Step.java"), "package sample; public interface Step { default StoredId getOwner() { return new StoredId(); } }\n").unwrap();
+            let (index, mut sources) = fixture.indexed_sources();
+            let report = repair_virtual_sources(&index, &mut sources, &HashSet::new()).unwrap();
+            assert_eq!(report.count, 0);
+            assert!(report.bridges.is_empty());
+            assert_eq!(sources[0].1, child);
         }
     }
 

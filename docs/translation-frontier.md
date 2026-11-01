@@ -1,6 +1,58 @@
 # Translation frontier
 
-## Current checkpoint — 2026-11-01 (generalized JVM primitive rules)
+## Current checkpoint — 2026-11-01 (retained constant defaults)
+
+The fresh standard conversion translates **4,491** and retains 1,880 of
+**6,371 original owners**: **+10 / -0** against the accepted baseline. All original
+owner identities are compared. The accepted-baseline trial gains the same ten
+enums: the five Wms integrations, three LiddConnect integrations, and the
+MicrosoftBC job and order integrations. No generated application code is patched.
+
+Explicit interface super calls and inherited defaults share a source proof for
+typed boolean, integer, string and enum constants. Java receives the method body
+directly, so it can implement retained Kotlin contracts without assuming where
+Kotlin stores its default implementation. The proof covers properties as getter
+methods and ordinary zero-argument value methods. Complete own implementations
+also close retained contracts; abstract interface redeclarations remain abstract.
+Java child interfaces materialize inherited defaults needed by their Kotlin
+descendants, including value-class consumers.
+
+Kotlin bridges require an actual caller or a concrete mixed-build obligation.
+Both reference conversions add **zero Kotlin function bridges** across the 510
+remaining Kotlin files. Receiver-dependent accessor chains retain their existing
+proof. Effects, ambiguous bindings, reabstraction and unsupported JVM signatures
+do not become constants. Interfaces with observable companion initialization stay
+on their existing initialization path. Direct children of a retained Kotlin sealed
+interface stay Kotlin until its JVM permits boundary can migrate; indirect
+children behind a nonsealed interface remain eligible.
+
+Formatting, clippy, **393 library tests**, **107 focused tests**, and **20 native
+test cases** pass. Native comparisons cover all three JVM-default modes, plain
+Java and Lombok, covariant dispatch, default-property diamonds, complete exact
+getters, abstract method redeclarations, overloads, initialization order and
+retained Kotlin value-class consumers. The full Windows Rust sweep is
+**1,629 pass / 62 known fail / 148 ignored**, with the same failure names as the
+accepted baseline and no newly failing tests.
+
+Both full Gradle builds pass: the baseline trial in **4m16s**, the fresh tree in
+**5m06s**, each with 110 tasks. Both Hastings runs import all **9,113 records** and
+remain free of errors and stack traces for **105.3** and **105.7 seconds** after
+the complete dataset marker. Both disposable applications are stopped. The
+original I/O files still match `d096ed8`. Installation requires successful Linux
+CI on the exact main commit.
+
+Evidence: `target/constant-default-frontier-v4-20261101/acceptance.json`.
+Reference gates are under `target/constant-default-frontier-v2-20261101/`;
+subsequent test revisions use the identical frozen compiler and record all source
+and binary hashes. Frozen SHA256:
+`6b987a2d6614a10afaa947749c8f27f904f2cfe28c694826ca85a152b9828243`.
+
+The translation frontier remains active. A separate source-indexing limitation
+was reproduced with compact Kotlin property declarations; its failing control
+and next strategy are recorded in the evidence directory. Ordinary method-call
+chains are also candidates for extending the existing accessor-chain proof.
+
+## Previous checkpoint — 2026-11-01 (generalized JVM primitive rules)
 
 Primitive names, wrappers, arrays and JVM descriptors now share one internal
 vocabulary across rendering, semantic facts, constructor/overload checks and

@@ -312,12 +312,10 @@ fn transitive_retained_supertype_abi_mismatch_taints() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// A Java implementation must not split a retained Kotlin interface diamond
-/// whose property has an implementation on one branch. Kotlin's IR builds a
-/// fake override for the diamond; leaving the implementation in Kotlin keeps
-/// that override connected to its real declaration.
+/// Materializing the selected constant getter closes the retained property
+/// diamond without depending on the provider's JVM-default mode.
 #[test]
-fn retained_interface_property_diamond_keeps_implementation_kotlin() {
+fn retained_interface_property_diamond_materializes_a_java_getter() {
     let root = Path::new("tests/tmp_scratch_iface_diamond");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -346,18 +344,16 @@ fn retained_interface_property_diamond_keeps_implementation_kotlin() {
 
     let out_java = fs::read_to_string(root.join("Concrete.java")).unwrap_or_default();
     assert!(
-        out_java.is_empty(),
-        "implementation of retained property diamond must stay Kotlin, got:\n{out_java}"
+        out_java.contains("getCategory()") && out_java.contains("Category.PRIMARY"),
+        "the complete retained property contract needs a physical getter:\n{out_java}"
     );
-    let kept = fs::read_to_string(root.join("implementation.kt")).unwrap();
-    assert!(kept.contains("data class Concrete"));
+    assert!(!root.join("implementation.kt").exists());
     let _ = fs::remove_dir_all(root);
 }
 
-/// Exact property types are not enough to make a Java implementation safe
-/// while its property-owning Kotlin interface remains in the mixed source set.
+/// An exact public getter implements a retained Kotlin property's JVM contract.
 #[test]
-fn retained_property_interface_keeps_exact_implementation_kotlin() {
+fn retained_property_interface_accepts_a_complete_exact_implementation() {
     let root = Path::new("tests/tmp_scratch_iface_property");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
@@ -386,9 +382,10 @@ fn retained_property_interface_keeps_exact_implementation_kotlin() {
 
     let out_java = fs::read_to_string(root.join("Exact.java")).unwrap_or_default();
     assert!(
-        out_java.is_empty(),
-        "exact implementation of retained property interface must stay Kotlin, got:\n{out_java}"
+        out_java.contains("String getLabel()"),
+        "the exact implementation needs a physical Java getter:\n{out_java}"
     );
+    assert!(!root.join("implementation.kt").exists());
     let _ = fs::remove_dir_all(root);
 }
 

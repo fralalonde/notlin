@@ -582,6 +582,7 @@ fn lower_with_plan(
             retained_hint.unwrap_or(&std::collections::HashSet::new()),
             scope.roots,
             &mut plan,
+            Some(semantic_provider),
         );
     }
     let effectful_file_initializer =

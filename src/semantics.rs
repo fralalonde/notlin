@@ -53,6 +53,7 @@ pub use container_types::{ContainerLambdaBinding, ContainerPropertyAccess};
 pub use eager_collections::{
     EagerCollectionCall, EagerCollectionOperation, EagerPropertyProjection,
 };
+pub(crate) use enum_when::is_java_identifier;
 pub use enum_when::{EnumWhenArm, EnumWhenLowering};
 pub use inherited_properties::InheritedPropertyAccess;
 pub use object_calls::{ReferenceStringCall, ReferenceStringCallKind, ReferenceStringReceiver};
