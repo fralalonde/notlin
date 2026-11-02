@@ -70,7 +70,7 @@ fn is_descendant_of(node: tree_sitter::Node<'_>, ancestor: tree_sitter::Node<'_>
     false
 }
 
-pub(super) fn annotation_fq_name(
+pub(crate) fn annotation_fq_name(
     annotation: tree_sitter::Node<'_>,
     source: &str,
 ) -> Option<String> {
@@ -121,11 +121,25 @@ pub(super) fn annotation_type_is_local(
     })
 }
 
-pub(super) fn annotation_import_name(name: String, source: &str) -> String {
+pub(crate) fn annotation_import_name(name: String, source: &str) -> String {
     annotation_imports(source)
         .find(|(_, alias)| *alias == Some(name.as_str()))
         .map(|(path, _)| path.to_string())
         .unwrap_or(name)
+}
+
+/// Resolve annotation identity without forcing fully qualified names into Java.
+pub(crate) fn annotation_binding_name(name: String, source: &str) -> String {
+    let explicit = annotation_imports(source)
+        .filter(|(path, alias)| {
+            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == name
+        })
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+    match explicit.as_slice() {
+        [path] => (*path).to_owned(),
+        _ => name,
+    }
 }
 
 /// Some(true) proves the builtin identity; None leaves a wildcard binding open.
@@ -139,7 +153,7 @@ pub(crate) fn kotlin_builtin_annotation_binding(
     let Some(name) = annotation_fq_name(annotation, source) else {
         return Some(false);
     };
-    let name = annotation_import_name(name, source);
+    let name = annotation_binding_name(name, source);
     if name == canonical {
         return Some(true);
     }
@@ -153,10 +167,15 @@ pub(crate) fn kotlin_builtin_annotation_binding(
     }) {
         return Some(false);
     }
-    if imports
-        .iter()
-        .any(|(path, _)| path.ends_with(".*") && *path != "kotlin.*")
-    {
+    if imports.iter().any(|(path, _)| {
+        path.ends_with(".*")
+            && *path != "kotlin.*"
+            && canonical
+                .rsplit_once('.')
+                .map(|(package, _)| format!("{package}.*"))
+                .as_deref()
+                != Some(*path)
+    }) {
         return None;
     }
     Some(true)
@@ -341,7 +360,45 @@ fn superclass_annotations_are_compatible(
             class_annotation && known_mapped_superclass_annotation(&name, file, workspace);
         let safe_constructor_annotation =
             constructor_annotation && known_jvm_overloads_annotation(&name, file, workspace);
-        if !safe_class_annotation && !safe_constructor_annotation {
+        let compiler_suppression = kotlin_builtin_annotation_binding(
+            annotation,
+            "kotlin.Suppress",
+            source,
+            Some(workspace),
+            Some(file),
+        ) == Some(true);
+        let named_property_accessor = kotlin_builtin_annotation_binding(
+            annotation,
+            "kotlin.jvm.JvmName",
+            source,
+            Some(workspace),
+            Some(file),
+        ) == Some(true)
+            && {
+                let mut parent = annotation.parent();
+                let mut property = None;
+                while let Some(node) = parent {
+                    if node.kind() == "class_parameter" {
+                        property = Some(node);
+                        break;
+                    }
+                    if node.id() == class.id() {
+                        break;
+                    }
+                    parent = node.parent();
+                }
+                property.is_some_and(|property| {
+                    let names = crate::workspace::property_accessors::from_node(property, source);
+                    !names.is_default()
+                        && names.getter != crate::workspace::AccessorName::Unknown
+                        && names.setter != crate::workspace::AccessorName::Unknown
+                })
+            };
+        if !safe_class_annotation
+            && !safe_constructor_annotation
+            && !compiler_suppression
+            && !named_property_accessor
+        {
             return false;
         }
     }
@@ -1073,6 +1130,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if self.kotlin_builtin_annotation_binding(node, "kotlin.Suppress") == Some(true) {
             return Some(String::new());
         }
+        if self.kotlin_builtin_annotation_binding(node, "kotlin.jvm.JvmName") == Some(true) {
+            return Some(String::new());
+        }
         if self.kotlin_builtin_annotation_binding(node, "kotlin.Deprecated") == Some(true) {
             return Some("@java.lang.Deprecated".to_string());
         }
@@ -1574,14 +1634,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return false;
         }
         let source = snapshot.source_text();
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
-            .is_err()
-        {
-            return false;
-        }
-        let Some(tree) = parser.parse(source, None) else {
+        let Some(tree) = workspace.source_tree(snapshot) else {
             return false;
         };
         let mut pending = vec![tree.root_node()];
@@ -1983,6 +2036,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let name = kt::field(decl, "name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_else(|| "Anonymous".to_string());
+        super::bean_metadata::preserve(self, decl, &mut annotations);
         // Register every instance property before emitting any body member.
         // Kotlin permits a default method to read a property declared before
         // or after it; Java must spell that implicit receiver as a getter.
@@ -2151,14 +2205,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             if !*is_property {
                 continue;
             }
-            let getter = crate::workspace::property_accessor_name(member_name);
+            let getter = self.property_getter_name(decl, member_name);
+            let setter = self.property_setter_name(decl, member_name);
             self.class_props.insert(
                 member_name.clone(),
-                if *is_mutable {
-                    crate::property_abi::setter_name(member_name)
-                } else {
-                    String::new()
-                },
+                if *is_mutable { setter } else { String::new() },
             );
             // A retained Kotlin property repaired for a Java interface has an
             // explicit `getX()` bridge. If that class translates on a later
@@ -2396,10 +2447,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         .and_then(|variable| kt::child(variable, "identifier"))
                     {
                         let property_name = self.text(property_name).to_string();
-                        self.self_getters.insert(
-                            property_name.clone(),
-                            crate::workspace::property_accessor_name(&property_name),
-                        );
+                        let getter = self.property_getter_name(property, &property_name);
+                        self.self_getters.insert(property_name.clone(), getter);
                         self.class_props.insert(
                             property_name.clone(),
                             if kt::child(property, "var").is_some() {
@@ -2480,9 +2529,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                             &pty,
                                         );
                                     }
-                                    let getter_name =
-                                        crate::workspace::property_accessor_name(&pname);
-                                    let setter_name = crate::property_abi::setter_name(&pname);
+                                    let getter_name = self.property_getter_name(member, &pname);
+                                    let setter_name = self.property_setter_name(member, &pname);
                                     let getter = kt::child(member, "getter");
                                     // Interface properties have no backing
                                     // field, so use-site getter annotations
@@ -2580,6 +2628,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if is_data
             && !params.is_empty()
             && self.lombok
+            && self.constructor_accessors_are_default(decl, &params)
             // Lombok constructors cannot run Kotlin initialization after
             // assigning primary properties. Use explicit Java for this class.
             && !kt::child(decl, "class_body").is_some_and(|body| {
@@ -2843,7 +2892,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             return;
         }
         if is_data && !params.is_empty() {
-            let as_record = !self.lombok && self.data_class_can_be_record(decl);
+            let as_record = !self.lombok
+                && self.data_class_can_be_record(decl)
+                && self.constructor_accessors_are_default(decl, &params);
             let jackson_defaults = self.jackson_default_factory_supported(decl, &params);
             let jackson_creator = self.jackson_default_deserializer_name(decl).is_some();
             let has_initialization = kt::child(decl, "class_body").is_some_and(|body| {
@@ -3047,8 +3098,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
                 out.blank();
                 for (_, _, fname, ftype) in &params {
-                    let getter = crate::workspace::property_accessor_name(fname);
-                    let setter = crate::property_abi::setter_name(fname);
+                    let getter = self.property_getter_name(decl, fname);
+                    let setter = self.property_setter_name(decl, fname);
                     // `@get:`-targeted annotations belong on the generated
                     // getter, which this path emits.
                     if !self.class_declares_method(decl, &getter) {
@@ -3166,6 +3217,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 });
             let lombok_accessors = self.lombok
                 && !params.is_empty()
+                && self.constructor_accessors_are_default(decl, &params)
                 && !self.class_body_defines_lombok_generated(decl);
             // Type-level @Setter skips final and static fields. It covers the
             // same mutable constructor properties when the body adds no other
@@ -3306,8 +3358,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     if !*is_property {
                         continue;
                     }
-                    let getter = crate::workspace::property_accessor_name(fname);
-                    let setter = crate::property_abi::setter_name(fname);
+                    let getter = self.property_getter_name(decl, fname);
+                    let setter = self.property_setter_name(decl, fname);
                     // `@get:`-targeted annotations belong on the generated
                     // getter, which this path emits.
                     if !self.class_declares_method(decl, &getter) {
@@ -3804,11 +3856,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         else {
             return Vec::new();
         };
-        let name = format!(
-            "{}{}",
-            if getter { "get" } else { "set" },
-            capitalize(property)
-        );
+        let names = self.property_accessor_names(property_node, property);
+        let name = if getter {
+            names.getter(property)
+        } else {
+            names.setter(property)
+        }
+        .unwrap_or_else(|| {
+            format!(
+                "{}{}",
+                if getter { "get" } else { "set" },
+                capitalize(property)
+            )
+        });
         // The method-name marker must be attached to this exact property, not
         // merely somewhere in the owning class (which could be an overload).
         let property_marker = self
@@ -3847,7 +3907,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         annotations
     }
 
-    fn property_repair_bridge_for(
+    pub(super) fn property_repair_bridge_for(
         &self,
         function: tree_sitter::Node,
         property: &str,
@@ -3961,11 +4021,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     /// The `class_parameter` for a primary-constructor property, by name.
-    fn param_node(
+    pub(super) fn param_node<'node>(
         &self,
-        decl: tree_sitter::Node<'tree>,
+        decl: tree_sitter::Node<'node>,
         property: &str,
-    ) -> Option<tree_sitter::Node<'tree>> {
+    ) -> Option<tree_sitter::Node<'node>> {
         let parameters = kt::child(decl, "primary_constructor")
             .and_then(|ctor| kt::child(ctor, "class_parameters"))?;
         let mut cursor = parameters.walk();
@@ -4548,7 +4608,11 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             .param_node(decl, property)
             .map(|parameter| self.annotation_split(parameter).1)
             .unwrap_or_default();
-        if property
+        let getter = self
+            .property_accessor_names(decl, property)
+            .getter(property)
+            .unwrap_or_else(|| crate::workspace::property_accessor_name(property));
+        if getter
             .strip_prefix("is")
             .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_uppercase))
             && self
@@ -4561,7 +4625,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             && super::jackson_property_names::is_exposed(self, decl)
         {
             annotations.push(format!(
-                "@com.fasterxml.jackson.annotation.JsonProperty(\"{property}\")"
+                "@com.fasterxml.jackson.annotation.JsonProperty(\"{getter}\")"
             ));
         }
         annotations
@@ -5505,6 +5569,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
         // just as it does for classes. Keep explicit methods when boolean
         // naming or additional body storage requires a different contract.
         let lombok_accessors = self.lombok
+            && self.constructor_accessors_are_default(decl, &params)
             && params.iter().any(|(property, _, _, _)| *property)
             && params.iter().all(|(property, _, property_name, ty)| {
                 let kotlin_getter = crate::workspace::property_accessor_name(property_name);
@@ -5586,8 +5651,8 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             }
             out.blank();
             for (_is_property, is_mutable, fname, ftype) in &params {
-                let getter_name = crate::workspace::property_accessor_name(fname);
-                let setter_name = crate::property_abi::setter_name(fname);
+                let getter_name = self.property_getter_name(decl, fname);
+                let setter_name = self.property_setter_name(decl, fname);
                 let declares_getter = members.iter().any(|member| {
                     member.kind() == "function_declaration"
                         && kt::field(*member, "name")
@@ -5656,10 +5721,8 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                 && let Some(identifier) = kt::child(variable, "identifier")
             {
                 let property = self.text(identifier).to_owned();
-                self.self_getters.insert(
-                    property.clone(),
-                    crate::workspace::property_accessor_name(&property),
-                );
+                let getter = self.property_getter_name(*member, &property);
+                self.self_getters.insert(property.clone(), getter);
             }
         }
         // body members

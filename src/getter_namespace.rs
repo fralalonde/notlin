@@ -121,9 +121,13 @@ fn getter_names(
             if owner.language == SourceLanguage::Kotlin
                 && member.kind == MemberKind::Property
                 && !member.is_jvm_field
-                && !member.setter_name_renamed
             {
-                names.insert(crate::workspace::property_accessor_name(&member.name));
+                names.insert(
+                    index
+                        .property_accessor_names(owner, member)
+                        .getter(&member.name)
+                        .unwrap_or_else(|| crate::workspace::property_accessor_name(&member.name)),
+                );
             } else if !properties_only
                 && member.kind == MemberKind::Method
                 && member.parameter_types.is_empty()

@@ -95,6 +95,17 @@ impl Expr<'_, '_, '_> {
     }
 
     pub(crate) fn safe_receiver_java_type(&mut self, receiver: Node<'_>) -> String {
+        self.receiver_java_type(receiver, true)
+            .expect("required receiver inference always supplies a type")
+    }
+
+    /// Optional lowering probes must not diagnose or taint an unrelated path
+    /// when the receiver needs the ordinary emitter's later type inference.
+    pub(crate) fn probe_receiver_java_type(&mut self, receiver: Node<'_>) -> Option<String> {
+        self.receiver_java_type(receiver, false)
+    }
+
+    fn receiver_java_type(&mut self, receiver: Node<'_>, allow_inference: bool) -> Option<String> {
         let source = self.unit.source;
         let file = self
             .unit
@@ -107,12 +118,12 @@ impl Expr<'_, '_, '_> {
                 crate::semantics::java_expression_return(source, &file, receiver, provider)
             && let Some(ty) = read.java_value_type()
         {
-            return java_type_spelling(&kotlin_type_text(&ty.ty, ty.nullable));
+            return Some(java_type_spelling(&kotlin_type_text(&ty.ty, ty.nullable)));
         }
         if receiver.kind() == "navigation_expression"
             && let Some((base, member)) = self.unit.nav_base_member(receiver)
         {
-            let base_type = self.safe_receiver_java_type(base);
+            let base_type = self.receiver_java_type(base, allow_inference)?;
             if let Some(workspace) = self.unit.workspace
                 && let Some(source_file) = workspace.source_file(&file)
                 && let Some(owner) = workspace.resolve_type(source_file, &base_type)
@@ -143,9 +154,9 @@ impl Expr<'_, '_, '_> {
                         owner.package.as_deref().unwrap_or(""),
                         provider,
                     );
-                    return java_type_spelling(&kotlin_type_text(&ty.ty, ty.nullable));
+                    return Some(java_type_spelling(&kotlin_type_text(&ty.ty, ty.nullable)));
                 }
-                return java_type_spelling(ty);
+                return Some(java_type_spelling(ty));
             }
         }
         if let Some(provider) = self.unit.semantic_provider {
@@ -173,11 +184,29 @@ impl Expr<'_, '_, '_> {
                 // and nullable primitive boxing.
                 let mut ty = ty.clone();
                 qualify_receiver_type(&mut ty.ty, &symbol.id.file, &symbol.id.package, provider);
-                return java_type_spelling(&kotlin_type_text(&ty.ty, ty.nullable));
+                return Some(java_type_spelling(&kotlin_type_text(&ty.ty, ty.nullable)));
             }
         }
-        crate::transpiler::types::erase_nullable_annotations(&self.unit.infer_type(receiver))
-            .replace("@NotNull ", "")
+        if !allow_inference {
+            return match receiver.kind() {
+                "identifier" => self
+                    .unit
+                    .var_types
+                    .get(self.unit.text(receiver).trim())
+                    .map(|ty| {
+                        crate::transpiler::types::erase_nullable_annotations(ty)
+                            .replace("@NotNull ", "")
+                    }),
+                "parenthesized_expression" => receiver
+                    .named_child(0)
+                    .and_then(|inner| self.receiver_java_type(inner, false)),
+                _ => None,
+            };
+        }
+        Some(
+            crate::transpiler::types::erase_nullable_annotations(&self.unit.infer_type(receiver))
+                .replace("@NotNull ", ""),
+        )
     }
 }
 

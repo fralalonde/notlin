@@ -60,6 +60,87 @@ Evidence and negative controls are under
 names and their source/bean roles before removing the current descendant guard;
 do not replace it with a naive narrow-method rename.
 
+The accessor follow-up records exact getter/setter JVM names and consumes
+them in declaration emission, Java property reads/writes and retained Kotlin
+caller contracts. It replaces the coarse setter-renamed flag, resolves imported
+annotation aliases and source shadows, and reads annotated constructor types
+from syntax instead of splitting on use-site colons. Retained superclass checks
+reuse the cached tree and accept proved accessor annotations. The missing
+`CharSequence.toString` platform signature is also supplied. All 27 focused
+release checks pass, including original/plain/Lombok execution, distinct stored
+and lookup values, and a Java `toString()` returning null. The 416 library tests
+pass with normal Windows access; the 11 sandbox failures reproduce previously
+resolved permission restrictions. The native JDK25 signature gate proves all
+22 rows, 28 cases and eight owners. Formatting and CI Clippy pass.
+
+This follow-up is **accepted through the two-stage application gate below**.
+Its real Jackson control exposed
+an empty-bean difference: original Kotlin Box/DataBox/Mutable types serialize as
+`{}`, while unmarked Java throws `InvalidDefinitionException`. Generated owners
+with renamed getters now carry the standard `java.beans.JavaBean` marker. Native
+controls preserve the original JSON and JavaBeans descriptors, without inventing
+logical JSON properties. Both ordinary and Kotlin-module mappers are exercised;
+JSON-exposed boolean types additionally keep their physical getter names under
+the application's Kotlin module. Unmarked renamed booleans with arbitrary mapper
+configurations still need a separate metadata policy; this is not a claim of
+equivalence for every possible Jackson configuration.
+
+Operation-derived contracts also preserve logical property identity after a
+non-bean interface getter becomes Java. Retained Kotlin implementations keep
+private storage and explicit accessor bridges, including mutable implementations
+of read-only contracts and data-class copying. Known file-level Kotlin `Suppress`
+metadata stays with Kotlin residue instead of tainting the next declaration;
+aliases are bound and foreign annotations remain conservative. Generated bridge
+setters qualify their storage with `this`, fixing parameter shadowing for a
+property literally named `value`. Original/plain/Lombok controls compile and run
+these cases and compare JSON, storage visibility and accessor dispatch. Evidence
+is under `target/bean-metadata-20261102/`; earlier evidence remains under
+`target/physical-accessors-20261102/`.
+
+The first frozen candidate passed 37 focused release checks, all 416 library checks
+(five ignored), formatting and CI Clippy. Its complete Rust run has 1697 passes,
+169 ignored and exactly the same 62 known Windows failures, with no new failures.
+All 386 compiler inputs matched its frozen copies. The live reference was still
+clean at `3382c909`. The first fresh standard conversion under
+`target/physical-accessors-gate-20261102/` used binary
+SHA256 `11094cada263dab01f28786c6f3f5fbda41eaac55d5e05ac2bbf90fd3363684f`.
+It stopped before Gradle because only 4155 owners translated: `IWorkflowNode`,
+`IWorkflowStepNode` and `WorkflowPositionNode` regressed. The new optional
+accessor probe had called required receiver inference, diagnosing an unknown
+generic `data: T` before the normal generic lowering could handle it.
+
+The correction separates optional receiver probing from diagnostic-emitting
+required inference. All 39 focused checks pass, including a new original/plain/
+Lombok generic-forwarding control beside an unrelated renamed getter; formatting
+and CI Clippy pass. The complete Rust comparison has 1698 passes, 170 ignored and
+the same 62 known Windows failures, with no new failures. Its accepted incremental
+application gate is under `target/physical-accessors-probe-fix-20261102/`. The frozen binary
+is `874abc114a8267bf8a0fed9d20e9bd54cf6e73794ab8e9df4d4de68633fcb979`.
+The standard root conversion on a copy of the 4155-output baseline restores
+exactly those three owners, bringing the cumulative total back to 4158. Every
+one of the 6932 existing Java files remains byte-identical. The complete Gradle
+build passes in 479.5 seconds; all 3070 passing and 76 skipped test identities and
+outcomes match the pristine reference. Hastings loads 9745 records and stays free
+of errors and stack traces for 106 seconds after import; the owned app is stopped.
+No generated source is hand-edited. This is two-stage baseline acceptance, not
+a claim that the corrected binary has completed a new pristine conversion.
+
+An isolated discovery implementation identifies one `IEntity.id` family on the
+pristine reference: ten Kotlin property declarations, one independent Kotlin
+getter function, one existing Java implementation and 245 descendants, with no
+unresolved source edges. Two properties return narrower ID types. Those bean
+return types and the existing Java implementation need coordinated migration;
+245 is the family size, not a projected translation gain. The detector handles
+shared roots, covariance, class-local and enum properties, unrelated names, and
+physical-name collisions. Its scoped regression and CI Clippy pass. Discovery
+and six-mode callable-reference controls remain in a disposable compiler copy,
+not in the main candidate. Evidence is
+`target/getter-references-compiler-20261102/`.
+
+Complete automatic hierarchy normalization and bound Java/Kotlin caller migration,
+including callable references, before removing the descendant guard. The guard
+remains; its normalization prototype is not part of the accepted accessor change.
+
 On 2026-11-02 the user confirmed that unconverted `exp/kotlin-killer2` defines
 the required application behavior. Its latest production commit is
 `0f16243c38c7c35d7019b992372b02ff70bd20d1`. The new pristine control reproduces

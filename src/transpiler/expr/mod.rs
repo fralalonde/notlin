@@ -218,6 +218,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         "(({owner}) {implicit_this}).{}()",
                         crate::workspace::property_accessor_name(&access.getter_contract.name)
                     )
+                } else if let Some(getter) = self.inherited_renamed_property_getter(&name) {
+                    format!("{implicit_this}.{getter}()")
                 } else if !self.unit.var_types.contains_key(&name)
                     && self.enclosing_record_has_component(&name)
                 {
@@ -406,6 +408,31 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         }
     }
 
+    fn inherited_renamed_property_getter(&self, property: &str) -> Option<String> {
+        let workspace = self.unit.workspace?;
+        if !workspace.members_named(property).any(|(_, member)| {
+            member.kind == crate::workspace::MemberKind::Property
+                && matches!(
+                    member.accessors.getter,
+                    crate::workspace::AccessorName::Named(_)
+                )
+        }) {
+            return None;
+        }
+        let owner = self.enclosing_type_name()?;
+        let file = self
+            .unit
+            .workspace_file
+            .as_deref()
+            .unwrap_or(self.unit.file);
+        let (owner, member) = workspace.property_in_type(file, &owner, property)?;
+        let names = workspace.property_accessor_names(owner, member);
+        let crate::workspace::AccessorName::Named(getter) = &names.getter else {
+            return None;
+        };
+        (!getter.starts_with("notlinProperty")).then(|| getter.clone())
+    }
+
     /// Unit is a singleton value, independently of the void descriptor used by
     /// Unit-returning methods. Source imports establish the type binding; value
     /// parameters, locals and properties can still shadow that spelling.
@@ -520,10 +547,14 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                         && let Some(owner) = workspace.resolve_type(file, &receiver_type)
                     {
                         use crate::workspace::{MemberKind, SourceLanguage};
-                        let setter = format!("set{}", crate::transpiler::unit::capitalize(&member));
                         let property = owner.members.iter().find(|candidate| {
                             candidate.name == member && candidate.kind == MemberKind::Property
                         });
+                        let names = property
+                            .map(|property| workspace.property_accessor_names(owner, property));
+                        let setter = property
+                            .and_then(|_| names.as_ref()?.setter(&member))
+                            .unwrap_or_else(|| crate::property_abi::setter_name(&member));
                         if property.is_some_and(|property| property.is_jvm_field)
                             || owner.members.iter().any(|candidate| {
                                 candidate.name == member
@@ -562,7 +593,10 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                             || (owner.language == SourceLanguage::Kotlin
                                 && property.is_some_and(|property| {
                                     property.is_mutable
-                                        && !property.setter_name_renamed
+                                        && names
+                                            .as_ref()
+                                            .and_then(|names| names.setter(&member))
+                                            .is_some()
                                         && !property.has_custom_accessor
                                 }))
                             || owner.members.iter().any(|candidate| {
@@ -649,7 +683,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     /// class whose plain public `var` property exposes the ordinary
     /// JavaBean setter ABI. `@JvmField` properties have no setter method,
     /// a custom accessor block can hide the setter (`private set`), and
-    /// `@JvmName` can rename it — indexed as `setter_name_renamed`; all of
+    /// `@JvmName` can rename it; the index carries the exact accessor name. All of
     /// those keep today's behavior. Declaration-site annotations such as
     /// serialization or tooling markers do not change the setter name and
     /// do NOT block this rewrite. Returns just the setter name; the caller
@@ -714,10 +748,11 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 && candidate.name == member
                 && !candidate.is_static
         })?;
+        let names = workspace.property_accessor_names(declaration, property);
         if !property.is_mutable
             || property.is_jvm_field
             || property.has_custom_accessor
-            || property.setter_name_renamed
+            || names.setter(member).is_none()
             || !matches!(
                 property.visibility.as_deref(),
                 None | Some("public") | Some("protected")
@@ -737,10 +772,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         {
             return None;
         }
-        Some(format!(
-            "set{}",
-            crate::transpiler::unit::capitalize(member)
-        ))
+        names.setter(member)
     }
 
     /// A bare assignment in a translated subclass cannot write an inherited

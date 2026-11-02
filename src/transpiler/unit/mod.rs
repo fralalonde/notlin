@@ -13,9 +13,12 @@ use crate::workspace::SourceIndex;
 use std::path::{Path, PathBuf};
 
 mod annotation_values;
+mod bean_metadata;
 mod class;
 mod jackson_property_names;
-pub(crate) use class::kotlin_builtin_annotation_binding;
+pub(crate) use class::{
+    annotation_binding_name, annotation_fq_name, kotlin_builtin_annotation_binding,
+};
 mod function;
 mod property;
 mod types_infer;
@@ -1542,6 +1545,24 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
                 "shebang_line" | ";" | "line_comment" | "multiline_comment" | "block_comment" => {}
                 "file_annotation" | "annotated_expression" => {
+                    // File diagnostics metadata does not annotate the next
+                    // declaration. Keep it in any Kotlin residue, but do not
+                    // let it prevent an otherwise translatable Java owner.
+                    if child.kind() == "file_annotation"
+                        && kotlin_builtin_annotation_binding(
+                            child,
+                            "kotlin.Suppress",
+                            self.source,
+                            self.workspace,
+                            self.workspace.and_then(|index| {
+                                index.source_file(
+                                    self.workspace_file.as_deref().unwrap_or(self.file),
+                                )
+                            }),
+                        ) == Some(true)
+                    {
+                        continue;
+                    }
                     // Queue parser-recovered interfaces for the normal
                     // declaration-dispatch pass below. That pass runs after
                     // class-body facts and plans have been prepared.

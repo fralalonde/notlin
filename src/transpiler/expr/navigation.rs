@@ -48,6 +48,9 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         if let Some(java) = self.planned_container_property_access(node) {
             return java;
         }
+        if let Some(java) = self.renamed_property_read(node) {
+            return java;
+        }
         // Map/Iterable collection ops (`x.filterValues { .. }`,
         // `x.mapKeys { .. }`, `x.associateBy { .. }`) — Java has no such
         // members: lower through stream/entrySet before generic handling.
@@ -837,6 +840,49 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             );
         }
         result
+    }
+
+    fn renamed_property_read(&mut self, node: tree_sitter::Node) -> Option<String> {
+        let (base, property) = self.unit.nav_base_member(node)?;
+        let workspace = self.unit.workspace?;
+        if !workspace.members_named(&property).any(|(_, member)| {
+            member.kind == crate::workspace::MemberKind::Property
+                && member.accessors.getter != crate::workspace::AccessorName::Default
+        }) {
+            return None;
+        }
+        if node
+            .children(&mut node.walk())
+            .any(|part| part.kind() == "::")
+        {
+            return None;
+        }
+        let receiver = if self.unit.text(base).trim() == "this" {
+            self.enclosing_type_name()?
+        } else {
+            self.probe_receiver_java_type(base)?
+        };
+        let file = self
+            .unit
+            .workspace_file
+            .as_deref()
+            .unwrap_or(self.unit.file);
+        let (owner, member) = workspace.property_in_type(file, &receiver, &property)?;
+        let names = workspace.property_accessor_names(owner, member);
+        if member.is_jvm_field || names.getter == crate::workspace::AccessorName::Default {
+            return None;
+        }
+        let Some(getter) = names.getter(&property) else {
+            self.unit
+                .diag_untranslatable(node, "property getter JVM name is not established");
+            return Some("null".into());
+        };
+        // Existing property-ABI repairs supply their public forwarding method;
+        // the temporary accessor is coalesced if that owner becomes Java.
+        if getter.starts_with("notlinProperty") {
+            return None;
+        }
+        Some(format!("{}.{}()", self.transpile(base), getter))
     }
 
     pub(crate) fn navigation_call(&mut self, node: tree_sitter::Node) -> String {

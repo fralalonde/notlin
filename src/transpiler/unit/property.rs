@@ -7,6 +7,97 @@ use crate::transpiler::java::JavaOut;
 use crate::transpiler::kt;
 
 impl<'src, 'tree> Unit<'src, 'tree> {
+    pub(super) fn property_accessor_names(
+        &self,
+        decl: tree_sitter::Node<'_>,
+        property: &str,
+    ) -> crate::workspace::PropertyAccessors {
+        let node = self.param_node(decl, property).unwrap_or(decl);
+        let mut names = crate::workspace::property_accessors::from_node(node, self.source);
+        if let Some(index) = self.workspace
+            && let Some(file) =
+                index.source_file(self.workspace_file.as_deref().unwrap_or(self.file))
+        {
+            names = names.in_context(index, file);
+        }
+        // ABI repair coalesces its temporary bridge when its owner becomes Java.
+        for (getter, slot, ordinary) in [
+            (
+                true,
+                &mut names.getter,
+                crate::workspace::property_accessor_name(property),
+            ),
+            (
+                false,
+                &mut names.setter,
+                crate::property_abi::setter_name(property),
+            ),
+        ] {
+            let crate::workspace::AccessorName::Named(temporary) = slot else {
+                continue;
+            };
+            let Some(physical) = temporary
+                .strip_prefix("notlinProperty")
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            if self.accessor_class_body(decl).is_some_and(|body| {
+                body.named_children(&mut body.walk()).any(|function| {
+                    function.kind() == "function_declaration"
+                        && kt::field(function, "name")
+                            .is_some_and(|name| self.text(name) == physical)
+                        && self.is_property_repair_bridge(function)
+                        && self.property_repair_bridge_for(function, property, getter)
+                })
+            }) {
+                *slot = if physical == ordinary {
+                    crate::workspace::AccessorName::Default
+                } else {
+                    crate::workspace::AccessorName::Named(physical.into())
+                };
+            }
+        }
+        names
+    }
+
+    pub(super) fn property_getter_name(
+        &mut self,
+        decl: tree_sitter::Node<'_>,
+        property: &str,
+    ) -> String {
+        self.property_accessor_names(decl, property)
+            .getter(property)
+            .unwrap_or_else(|| {
+                self.diag_untranslatable(decl, "property getter JVM name is not established");
+                crate::workspace::property_accessor_name(property)
+            })
+    }
+
+    pub(super) fn property_setter_name(
+        &mut self,
+        decl: tree_sitter::Node<'_>,
+        property: &str,
+    ) -> String {
+        self.property_accessor_names(decl, property)
+            .setter(property)
+            .unwrap_or_else(|| {
+                self.diag_untranslatable(decl, "property setter JVM name is not established");
+                crate::property_abi::setter_name(property)
+            })
+    }
+
+    pub(super) fn constructor_accessors_are_default(
+        &self,
+        decl: tree_sitter::Node<'_>,
+        params: &[(bool, bool, String, String)],
+    ) -> bool {
+        params
+            .iter()
+            .filter(|(property, _, _, _)| *property)
+            .all(|(_, _, property, _)| self.property_accessor_names(decl, property).is_default())
+    }
+
     /// An explicit getter reading its JVM backing field must not call itself.
     /// Other property reads keep their accessor path, including virtual dispatch
     /// through getters added while a Kotlin owner was retained.
@@ -126,8 +217,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         ) {
             kt::child(decl, "class_body").or_else(|| kt::child(decl, "enum_class_body"))
         } else {
-            kt::parent_of(decl)
-                .filter(|parent| matches!(parent.kind(), "class_body" | "enum_class_body"))
+            let mut owner = decl.parent();
+            while let Some(node) = owner {
+                if matches!(node.kind(), "class_body" | "enum_class_body") {
+                    return Some(node);
+                }
+                if matches!(
+                    node.kind(),
+                    "class_declaration" | "object_declaration" | "companion_object"
+                ) {
+                    return kt::child(node, "class_body")
+                        .or_else(|| kt::child(node, "enum_class_body"));
+                }
+                owner = node.parent();
+            }
+            None
         }
     }
 
@@ -515,7 +619,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 self.property_repair_bridge_annotations(&owner, property_node, &property, false)
             })
             .unwrap_or_default();
-        if self.class_declares_method(decl, &crate::workspace::property_accessor_name(&name)) {
+        let getter_name = self.property_getter_name(decl, &name);
+        let setter_name = self.property_setter_name(decl, &name);
+        if self.class_declares_method(decl, &getter_name) {
             field_annotations.append(&mut getter_annotations);
         }
 
@@ -541,8 +647,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
         // getter — but not if the user declared their own accessor-method
         // of the same name in the class body (would collide in Java).
-        let getter_name = crate::workspace::property_accessor_name(&name);
-        let setter_name = crate::property_abi::setter_name(&name);
         let set_private = setter
             .as_ref()
             .and_then(|s| kt::child(*s, "modifiers"))

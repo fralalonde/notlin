@@ -218,6 +218,7 @@ const SIGNATURES: &[Signature] = &[
         BUILDER
     ),
     signature!(BUILDER, "toString", Instance, &[], STRING),
+    signature!("java.lang.CharSequence", "toString", Instance, &[], STRING),
     signature!(
         "java.util.UUID",
         "randomUUID",
@@ -1144,15 +1145,15 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_table_shape_is_21_rows_27_cases_7_owners() {
+    fn bootstrap_table_shape_is_22_rows_28_cases_8_owners() {
         let cases = expanded_cases();
-        assert_eq!(SIGNATURES.len(), 21, "declared bootstrap rows");
-        assert_eq!(cases.len(), 27, "expanded parameter cases");
+        assert_eq!(SIGNATURES.len(), 22, "declared bootstrap rows");
+        assert_eq!(cases.len(), 28, "expanded parameter cases");
         let owners = SIGNATURES
             .iter()
             .map(|signature| signature.owner)
             .collect::<BTreeSet<_>>();
-        assert_eq!(owners.len(), 7, "declared owners");
+        assert_eq!(owners.len(), 8, "declared owners");
 
         // Every row, and every alternative within it, contributes cases.
         let visited = cases.iter().map(|case| case.row).collect::<BTreeSet<_>>();
@@ -1441,7 +1442,7 @@ mod tests {
             .iter()
             .map(|signature| signature.owner)
             .collect::<BTreeSet<_>>();
-        assert_eq!(owners.len(), 7);
+        assert_eq!(owners.len(), 8);
 
         let mut evidence = Vec::new();
         for owner in &owners {
@@ -1462,14 +1463,14 @@ mod tests {
             evidence.append(&mut owner_evidence);
         }
 
-        assert_eq!(evidence.len(), 27, "expanded cases proved");
+        assert_eq!(evidence.len(), cases.len(), "expanded cases proved");
         assert_eq!(
             evidence
                 .iter()
                 .map(|case| case.row)
                 .collect::<BTreeSet<_>>()
                 .len(),
-            21,
+            SIGNATURES.len(),
             "distinct rows proved"
         );
         assert_eq!(
@@ -1507,7 +1508,7 @@ mod tests {
         }
         eprintln!(
             "native conformance: {} rows, {} cases, {} owners, all unique",
-            21,
+            SIGNATURES.len(),
             evidence.len(),
             owners.len()
         );

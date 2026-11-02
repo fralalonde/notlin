@@ -40,6 +40,101 @@ impl PersistedPropertyContract {
     }
 }
 
+/// Preserve the source property's identity after its interface becomes Java.
+/// A method named `readValue` cannot be rediscovered as the former `value`
+/// property from JavaBean spelling alone. Match operation-derived names to
+/// the actual emitted signatures, and bind types in that Java source's scope.
+pub(crate) fn remember_emitted_property_contracts(
+    index: &SourceIndex,
+    generated_java: &HashSet<std::path::PathBuf>,
+    source_contracts: &[(std::path::PathBuf, PropertyAccessorContract)],
+    persisted: &mut Vec<PersistedPropertyContract>,
+) {
+    let mut by_owner = HashMap::<&str, Vec<&PropertyAccessorContract>>::new();
+    for (_, contract) in source_contracts {
+        by_owner
+            .entry(&contract.owner_type)
+            .or_default()
+            .push(contract);
+    }
+    if by_owner.is_empty() {
+        return;
+    }
+    for file in index
+        .java_files()
+        .filter(|file| generated_java.contains(&file.path))
+    {
+        for owner in file
+            .declarations
+            .iter()
+            .filter(|owner| owner.kind == DeclarationKind::Interface)
+        {
+            let symbol = crate::semantics::workspace_symbol(index, owner);
+            let mut path = symbol.owner_path.clone();
+            path.push(symbol.name);
+            let name = if symbol.package.is_empty() {
+                path.join(".")
+            } else {
+                format!("{}.{}", symbol.package, path.join("."))
+            };
+            let Some(contracts) = by_owner.get(name.as_str()) else {
+                continue;
+            };
+            for source in contracts {
+                let getters = owner
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member.kind == MemberKind::Method
+                            && !member.is_static
+                            && member.name == source.getter
+                            && member.parameter_types.is_empty()
+                            && member.type_name.as_deref() != Some("void")
+                    })
+                    .collect::<Vec<_>>();
+                let [getter] = getters.as_slice() else {
+                    continue;
+                };
+                let Some(ty) = getter.type_name.as_deref() else {
+                    continue;
+                };
+                if source.setter.as_ref().is_some_and(|setter| {
+                    owner
+                        .members
+                        .iter()
+                        .filter(|member| {
+                            member.kind == MemberKind::Method
+                                && !member.is_static
+                                && &member.name == setter
+                                && member.type_name.as_deref() == Some("void")
+                                && member.parameter_types == [ty]
+                        })
+                        .count()
+                        != 1
+                }) {
+                    continue;
+                }
+                let contract = PersistedPropertyContract {
+                    owner_file: file.path.clone(),
+                    owner_name: owner.name.clone(),
+                    owner_package: owner.package.clone(),
+                    owner_kind: owner.kind,
+                    contract: PropertyContract {
+                        name: source.property.clone(),
+                        type_name: java_type_to_kotlin(ty).into(),
+                        type_source: file.path.clone(),
+                        getter: source.getter.clone(),
+                        setter: source.setter.clone(),
+                    },
+                };
+                if !persisted.contains(&contract) {
+                    persisted.push(contract);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 fn persisted_owner_matches(
     persisted: &PersistedPropertyContract,
@@ -1652,10 +1747,15 @@ fn private_storage_source_shape_supported(
         return false;
     };
     property_type_from_node(*property_node, source).is_some()
-        && private_storage_source_node_supported(*property_node, source)
+        && private_storage_source_node_supported(*property_node, source, index, source_file)
 }
 
-fn private_storage_source_node_supported(node: Node<'_>, source: &str) -> bool {
+fn private_storage_source_node_supported(
+    node: Node<'_>,
+    source: &str,
+    index: &SourceIndex,
+    file: &crate::workspace::SourceFile,
+) -> bool {
     if node
         .named_children(&mut node.walk())
         .any(|child| child.kind() == "property_delegate")
@@ -1673,15 +1773,19 @@ fn private_storage_source_node_supported(node: Node<'_>, source: &str) -> bool {
     let mut pending = vec![modifiers];
     while let Some(child) = pending.pop() {
         if child.kind() == "annotation" {
-            let text = node_text(child, source).trim();
-            if text.starts_with("@JvmName") {
-                return false;
-            }
+            let jvm_name = crate::transpiler::unit::kotlin_builtin_annotation_binding(
+                child,
+                "kotlin.jvm.JvmName",
+                source,
+                Some(index),
+                Some(file),
+            ) == Some(true);
             if let Some(target) = child
                 .named_children(&mut child.walk())
                 .find(|node| node.kind() == "use_site_target")
                 .map(|target| node_text(target, source).trim().trim_end_matches(':'))
                 && !matches!(target, "field" | "param" | "property")
+                && !(jvm_name && matches!(target, "get" | "set"))
             {
                 return false;
             }
@@ -2039,8 +2143,18 @@ fn source_contract_properties(
             name: member.name.clone(),
             type_name: type_name.clone(),
             type_source: inferred.map_or_else(|| type_source.clone(), |(_, file)| file),
-            getter: crate::workspace::property_accessor_name(&member.name),
-            setter: member.is_mutable.then(|| setter_name(&member.name)),
+            getter: index
+                .property_accessor_names(target, member)
+                .getter(&member.name)?,
+            setter: if member.is_mutable {
+                Some(
+                    index
+                        .property_accessor_names(target, member)
+                        .setter(&member.name)?,
+                )
+            } else {
+                None
+            },
         });
     }
     Some(properties)
@@ -4352,6 +4466,13 @@ fn inherited_generated_contracts(
             && let Some(contracts) = java_property_contracts(resolved, &file.path)
         {
             for mut contract in contracts {
+                if persisted_contracts
+                    .for_owner(file, resolved)
+                    .iter()
+                    .any(|known| known.contract.name == contract.name)
+                {
+                    continue;
+                }
                 let mentions_parent_parameter =
                     type_mentions_any_parameter(&contract.type_name, &resolved.type_params);
                 let Some(specialized) =
@@ -4952,7 +5073,9 @@ fn repair_declaration(
                         local_property,
                         contract,
                     )
-                    && private_storage_source_node_supported(child, source)
+                    && index.source_file(path).is_some_and(|file| {
+                        private_storage_source_node_supported(child, source, index, file)
+                    })
                     && private_storage_property_ancestors_repairable(
                         index,
                         declaration,
@@ -5081,6 +5204,7 @@ fn repair_declaration(
                         &bridge_contract,
                         bridge_contract.setter.is_some()
                             || has_inherited_setter(index, declaration, &contract.name),
+                        source,
                     )
                 } {
                     let origin = repair_property_origin(index, declaration, child, source, path);
@@ -5693,6 +5817,7 @@ fn class_property_bridge(
     text: &str,
     contract: &PropertyContract,
     setter_override: bool,
+    source: &str,
 ) -> Option<(String, Option<String>, Option<String>)> {
     let (prefix, mutable) = property_prefix(text)?;
     let ty = property_type(text)?;
@@ -5721,12 +5846,26 @@ fn class_property_bridge(
         cleaned.push(' ');
     }
     let custom_accessors = text.contains("get()") || text.contains("set(");
-    if custom_accessors {
+    let named_contract = contract.getter
+        != crate::workspace::property_accessor_name(&contract.name)
+        || contract
+            .setter
+            .as_ref()
+            .is_some_and(|setter| *setter != setter_name(&contract.name));
+    if custom_accessors || named_contract {
+        if named_contract && !cleaned.split_whitespace().any(|word| word == "final") {
+            cleaned.push_str("final ");
+        }
         cleaned.push_str(&format!(
             "@get:kotlin.jvm.JvmName(\"notlinProperty{}\") ",
             contract.getter
         ));
-        if let Some(setter) = &contract.setter {
+        if let Some(setter) = mutable.then(|| {
+            contract
+                .setter
+                .clone()
+                .unwrap_or_else(|| setter_name(&contract.name))
+        }) {
             cleaned.push_str(&format!(
                 "@set:kotlin.jvm.JvmName(\"notlinProperty{}\") ",
                 setter
@@ -5743,6 +5882,7 @@ fn class_property_bridge(
     let getter_annotations = targeted_annotations(prefix, "get")
         .into_iter()
         .chain(custom_accessor_annotations(text, "get()"))
+        .filter(|annotation| !is_jvm_name_control(annotation, source))
         .map(|annotation| format!("{annotation}\n"))
         .collect::<String>();
     let getter = format!(
@@ -5757,10 +5897,11 @@ fn class_property_bridge(
         let annotations = targeted_annotations(prefix, "set")
             .into_iter()
             .chain(custom_accessor_annotations(text, "set("))
+            .filter(|annotation| !is_jvm_name_control(annotation, source))
             .map(|annotation| format!("{annotation}\n"))
             .collect::<String>();
         format!(
-            "{annotations}{}{setter}(value: {ty}) {{ {} = value }}",
+            "{annotations}{}{setter}(value: {ty}) {{ this.{} = value }}",
             if setter_override {
                 "override fun "
             } else {
@@ -5770,6 +5911,17 @@ fn class_property_bridge(
         )
     });
     Some((replacement, Some(getter), setter))
+}
+
+fn is_jvm_name_control(annotation: &str, source: &str) -> bool {
+    let name = annotation
+        .trim_start_matches('@')
+        .split('(')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let name = crate::transpiler::unit::annotation_binding_name(name.into(), source);
+    matches!(name.as_str(), "JvmName" | "kotlin.jvm.JvmName")
 }
 
 fn private_storage_bridge_supported(
@@ -5989,7 +6141,7 @@ fn private_storage_property_bridge(
             ""
         };
         format!(
-            "{modifier}fun {setter_name}(value: {ty}) {{ {} = value }}",
+            "{modifier}fun {setter_name}(value: {ty}) {{ this.{} = value }}",
             contract.name
         )
     });
@@ -6825,7 +6977,9 @@ mod tests {
         assert!(repaired.contains("final @JvmField val name: String"));
         assert!(repaired.contains("final @JvmField var enabled: Boolean"));
         assert!(repaired.contains("override fun getName(): String = name"));
-        assert!(repaired.contains("override fun setEnabled(value: Boolean) { enabled = value }"));
+        assert!(
+            repaired.contains("override fun setEnabled(value: Boolean) { this.enabled = value }")
+        );
         assert!(repaired.contains(" : Child {\n    override fun "));
         assert!(java.exists());
     }
@@ -8280,7 +8434,7 @@ mod tests {
         );
         assert!(base.contains("override fun getId(): String = id"), "{base}");
         assert!(
-            base.contains("override fun setId(value: String) { id = value }"),
+            base.contains("override fun setId(value: String) { this.id = value }"),
             "{base}"
         );
         assert!(!base.contains("@JvmField"), "{base}");
@@ -8294,7 +8448,7 @@ mod tests {
             "{child}"
         );
         assert!(
-            child.contains("override fun setId(value: String) { id = value }"),
+            child.contains("override fun setId(value: String) { this.id = value }"),
             "{child}"
         );
     }
@@ -8438,6 +8592,7 @@ mod tests {
             "override val name: String\n    @JsonIgnore\n    get() = \"name\"",
             &contract,
             false,
+            "",
         )
         .unwrap();
         assert_eq!(
@@ -8445,7 +8600,8 @@ mod tests {
             Some("@JsonIgnore\noverride fun getName(): String = name")
         );
         let (_, getter, _) =
-            class_property_bridge("override val name:\n        String", &contract, false).unwrap();
+            class_property_bridge("override val name:\n        String", &contract, false, "")
+                .unwrap();
         assert_eq!(
             getter.as_deref(),
             Some("override fun getName(): String = name")
@@ -9553,7 +9709,9 @@ mod tests {
         assert_eq!(count, 3);
         assert!(rewritten.contains("override fun getEnabled(): Boolean"));
         assert!(rewritten.contains("fun setEnabled(value: Boolean)"));
-        assert!(rewritten.contains("override fun setEnabled(value: Boolean) { enabled = value }"));
+        assert!(
+            rewritten.contains("override fun setEnabled(value: Boolean) { this.enabled = value }")
+        );
     }
 
     #[test]

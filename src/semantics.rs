@@ -461,6 +461,18 @@ fn parameter_signature(source: &str, node: tree_sitter::Node) -> String {
     let raw = node.utf8_text(source.as_bytes()).unwrap_or("");
     let mut ty = node
         .child_by_field_name("type")
+        .or_else(|| {
+            node.named_children(&mut node.walk()).find(|child| {
+                matches!(
+                    child.kind(),
+                    "user_type"
+                        | "nullable_type"
+                        | "function_type"
+                        | "parenthesized_type"
+                        | "dynamic"
+                )
+            })
+        })
         .and_then(|n| n.utf8_text(source.as_bytes()).ok())
         .map(str::to_owned);
     if ty.is_none() && node.kind() == "spread_parameter" {

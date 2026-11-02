@@ -645,6 +645,12 @@ where
             .iter()
             .flat_map(|plan| plan.emitted_owners.iter().cloned())
             .collect::<Vec<_>>();
+        repaired_property_contracts.extend(
+            crate::workspace::property_accessors::emitted_contracts(
+                &current_index,
+                &emitted_owners,
+            ),
+        );
         let callsite_plans = plans
             .iter()
             .map(|plan| plan.translation.clone())
@@ -750,6 +756,12 @@ where
             "property repair index",
         );
         let generated_java = cumulative.keys().cloned().collect::<HashSet<_>>();
+        crate::property_abi::remember_emitted_property_contracts(
+            &repair_index,
+            &generated_java,
+            &repaired_property_contracts,
+            &mut persisted_abi_contracts,
+        );
         let getter_repairs = crate::default_getter_repair::repair_virtual_sources(
             &repair_index,
             &mut next,
