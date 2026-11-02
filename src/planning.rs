@@ -697,7 +697,6 @@ impl AcceptedTranslationPlan {
                     error,
                 }
             })?;
-            crate::java_ir::remove_unused_lombok_imports(&mut unit);
             if let Some(provider) = semantic_provider {
                 attach_resolved_targets(&mut unit.root, &[], provider, &facade_targets);
             }
@@ -745,6 +744,7 @@ impl AcceptedTranslationPlan {
                     translation.provenance.push(origin);
                 }
             }
+            crate::java_ir::tidy_generated_java(&mut unit);
             assignments.push((path.clone(), owners.clone(), snapshot_hash));
             files.push(AcceptedJavaFile { path, unit, owners });
         }

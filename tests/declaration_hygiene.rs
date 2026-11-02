@@ -111,8 +111,8 @@ fn kotlin_only_import_is_not_carried_into_generated_java() {
         "unresolvable Kotlin-only import leaked into generated Java:\n{java}"
     );
     assert!(
-        java.contains("import java.util.*;"),
-        "stdlib collections import must stay:\n{java}"
+        java.contains("import java.util.ArrayList;"),
+        "the referenced collection type must remain imported:\n{java}"
     );
     let _ = fs::remove_dir_all(root);
 }

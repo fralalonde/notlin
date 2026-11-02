@@ -31,7 +31,7 @@ pub struct GeneratedGetterContract {
 }
 
 /// Collect only contracts that are directly represented by one accepted,
-/// ordinary top-level Java class and one uniquely indexed Kotlin property.
+/// ordinary top-level Java class or enum and one uniquely indexed Kotlin property.
 /// Accessor markers are argument-free, so Lombok's default public instance
 /// getter name and no-throws signature apply without configuration overrides.
 /// Constructor annotations do not change that accessor contract.
@@ -54,7 +54,7 @@ pub(crate) fn collect(
         .children
         .iter()
         .filter_map(element_node)
-        .filter(|node| node.kind == "class_declaration")
+        .filter(|node| storage_owner_kind(node).is_some())
     {
         let Some(class_name) = declaration_name(node) else {
             continue;
@@ -63,7 +63,9 @@ pub(crate) fn collect(
             .owners
             .iter()
             .filter(|owner| {
-                owner.kind == "class" && owner.name == class_name && owner.owner_path.is_empty()
+                Some(owner.kind.as_str()) == storage_owner_kind(node)
+                    && owner.name == class_name
+                    && owner.owner_path.is_empty()
             })
             .collect::<Vec<_>>();
         let [owner] = owners.as_slice() else {
@@ -72,11 +74,14 @@ pub(crate) fn collect(
         let Some(marker) = getter_marker(node, &imports) else {
             continue;
         };
+        if node.kind == "enum_declaration" && marker != GetterMarker::Getter {
+            continue;
+        }
         if direct_child_kind(node, "type_parameters").is_some() {
             continue;
         }
         let class_path = vec![class_name.clone()];
-        let Some(body) = field(node, "body") else {
+        let Some(body) = storage_body(node) else {
             continue;
         };
         let candidates = eligible_fields(body, marker, &imports);
@@ -212,7 +217,7 @@ pub(crate) fn collect_java_source(
         .children
         .iter()
         .filter_map(element_node)
-        .filter(|node| node.kind == "class_declaration")
+        .filter(|node| storage_owner_kind(node).is_some())
     {
         let Some(class_name) = declaration_name(node) else {
             continue;
@@ -224,7 +229,7 @@ pub(crate) fn collect_java_source(
             .iter()
             .filter(|symbol| {
                 symbol.id.file == path
-                    && symbol.id.kind == "class"
+                    && Some(symbol.id.kind.as_str()) == storage_owner_kind(node)
                     && symbol.id.owner_path.is_empty()
                     && symbol.id.name == class_name
                     && symbol.location.snapshot_hash == source_hash
@@ -240,7 +245,10 @@ pub(crate) fn collect_java_source(
         let Some(marker) = getter_marker(node, &imports) else {
             continue;
         };
-        let Some(body) = field(node, "body") else {
+        if node.kind == "enum_declaration" && marker != GetterMarker::Getter {
+            continue;
+        }
+        let Some(body) = storage_body(node) else {
             continue;
         };
         for candidate in eligible_fields(body, marker, &imports) {
@@ -332,6 +340,23 @@ enum GetterMarker {
     Value,
 }
 
+fn storage_owner_kind(node: &JavaSyntaxNode) -> Option<&'static str> {
+    match node.kind.as_str() {
+        "class_declaration" => Some("class"),
+        "enum_declaration" => Some("enum"),
+        _ => None,
+    }
+}
+
+fn storage_body(node: &JavaSyntaxNode) -> Option<&JavaSyntaxNode> {
+    let body = field(node, "body")?;
+    if node.kind == "enum_declaration" {
+        direct_child_kind(body, "enum_body_declarations")
+    } else {
+        Some(body)
+    }
+}
+
 fn getter_marker(
     class: &JavaSyntaxNode,
     imports: &BTreeMap<String, String>,
@@ -393,18 +418,18 @@ pub(crate) fn has_plain_public_setter(source: &str, owner: &str, property: &str)
         .iter()
         .filter_map(element_node)
         .find(|node| {
-            node.kind == "class_declaration" && declaration_name(node).as_deref() == Some(owner)
+            storage_owner_kind(node).is_some() && declaration_name(node).as_deref() == Some(owner)
         })
     else {
         return false;
     };
-    if !matches!(
-        getter_marker(class, &imports),
-        Some(GetterMarker::Getter | GetterMarker::Data)
-    ) {
+    let marker = getter_marker(class, &imports);
+    if !matches!(marker, Some(GetterMarker::Getter | GetterMarker::Data))
+        || (class.kind == "enum_declaration" && marker != Some(GetterMarker::Getter))
+    {
         return false;
     }
-    let Some(body) = field(class, "body") else {
+    let Some(body) = storage_body(class) else {
         return false;
     };
     let Some(target) = body.children.iter().filter_map(element_node).find(|node| {
@@ -1197,6 +1222,39 @@ mod tests {
             symbols,
             types,
         }
+    }
+
+    #[test]
+    fn enum_storage_shares_class_getter_proofs_and_field_setter_rules() {
+        let java = "package sample; @lombok.Getter enum Box { ONE(1); @lombok.Setter private int count; private Box(int count) { this.count = count; } }";
+        let (mut file, provider) = fixture(
+            java,
+            "enum class Box(var count: Int) { ONE(1) }",
+            &[("count", "Int")],
+            Vec::new(),
+        );
+        file.owners[0].kind = "enum".into();
+        let accepted = collect(&file, &provider);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].method_name, "getCount");
+        assert_eq!(accepted[0].jvm_signature.descriptor, "()I");
+        let path = Path::new("src/Box.java");
+        let mut provider = java_source_provider(path, java, &["Box"], Vec::new());
+        provider.symbols[0].id.kind = "enum".into();
+        let indexed = collect_java_source(path, java, &provider);
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].method_name, "getCount");
+        assert!(has_plain_public_setter(java, "Box", "count"));
+        let suppressed = java.replace(
+            "private Box",
+            "public int getCount() { return count; } private Box",
+        );
+        file.unit = crate::java_ir::parse_java(&suppressed).unwrap();
+        assert!(collect(&file, &provider).is_empty());
+        let invalid = java.replace("@lombok.Getter", "@lombok.Data");
+        file.unit = crate::java_ir::parse_java(&invalid).unwrap();
+        assert!(collect(&file, &provider).is_empty());
+        assert!(!has_plain_public_setter(&invalid, "Box", "count"));
     }
 
     #[test]

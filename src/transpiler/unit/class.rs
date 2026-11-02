@@ -919,9 +919,75 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
         }
-        // The generated body uses ArrayList/HashMap/HashSet/List/Map/Set from
-        // stdlib collections; java.util.* covers them all in one line.
-        block.push_str("import java.util.*;\n");
+        // Keep source wildcard binding unchanged. Otherwise import only the
+        // JDK names introduced by lowering, respecting existing single imports
+        // and workspace types that shadow Kotlin's implicit collection names.
+        if imports.iter().any(|import| import.ends_with(".*")) {
+            if !imports.iter().any(|import| import == "java.util.*") {
+                block.push_str("import java.util.*;\n");
+            }
+        } else {
+            for simple in [
+                "AbstractMap",
+                "ArrayDeque",
+                "ArrayList",
+                "Arrays",
+                "Collection",
+                "Collections",
+                "Comparator",
+                "ConcurrentModificationException",
+                "Deque",
+                "EnumMap",
+                "EnumSet",
+                "HashMap",
+                "HashSet",
+                "IdentityHashMap",
+                "Iterator",
+                "LinkedHashMap",
+                "LinkedHashSet",
+                "LinkedList",
+                "List",
+                "ListIterator",
+                "Locale",
+                "Map",
+                "NoSuchElementException",
+                "Objects",
+                "Optional",
+                "OptionalDouble",
+                "OptionalInt",
+                "OptionalLong",
+                "Queue",
+                "Random",
+                "Set",
+                "SortedMap",
+                "SortedSet",
+                "Spliterator",
+                "Spliterators",
+                "TreeMap",
+                "TreeSet",
+                "UUID",
+            ] {
+                if !import_is_referenced(simple, &body)
+                    || imports
+                        .iter()
+                        .any(|import| import.rsplit('.').next() == Some(simple))
+                    || own_names.iter().any(|name| name == simple)
+                    || self.workspace.is_some_and(|workspace| {
+                        workspace
+                            .source_file(self.workspace_file.as_deref().unwrap_or(self.file))
+                            .and_then(|file| {
+                                workspace
+                                    .resolve_type(file, simple)
+                                    .filter(|declaration| declaration.package == file.package)
+                            })
+                            .is_some()
+                    })
+                {
+                    continue;
+                }
+                block.push_str(&format!("import java.util.{simple};\n"));
+            }
+        }
         block.push_str("import java.util.stream.Stream;\n");
         block.push('\n');
         let mut annotation_imports = Vec::new();
@@ -3132,7 +3198,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         out.line("@AllArgsConstructor");
                     }
                 }
-                out.blank();
             }
             // Java-native declaration annotations pass through verbatim
             // (collected during the modifiers scan above).
@@ -5436,6 +5501,32 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
         let emit_entries_bridge = self
             .workspace
             .is_some_and(|workspace| workspace.has_enum_entries_consumer(name));
+        // Lombok can supply an enum's ordinary constructor-property accessors
+        // just as it does for classes. Keep explicit methods when boolean
+        // naming or additional body storage requires a different contract.
+        let lombok_accessors = self.lombok
+            && params.iter().any(|(property, _, _, _)| *property)
+            && params.iter().all(|(property, _, property_name, ty)| {
+                let kotlin_getter = crate::workspace::property_accessor_name(property_name);
+                let lombok_getter = if ty == "boolean" {
+                    if kotlin_getter.starts_with("is") {
+                        kotlin_getter.clone()
+                    } else {
+                        format!("is{}", capitalize(property_name))
+                    }
+                } else {
+                    format!("get{}", capitalize(property_name))
+                };
+                !*property || kotlin_getter == lombok_getter
+            })
+            && !members.iter().any(|member| match member.kind() {
+                "property_declaration" => self.property_emits_backing_field(*member),
+                "variable_declaration" => true,
+                _ => false,
+            });
+        if lombok_accessors {
+            out.line("@Getter");
+        }
         // Java-native declaration annotations pass through verbatim
         // (collected during the modifiers scan above).
         for annotation in annotations {
@@ -5443,15 +5534,16 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
         }
         out.open(format!("{}enum {}{}", visibility, name, implements));
         // constants
-        out.line(entries.join(",\n"));
-        if entries.is_empty()
+        let needs_semicolon = entries.is_empty()
             || !members.is_empty()
             || !params.is_empty()
             || emit_entries_bridge
-            || !default_bridges.is_empty()
-        {
-            out.line(";");
-        }
+            || !default_bridges.is_empty();
+        out.line(format!(
+            "{}{}",
+            entries.join(",\n"),
+            if needs_semicolon { ";" } else { "" }
+        ));
         if emit_entries_bridge {
             out.blank();
             out.open(format!(
@@ -5482,6 +5574,14 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                 for annotation in self.param_annotations(decl, fname) {
                     out.line(annotation);
                 }
+                if lombok_accessors {
+                    self.emit_lombok_getter_annotation(decl, fname, out);
+                    // Lombok supports type-level @Getter on enums, but its
+                    // @Setter handler accepts only classes and fields.
+                    if *is_mutable && self.param_setter_annotations(decl, fname).is_empty() {
+                        out.line("@Setter");
+                    }
+                }
                 out.line(format!("private {}{} {};", final_kw, ftype, fname));
             }
             out.blank();
@@ -5500,7 +5600,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                 });
                 // `@get:`-targeted annotations belong on the generated
                 // getter, which this path emits.
-                if !declares_getter {
+                if !declares_getter && !lombok_accessors {
                     for annotation in self.param_getter_annotations(decl, fname) {
                         out.line(annotation);
                     }
@@ -5508,9 +5608,13 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                     out.line(format!("return {};", fname));
                     out.close();
                 }
-                if *is_mutable && !declares_setter {
+                let setter_annotations = self.param_setter_annotations(decl, fname);
+                if *is_mutable
+                    && !declares_setter
+                    && (!lombok_accessors || !setter_annotations.is_empty())
+                {
                     out.blank();
-                    for annotation in self.param_setter_annotations(decl, fname) {
+                    for annotation in setter_annotations {
                         out.line(annotation);
                     }
                     out.open(format!("public void {}({} {})", setter_name, ftype, fname));

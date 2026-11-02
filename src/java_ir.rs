@@ -7,6 +7,9 @@
 
 use tree_sitter::{Node, Parser};
 
+mod idiomatic;
+pub use idiomatic::tidy_generated_java;
+
 /// A Java name's identifiers, independent of whitespace and comments. Type
 /// annotations and type arguments are separate syntax and must not be erased.
 pub(crate) fn qualified_name(node: Node<'_>, source: &str) -> Option<String> {

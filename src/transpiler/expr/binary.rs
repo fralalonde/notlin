@@ -335,6 +335,34 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                     });
                     let is_primitive = !nullable_operand
                         && (is_likely_primitive(lhs_text) || self.known_primitive_operand(l));
+                    // Kotlin compares null by identity even for a type with a
+                    // custom equals implementation. Java's direct null check
+                    // is clearer and evaluates each operand exactly once.
+                    let null_operand = if self.unit.text(l).trim() == "null" {
+                        Some(r)
+                    } else if self.unit.text(r).trim() == "null" {
+                        Some(l)
+                    } else {
+                        None
+                    };
+                    if let Some(other) = null_operand {
+                        let reference = self.unit.text(other).trim() == "null"
+                            || self
+                                .known_expression_type(other)
+                                .is_some_and(|ty| !is_primitive_type(&ty));
+                        let lhs = self.transpile(l);
+                        let rhs = self.transpile(r);
+                        if reference || referential {
+                            return format!("({lhs} {java_op} {rhs})");
+                        }
+                        // Kotlin permits always-false primitive/null
+                        // comparisons. Boxing also keeps an unknown call's
+                        // result safe when its Java type is primitive.
+                        return format!(
+                            "{}Objects.equals({lhs}, {rhs})",
+                            if java_op == "!=" { "!" } else { "" }
+                        );
+                    }
                     if referential {
                         // Referential equality keeps Java identity regardless
                         // of operand type.

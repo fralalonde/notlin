@@ -191,6 +191,18 @@ explicit capability proof; recognizing an annotation is insufficient.
   one class-level `@Setter`; final fields remain read-only. Classes with body
   storage retain selective field setters. Data classes continue to use `@Data`
   or `@Value`, while ordinary classes retain their identity object methods.
+- Generated Java shares one syntax-based import and whitespace cleanup in both
+  modes, after helper injection. It removes unused exact imports and duplicates,
+  sorts import groups, and trims excess blank lines without rewriting literals,
+  text blocks or comments. Javadoc references keep their imports. Source wildcard
+  binding stays unchanged; generated collection imports use explicit names when
+  no source wildcard requires the conservative form.
+- Reference/null comparisons use direct Java null checks when the operand is
+  known to be a reference. Primitive or unknown results keep a boxing-safe
+  comparison. Enum constructor properties can use Lombok `@Getter` when method
+  names match, with getter annotations forwarded through `onMethod_`. Mutable
+  enum fields use field-level `@Setter`: Lombok rejects it on an enum type.
+  Primitive `enabled` and nullable `isReady` retain explicit Kotlin-named getters.
 - Parallel Kotlin property contracts follow already-generated Java descendants
   as well as Kotlin descendants. Translating a connecting class earlier must
   not erase the inherited getter evidence needed to repair the interface.
