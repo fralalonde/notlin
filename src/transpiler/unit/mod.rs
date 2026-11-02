@@ -12,7 +12,10 @@ use crate::transpiler::types::AnnotationSet;
 use crate::workspace::SourceIndex;
 use std::path::{Path, PathBuf};
 
+mod annotation_values;
 mod class;
+mod jackson_property_names;
+pub(crate) use class::kotlin_builtin_annotation_binding;
 mod function;
 mod property;
 mod types_infer;
@@ -299,17 +302,17 @@ pub struct UnitOptions {
 }
 
 impl<'src, 'tree> Unit<'src, 'tree> {
-    pub(super) fn proven_call_return_type(
+    pub(super) fn proven_expression_return_type(
         &self,
         node: tree_sitter::Node<'_>,
-    ) -> Option<crate::semantics::DeclaredCallReturn> {
+    ) -> Option<crate::semantics::DeclaredExpressionReturn> {
         if let Some(text) = self.text_operation_call(node) {
-            return Some(crate::semantics::DeclaredCallReturn {
+            return Some(crate::semantics::DeclaredExpressionReturn {
                 result_type: text.return_type(),
                 platform: false,
             });
         }
-        crate::semantics::declared_source_call_return_type(
+        crate::semantics::declared_source_expression_return_type(
             self.source,
             self.workspace_file.as_deref().unwrap_or(self.file),
             node,

@@ -2,6 +2,7 @@
 //! with respect to writes; all build snapshots are checked before application.
 
 use crate::cli::Cli;
+use crate::java_ir::qualified_name;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -177,25 +178,6 @@ fn uses_jspecify(source: &str) -> bool {
         pending.extend(node.named_children(&mut node.walk()));
     }
     false
-}
-
-fn qualified_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
-    let mut pending = vec![node];
-    let mut names = Vec::new();
-    while let Some(node) = pending.pop() {
-        match node.kind() {
-            "identifier" | "type_identifier" => names.push(node.utf8_text(source.as_bytes()).ok()?),
-            "scoped_identifier" | "scoped_type_identifier" => {
-                let children = node
-                    .named_children(&mut node.walk())
-                    .filter(|child| !child.is_extra())
-                    .collect::<Vec<_>>();
-                pending.extend(children.into_iter().rev());
-            }
-            _ => return None,
-        }
-    }
-    Some(names.join("."))
 }
 
 fn gradle_dependency_block(kotlin: bool) -> String {

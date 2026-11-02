@@ -384,7 +384,7 @@ class Example"#;
 }
 #[test]
 fn annotations_option_controls_import() {
-    let source = r#"val x: Int = 1"#;
+    let source = r#"val x: String? = null"#;
     for (selected, package) in [
         (None, Some("org.jspecify.annotations")),
         (Some("jspecify"), Some("org.jspecify.annotations")),
@@ -408,6 +408,12 @@ fn annotations_option_controls_import() {
                 "selected {selected:?}: {all}"
             );
         }
+        let (unused, errors, _, _) = notlin::transpiler::transpile("val x: Int = 1", &path, &cli);
+        assert_eq!(errors, 0);
+        assert!(
+            unused.iter().all(|(_, java)| !java.contains(".Nullable;")),
+            "selected {selected:?}: {unused:?}"
+        );
     }
 }
 

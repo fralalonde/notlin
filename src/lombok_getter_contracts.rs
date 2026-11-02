@@ -32,8 +32,9 @@ pub struct GeneratedGetterContract {
 
 /// Collect only contracts that are directly represented by one accepted,
 /// ordinary top-level Java class and one uniquely indexed Kotlin property.
-/// Marker annotations are argument-free, so Lombok's default public instance
+/// Accessor markers are argument-free, so Lombok's default public instance
 /// getter name and no-throws signature apply without configuration overrides.
+/// Constructor annotations do not change that accessor contract.
 pub(crate) fn collect(
     file: &AcceptedJavaFile,
     provider: &dyn SemanticProvider,
@@ -345,30 +346,29 @@ fn getter_marker(
     {
         let name = annotation_name(annotation)?;
         let canonical = resolve_annotation(&name, imports)?;
-        let simple = canonical.rsplit('.').next()?;
+        // Constructor options (including onConstructor_) affect constructors,
+        // never getter naming, visibility or suppression.
+        if matches!(
+            canonical.as_str(),
+            "lombok.NoArgsConstructor"
+                | "lombok.RequiredArgsConstructor"
+                | "lombok.AllArgsConstructor"
+        ) {
+            continue;
+        }
         if let Some(current) = match canonical.as_str() {
             "lombok.Getter" => Some(GetterMarker::Getter),
             "lombok.Data" => Some(GetterMarker::Data),
             "lombok.Value" => Some(GetterMarker::Value),
-            "lombok.NoArgsConstructor"
-            | "lombok.RequiredArgsConstructor"
-            | "lombok.AllArgsConstructor"
-            | "lombok.EqualsAndHashCode"
-            | "lombok.ToString"
-            | "lombok.Setter" => None,
+            "lombok.EqualsAndHashCode" | "lombok.ToString" | "lombok.Setter" => None,
             _ => None,
         } {
             if marker.replace(current).is_some() {
                 return None;
             }
         } else if !matches!(
-            simple,
-            "NoArgsConstructor"
-                | "RequiredArgsConstructor"
-                | "AllArgsConstructor"
-                | "EqualsAndHashCode"
-                | "ToString"
-                | "Setter"
+            canonical.as_str(),
+            "lombok.EqualsAndHashCode" | "lombok.ToString" | "lombok.Setter"
         ) {
             return None;
         }
@@ -1196,6 +1196,45 @@ mod tests {
             source: source.to_owned(),
             symbols,
             types,
+        }
+    }
+
+    #[test]
+    fn constructor_options_preserve_getter_contracts_for_accepted_and_indexed_java() {
+        for constructor in [
+            "@lombok.AllArgsConstructor(onConstructor_ = {@java.beans.ConstructorProperties({\"count\"})})",
+            "@lombok.RequiredArgsConstructor(access = lombok.AccessLevel.PRIVATE)",
+            "@lombok.NoArgsConstructor(force = true, staticName = \"create\")",
+        ] {
+            let java = format!(
+                "package sample; @lombok.Getter {constructor} class Box {{ private int count; }}"
+            );
+            let (file, provider) = fixture(
+                &java,
+                "package sample\nclass Box(val count: Int)",
+                &[("count", "Int")],
+                Vec::new(),
+            );
+            assert_eq!(collect(&file, &provider).len(), 1, "{java}");
+            let path = Path::new("src/Box.java");
+            let provider = java_source_provider(path, &java, &["Box"], Vec::new());
+            assert_eq!(
+                collect_java_source(path, &java, &provider).len(),
+                1,
+                "{java}"
+            );
+        }
+        for name in ["AllArgsConstructor", "Setter", "EqualsAndHashCode"] {
+            let java = format!(
+                "package sample; import other.{name}; @lombok.Getter @{name} class Box {{ private int count; }}"
+            );
+            let (file, provider) = fixture(
+                &java,
+                "package sample\nclass Box(val count: Int)",
+                &[("count", "Int")],
+                Vec::new(),
+            );
+            assert!(collect(&file, &provider).is_empty(), "{java}");
         }
     }
 

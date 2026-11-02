@@ -21,8 +21,17 @@ Behavior contract:
 - **Source migration.** Recompile callers; the application must compile and run
   the same after conversion. Kotlin-only constraints/ABI differences can be
   diagnosed; unchanged precompiled Kotlin compatibility is not the target.
+  Observable behavior comes from the selected reference branch before
+  translation. Older reference branches may contain manual fixes that are
+  useful strategies, but they do not define the current behavior baseline.
+  Conflicting source methods may be renamed together with their bound callers;
+  preserving their old JVM names is not an acceptance requirement. Do not
+  change production behavior to satisfy assertions that already fail on the
+  unconverted reference. Keep those failures visible and separate from new
+  translation regressions; a failing Gradle build is still a failing gate.
 - **Reference build gate.** Acceptance requires exporting the clean reference
-  commit, running `notlin --in-place --lombok .` from its root, and passing the
+  commit from `exp/kotlin-killer2`, running `notlin --in-place --lombok .` from
+  its root, and passing the
   complete Gradle `build` on the resulting tree. Incremental translation trials
   are useful for iteration but do not establish that a full conversion builds.
   Do not hand-fix generated sources in the acceptance copy. Run Hastings dev
@@ -30,6 +39,18 @@ Behavior contract:
   for `Done loading dev resources [customers/hastings/hastings-dev.csv]`;
   Spring's started marker and the first completed import do not prove that
   the complete development dataset loaded successfully.
+  Pin the reference commit in the evidence. When the reference branch changes,
+  establish its original build, startup and complete import count before
+  comparing the translated application; counts from an older branch are not a
+  regression baseline for the new branch.
+  Diagnostic reconstruction must preserve complete migration spans, including
+  parser-detached annotation wrappers. Coverage report `location` ranges alone
+  are ownership boundaries; pruning only those ranges can leave annotations
+  attached to the next surviving declaration. Use the compiler's migration
+  spans or restore complete original declarations with their wrappers.
+  A partial restore must also preserve existing accessor repairs or include
+  their parent contract component. Restoring an original Kotlin property
+  against a parent already repaired to a Kotlin method creates invalid input.
 - **Collections.** Prefer suitable immutable Java equivalents. If none fits,
   mutable fallbacks are allowed; mutability/read-only enforcement differences
   alone do not block conversion. Preserve values, relevant order, overloads,

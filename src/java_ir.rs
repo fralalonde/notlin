@@ -7,6 +7,30 @@
 
 use tree_sitter::{Node, Parser};
 
+/// A Java name's identifiers, independent of whitespace and comments. Type
+/// annotations and type arguments are separate syntax and must not be erased.
+pub(crate) fn qualified_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.has_error() {
+        return None;
+    }
+    let mut pending = vec![node];
+    let mut names = Vec::new();
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" | "type_identifier" => names.push(node.utf8_text(source.as_bytes()).ok()?),
+            "scoped_identifier" | "scoped_type_identifier" => {
+                let children = node
+                    .named_children(&mut node.walk())
+                    .filter(|child| !child.is_extra())
+                    .collect::<Vec<_>>();
+                pending.extend(children.into_iter().rev());
+            }
+            _ => return None,
+        }
+    }
+    (!names.is_empty()).then(|| names.join("."))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JavaIrError {
     pub message: String,

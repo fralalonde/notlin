@@ -70,7 +70,10 @@ fn is_descendant_of(node: tree_sitter::Node<'_>, ancestor: tree_sitter::Node<'_>
     false
 }
 
-fn annotation_fq_name(annotation: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+pub(super) fn annotation_fq_name(
+    annotation: tree_sitter::Node<'_>,
+    source: &str,
+) -> Option<String> {
     let mut stack = vec![annotation];
     while let Some(node) = stack.pop() {
         if matches!(node.kind(), "user_type" | "scoped_type_identifier") {
@@ -86,7 +89,7 @@ fn annotation_fq_name(annotation: tree_sitter::Node<'_>, source: &str) -> Option
     None
 }
 
-fn annotation_imports(source: &str) -> impl Iterator<Item = (&str, Option<&str>)> {
+pub(super) fn annotation_imports(source: &str) -> impl Iterator<Item = (&str, Option<&str>)> {
     source.lines().filter_map(|line| {
         let import = line
             .trim()
@@ -103,7 +106,7 @@ fn annotation_imports(source: &str) -> impl Iterator<Item = (&str, Option<&str>)
     })
 }
 
-fn annotation_type_is_local(
+pub(super) fn annotation_type_is_local(
     workspace: Option<&crate::workspace::SourceIndex>,
     file: Option<&crate::workspace::SourceFile>,
     name: &str,
@@ -118,11 +121,45 @@ fn annotation_type_is_local(
     })
 }
 
-fn annotation_import_name(name: String, source: &str) -> String {
+pub(super) fn annotation_import_name(name: String, source: &str) -> String {
     annotation_imports(source)
         .find(|(_, alias)| *alias == Some(name.as_str()))
         .map(|(path, _)| path.to_string())
         .unwrap_or(name)
+}
+
+/// Some(true) proves the builtin identity; None leaves a wildcard binding open.
+pub(crate) fn kotlin_builtin_annotation_binding(
+    annotation: tree_sitter::Node<'_>,
+    canonical: &str,
+    source: &str,
+    workspace: Option<&crate::workspace::SourceIndex>,
+    file: Option<&crate::workspace::SourceFile>,
+) -> Option<bool> {
+    let Some(name) = annotation_fq_name(annotation, source) else {
+        return Some(false);
+    };
+    let name = annotation_import_name(name, source);
+    if name == canonical {
+        return Some(true);
+    }
+    let simple = canonical.rsplit('.').next()?;
+    if name != simple || annotation_type_is_local(workspace, file, simple) {
+        return Some(false);
+    }
+    let imports = annotation_imports(source).collect::<Vec<_>>();
+    if imports.iter().any(|(path, alias)| {
+        alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == simple
+    }) {
+        return Some(false);
+    }
+    if imports
+        .iter()
+        .any(|(path, _)| path.ends_with(".*") && *path != "kotlin.*")
+    {
+        return None;
+    }
+    Some(true)
 }
 
 fn kotlin_annotation_meta_name(
@@ -714,10 +751,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             let Some(type_node) = type_node else {
                 return false;
             };
-            let raw = self
-                .text(type_node)
-                .trim()
-                .trim_start_matches("@Nullable ")
+            let raw = crate::transpiler::types::strip_nullable_prefix(self.text(type_node).trim())
                 .trim_end_matches('?')
                 .split('<')
                 .next()
@@ -825,6 +859,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         };
         let (qualified, jspecify_non_null) =
             crate::transpiler::types::import_jspecify_non_null(&qualified, imports);
+        let (qualified, nullable_annotation) =
+            crate::transpiler::types::import_nullable_annotation(&qualified, imports, self.annots);
         // Always rewrite the body region: the alias lowering above already
         // produced a replacement string, so the buffer's copy is stale.
         out.buf.truncate(import_anchor);
@@ -889,7 +925,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         block.push_str("import java.util.stream.Stream;\n");
         block.push('\n');
         let mut annotation_imports = Vec::new();
-        if let Some(pkg) = crate::transpiler::types::nullable_import(self.annots) {
+        if nullable_annotation
+            && let Some(pkg) = crate::transpiler::types::nullable_import(self.annots)
+        {
             annotation_imports.push(format!("{pkg}.Nullable"));
         }
         if jspecify_non_null {
@@ -972,6 +1010,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if self.kotlin_builtin_annotation_binding(node, "kotlin.Deprecated") == Some(true) {
             return Some("@java.lang.Deprecated".to_string());
         }
+        let implicit_empty_value =
+            super::annotation_values::omits_value(argument_node, self.source, &argument_text)
+                && super::annotation_values::requires_empty_value(self, &name);
         // Kotlin-only argument shapes taint immediately — except a
         // `Name::class` class literal, which rewrites to `Name.class` in Java
         // when `Name` resolves to a Java-visible declaration (checked below);
@@ -1008,6 +1049,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 return None;
             }
             let lowered = lower_known_annotation_positional_argument(&name, &lowered);
+            let lowered =
+                super::annotation_values::supply_empty_value(lowered, implicit_empty_value);
             return Some(
                 format!(
                     "@{name}{}",
@@ -1029,6 +1072,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // braces.
         let lowered = lower_annotation_arrays(&lower_annotation_raw_strings(&argument_text));
         let lowered = lower_known_annotation_positional_argument(&name, &lowered);
+        let lowered = super::annotation_values::supply_empty_value(lowered, implicit_empty_value);
         let arguments = brace_wrap_unnamed_nested_annotations(&prefix_nested_annotations(&lowered));
         let rebuilt = format!("@{name}{arguments}");
         // Kotlin wildcard/star imports and `!` nullability assertions never
@@ -1044,36 +1088,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         annotation: tree_sitter::Node<'_>,
         canonical: &str,
     ) -> Option<bool> {
-        let Some(name) = annotation_fq_name(annotation, self.source) else {
-            return Some(false);
-        };
-        let name = annotation_import_name(name, self.source);
-        if name == canonical {
-            return Some(true);
-        }
-        let simple = canonical.rsplit('.').next()?;
-        if name != simple {
-            return Some(false);
-        }
         let file = self.workspace.and_then(|index| {
             index.source_file(self.workspace_file.as_deref().unwrap_or(self.file))
         });
-        if annotation_type_is_local(self.workspace, file, simple) {
-            return Some(false);
-        }
-        let imports = annotation_imports(self.source).collect::<Vec<_>>();
-        if imports.iter().any(|(path, alias)| {
-            alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path)) == simple
-        }) {
-            return Some(false);
-        }
-        if imports
-            .iter()
-            .any(|(path, _)| path.ends_with(".*") && *path != "kotlin.*")
-        {
-            return None;
-        }
-        Some(true)
+        kotlin_builtin_annotation_binding(annotation, canonical, self.source, self.workspace, file)
     }
 
     pub(crate) fn check_builtin_annotation_contracts(&mut self, decl: tree_sitter::Node<'_>) {
@@ -1951,6 +1969,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             }
         }
         let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
+        if !is_interface
+            && self.workspace.is_some_and(|index| {
+                crate::getter_namespace::inherits_independent_getters(index, indexed_path, &name)
+            })
+        {
+            self.diag_untranslatable(
+                decl,
+                "inherited independent JVM getter descriptors would acquire a Java covariant bridge",
+            );
+            return;
+        }
         if self.has_companion_operator_invoke(decl)
             && self.workspace.is_some_and(|workspace| {
                 // Kotlin class-call ABI `Type(...)`: only Kotlin that stays
@@ -2372,7 +2401,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                                     | "double"
                                                     | "char"
                                             );
-                                    if kt::child(member, "val").is_some() {
+                                    if kt::child(member, "val").is_some()
+                                        && self.workspace.is_some_and(|index| {
+                                            index.interface_collection_return_needs_wildcard(
+                                                self.workspace_file.as_deref().unwrap_or(self.file),
+                                                &name,
+                                                &pname,
+                                            )
+                                        })
+                                    {
                                         pty = crate::transpiler::types::covariant_interface_return(
                                             &pty,
                                         );
@@ -2551,15 +2588,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 // Kotlin writes persistence and metadata annotations on the
                 // constructor property; the Java side must carry them on the
                 // FIELD, which is the element the ORM reads.
-                // This path emits no explicit getter (Lombok generates the
-                // accessors), so a `@get:` annotation has nowhere better to go
-                // than the field it is written on.
-                for annotation in self
-                    .param_annotations(decl, fname)
-                    .into_iter()
-                    .chain(self.param_getter_annotations(decl, fname))
-                {
+                for annotation in self.param_annotations(decl, fname) {
                     out.line(annotation);
+                }
+                if use_lombok_generated_members {
+                    self.emit_lombok_getter_annotation(decl, fname, out);
                 }
                 let nullability = if is_non_null_reference(fname, ftype) {
                     "@lombok.NonNull "
@@ -2665,6 +2698,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     } else {
                         ftype.clone()
                     };
+                    for annotation in self.param_getter_annotations(decl, fname) {
+                        out.line(annotation);
+                    }
                     out.line(format!(
                         "public {} {}() {{ return {}; }}",
                         getter_type, getter, fname
@@ -2717,6 +2753,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     {
                         continue;
                     }
+                    for annotation in self.param_getter_annotations(decl, field_name) {
+                        out.line(annotation);
+                    }
                     out.line(format!(
                         "public boolean {}() {{ return {}; }}",
                         getter, field_name
@@ -2733,6 +2772,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             if let Some(body) = kt::child(decl, "class_body") {
                 self.transpile_class_body(body, out);
             }
+            self.emit_data_api_members(decl, &name, &params, false, out);
             out.close();
             return;
         }
@@ -3047,9 +3087,17 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             let lombok_supplies_all_args = !jpa_no_arg
                 && !body_has_instance_fields
                 && !self.constructor_has_covariant_input(decl, &params)
-                && params
-                    .iter()
-                    .all(|(_, _, name, _)| self.param_parameter_annotations(decl, name).is_empty());
+                && params.iter().all(|(_, _, name, _)| {
+                    self.param_parameter_annotations(decl, name).is_empty()
+                        && !self
+                            .param_getter_annotations(decl, name)
+                            .iter()
+                            .any(|annotation| {
+                                super::jackson_property_names::is_property_annotation(
+                                    self, annotation,
+                                )
+                            })
+                });
             let lombok_accessors = self.lombok
                 && !params.is_empty()
                 && !self.class_body_defines_lombok_generated(decl);
@@ -3076,7 +3124,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     && !has_secondary_constructor
                     && lombok_supplies_all_args
                 {
-                    out.line("@AllArgsConstructor");
+                    if let Some(contract) = self.constructor_property_contract(decl, &params) {
+                        out.line(format!(
+                            "@AllArgsConstructor(onConstructor_ = {{{contract}}})"
+                        ));
+                    } else {
+                        out.line("@AllArgsConstructor");
+                    }
                 }
                 out.blank();
             }
@@ -3098,24 +3152,15 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 // Kotlin writes persistence and metadata annotations on the
                 // constructor property; the Java side must carry them on the
                 // FIELD, which is the element the ORM reads.
-                // The getter below is emitted only when this is NOT --lombok
-                // (`accessors (skipped under --lombok: @Getter generates
-                // them)`), so under Lombok a `@get:` annotation has nowhere
-                // to land and must stay on the field it is written on:
-                // dropping it would lose the very metadata the ORM reads.
                 let mut annotations = self.param_annotations(decl, fname);
                 if lombok_accessors && *is_mutable && !lombok_class_setters {
                     annotations.push("@Setter".into());
                 }
-                let lombok_needs_kotlin_boolean_getter = lombok_accessors
-                    && ftype == "boolean"
-                    && !(fname.starts_with("is")
-                        && fname.chars().nth(2).is_some_and(|c| c.is_ascii_uppercase()));
-                if lombok_accessors && !lombok_needs_kotlin_boolean_getter {
-                    annotations.extend(self.param_getter_annotations(decl, fname));
-                }
                 for annotation in annotations {
                     out.line(annotation);
+                }
+                if lombok_accessors {
+                    self.emit_lombok_getter_annotation(decl, fname, out);
                 }
                 out.line(format!("private {}{} {};", final_kw, ftype, fname));
             }
@@ -3132,6 +3177,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 for annotation in &ctor_annotations {
                     out.line(annotation.clone());
                 }
+                self.emit_constructor_property_contract(decl, &params, out);
                 if self.constructor_has_covariant_input(decl, &params) {
                     out.line("@SuppressWarnings(\"unchecked\")");
                 }
@@ -3159,6 +3205,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 for annotation in &ctor_annotations {
                     out.line(annotation.clone());
                 }
+                self.emit_constructor_property_contract(decl, &params, out);
                 if self.constructor_has_covariant_input(decl, &params) {
                     out.line("@SuppressWarnings(\"unchecked\")");
                 }
@@ -3443,8 +3490,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         params: &[(bool, bool, String, String)],
         out: &mut JavaOut,
     ) {
+        if let Some(contract) = self.constructor_property_contract(decl, params) {
+            out.line(contract);
+        }
+    }
+
+    fn constructor_property_contract(
+        &self,
+        decl: tree_sitter::Node,
+        params: &[(bool, bool, String, String)],
+    ) -> Option<String> {
         if params.is_empty() || params.iter().any(|(property, _, _, _)| !property) {
-            return;
+            return None;
         }
         let imported_names = self
             .source
@@ -3473,19 +3530,19 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     })
             });
         if already_present {
-            return;
+            return None;
         }
         // Primary data-class property names survive in the existing Lombok
         // path and must also survive when custom members require plain Java.
         // Secondary/default overloads deliberately receive no creator marker.
-        out.line(format!(
+        Some(format!(
             "@java.beans.ConstructorProperties({{{}}})",
             params
                 .iter()
                 .map(|(_, _, name, _)| format!("\"{name}\""))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ));
+        ))
     }
 
     /// Preserve primary-constructor annotations, including MapStruct's `Default`
@@ -3937,7 +3994,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         java_type: &str,
         prefix: &str,
     ) -> String {
-        let annotations = self.param_parameter_annotations(decl, name);
+        let mut annotations = self.param_parameter_annotations(decl, name);
+        if !annotations.iter().any(|annotation| {
+            super::jackson_property_names::is_property_annotation(self, annotation)
+        }) && let Some(annotation) =
+            self.param_getter_annotations(decl, name)
+                .into_iter()
+                .find(|annotation| {
+                    super::jackson_property_names::is_property_annotation(self, annotation)
+                })
+        {
+            // Kotlin metadata connects the getter's JSON name to the primary
+            // property. Keep that connection for Java constructor binding too.
+            annotations.push(annotation);
+        }
         let annotations = if annotations.is_empty() {
             String::new()
         } else {
@@ -4409,9 +4479,42 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
     /// Annotations for a constructor property that belong on the GETTER —
     /// `@get:`-targeted ones, which say so themselves.
     fn param_getter_annotations(&self, decl: tree_sitter::Node, property: &str) -> Vec<String> {
-        self.param_node(decl, property)
+        let mut annotations = self
+            .param_node(decl, property)
             .map(|parameter| self.annotation_split(parameter).1)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if property
+            .strip_prefix("is")
+            .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_uppercase))
+            && self
+                .param_node(decl, property)
+                .and_then(|parameter| kt::child(parameter, "user_type"))
+                .is_some_and(|ty| matches!(self.text(ty), "Boolean" | "kotlin.Boolean"))
+            && !annotations.iter().any(|annotation| {
+                super::jackson_property_names::is_property_annotation(self, annotation)
+            })
+            && super::jackson_property_names::is_exposed(self, decl)
+        {
+            annotations.push(format!(
+                "@com.fasterxml.jackson.annotation.JsonProperty(\"{property}\")"
+            ));
+        }
+        annotations
+    }
+
+    fn emit_lombok_getter_annotation(
+        &self,
+        decl: tree_sitter::Node,
+        property: &str,
+        out: &mut JavaOut,
+    ) {
+        let annotations = self.param_getter_annotations(decl, property);
+        if !annotations.is_empty() {
+            out.line(format!(
+                "@lombok.Getter(onMethod_ = {{{}}})",
+                annotations.join(", ")
+            ));
+        }
     }
 
     fn param_setter_annotations(&self, decl: tree_sitter::Node, property: &str) -> Vec<String> {
@@ -6238,11 +6341,10 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                 // that choice when null also matches a Java secondary overload.
                 for (index, value) in args.iter_mut().enumerate() {
                     if value.trim() == "null" {
-                        let cast_type = primary[index]
-                            .3
-                            .replace("@Nullable ", "")
-                            .replace("@NotNull ", "")
-                            .replace("@lombok.NonNull ", "");
+                        let cast_type =
+                            crate::transpiler::types::erase_nullable_annotations(&primary[index].3)
+                                .replace("@NotNull ", "")
+                                .replace("@lombok.NonNull ", "");
                         *value = format!("({cast_type}) null");
                     }
                 }
@@ -6682,7 +6784,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             })
         };
         fn raw_type(ty: &str) -> &str {
-            ty.trim_start_matches("@Nullable ")
+            crate::transpiler::types::strip_nullable_prefix(ty)
                 .trim_start_matches("@lombok.NonNull ")
         }
         if !declares("equals") {
@@ -6747,6 +6849,19 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             ));
             out.close();
         }
+        self.emit_data_api_members(decl, name, params, as_record, out);
+    }
+
+    /// Lombok supplies Object methods and accessors, but not Kotlin's public
+    /// copy/component API. Java callers can use these without Kotlin syntax.
+    fn emit_data_api_members(
+        &self,
+        decl: tree_sitter::Node,
+        name: &str,
+        params: &[(bool, bool, String, String)],
+        as_record: bool,
+        out: &mut JavaOut,
+    ) {
         let generic = kt::child(decl, "type_parameters")
             .map(|tp| {
                 tp.children(&mut tp.walk())
@@ -6765,7 +6880,12 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             "public {self_type} copy({})",
             params
                 .iter()
-                .map(|(_, _, field, ty)| format!("{ty} {field}"))
+                .map(|(_, _, field, ty)| {
+                    format!(
+                        "{} {field}",
+                        self.constructor_parameter_java_type(decl, field, ty)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ));

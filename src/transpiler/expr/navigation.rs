@@ -643,7 +643,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                                 let t0 = self.unit.text(b).trim().to_string();
                                 let ct = self.unit.var_types.get(&t0).cloned();
                                 ct.map(|c| {
-                                    let bare = c.strip_prefix("@Nullable ").unwrap_or(&c).trim();
+                                    let bare =
+                                        crate::transpiler::types::strip_nullable_prefix(&c).trim();
                                     self.unit.record_types.contains(bare)
                                         && self.unit.data_components.get(bare).is_some_and(
                                             |components| {

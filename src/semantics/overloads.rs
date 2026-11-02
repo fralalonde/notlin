@@ -262,8 +262,13 @@ fn result_check<P: SemanticProvider + ?Sized>(
     {
         return Err(());
     }
-    let nullability =
-        super::source_calls::java_method_return_nullability(target_source, declaration).ok_or(())?;
+    let nullability = super::source_calls::java_method_return_nullability(
+        target_source,
+        declaration,
+        &target.file,
+        provider,
+    )
+    .ok_or(())?;
     if nullability != super::ReferenceReturnNullability::Platform {
         return Ok(None);
     }

@@ -396,6 +396,8 @@ where
                 false,
             )?
         };
+        let namespace_splits =
+            crate::getter_namespace::plan(&current_index, &virtual_sources, &planned.retained)?;
         retained_seed = Some(planned.roots);
         let plans = planned.plans;
         profile_phase(
@@ -478,7 +480,12 @@ where
                 }
                 continue;
             }
-            match migrate::propose_speculative_migration(&plan.source, &plan.coverage) {
+            match namespace_splits.proposal(
+                &current_index,
+                &plan.file,
+                &plan.source,
+                &plan.coverage,
+            )? {
                 MigrationProposal::Untouched => {}
                 MigrationProposal::Delete => {
                     next.remove(&plan.file);
@@ -728,6 +735,11 @@ where
             }
         }
         next = residual_by_path.into_iter().collect();
+        merge_accessor_repairs(
+            &mut translation_plans,
+            namespace_splits.report,
+            &vetoed_this_round,
+        );
         let repair_overlays = speculative_overlays(&sources, &next, &cumulative);
         let repair_index =
             index.with_overlays_using_cache_from(&repair_overlays, &current_index)?;
@@ -803,7 +815,15 @@ where
                 full_callsite_sweep,
             )
         };
-        latest_cache_index = Some(callsite_cache_index.unwrap_or(repair_index));
+        let callsite_index = callsite_cache_index.unwrap_or(repair_index);
+        let reflection_repairs =
+            crate::reflection_accessors::repair_virtual_sources(&callsite_index, &mut next);
+        merge_accessor_repairs(
+            &mut translation_plans,
+            reflection_repairs,
+            &vetoed_this_round,
+        );
+        latest_cache_index = Some(callsite_index);
         profile_phase(
             profile_speculation,
             round,

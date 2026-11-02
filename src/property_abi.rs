@@ -5352,7 +5352,19 @@ fn plain_computed_property_method(
         return None;
     }
     let getter = computed_getter_shape(index, declaration, property, source)?;
-    let ty = node_text(getter.return_type, source);
+    let (return_type, body) = if let Some(ty) = getter.return_type {
+        (
+            format!(": {}", node_text(ty, source)),
+            node_text(getter.body, source).to_owned(),
+        )
+    } else {
+        // Retain Kotlin's exact inferred type, including a narrower override
+        // or a boxed/platform value, instead of widening to the Java contract.
+        (
+            String::new(),
+            format!("= {}", node_text(getter.expression?, source)),
+        )
+    };
     let mut annotations = Vec::new();
     let mut pending = vec![property];
     while let Some(node) = pending.pop() {
@@ -5376,11 +5388,11 @@ fn plain_computed_property_method(
         .map(|(_, text)| format!("{text}\n"))
         .collect::<String>();
     Some(format!(
-        "{annotations}{}{}override fun {}(): {ty} {}",
+        "{annotations}{}{}override fun {}(){return_type} {}",
         if getter.is_public { "public " } else { "" },
         if getter.is_final { "final " } else { "" },
         contract.getter,
-        rewrite_super_property_access(index, declaration, contract, node_text(getter.body, source)),
+        rewrite_super_property_access(index, declaration, contract, &body),
     ))
 }
 
@@ -7998,7 +8010,7 @@ mod tests {
             "@get:GetterOnly override val name: String get() = \"value\"",
             "override val name: String\n@GetterOnly get() = \"value\"",
             "private override val name: String get() = \"value\"",
-            "override val name get() = \"value\"",
+            "override val name get() { println(\"extra\"); return \"value\" }",
         ] {
             let source = format!("class Impl {{\n{property}\n}}\n");
             let tree = crate::transpiler::parse_tree(&source);
@@ -8015,6 +8027,46 @@ mod tests {
                 pending.extend(node.named_children(&mut node.walk()));
             }
             assert!(found, "missing property AST: {property}");
+        }
+    }
+
+    #[test]
+    fn inferred_computed_methods_keep_the_original_expression_type() {
+        for (getter, expected) in [
+            ("get() = producer.value", "= producer.value"),
+            (
+                "get(): String { return producer.value }",
+                ": String { return producer.value }",
+            ),
+            ("get() = Unit", "= Unit"),
+            (
+                "get(): String = producer.value",
+                ": String = producer.value",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.write(
+                "Api.java",
+                "// NOTLIN: generated from Api.kt\npackage sample; public interface Api { Object getName(); }\n",
+            );
+            fixture.write("Meta.java", "package sample; @java.lang.annotation.Target(java.lang.annotation.ElementType.METHOD) public @interface Meta {}\n");
+            let source = format!(
+                "package sample\nclass Impl(val producer: Producer) : Api {{\n@get:Meta public final override val name {getter}\n}}\n"
+            );
+            let path = fixture.write("Impl.kt", &source);
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let (repaired, count) = repair_file(&index, &path, &source);
+            assert_eq!(count, 1, "{repaired}");
+            assert!(
+                repaired.contains(&format!(
+                    "@Meta\npublic final override fun getName(){expected}"
+                )) || repaired.contains(&format!(
+                    "@Meta\npublic final override fun getName() {expected}"
+                )),
+                "{repaired}"
+            );
+            assert!(!repaired.contains("val name"), "{repaired}");
+            assert!(!repaired.contains("notlinProperty"), "{repaired}");
         }
     }
 

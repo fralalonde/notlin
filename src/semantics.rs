@@ -6,11 +6,12 @@ use crate::facts::protocol::{CallSite, MemberFacts, SiteStatus};
 use crate::jvm_primitive::JvmPrimitive;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod java_metadata;
+mod java_scalar_returns;
 pub(crate) mod map_algebra;
 mod map_alias;
 
@@ -102,6 +103,12 @@ pub enum ReferenceReturnNullability {
     Platform,
 }
 
+#[derive(Debug, Clone)]
+struct ReferenceReturnFact {
+    nullability: ReferenceReturnNullability,
+    bindings: Vec<java_metadata::Binding>,
+}
+
 /// An exact Java synthetic-property call, including the distinction between
 /// JVM primitives and boxed/platform returns. Types are qualified in the
 /// declaring file's scope; dependencies retain the original method identity.
@@ -114,6 +121,23 @@ pub struct JavaPropertyRead {
     pub nullability: ReferenceReturnNullability,
     pub jvm_primitive: bool,
     pub dependencies: Vec<SymbolId>,
+}
+
+impl JavaPropertyRead {
+    /// Preserve the physical wrapper when a Java reference uses a Kotlin
+    /// primitive classifier. Null checks and temporary values must not unbox it.
+    pub(crate) fn java_value_type(&self) -> Option<TypeRef> {
+        let mut ty = self.result_type.clone();
+        if !self.jvm_primitive
+            && let KotlinType::Primitive(name) = &ty.ty
+        {
+            ty.ty = KotlinType::Named {
+                name: JvmPrimitive::kotlin(name)?.boxed_qualified.to_owned(),
+                arguments: Vec::new(),
+            };
+        }
+        Some(ty)
+    }
 }
 pub fn declaration_node_kind(kind: &str) -> bool {
     matches!(
@@ -2375,7 +2399,7 @@ pub struct SyntaxSemanticProvider {
     aliases: BTreeMap<(String, String), TypeAliasDefinition>,
     sources: BTreeMap<PathBuf, String>,
     imports_by_file: BTreeMap<PathBuf, Vec<String>>,
-    parents: BTreeMap<SymbolId, Vec<SymbolId>>,
+    parents: HashMap<SymbolId, Vec<SymbolId>>,
     incomplete_inheritance: BTreeSet<SymbolId>,
     inheritance_indexed: bool,
     companion_member_owners: BTreeMap<SymbolId, SymbolId>,
@@ -2384,7 +2408,7 @@ pub struct SyntaxSemanticProvider {
     java_public_instance_getter_locations: BTreeSet<(PathBuf, usize)>,
     java_return_shapes: BTreeMap<(PathBuf, usize), java_property_reads::JavaReturnShape>,
     java_uncertain_getter_owners: BTreeSet<SymbolId>,
-    reference_return_nullability_locations: BTreeMap<(PathBuf, usize), ReferenceReturnNullability>,
+    reference_return_nullability_locations: BTreeMap<(PathBuf, usize), ReferenceReturnFact>,
     annotated_java_packages: BTreeSet<String>,
     java_visible_fields: BTreeSet<(PathBuf, Vec<String>, String)>,
     java_field_lookup_locations: BTreeSet<(PathBuf, usize)>,
@@ -2423,7 +2447,7 @@ struct FileSemanticFacts {
     java_public_instance_getter_locations: BTreeSet<(PathBuf, usize)>,
     java_return_shapes: BTreeMap<(PathBuf, usize), java_property_reads::JavaReturnShape>,
     java_uncertain_getter_owners: BTreeSet<SymbolId>,
-    reference_return_nullability_locations: BTreeMap<(PathBuf, usize), ReferenceReturnNullability>,
+    reference_return_nullability_locations: BTreeMap<(PathBuf, usize), ReferenceReturnFact>,
     java_visible_fields: BTreeSet<(PathBuf, Vec<String>, String)>,
     java_field_lookup_locations: BTreeSet<(PathBuf, usize)>,
     java_member_metadata: BTreeMap<(PathBuf, usize), Vec<java_metadata::Binding>>,
@@ -2702,6 +2726,9 @@ impl FileSemanticFacts {
                         .nonsealed_interface_locations
                         .insert((file.to_path_buf(), node.start_byte()));
                 }
+                let java_scalar = java_metadata
+                    .as_ref()
+                    .and_then(|metadata| java_scalar_returns::collect(source, node, metadata));
                 let explicit = if property_param {
                     named_type_child(node)
                 } else {
@@ -2712,9 +2739,12 @@ impl FileSemanticFacts {
                 let ty = explicit
                     .map(FactStatus::Established)
                     .unwrap_or(FactStatus::Unknown);
-                if let Some(nullability) =
-                    source_calls::reference_return_nullability(source, node, &ty)
-                {
+                if let Some(nullability) = source_calls::reference_return_nullability(
+                    source,
+                    node,
+                    &ty,
+                    java_scalar.as_ref(),
+                ) {
                     facts
                         .reference_return_nullability_locations
                         .insert((file.to_path_buf(), node.start_byte()), nullability);
@@ -2789,8 +2819,13 @@ impl FileSemanticFacts {
                         .extension()
                         .is_some_and(|extension| extension == "java")
                 {
-                    if let Some(shape) =
-                        java_property_reads::collect(source, node, java_metadata.as_ref().unwrap())
+                    if let Some(signature) = java_scalar.as_ref()
+                        && let Some(shape) = java_property_reads::collect(
+                            source,
+                            node,
+                            java_metadata.as_ref().unwrap(),
+                            signature,
+                        )
                     {
                         facts
                             .java_return_shapes
@@ -3069,18 +3104,33 @@ impl SyntaxSemanticProvider {
         owners.next().is_none().then_some(owner)
     }
 
+    fn reference_return_fact(&self, symbol: &SemanticSymbol) -> Option<ReferenceReturnNullability> {
+        let fact = self
+            .reference_return_nullability_locations
+            .get(&(symbol.location.file.clone(), symbol.location.start_byte))?;
+        fact.bindings
+            .iter()
+            .all(|binding| binding.valid(&symbol.id.file, &symbol.id.package, self))
+            .then_some(fact.nullability)
+    }
+
     fn inherits_type(&self, descendant: &SymbolId, ancestor: &SymbolId) -> bool {
         if descendant == ancestor {
             return false;
         }
-        let mut queue = self.parents.get(descendant).cloned().unwrap_or_default();
-        let mut seen = BTreeSet::new();
+        let mut queue = self
+            .parents
+            .get(descendant)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
         while let Some(current) = queue.pop() {
-            if current == *ancestor {
+            if current == ancestor {
                 return true;
             }
-            if seen.insert(current.clone()) {
-                queue.extend(self.parents.get(&current).into_iter().flatten().cloned());
+            if seen.insert(current) {
+                queue.extend(self.parents.get(current).into_iter().flatten());
             }
         }
         false
@@ -4058,10 +4108,7 @@ impl SemanticProvider for SyntaxSemanticProvider {
         {
             return None;
         }
-        let nullability = self
-            .reference_return_nullability_locations
-            .get(&(symbol.location.file.clone(), symbol.location.start_byte))
-            .copied()?;
+        let nullability = self.reference_return_fact(symbol)?;
         // A direct annotation may narrow an inherited return contract. An
         // unannotated Java override must not erase an inherited nullness fact.
         // Walk all overridden slots so a platform intermediary cannot hide an
@@ -4075,14 +4122,11 @@ impl SemanticProvider for SyntaxSemanticProvider {
             if !overridden.id.parameters.is_empty() || !seen.insert(overridden.id.clone()) {
                 continue;
             }
-            let inherited = self.reference_return_nullability_locations.get(&(
-                overridden.location.file.clone(),
-                overridden.location.start_byte,
-            ))?;
+            let inherited = self.reference_return_fact(overridden)?;
             if (nullability == ReferenceReturnNullability::Platform
-                && *inherited != ReferenceReturnNullability::Platform)
+                && inherited != ReferenceReturnNullability::Platform)
                 || (nullability == ReferenceReturnNullability::Nullable
-                    && *inherited == ReferenceReturnNullability::NonNull)
+                    && inherited == ReferenceReturnNullability::NonNull)
                 || (overridden
                     .id
                     .file
@@ -7243,17 +7287,6 @@ pub(crate) fn lexical_binding_type(
 ) -> Option<TypeRef> {
     let mut ancestor = expression.parent();
     while let Some(scope) = ancestor {
-        if matches!(
-            scope.kind(),
-            "lambda_literal"
-                | "function_literal"
-                | "anonymous_function"
-                | "catch_block"
-                | "catch_clause"
-                | "enhanced_for_statement"
-        ) {
-            return None;
-        }
         if scope.kind() == "for_statement"
             && scope.named_children(&mut scope.walk()).any(|binding| {
                 binding.kind() == "variable_declaration"
@@ -7266,7 +7299,10 @@ pub(crate) fn lexical_binding_type(
         {
             return None;
         }
-        if matches!(scope.kind(), "block" | "constructor_body" | "for_statement") {
+        if matches!(
+            scope.kind(),
+            "block" | "constructor_body" | "for_statement" | "lambda_literal"
+        ) {
             let mut cursor = scope.walk();
             let mut binding = None;
             for declaration in scope.named_children(&mut cursor) {
@@ -7295,7 +7331,18 @@ pub(crate) fn lexical_binding_type(
                     .child_by_field_name("type")
                     .or_else(|| named_type_child(variable))
                     .or_else(|| declaration.child_by_field_name("type"))
-                    .or_else(|| named_type_child(declaration))?;
+                    .or_else(|| named_type_child(declaration))
+                    .or_else(|| {
+                        declaration
+                            .named_children(&mut declaration.walk())
+                            .find(|child| {
+                                child.kind() == "as_expression"
+                                    && child
+                                        .children(&mut child.walk())
+                                        .any(|token| token.kind() == "as")
+                            })
+                            .and_then(named_type_child)
+                    })?;
                 let mut callable = scope.parent();
                 while callable.is_some_and(|node| {
                     !matches!(
@@ -7315,6 +7362,17 @@ pub(crate) fn lexical_binding_type(
                         .unwrap_or_default(),
                 ));
             }
+        }
+        if matches!(
+            scope.kind(),
+            "lambda_literal"
+                | "function_literal"
+                | "anonymous_function"
+                | "catch_block"
+                | "catch_clause"
+                | "enhanced_for_statement"
+        ) {
+            return None;
         }
         if matches!(
             scope.kind(),
@@ -7572,18 +7630,31 @@ fn resolve_public_instance_call<P: SemanticProvider + ?Sized>(
 /// Infer an expression-bodied member from the selected source declaration,
 /// including qualified super dispatch. Generic/boxed JVM shapes never become
 /// primitives merely because their Kotlin spelling resembles one.
-pub(crate) struct DeclaredCallReturn {
+pub(crate) struct DeclaredExpressionReturn {
     pub result_type: TypeRef,
     pub platform: bool,
 }
 
-pub(crate) fn declared_source_call_return_type<P: SemanticProvider + ?Sized>(
+pub(crate) fn declared_source_expression_return_type<P: SemanticProvider + ?Sized>(
     source: &str,
     file: &Path,
     call: tree_sitter::Node<'_>,
     provider: &P,
-) -> Option<DeclaredCallReturn> {
-    if call.kind() != "call_expression" || provider.source_for_file(file)? != source {
+) -> Option<DeclaredExpressionReturn> {
+    if provider.source_for_file(file)? != source {
+        return None;
+    }
+    if call.kind() == "navigation_expression" {
+        let read = java_expression_return(source, file, call, provider)?;
+        let safe = call
+            .children(&mut call.walk())
+            .any(|child| child.kind() == "?.");
+        return Some(DeclaredExpressionReturn {
+            result_type: read.java_value_type()?,
+            platform: !safe && read.nullability == ReferenceReturnNullability::Platform,
+        });
+    }
+    if call.kind() != "call_expression" {
         return None;
     }
     let callee = call_callee_node(call)?;
@@ -7606,18 +7677,9 @@ pub(crate) fn declared_source_call_return_type<P: SemanticProvider + ?Sized>(
     if let Some(read) = java_getter_call_return(source, file, call, callee, provider)
         .or_else(|| provider.declared_java_method_return(&target))
     {
-        let mut ty = read.result_type;
-        if !read.jvm_primitive
-            && let KotlinType::Primitive(name) = &ty.ty
-        {
-            let boxed = JvmPrimitive::kotlin(name)?.boxed_qualified;
-            ty.ty = KotlinType::Named {
-                name: boxed.to_owned(),
-                arguments: vec![],
-            };
-        }
+        let mut ty = read.java_value_type()?;
         ty.nullable |= safe;
-        return Some(DeclaredCallReturn {
+        return Some(DeclaredExpressionReturn {
             result_type: ty,
             platform: !safe && read.nullability == ReferenceReturnNullability::Platform,
         });
@@ -7625,7 +7687,7 @@ pub(crate) fn declared_source_call_return_type<P: SemanticProvider + ?Sized>(
     let ty = provider.explicit_nongeneric_kotlin_return(&target)?;
     let mut ty = qualify_type_in_file(&ty, &target.file, provider, &mut Vec::new())?;
     ty.nullable |= safe;
-    Some(DeclaredCallReturn {
+    Some(DeclaredExpressionReturn {
         result_type: ty,
         platform: false,
     })
@@ -7661,7 +7723,9 @@ fn indexed_call_return_classifier<P: SemanticProvider + ?Sized>(
     else {
         return None;
     };
-    if let Some(read) = java_getter_call_return(source, file, call, callee, provider) {
+    if let Some(read) = java_getter_call_return(source, file, call, callee, provider)
+        .or_else(|| provider.declared_java_method_return(&id))
+    {
         let safe = explicit_receiver_node(call, callee).is_some_and(|receiver| {
             source
                 .get(receiver.end_byte()..callee.start_byte())
@@ -7761,6 +7825,62 @@ fn java_getter_call_return<P: SemanticProvider + ?Sized>(
     }
     let read = provider.java_property_read(&owner, &property)?;
     (read.method_name == name).then_some(read)
+}
+
+/// The physical result contract of a source Java call or getter projection.
+/// The value type includes an explicit safe receiver's null propagation; the
+/// producer's own JVM and nullness contract stays separate.
+pub(crate) fn java_expression_return<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    expression: tree_sitter::Node<'_>,
+    provider: &P,
+) -> Option<JavaPropertyRead> {
+    if provider.source_for_file(file)? != source {
+        return None;
+    }
+    if expression.kind() == "call_expression" {
+        let callee = call_callee_node(expression)?;
+        let name = callee.utf8_text(source.as_bytes()).ok()?;
+        let FactStatus::Established(target) =
+            resolve_required_call(source, file, expression, callee, name, provider)
+        else {
+            return None;
+        };
+        let mut read = java_getter_call_return(source, file, expression, callee, provider)
+            .or_else(|| provider.declared_java_method_return(&target))?;
+        read.result_type.nullable |=
+            explicit_receiver_node(expression, callee).is_some_and(|receiver| {
+                source
+                    .get(receiver.end_byte()..callee.start_byte())
+                    .is_some_and(|text| text.trim() == "?.")
+            });
+        return Some(read);
+    }
+    if expression.kind() != "navigation_expression" {
+        return None;
+    }
+    let parts = expression
+        .named_children(&mut expression.walk())
+        .filter(|child| !child.is_extra())
+        .collect::<Vec<_>>();
+    let [base, member] = parts.as_slice() else {
+        return None;
+    };
+    let separator = source.get(base.end_byte()..member.start_byte())?.trim();
+    if !matches!(separator, "." | "?.") {
+        return None;
+    }
+    let classifier = guarded_receiver_classifier(source, file, *base, provider)?;
+    let FactStatus::Established(owner) =
+        provider.resolve_type_in_file(file, &package_name(source), &classifier)
+    else {
+        return None;
+    };
+    let mut read =
+        provider.java_property_read(&owner, member.utf8_text(source.as_bytes()).ok()?)?;
+    read.result_type.nullable |= separator == "?.";
+    Some(read)
 }
 
 fn qualified_source_type_name(id: &SymbolId) -> String {
@@ -8928,7 +9048,7 @@ fn known_locale_argument<P: SemanticProvider + ?Sized>(
         .is_some_and(|ty| ty == "java.util.Locale")
 }
 
-fn call_argument_count(call: tree_sitter::Node<'_>) -> usize {
+pub(crate) fn call_argument_count(call: tree_sitter::Node<'_>) -> usize {
     let argument_list = call
         .child_by_field_name("arguments")
         .or_else(|| {
@@ -10309,7 +10429,14 @@ public class Holder<T extends Marker> {
                 "{file:?} / {package} / {ty}"
             );
         }
-        assert_eq!(provider.parents, legacy_parents(&provider));
+        assert_eq!(
+            provider
+                .parents
+                .iter()
+                .map(|(owner, parents)| (owner.clone(), parents.clone()))
+                .collect::<BTreeMap<_, _>>(),
+            legacy_parents(&provider),
+        );
 
         let owner = provider
             .symbols_named("Outer")

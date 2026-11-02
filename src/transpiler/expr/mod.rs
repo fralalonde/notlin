@@ -688,7 +688,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .or_else(|| {
                 self.unit.var_types.get(receiver).map(|stored| {
                     crate::semantics::TypeRef::from_java_name(
-                        stored.strip_prefix("@Nullable ").unwrap_or(stored).trim(),
+                        crate::transpiler::types::strip_nullable_prefix(stored).trim(),
                     )
                 })
             })?;

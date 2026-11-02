@@ -175,7 +175,7 @@ fn relative_single_file_migrations_resolve_the_current_project_directory() {
         fs::write(scratch.source("build.gradle"), "plugins { id 'java' }\n").unwrap();
         fs::write(
             scratch.source("Model.kt"),
-            "interface Example {fun text():String}\n",
+            "interface Example {fun text():String?}\n",
         )
         .unwrap();
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"))

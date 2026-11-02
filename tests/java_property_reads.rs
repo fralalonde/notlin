@@ -626,10 +626,113 @@ fn annotation_defaults_owners_and_unknown_method_annotations_remain_unresolved()
     }
 
     let type_use = "package sample; public class Box { public java.lang.@org.jetbrains.annotations.Nullable String getLabel() { return null; } }";
-    assert!(
-        read(type_use, "label").is_none(),
-        "return-type-use annotations need their own binding proof"
+    assert_eq!(
+        read(type_use, "label").unwrap().nullability,
+        ReferenceReturnNullability::Nullable,
     );
+}
+
+#[test]
+fn scalar_type_use_returns_share_bound_getter_and_ordinary_method_facts() {
+    for (annotation, expected) in [
+        (
+            "org.jspecify.annotations.NonNull",
+            ReferenceReturnNullability::NonNull,
+        ),
+        (
+            "org.jspecify.annotations.Nullable",
+            ReferenceReturnNullability::Nullable,
+        ),
+        (
+            "org.jetbrains.annotations.NotNull",
+            ReferenceReturnNullability::NonNull,
+        ),
+        (
+            "org.jetbrains.annotations.Nullable",
+            ReferenceReturnNullability::Nullable,
+        ),
+    ] {
+        let java = format!(
+            "package sample; public class Box {{ public java.util.@{annotation} UUID getId() {{return null;}} public java.util.@{annotation} UUID id() {{return null;}} }}"
+        );
+        let provider = indexed(&[("Box.java", &java)]);
+        let getter = provider
+            .java_property_read(&owner(&provider), "id")
+            .unwrap();
+        assert_eq!(getter.nullability, expected, "{annotation}");
+        assert!(!getter.jvm_primitive);
+        assert!(
+            matches!(&getter.result_type.ty, KotlinType::Named{name,..} if name=="java.util.UUID")
+        );
+        let method = provider.symbols_named("id")[0].id.clone();
+        let result = provider.declared_java_method_return(&method).unwrap();
+        assert_eq!(result.nullability, expected);
+        assert_eq!(result.result_type, getter.result_type);
+        assert_eq!(
+            provider.reference_return_nullability(&method),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn scalar_type_use_bindings_follow_java_tokens_and_keep_boxed_returns_references() {
+    let java = "package sample; import\n org /* library */ . jspecify.annotations.NonNull; public class Box { public java . util . @NonNull UUID getId(){return null;} public java.lang.@NonNull Double getValue(){return null;} }";
+    let provider = indexed(&[("Box.java", java)]);
+    for property in ["id", "value"] {
+        let fact = provider
+            .java_property_read(&owner(&provider), property)
+            .unwrap();
+        assert_eq!(fact.nullability, ReferenceReturnNullability::NonNull);
+        assert!(!fact.jvm_primitive, "{property}");
+    }
+}
+
+#[test]
+fn unbound_conflicting_and_component_annotations_do_not_become_outer_return_facts() {
+    for (imports, ty) in [
+        ("import custom.NonNull;", "java.util.@NonNull UUID"),
+        ("", "java.util.@custom.NonNull UUID"),
+        (
+            "",
+            "java.util.@org.jspecify.annotations.NonNull @org.jspecify.annotations.Nullable UUID",
+        ),
+        (
+            "",
+            "java.util.@org.jspecify.annotations.NonNull List<String>",
+        ),
+        (
+            "",
+            "java.util.List<java.lang.@org.jspecify.annotations.NonNull String>",
+        ),
+        ("", "java.lang.String @org.jspecify.annotations.NonNull []"),
+        ("", "@org.jspecify.annotations.Nullable Outer.Inner"),
+    ] {
+        let java = format!(
+            "package sample; {imports} public class Box {{ public {ty} getValue() {{return null;}} public {ty} value() {{return null;}} }} class Outer {{class Inner {{}}}}"
+        );
+        let provider = indexed(&[("Box.java", &java)]);
+        assert!(
+            provider
+                .java_property_read(&owner(&provider), "value")
+                .is_none(),
+            "{ty}"
+        );
+        let method = provider.symbols_named("value")[0].id.clone();
+        assert!(
+            provider.reference_return_nullability(&method).is_none(),
+            "{ty}"
+        );
+    }
+    let java = "package sample; import org.jspecify.annotations.NonNull; public class Box extends Parent { public java.util.@NonNull UUID getId(){return null;} public java.util.@NonNull UUID id(){return null;} } class Parent { @interface NonNull {} }";
+    let provider = indexed(&[("Box.java", java)]);
+    assert!(
+        provider
+            .java_property_read(&owner(&provider), "id")
+            .is_none()
+    );
+    let method = provider.symbols_named("id")[0].id.clone();
+    assert!(provider.reference_return_nullability(&method).is_none());
 }
 
 #[test]
@@ -660,6 +763,44 @@ fn comment_imports_and_same_package_nullness_shadows_do_not_prove_annotations() 
             .is_none(),
         "a same-package annotation with the same simple name is not JetBrains Nullable"
     );
+}
+
+#[test]
+fn inherited_annotation_shadows_are_checked_across_source_files() {
+    for imports in [
+        "import org.jspecify.annotations.NonNull;",
+        "import org.jspecify.annotations.*;",
+    ] {
+        let java = format!(
+            "package sample; {imports} public class Box extends Parent {{ public java.util.@NonNull UUID getId(){{return null;}} public java.util.@NonNull UUID id(){{return null;}} }}"
+        );
+        let provider = indexed(&[
+            ("Box.java", &java),
+            (
+                "Parent.java",
+                "package sample; public class Parent extends Grandparent {}",
+            ),
+            (
+                "Grandparent.java",
+                "package sample; public class Grandparent { public @interface NonNull {} }",
+            ),
+        ]);
+        assert!(
+            provider
+                .java_property_read(&owner(&provider), "id")
+                .is_none(),
+            "{imports}"
+        );
+        let method = provider.symbols_named("id")[0].id.clone();
+        assert!(
+            provider.declared_java_method_return(&method).is_none(),
+            "{imports}"
+        );
+        assert!(
+            provider.reference_return_nullability(&method).is_none(),
+            "{imports}"
+        );
+    }
 }
 
 #[test]

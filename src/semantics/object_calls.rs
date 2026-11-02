@@ -108,6 +108,27 @@ fn object_receiver<P: SemanticProvider + ?Sized>(
     }
 
     let receiver = explicit_receiver_node(call, callee)?;
+    if source
+        .get(receiver.end_byte()..callee.start_byte())
+        .is_some_and(|text| text.trim() == "?.")
+        && let Some(read) = super::java_expression_return(source, file, receiver, provider)
+        && !read.jvm_primitive
+        && let KotlinType::Primitive(name) = &read.result_type.ty
+        && let Some(primitive) = crate::jvm_primitive::JvmPrimitive::kotlin(name)
+    {
+        // Safe dispatch narrows a proven physical wrapper before its virtual
+        // Object call. Keep it in the shared reference-call proof instead of
+        // admitting it through a second method-spelling shortcut.
+        return Some(ReferenceStringReceiver::Standard {
+            canonical_type: primitive.boxed_qualified.to_owned(),
+            expression: super::SourceLocation {
+                file: file.to_path_buf(),
+                snapshot_hash: *blake3::hash(source.as_bytes()).as_bytes(),
+                start_byte: receiver.start_byte(),
+                end_byte: receiver.end_byte(),
+            },
+        });
+    }
     if receiver.kind() == "call_expression" {
         return returned_receiver(source, file, call, receiver, provider);
     }

@@ -139,7 +139,8 @@ pub(super) fn reference_return_nullability(
     source: &str,
     node: tree_sitter::Node<'_>,
     ty: &super::FactStatus<super::TypeRef>,
-) -> Option<super::ReferenceReturnNullability> {
+    java_scalar: Option<&super::java_scalar_returns::ScalarReturn>,
+) -> Option<super::ReferenceReturnFact> {
     use super::{FactStatus, KotlinType, ReferenceReturnNullability};
 
     if !matches!(node.kind(), "function_declaration" | "method_declaration")
@@ -179,15 +180,6 @@ pub(super) fn reference_return_nullability(
         {
             return None;
         }
-        if super::declaration_type_node(node)
-            .and_then(|ty| ty.utf8_text(source.as_bytes()).ok())
-            .is_none_or(|ty| ty.contains('@'))
-        {
-            // Qualified/type-use annotations need their own enhancement
-            // analysis; do not silently classify an ignored @NotNull as
-            // a platform return and change its behavior on null.
-            return None;
-        }
         if java_method_declares_throws(source, node) {
             return None;
         }
@@ -196,16 +188,19 @@ pub(super) fn reference_return_nullability(
             // method. We do not interpret defaults, so retain instead.
             return None;
         }
-        return java_method_return_nullability(source, node);
+        return Some(java_scalar?.nullness.clone());
     }
 
     if declares_checked_throws(source, node) {
         return None;
     }
-    Some(if ty.nullable {
-        ReferenceReturnNullability::Nullable
-    } else {
-        ReferenceReturnNullability::NonNull
+    Some(super::ReferenceReturnFact {
+        nullability: if ty.nullable {
+            ReferenceReturnNullability::Nullable
+        } else {
+            ReferenceReturnNullability::NonNull
+        },
+        bindings: Vec::new(),
     })
 }
 
@@ -274,114 +269,23 @@ pub(super) fn java_method_declares_throws(source: &str, node: tree_sitter::Node<
     })
 }
 
-pub(super) fn java_method_return_nullability(
+pub(super) fn java_method_return_nullability<P: SemanticProvider + ?Sized>(
     source: &str,
     node: tree_sitter::Node<'_>,
+    file: &Path,
+    provider: &P,
 ) -> Option<super::ReferenceReturnNullability> {
-    java_method_return_nullability_with_metadata(source, node, &[])
-}
-
-pub(super) fn java_method_return_nullability_with_metadata(
-    source: &str,
-    node: tree_sitter::Node<'_>,
-    metadata: &[super::java_metadata::Binding],
-) -> Option<super::ReferenceReturnNullability> {
-    use super::ReferenceReturnNullability;
-
-    let modifiers = node
-        .named_children(&mut node.walk())
-        .find(|child| child.kind() == "modifiers");
-    let Some(modifiers) = modifiers else {
-        return Some(ReferenceReturnNullability::Platform);
-    };
-    let mut result = ReferenceReturnNullability::Platform;
-    let mut has_nullness = false;
-    let mut cursor = modifiers.walk();
-    for annotation in modifiers
-        .named_children(&mut cursor)
-        .filter(|child| matches!(child.kind(), "annotation" | "marker_annotation"))
-    {
-        let name = annotation
-            .child_by_field_name("name")
-            .or_else(|| {
-                annotation
-                    .named_children(&mut annotation.walk())
-                    .find(|child| matches!(child.kind(), "identifier" | "scoped_identifier"))
-            })
-            .and_then(|name| name.utf8_text(source.as_bytes()).ok())?;
-        let annotation_kind = match java_nullness_annotation(source, name.trim()) {
-            Some(kind) => kind,
-            None if metadata
-                .iter()
-                .any(|binding| binding.at(annotation) && binding.neutral_for_nullness()) =>
-            {
-                continue;
-            }
-            None => return None,
-        };
-        match annotation_kind {
-            JavaNullnessAnnotation::Override => {}
-            JavaNullnessAnnotation::NonNull if !has_nullness => {
-                result = ReferenceReturnNullability::NonNull;
-                has_nullness = true;
-            }
-            JavaNullnessAnnotation::Nullable if !has_nullness => {
-                result = ReferenceReturnNullability::Nullable;
-                has_nullness = true;
-            }
-            JavaNullnessAnnotation::NonNull | JavaNullnessAnnotation::Nullable => return None,
-        }
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
     }
-    Some(result)
-}
-
-#[derive(Clone, Copy)]
-enum JavaNullnessAnnotation {
-    Override,
-    NonNull,
-    Nullable,
-}
-
-fn java_nullness_annotation(source: &str, spelling: &str) -> Option<JavaNullnessAnnotation> {
-    const NOT_NULL: &str = "org.jetbrains.annotations.NotNull";
-    const NULLABLE: &str = "org.jetbrains.annotations.Nullable";
-    const JSPECIFY_NON_NULL: &str = "org.jspecify.annotations.NonNull";
-    const JSPECIFY_NULLABLE: &str = "org.jspecify.annotations.Nullable";
-    match spelling {
-        NOT_NULL | JSPECIFY_NON_NULL => return Some(JavaNullnessAnnotation::NonNull),
-        NULLABLE | JSPECIFY_NULLABLE => return Some(JavaNullnessAnnotation::Nullable),
-        "java.lang.Override" => return Some(JavaNullnessAnnotation::Override),
-        "Override" => {
-            let conflicting_import = source
-                .lines()
-                .filter_map(|line| line.trim().strip_prefix("import "))
-                .map(|import| import.trim_end_matches(';').trim())
-                .any(|import| {
-                    import.rsplit('.').next() == Some("Override") && import != "java.lang.Override"
-                });
-            return (!conflicting_import).then_some(JavaNullnessAnnotation::Override);
-        }
-        _ => {}
-    }
-    if !matches!(spelling, "NotNull" | "Nullable" | "NonNull") {
-        return None;
-    }
-    let matching_imports = source
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("import "))
-        .map(|import| import.trim_end_matches(';').trim())
-        .filter(|import| import.rsplit('.').next() == Some(spelling))
-        .collect::<Vec<_>>();
-    match matching_imports.as_slice() {
-        [import]
-            if spelling == "NotNull" && *import == NOT_NULL
-                || spelling == "NonNull" && *import == JSPECIFY_NON_NULL =>
-        {
-            Some(JavaNullnessAnnotation::NonNull)
-        }
-        [import] if spelling == "Nullable" && matches!(*import, NULLABLE | JSPECIFY_NULLABLE) => {
-            Some(JavaNullnessAnnotation::Nullable)
-        }
-        _ => None,
-    }
+    let scope = super::java_metadata::Scope::new(source, root);
+    let signature = super::java_scalar_returns::collect(source, node, &scope)?;
+    let package = super::package_name(source);
+    signature
+        .nullness
+        .bindings
+        .iter()
+        .all(|binding| binding.valid(file, &package, provider))
+        .then_some(signature.nullness.nullability)
 }

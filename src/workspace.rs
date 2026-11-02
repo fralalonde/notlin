@@ -2110,6 +2110,83 @@ impl SourceIndex {
         Some(requirements)
     }
 
+    /// Widen a collection return only for an actual narrowing override. An
+    /// unnecessary wildcard changes Java callers' element type through capture.
+    pub(crate) fn interface_collection_return_needs_wildcard(
+        &self,
+        declaring: &Path,
+        owner_name: &str,
+        property: &str,
+    ) -> bool {
+        let Some(file) = self.source_file(declaring) else {
+            return false;
+        };
+        let Some(owner) = file
+            .declarations
+            .iter()
+            .find(|owner| owner.name == owner_name && owner.kind == DeclarationKind::Interface)
+        else {
+            return false;
+        };
+        let Some(contract) = owner
+            .members
+            .iter()
+            .find(|member| member.name == property && member.kind == MemberKind::Property)
+        else {
+            return false;
+        };
+        let Some(return_type) = contract.type_name.as_deref() else {
+            return false;
+        };
+        let (base, Some(_)) = split_generic(return_type.trim().trim_end_matches('?')) else {
+            return false;
+        };
+        if !collection_base_is_unshadowed(self, file, base) {
+            return false;
+        }
+        let getter = property_accessor_name(property);
+        let owner_key = declaration_key(owner);
+        let mut pending = self.direct_subtypes(owner);
+        let mut seen = HashSet::new();
+        while let Some(child) = pending.pop() {
+            if !seen.insert(child as *const Declaration as usize) {
+                continue;
+            }
+            pending.extend(self.direct_subtypes(child));
+            let Some(child_file) = self.declaration_source_file(child) else {
+                continue;
+            };
+            if !child.members.iter().any(|member| {
+                !member.is_static
+                    && (member.kind == MemberKind::Property && member.name == property
+                        || member.kind == MemberKind::Method
+                            && member.name == getter
+                            && member.parameter_types.is_empty())
+                    && member.type_name.as_deref().is_some_and(|ty| {
+                        !source_types_have_same_identity(self, child_file, ty, file, return_type)
+                    })
+            }) {
+                continue;
+            }
+            if self
+                .member_conflicts_for(&child.supertypes, child)
+                .iter()
+                .any(|conflict| {
+                    conflict.legacy_mismatch
+                        && conflict.supertype == owner_key
+                        && (conflict.kind == MemberKind::Property
+                            && conflict.member_name == property
+                            || conflict.kind == MemberKind::Method
+                                && conflict.member_name == getter
+                                && conflict.parameter_types.is_empty())
+                })
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Whether an interface getter has Kotlin's read-only collection contract,
     /// so Java can express its declaration-site variance with a wildcard.
     /// This source-only proof is shared by interface emission and override
@@ -6939,7 +7016,8 @@ fn constructor_property_annotations_unsupported(text: &str) -> bool {
 /// storage even when the getter never mentions `field`.
 pub(crate) struct PlainComputedGetter<'tree> {
     pub body: tree_sitter::Node<'tree>,
-    pub return_type: tree_sitter::Node<'tree>,
+    pub return_type: Option<tree_sitter::Node<'tree>>,
+    pub expression: Option<tree_sitter::Node<'tree>>,
     pub is_final: bool,
     pub is_public: bool,
 }
@@ -6970,7 +7048,6 @@ pub(crate) fn computed_property_getter<'tree>(
     let variable = children
         .iter()
         .find(|child| child.kind() == "variable_declaration")?;
-    let return_type = first_type_node(*variable)?;
     let modifiers = children.iter().find(|child| child.kind() == "modifiers")?;
     let mut is_final = false;
     let mut is_public = false;
@@ -6999,6 +7076,14 @@ pub(crate) fn computed_property_getter<'tree>(
     let [getter] = getters.as_slice() else {
         return None;
     };
+    let return_type = first_type_node(*variable).or_else(|| first_type_node(**getter));
+    let expression = default_getters::expression_body(node, source);
+    if return_type.is_none() && expression.is_none() {
+        // An inferred function needs an expression body. A single-return
+        // getter can use that expression too; complex blocks need a separate
+        // return-inference plan rather than accidentally becoming Unit.
+        return None;
+    }
     let body = getter
         .named_children(&mut getter.walk())
         .find(|child| child.kind() == "function_body")?;
@@ -7018,6 +7103,7 @@ pub(crate) fn computed_property_getter<'tree>(
     Some(PlainComputedGetter {
         body,
         return_type,
+        expression,
         is_final,
         is_public,
     })

@@ -197,7 +197,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 return None;
             }
             let java = kt::java_type_ann(ty, source, self.unit.annots);
-            let java = java.trim_start_matches("@Nullable ").trim();
+            let java = crate::transpiler::types::strip_nullable_prefix(&java).trim();
             let boxed = crate::transpiler::types::boxed_name(java).unwrap_or(java);
             if boxed.contains('?') || boxed.is_empty() {
                 return None;

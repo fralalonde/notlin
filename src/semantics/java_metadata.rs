@@ -13,8 +13,6 @@ pub(super) struct Binding {
     anchor: String,
     canonical_anchor: String,
     qualified: bool,
-    start: usize,
-    end: usize,
     lexical_owners: Vec<usize>,
     foreign_stars: Vec<String>,
 }
@@ -30,15 +28,11 @@ impl Binding {
         )
     }
 
-    pub fn at(&self, annotation: Node<'_>) -> bool {
-        self.start == annotation.start_byte() && self.end == annotation.end_byte()
-    }
-
-    pub fn valid(
+    pub fn valid<P: SemanticProvider + ?Sized>(
         &self,
         file: &Path,
         package: &str,
-        provider: &super::SyntaxSemanticProvider,
+        provider: &P,
     ) -> bool {
         let head = self.written.split('.').next().unwrap_or("");
         if self.foreign_stars.iter().any(|package| {
@@ -50,16 +44,22 @@ impl Binding {
         }) {
             return false;
         }
+        let head_types = provider
+            .symbols_named(head)
+            .into_iter()
+            .filter(|symbol| super::is_type_symbol(&symbol.id))
+            .collect::<Vec<_>>();
         for start in &self.lexical_owners {
-            let Some(owner) = provider
-                .type_symbols_by_location
-                .get(&(file.to_path_buf(), *start))
-                .and_then(|index| provider.symbols.get(*index))
-            else {
+            let Some(owner) = provider.symbols_in_file(file).into_iter().find(|symbol| {
+                symbol.location.start_byte == *start && super::is_type_symbol(&symbol.id)
+            }) else {
                 return false;
             };
             if !provider.has_complete_inheritance(&owner.id) {
                 return false;
+            }
+            if head_types.is_empty() {
+                continue;
             }
             let mut pending = vec![owner.id.clone()];
             let mut seen = BTreeSet::new();
@@ -69,14 +69,17 @@ impl Binding {
                 }
                 let mut path = parent.owner_path.clone();
                 path.push(parent.name.clone());
-                if provider.symbols_named(head).iter().any(|symbol| {
-                    super::is_type_symbol(&symbol.id)
-                        && symbol.id.file == parent.file
-                        && symbol.id.owner_path == path
-                }) {
+                if head_types
+                    .iter()
+                    .any(|symbol| symbol.id.file == parent.file && symbol.id.owner_path == path)
+                {
                     return false;
                 }
-                pending.extend(provider.parents.get(&parent).into_iter().flatten().cloned());
+                let FactStatus::Established(parents) = provider.instance_contract_parents(&parent)
+                else {
+                    return false;
+                };
+                pending.extend(parents);
             }
         }
         if self.qualified {
@@ -193,7 +196,7 @@ impl<'src> Scope<'src> {
                 && let Some(path) = node
                     .named_children(&mut node.walk())
                     .find(|part| matches!(part.kind(), "identifier" | "scoped_identifier"))
-                    .and_then(|path| path.utf8_text(source.as_bytes()).ok())
+                    .and_then(|path| crate::java_ir::qualified_name(path, source))
             {
                 let static_import = node
                     .children(&mut node.walk())
@@ -232,17 +235,14 @@ impl<'src> Scope<'src> {
     }
 
     pub fn binding(&self, annotation: Node<'_>) -> Option<Binding> {
-        let written = annotation
-            .child_by_field_name("name")?
-            .utf8_text(self.source.as_bytes())
-            .ok()?
-            .trim();
+        let written =
+            crate::java_ir::qualified_name(annotation.child_by_field_name("name")?, self.source)?;
         let head = written.split('.').next()?;
         if self.names.contains(head) {
             return None;
         }
         let exact = self.exact.get(head);
-        let qualified = preserves_members(written);
+        let qualified = preserves_members(&written);
         let mut foreign_stars = Vec::new();
         let (anchor, canonical_anchor, canonical) = if qualified {
             if exact.is_some() {
@@ -278,7 +278,9 @@ impl<'src> Scope<'src> {
                 let [canonical] = candidates.as_slice() else {
                     return None;
                 };
-                let package = canonical.strip_suffix(written)?.trim_end_matches('.');
+                let package = canonical
+                    .strip_suffix(written.as_str())?
+                    .trim_end_matches('.');
                 foreign_stars = self
                     .stars
                     .iter()
@@ -318,8 +320,6 @@ impl<'src> Scope<'src> {
             anchor,
             canonical_anchor,
             qualified,
-            start: annotation.start_byte(),
-            end: annotation.end_byte(),
             lexical_owners,
             foreign_stars,
         })

@@ -1,6 +1,282 @@
 # Translation frontier
 
-## Current checkpoint — 2026-11-01 (shared source defaults and JSpecify)
+The accepted 2026-11-02 conversion uses clean `exp/kotlin-killer2` commit
+`3382c909b00c61725c80892cd26acc5917b4c7b6`. The standard root conversion with
+`--in-place --lombok` translates **4158 / 6694 original declarations (62.1%)**,
+retains 2536, deletes 420 Kotlin files and trims 578. Nine Kotlin files remain
+untouched. No generated source is hand-edited.
+
+The complete Gradle build passes: 97 tasks execute and 32 come from cache.
+Its 3070 passing and 76 skipped test cases have exactly the same identities
+and outcomes as the verified unconverted reference. Hastings imports all
+**9745 records**, then stays free of errors and stack traces for **106 seconds**.
+The owned app is stopped afterward. All 20 focused release-profile controls
+pass against the exact CLI binary; formatting and CI Clippy pass. The Rust
+comparison records 1684 passes and the same 62 known Windows failures, with
+no new failures.
+
+Acceptance evidence is `target/current-reference-release-20261102/acceptance.json`.
+The release binary SHA256 is
+`37508a26efe1fed75ad7d1a12ae657f39910c0a7c314f209b598cf681c7bacba`;
+all 379 compiler inputs stay unchanged through the gate. The conversion takes
+97m42s with two workers and profiling enabled. Ten migration rounds include a
+complete restart when speculative collection-contract groups shrink from 22
+to four. This is a correctness retry, not a failed convergence check. A sampled
+64-second planning interval uses 68.8 CPU seconds with no reads and only 1725
+bytes written. The next CPU pass must keep source I/O unchanged, measure its
+specific hot paths and prove identical ownership and generated sources.
+
+The final coverage has no ownership-cycle diagnostics. Four unstable owners
+appear in an intermediate probe only; do not report them as a final blocker.
+The 150 descendants retained for independent getter dispatch remain the next
+coordinated physical-name/caller migration case, after the CPU pass.
+
+On 2026-11-02 the user confirmed that unconverted `exp/kotlin-killer2` defines
+the required application behavior. Its latest production commit is
+`0f16243c38c7c35d7019b992372b02ff70bd20d1`. The new pristine control reproduces
+the same four assertion failures, and its Hastings runtime imports 9745 records
+then remains free of errors and stack traces for 105.9 seconds. All original
+files remain byte-identical during that control. The prior `daad4520` results
+below are historical and must not stand in for this newer control.
+The production behavior choice is resolved: preserve the current reference;
+do not make ERROR commands or shared derived-ID JSON behave differently just
+to satisfy assertions that fail before conversion.
+
+Reference commit `3382c909b00c61725c80892cd26acc5917b4c7b6` corrects only three
+inventory test files to characterize that existing behavior. Supported status
+changes are exercised; ERROR requests emit no event and leave state unchanged,
+including through a JPA reload. Both persistence and shared mappers omit the
+derived ID, while strict persistence JSON handling remains tested. Focused
+tests, the complete inventory unit/JPA tasks and the full Gradle build pass.
+The full build executes 35 tasks, restores 69 from cache and reports 27
+up-to-date; the affected inventory test tasks execute in the preceding module
+gate. No production file changes and no unrelated index changes are included.
+The commit is local, not pushed. Its archive matches all 4646 tested input
+files exactly (SHA256
+`296b20861d88a24704d874f4153a662298a9415899f5ab78f30ea139b4171d49`).
+Baseline evidence is under `target/reference-0f16243-20261102/`. The fresh
+standard translation and its complete build/Hastings gate are now accepted
+above, clearing the original reference blocker without production changes.
+
+The earlier branch's manual hierarchy fix is commit
+`94a5e49c901652c3b7f700c12115d3128e4c07b2`: the extra narrow method became
+`lookupEntityId()`. That commit is present on `exp/kotlin-killer`, absent from
+`exp/kotlin-killer2`. The current branch still declares both the inherited
+`id: IEntityId` getter and the independent `getId(): LookupEntityId` function.
+`LookupEntityId` implements `IEntityId`, but Kotlin keeps the property getter
+and explicit function independent; simply making the function a Java override
+changes dispatch. A distinct physical method name with bound Kotlin and Java
+callers updated is a valid generic strategy. Preserving the old JVM name is
+unnecessary for this source migration and is the reason the current temporary
+guard retains Java descendants. This remains a coordinated caller-rewrite
+task, not a request to copy older branch production changes wholesale.
+One current Java caller explicitly needs the narrow result:
+`AdHocMoveApplicationState` calls
+`((BaseLookupEntity) selectedReason).getId().toEntityIdClass(...)`.
+The coordinated rename must update this call as well.
+
+## Historical investigation at `daad4520`
+
+Reference selection changed to **`exp/kotlin-killer2`** on 2026-11-01, initially
+pinned at `daad4520a944081169e123f3062bc0e37d344042`. The accepted counts below
+belong to the previous reference branch. Its first measured standard conversion
+translates **4357** and retains **2332** of **6689 original owners**; this is a
+diagnostic baseline, not an accepted result. Lower counts are expected and
+must not be compared with the previous branch's conversion count.
+
+The untouched original imports **9741 records** under Hastings dev and remains
+free of errors and stack traces for 105 seconds after the complete import
+marker. Its full build fails `AbstractAssetAggregateCommandJpaTest` because the
+test requests `ERROR` while `StorageAssetAggregate` handles only `AVAILABLE`
+and `UNAVAILABLE`. A focused rerun reproduces the same failure. Running the
+untouched full build with `--continue` reveals four failing assertions: two
+status-command tests expect unsupported `ERROR` handling, and two derived-ID
+serialization assertions expect an `id` absent from the shared mapper output.
+The ID assertion also fails in the isolated original test class, excluding
+suite ordering.
+The site-class serialization test passes on the original. These reference
+failures need resolution before the full build gate can pass; no reference
+production code or tests have been changed to bypass them.
+
+The first translated build separately fails on an inferred `typeClass` override
+after its Kotlin parent becomes a Java getter. The current candidate repairs
+storage-free inferred class getters as inferred Kotlin methods, preserving
+narrower/platform types rather than replacing them with the parent's return
+type. Native controls compare values, null behavior, evaluation counts and
+getter annotations. Explicit types on getters are preserved too.
+
+That repair passes the reference Kotlin compilation. The next Java error is an
+omitted required annotation array: Kotlin accepts `@JsonSubTypes()`, while Java
+needs `@JsonSubTypes({})`. Making only that array explicit in a diagnostic copy
+clears the accompanying Lombok error cascade and passes both core API compiler
+tasks. The translator now reads required `value` array signatures from Java
+source, with bound signatures for external Java library annotations. It also
+handles named options while preserving explicit values and declared defaults.
+Native original/plain/Lombok controls and import-binding controls pass; the
+next reference build is pending.
+
+The updated CLI regenerates the affected owner successfully. Both core API
+compiler tasks execute successfully. The next real error is a retained
+`BaseLookupEntity.getId(): LookupEntityId` hiding `BaseEntity.getId(): IEntityId`
+after its parent property becomes a function. Native probes show that adding
+`override`, or suppressing the hiding diagnostic, changes parent-typed calls.
+A distinct Kotlin function name with the original `@JvmName` preserves both
+physical getter descriptors. The candidate now plans that split against the
+untouched ownership snapshot, updating bound retained Kotlin calls while
+keeping Java callers on the physical name. Property reads remain distinct from
+original method calls. Native original/plain/Lombok comparisons preserve
+mutable state, evaluation counts and parent/child dispatch. Open method
+families and unsupported callable references still require coordinated repairs.
+The fresh standard conversion under `target/getter-namespace-20261102/`
+finishes in 32m22s with **4357 translated / 2332 retained**, unchanged ownership
+sets and no hand-edited output. Its build exposes plugin-opened methods: the
+original bytecode's narrow getter is virtual even though its source lacks
+`open`. A scoped `INAPPLICABLE_JVM_NAME` suppression preserves that virtual
+method. Existing suppressions are merged through the shared builtin annotation
+binding. Native original/plain/Lombok comparisons pass with and without the
+all-open plugin. A diagnostic baseline copy with that emitter delta passes
+both common-module compiler tasks and production application compilation.
+
+The next candidate fixes three Java consumer defects exposed by the complete
+build. Lombok supplies Object methods but not Kotlin data-class `copy` and
+`componentN`, so those APIs share the existing explicit emitter; copy inputs
+reuse constructor variance. Getter annotations use Lombok's `onMethod_` rather
+than being moved to fields, preserving `@JsonIgnore(false)` overrides. Read-only
+interface collection returns keep exact element types unless an indexed
+descendant actually needs covariance. Original/plain/Lombok Java controls pass
+for generic shallow copies, mutations, JSON overrides, and exact/narrowed list
+returns. Its exact Kotlin subtype files must accompany a restored interface in
+focused trials; excluding them correctly retains the interface and leaves an
+incomplete diagnostic copy. With that scope corrected, the tests expose 58
+serialization failures, mostly old generated classes still carrying the same
+misplaced getter annotations. A constructor-AST inventory selects all 56
+affected translated owners for regeneration, without project-name exceptions.
+
+One additional JSON rule preserves Kotlin boolean names such as `isValid` in
+Jackson-exposed classes: JavaBean introspection otherwise calls the property
+`valid` while the creator expects `isValid`. Bound getter JSON names also reach
+Java constructor parameters, including explicit aliases. Native controls now
+register the Kotlin module and compare original/plain/Lombok round trips.
+Unmarked classes gain no Jackson annotations. Regenerating the affected owners
+clears 56 of the 58 serialization failures. The remaining duplicated inbound
+message test needs primary constructor names on an ordinary Kotlin class.
+The existing data-class constructor contract is now shared with ordinary
+property constructors, including Lombok `onConstructor_` and superclass calls.
+Native round trips pass for generated, explicit and delegating constructors.
+The updated message owner is regenerated under
+`target/constructor-surface-20261102/`; its full build and runtime control are
+complete. All compiler tasks pass, and the only four failing assertions match
+the untouched reference exactly. Hastings nevertheless fails at startup with
+getter recursion: javac adds a covariant bridge to a Java descendant of the
+independent wide/narrow Kotlin getters. A native empty-subclass probe reproduces
+the changed dispatch; finalizing the wide getter instead causes a linkage error.
+The current candidate keeps those descendants in Kotlin until physical names
+and Java callers can be migrated together. Cached syntax and scoped ancestry
+identify the family; unrelated classes remain eligible. The native dispatch
+fixture now includes a descendant. Constructor annotations also exposed a
+Lombok getter-contract guard that rejected all annotation arguments; constructor
+options now remain neutral for accessor metadata, with canonical binding checks.
+Focused getter/setter/safe-call JVM controls pass after that repair.
+The guarded family contains 150 previously translated owners. Replanning their
+original fragments retains all 150 and translates 30 other owners in those
+files. Three previously converted input interfaces must also stay Kotlin:
+their new retained implementations inherit properties from Kotlin class
+ancestors. Restoring only those interface owners leaves stale getter repairs
+in the older baseline. The current diagnostic reconstructs the entire Kotlin
+residue from original ownership spans through the compiler's migration planner,
+keeps existing Java outputs, and reruns the root conversion to establish one
+consistent set of repairs. The provisional replay before that pass is
+4236 Java-owned / 2453 Kotlin-owned / 6689 original owners; it is not an accepted
+fresh-conversion count. Current Rust checks pass 1682 tests with the same 62
+recorded Windows failures and no new failures; the exact CI Clippy command passes.
+That residue conversion converges in eight passes (95 minutes total) and emits
+51 additional Java owners, provisionally 4287 / 2402 / 6689. Its Kotlin compile
+exposes a diagnostic-harness error: reconstruction used ownership locations
+without the separate annotation-wrapper spans already handled by the normal
+translator. An original-source AST inventory finds 39 wrappers on removed
+owners. The repair reconstructs 14 affected files with 27 wrapper spans and
+restores four newly emitted Java owners for regeneration; earlier restored
+owners have no detached wrappers. This changes no compiler source or generated
+Java by hand. The corrected focused pass and runtime gate are under
+`target/getter-descendants-20261102/wrapper-repair/`.
+The focused correction emits five Java owners and removes the syntax errors.
+Restoring those files also discards 20 existing map getter bridges against
+already-repaired Kotlin method interfaces. The diagnostic restores those exact
+CLI-produced constructor properties and accessors from its saved result, after
+checking identical type/value tokens and parsing every result before writing.
+Core API compilation then passes. This remains diagnostic input repair, with no
+new compiler changes or hand-edited Java. That startup stops in common-module
+Java compilation: a Spring `Nullable` declaration annotation conflicts with an
+unconditionally added JSpecify `Nullable` import. Generated nullability markers
+now retain their canonical identity until final annotation placement and import
+selection, using the same collision check as `NonNull`. Foreign declaration
+annotations remain attached to their declarations, while generated JSpecify
+markers use legal qualified-type and array positions. Original/plain/Lombok JVM
+controls preserve explicit, aliased and wildcard library annotations, values,
+nulls and Lombok processing. The focused annotation suite passes all seven tests.
+The complete Rust run passes 1683 tests with the same 62 recorded Windows
+failures and no new failures; 162 native controls remain opt-in. Exact CI Clippy
+passes. Three fixtures now require actual nullable annotation use rather than
+an unused import. Focused CLI regeneration succeeds, both common-module
+compiler tasks execute successfully, and Hastings reaches its dev-data import.
+Hastings then imports all 9741 records and remains free of errors and stack
+traces for 105.1 seconds after the complete import marker. The owned application
+is stopped successfully. The full unqualified Gradle build finishes with six
+failures: the original four plus two assignment comparisons. Retained Kotlin
+`KProperty1.get()` now sees private Java backing fields instead of Kotlin
+metadata-backed public getters. Those two failures are translator regressions,
+separate from the pending original-reference behavior choice.
+
+The next candidate repairs bound `KProperty1.get()` calls in retained block
+functions through a local getter reader, only when translated Java models and
+actual reflection reads exist. Kotlin receivers retain Kotlin getter behavior;
+Java receivers use public instance getters, including boolean names, and missing
+getters preserve reflection's private-access failure. Shared lexical binding
+also recognizes explicit cast locals inside their own lambda scope without
+crossing an unproved enclosing lambda. Explicit, aliased and qualified library
+bindings, foreign-name guards, idempotence and absence of unused repairs pass.
+Original/plain/Lombok JVM controls compare values, changed assignments, boolean
+names, getter effects and private access. Exact CI Clippy passes. The next CLI
+repair succeeds with no new Java owners. The complete Rust run passes 1684 tests
+with the same 62 Windows failures and no new failures; 163 controls are opt-in.
+The repaired runtime imports all 9741 records, completes 105 seconds without
+errors or stack traces, and stops its owned application. The full unqualified
+Gradle build completes in 240.4 seconds with exactly the original four failed
+assertions and no new failure signatures. The assignment aggregate's 19 tests
+all pass. Compiler inputs remain unchanged across the gate; diff checks pass.
+The reference branch still points to `daad4520a944081169e123f3062bc0e37d344042`.
+Evidence is under `target/getter-descendants-20261102/reflection-getters/`.
+The candidate binary is
+`9cd45bb83fba8c4e3ab622de8cd77292b1b95665d30db2374b503c095047a84f`.
+This is an incremental diagnostic result, with no accepted fresh-conversion
+count. No commit, installation or push has been made. The build gate still
+needs the pending reference behavior choice: implement ERROR status commands
+and derived-ID JSON as expected by the original tests, or preserve application
+behavior and correct those tests. That unresolved choice has persisted across
+consecutive goal turns. Further acceptance and promotion are blocked; fresh
+standard conversion remains required after the original reference is green.
+Enumerating Java computed
+properties without backing fields and expression-body reflection callers are
+outside this getter-read repair.
+Full clean acceptance remains pending and no commit has been made.
+
+A diagnostic copy filter also omitted 93 source files in packages named
+`state`. Those files have been restored byte-for-byte and the complete baseline
+source inventory is checked. A focused common-module compile on that corrected
+copy reproduces the getter error. Earlier missing-state-package errors are
+copy errors, not translator defects.
+
+Evidence lives under `target/kotlin-killer2-20261101/`,
+`target/inferred-override-20261101/`, `target/annotation-arrays-20261101/` and
+`target/getter-namespace-20261102/`, `target/getter-namespace-v2-20261102/` and
+`target/java-surface-20261102/`, `target/jackson-surface-20261102/` and
+`target/constructor-surface-20261102/`.
+The latest diagnostic and consistent-residue replan are under
+`target/getter-descendants-20261102/`.
+The in-progress compiler candidate remains
+uncommitted until the new reference branch's full build and Hastings gate pass.
+
+## Last accepted checkpoint — previous reference branch, 2026-11-01
 
 The clean standard conversion translates **4909** and retains
 **1462** of **6371 original owners**:

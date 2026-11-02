@@ -5,8 +5,8 @@
 
 use super::{
     FactStatus, JavaPropertyRead, KotlinType, ReferenceReturnNullability, SemanticProvider,
-    SymbolId, SyntaxSemanticProvider, TypeRef, declaration_type_node, has_java_modifier,
-    own_type_parameters, source_calls,
+    SymbolId, SyntaxSemanticProvider, TypeRef, has_java_modifier, own_type_parameters,
+    source_calls,
 };
 use crate::jvm_primitive::JvmPrimitive;
 use rayon::prelude::*;
@@ -54,6 +54,7 @@ pub(super) fn collect(
     source: &str,
     node: Node<'_>,
     metadata: &super::java_metadata::Scope<'_>,
+    signature: &super::java_scalar_returns::ScalarReturn,
 ) -> Option<JavaReturnShape> {
     if node.kind() != "method_declaration"
         || own_type_parameters(node).is_some()
@@ -79,15 +80,7 @@ pub(super) fn collect(
         }
         ancestor = parent.parent();
     }
-    let spelling = declaration_type_node(node)?
-        .utf8_text(source.as_bytes())
-        .ok()?
-        .trim();
-    if spelling.contains(['@', '<', '[']) || spelling == "void" {
-        // Nested platform nullability and generic substitution need their own
-        // contract; the outer Java type alone does not prove element types.
-        return None;
-    }
+    let spelling = signature.spelling.as_str();
     let jvm_primitive = matches!(
         spelling,
         "boolean" | "byte" | "short" | "int" | "long" | "char" | "float" | "double"
@@ -95,57 +88,14 @@ pub(super) fn collect(
     // Validate annotations even on primitives; an unknown annotation may be a
     // processor contract rather than a harmless nullness marker.
     let EnclosingAnnotations {
-        legacy: mut annotation_bindings,
+        legacy: annotation_bindings,
         metadata: mut metadata_bindings,
     } = enclosing_annotation_bindings(source, node, metadata)?;
-    if let Some(modifiers) = node
-        .named_children(&mut node.walk())
-        .find(|child| child.kind() == "modifiers")
-    {
-        for annotation in modifiers
-            .named_children(&mut modifiers.walk())
-            .filter(|child| matches!(child.kind(), "annotation" | "marker_annotation"))
-        {
-            if let Some(binding) = metadata.binding(annotation)
-                && binding.neutral_for_nullness()
-                && binding.canonical != "java.lang.Override"
-            {
-                metadata_bindings.push(binding);
-                continue;
-            }
-            let name = annotation
-                .child_by_field_name("name")?
-                .utf8_text(source.as_bytes())
-                .ok()?;
-            let canonical = match name {
-                "Nullable"
-                    if metadata.binding(annotation).is_some_and(|binding| {
-                        binding.canonical == "org.jspecify.annotations.Nullable"
-                    }) =>
-                {
-                    "org.jspecify.annotations.Nullable"
-                }
-                "Nullable" => "org.jetbrains.annotations.Nullable",
-                "NotNull" => "org.jetbrains.annotations.NotNull",
-                "NonNull" => "org.jspecify.annotations.NonNull",
-                "Override" => "java.lang.Override",
-                _ => continue,
-            };
-            if !canonical_annotation_import(source, node, canonical, name == "Override") {
-                return None;
-            }
-            annotation_bindings.push((name.to_owned(), canonical.to_owned()));
-        }
-    }
-    let reference_nullability = source_calls::java_method_return_nullability_with_metadata(
-        source,
-        node,
-        &metadata_bindings,
-    )?;
+    metadata_bindings.extend(signature.nullness.bindings.iter().cloned());
     let nullability = if jvm_primitive {
         ReferenceReturnNullability::NonNull
     } else {
-        reference_nullability
+        signature.nullness.nullability
     };
     let mut result_type = TypeRef::from_java_name(spelling);
     if spelling == "java.lang.String" {
@@ -187,7 +137,7 @@ fn plain_java_lang_binding(source: &str, mut node: Node<'_>, simple: &str) -> bo
             let Some(path) = import
                 .named_children(&mut import.walk())
                 .find(|child| matches!(child.kind(), "identifier" | "scoped_identifier"))
-                .and_then(|path| path.utf8_text(source.as_bytes()).ok())
+                .and_then(|path| crate::java_ir::qualified_name(path, source))
             else {
                 return false;
             };
@@ -223,7 +173,7 @@ fn canonical_annotation_import(
         let Some(path) = import
             .named_children(&mut import.walk())
             .find(|child| matches!(child.kind(), "identifier" | "scoped_identifier"))
-            .and_then(|path| path.utf8_text(source.as_bytes()).ok())
+            .and_then(|path| crate::java_ir::qualified_name(path, source))
         else {
             return false;
         };
@@ -695,12 +645,14 @@ impl SyntaxSemanticProvider {
         let shape = self
             .java_return_shapes
             .get(&(owner.file.clone(), symbol.location.start_byte))?;
-        if !shape.metadata_bindings.is_empty()
-            && (!self.java_metadata_preserves_members(owner)
-                || shape
-                    .metadata_bindings
-                    .iter()
-                    .any(|binding| !binding.valid(&owner.file, &owner.package, self)))
+        let owner_metadata_needed = shape.metadata_bindings.iter().any(|binding| {
+            binding.neutral_for_nullness() && binding.canonical != "java.lang.Override"
+        });
+        if owner_metadata_needed && !self.java_metadata_preserves_members(owner)
+            || shape
+                .metadata_bindings
+                .iter()
+                .any(|binding| !binding.valid(&owner.file, &owner.package, self))
         {
             return None;
         }

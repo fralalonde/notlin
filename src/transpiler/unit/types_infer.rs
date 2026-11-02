@@ -22,10 +22,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         let Some(java_type) = self.current_function_return_type.as_deref() else {
             return java;
         };
-        let java_type = java_type
-            .trim()
-            .strip_prefix("@Nullable ")
-            .unwrap_or(java_type.trim());
+        let java_type = crate::transpiler::types::strip_nullable_prefix(java_type.trim());
         let Some((base, _)) = java_type.split_once('<') else {
             return java;
         };
@@ -186,6 +183,23 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     }
 
     fn infer_type_inner(&mut self, expr: tree_sitter::Node) -> String {
+        if self.call_receipt(expr).is_none()
+            && let Some(provider) = self.semantic_provider
+            && let Some(read) = crate::semantics::java_expression_return(
+                self.source,
+                self.workspace_file.as_deref().unwrap_or(self.file),
+                expr,
+                provider,
+            )
+            && let Some(ty) = read.java_value_type()
+            && let Some(java) = crate::transpiler::types::type_ref_to_java(
+                &ty,
+                crate::transpiler::types::AnnotationSet::None,
+                false,
+            )
+        {
+            return java;
+        }
         if let Some(text) = self.text_operation_call(expr)
             && let Some(java) = crate::transpiler::types::type_ref_to_java(
                 &text.return_type(),

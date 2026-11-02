@@ -102,6 +102,13 @@ impl Expr<'_, '_, '_> {
             .as_deref()
             .unwrap_or(self.unit.file)
             .to_path_buf();
+        if let Some(provider) = self.unit.semantic_provider
+            && let Some(read) =
+                crate::semantics::java_expression_return(source, &file, receiver, provider)
+            && let Some(ty) = read.java_value_type()
+        {
+            return java_type_spelling(&kotlin_type_text(&ty.ty, ty.nullable));
+        }
         if receiver.kind() == "navigation_expression"
             && let Some((base, member)) = self.unit.nav_base_member(receiver)
         {
@@ -169,9 +176,7 @@ impl Expr<'_, '_, '_> {
                 return java_type_spelling(&kotlin_type_text(&ty.ty, ty.nullable));
             }
         }
-        self.unit
-            .infer_type(receiver)
-            .replace("@Nullable ", "")
+        crate::transpiler::types::erase_nullable_annotations(&self.unit.infer_type(receiver))
             .replace("@NotNull ", "")
     }
 }

@@ -182,6 +182,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if self.is_property_repair_bridge(decl) {
             return;
         }
+        if self.workspace.is_some_and(|index| {
+            crate::getter_namespace::has_physical_getter_collision(
+                index,
+                self.workspace_file.as_deref().unwrap_or(self.file),
+                decl,
+                self.source,
+            )
+        }) {
+            self.diag_untranslatable(
+                decl,
+                "independent JVM getter descriptors need coordinated Java caller migration",
+            );
+            return;
+        }
         if let Some(_iface_type) = self.covariant_iface_return_conflict(decl) {
             self.diag_untranslatable(
                 decl,
@@ -414,6 +428,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         && !matches!(c.kind(), "line_comment" | "block_comment")
                 });
                 let inferred = body_expr.map(|be| {
+                    if let Some(contract) = self.proven_expression_return_type(be)
+                        && let Some(java) = crate::transpiler::types::type_ref_to_java(
+                            &contract.result_type,
+                            if contract.platform {
+                                // Keep flexible Java returns flexible for Kotlin callers.
+                                crate::transpiler::types::AnnotationSet::None
+                            } else {
+                                self.annots
+                            },
+                            true,
+                        )
+                    {
+                        return Some(java);
+                    }
                     match be.kind() {
                         "number_literal" => Some("int"),
                         "string_literal" | "interpolated_string" => {
@@ -451,21 +479,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                         // javac rejects with "unexpected return value" and turns
                         // every call site into "'void' type not allowed here".
                         "call_expression" => {
-                            if let Some(contract) = self.proven_call_return_type(be)
-                                && let Some(java) = crate::transpiler::types::type_ref_to_java(
-                                    &contract.result_type,
-                                    if contract.platform {
-                                        // Kotlin callers must retain Java's flexible platform
-                                        // type, rather than gaining an explicit nullable API.
-                                        crate::transpiler::types::AnnotationSet::None
-                                    } else {
-                                        self.annots
-                                    },
-                                    true,
-                                )
-                            {
-                                return Some(java);
-                            }
                             if let Some(fact) = self
                                 .reified_class_calls
                                 .get(&(be.start_byte(), be.end_byte()))

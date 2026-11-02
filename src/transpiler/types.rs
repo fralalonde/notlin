@@ -13,18 +13,40 @@ impl AnnotationSet {
     #[allow(dead_code)]
     pub fn nullable(&self) -> Option<&'static str> {
         match self {
-            AnnotationSet::Jetbrains => Some("@Nullable"),
-            AnnotationSet::Jspecify => Some("@Nullable"),
+            AnnotationSet::Jetbrains => Some("@org.jetbrains.annotations.Nullable"),
+            AnnotationSet::Jspecify => Some("@org.jspecify.annotations.Nullable"),
             AnnotationSet::None => None,
         }
     }
 }
 
+const NULLABLE_PREFIXES: [&str; 3] = [
+    "@Nullable ",
+    "@org.jetbrains.annotations.Nullable ",
+    "@org.jspecify.annotations.Nullable ",
+];
+
+pub(crate) fn split_nullable_prefix(java_type: &str) -> (&str, &str) {
+    NULLABLE_PREFIXES
+        .iter()
+        .find_map(|prefix| java_type.strip_prefix(prefix).map(|ty| (*prefix, ty)))
+        .unwrap_or(("", java_type))
+}
+
+pub(crate) fn strip_nullable_prefix(java_type: &str) -> &str {
+    split_nullable_prefix(java_type).1
+}
+
+pub(crate) fn erase_nullable_annotations(java_type: &str) -> String {
+    NULLABLE_PREFIXES
+        .iter()
+        .fold(java_type.to_owned(), |ty, prefix| ty.replace(prefix, ""))
+}
+
 /// Nullability markers describe declarations. Older annotation jars do not
 /// permit them in Java cast expressions, even when the declaration is nullable.
 pub(crate) fn cast_type(java_type: &str) -> String {
-    java_type
-        .replace("@Nullable ", "")
+    erase_nullable_annotations(java_type)
         .replace("@NotNull ", "")
         .replace("@NonNull ", "")
 }
@@ -165,7 +187,8 @@ fn outer_type_annotation_position(java_type: &str) -> (usize, bool) {
 /// Nullable types are kept in prefix form during planning. Place JSpecify's
 /// type-use annotation on the outer type only after all type rewrites finish.
 pub(crate) fn place_jspecify_nullable_annotations(body: &str) -> String {
-    if !body.contains("@Nullable") {
+    const NAME: &str = "org.jspecify.annotations.Nullable";
+    if !body.contains(NAME) {
         return body.to_owned();
     }
     let mut parser = tree_sitter::Parser::new();
@@ -181,7 +204,7 @@ pub(crate) fn place_jspecify_nullable_annotations(body: &str) -> String {
         if node.kind() == "marker_annotation"
             && node
                 .child_by_field_name("name")
-                .is_some_and(|name| name.utf8_text(body.as_bytes()).ok() == Some("Nullable"))
+                .is_some_and(|name| name.utf8_text(body.as_bytes()).ok() == Some(NAME))
             && let Some(parent) = node.parent()
         {
             let ty = match parent.kind() {
@@ -199,7 +222,15 @@ pub(crate) fn place_jspecify_nullable_annotations(body: &str) -> String {
                 if position > 0 {
                     let at = ty.start_byte() + position;
                     edits.push((node.start_byte(), node.end_byte(), ""));
-                    edits.push((at, at, if array { " @Nullable " } else { "@Nullable " }));
+                    edits.push((
+                        at,
+                        at,
+                        if array {
+                            " @org.jspecify.annotations.Nullable "
+                        } else {
+                            "@org.jspecify.annotations.Nullable "
+                        },
+                    ));
                 }
             }
         }
@@ -216,11 +247,29 @@ pub(crate) fn place_jspecify_nullable_annotations(body: &str) -> String {
 /// Shorten annotation syntax only, never string literals or user type names.
 /// A conflicting NonNull binding keeps the qualified spelling instead.
 pub(crate) fn import_jspecify_non_null(body: &str, imports: &[String]) -> (String, bool) {
-    const NAME: &str = "org.jspecify.annotations.NonNull";
-    if !body.contains(NAME)
+    import_generated_annotation(body, imports, "org.jspecify.annotations.NonNull")
+}
+
+pub(crate) fn import_nullable_annotation(
+    body: &str,
+    imports: &[String],
+    set: AnnotationSet,
+) -> (String, bool) {
+    let Some(package) = nullable_import(set) else {
+        return (body.to_owned(), false);
+    };
+    import_generated_annotation(body, imports, &format!("{package}.Nullable"))
+}
+
+/// Generated annotations carry their identity until the final import decision.
+/// An existing annotation or ordinary type with the same short name keeps its
+/// own binding. Only annotation-name nodes are shortened; literals stay data.
+fn import_generated_annotation(body: &str, imports: &[String], name: &str) -> (String, bool) {
+    let simple = name.rsplit('.').next().unwrap();
+    if !body.contains(name)
         || imports
             .iter()
-            .any(|import| import.rsplit('.').next() == Some("NonNull") && import != NAME)
+            .any(|import| import.rsplit('.').next() == Some(simple) && import != name)
     {
         return (body.to_owned(), false);
     }
@@ -231,23 +280,24 @@ pub(crate) fn import_jspecify_non_null(body: &str, imports: &[String]) -> (Strin
     let Some(tree) = parser.parse(body, None) else {
         return (body.to_owned(), false);
     };
-    let imported = imports.iter().any(|import| import == NAME);
+    let imported = imports.iter().any(|import| import == name);
     let mut pending = vec![tree.root_node()];
     let mut spans = Vec::new();
     while let Some(node) = pending.pop() {
         if matches!(node.kind(), "annotation" | "marker_annotation")
-            && let Some(name) = node.child_by_field_name("name")
-            && name.utf8_text(body.as_bytes()).ok() == Some(NAME)
+            && let Some(annotation_name) = node.child_by_field_name("name")
+            && annotation_name.utf8_text(body.as_bytes()).ok() == Some(name)
         {
-            spans.push((name.start_byte(), name.end_byte()));
+            spans.push((annotation_name.start_byte(), annotation_name.end_byte()));
         }
         if matches!(node.kind(), "identifier" | "type_identifier")
-            && node.utf8_text(body.as_bytes()).ok() == Some("NonNull")
+            && node.utf8_text(body.as_bytes()).ok() == Some(simple)
             && node.parent().is_some_and(|parent| {
-                !matches!(
+                !(matches!(
                     parent.kind(),
                     "scoped_identifier" | "scoped_type_identifier"
-                ) && !(imported && matches!(parent.kind(), "annotation" | "marker_annotation"))
+                ) && parent.child_by_field_name("name") == Some(node))
+                    && !(imported && matches!(parent.kind(), "annotation" | "marker_annotation"))
             })
         {
             return (body.to_owned(), false);
@@ -258,7 +308,7 @@ pub(crate) fn import_jspecify_non_null(body: &str, imports: &[String]) -> (Strin
     spans.sort_unstable();
     let mut result = body.to_owned();
     for (start, end) in spans.into_iter().rev() {
-        result.replace_range(start..end, "NonNull");
+        result.replace_range(start..end, simple);
     }
     (result, used)
 }
@@ -293,9 +343,7 @@ pub fn box_primitive_generics(targs: &str) -> String {
 /// implementation may then return `List<Derived>` for an interface contract of
 /// `List<? extends Base>`, matching Kotlin's `List<out T>` relationship.
 pub fn covariant_interface_return(java_type: &str) -> String {
-    let (prefix, ty) = java_type
-        .strip_prefix("@Nullable ")
-        .map_or(("", java_type), |ty| ("@Nullable ", ty));
+    let (prefix, ty) = split_nullable_prefix(java_type);
     let Some(open) = ty.find('<') else {
         return java_type.to_string();
     };
