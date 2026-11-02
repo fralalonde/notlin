@@ -106,6 +106,305 @@ fn populate(root: &Path) {
     }
 }
 
+fn populate_qualified_super(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    for (name, source) in [
+        (
+            "Root.java",
+            "package sample; public interface Root {String getId();}",
+        ),
+        (
+            "Left.java",
+            "package sample; public interface Left extends Root {@org.jetbrains.annotations.NotNull default String getId(){return \"left\";}}",
+        ),
+        (
+            "Branch.java",
+            "package sample; public interface Branch extends Left,Root {}",
+        ),
+        (
+            "Child.kt",
+            "package sample\nclass Child:Branch {override fun getId():String=super<Branch>.getId()}\n",
+        ),
+        (
+            "Runner.kt",
+            "package sample\nfun main(){println(Child().getId())}\n",
+        ),
+    ] {
+        fs::write(root.join(name), source).unwrap();
+    }
+}
+
+fn populate_inherited_default_join(root: &Path, retained_root: bool) {
+    fs::create_dir_all(root).unwrap();
+    let companion = if retained_root {
+        "companion object {suspend fun remainKotlin() {}}"
+    } else {
+        ""
+    };
+    for (name, source) in [
+        ("Root.kt", format!("package sample\ninterface Root {{fun number():Int\nfun value():Int=number()\n{companion}\n}}\n")),
+        ("Middle.kt", "package sample\ninterface Middle:Root\n".into()),
+        ("Special.kt", "package sample\ninterface Special:Root {override fun value():Int=2}\n".into()),
+        ("Child.kt", "package sample\ninterface Child:Middle,Special\n".into()),
+        ("Runner.kt", "package sample\nclass Impl:Child {override fun number():Int=7}\nfun main(){val x=Impl(); val root:Root=x;println(\"${x.value()}|${root.value()}\")}\n".into()),
+    ] {fs::write(root.join(name), source).unwrap();}
+}
+
+fn assert_inherited_default_join(root: &Path, retained_root: bool, lombok: bool) {
+    let result = translate(root, lombok);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        root.join("Special.java").exists(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        root.join("Child.java").exists(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    if retained_root {
+        assert!(root.join("Middle.kt").exists());
+        assert!(!root.join("Middle.java").exists());
+    } else {
+        let middle = fs::read_to_string(root.join("Middle.java")).unwrap();
+        assert!(
+            !middle.contains("value("),
+            "the forwarding interface must not copy a default: {middle}"
+        );
+    }
+}
+
+#[test]
+fn inherited_default_copies_do_not_create_unrelated_defaults_at_a_join() {
+    let scratch = Scratch::new();
+    for retained in [false, true] {
+        for lombok in [false, true] {
+            let root = scratch.0.join(format!("join-{retained}-{lombok}"));
+            populate_inherited_default_join(&root, retained);
+            assert_inherited_default_join(&root, retained, lombok);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin stdlib, Lombok, and its Kotlin compiler plugin"]
+fn real_toolchain_preserves_inherited_default_joins_in_every_mode() {
+    let stdlib = PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").unwrap());
+    let scratch = Scratch::new();
+    for mode in ["disable", "enable", "no-compatibility"] {
+        for retained in [false, true] {
+            let run = |root: &Path, output, lombok| {
+                let mut config = jvm_config(root, output, &stdlib, lombok);
+                config
+                    .kotlinc_args
+                    .push(format!("-jvm-default={mode}").into());
+                let result = validate_jvm_sources(&config).unwrap();
+                assert_eq!(result.commands.last().unwrap().stdout.trim(), "2|2");
+            };
+            let original = scratch.0.join(format!("join-original-{mode}-{retained}"));
+            populate_inherited_default_join(&original, retained);
+            run(
+                &original,
+                scratch.0.join(format!("join-before-{mode}-{retained}")),
+                false,
+            );
+            for lombok in [false, true] {
+                let root = scratch
+                    .0
+                    .join(format!("join-mixed-{mode}-{retained}-{lombok}"));
+                populate_inherited_default_join(&root, retained);
+                assert_inherited_default_join(&root, retained, lombok);
+                run(
+                    &root,
+                    scratch
+                        .0
+                        .join(format!("join-after-{mode}-{retained}-{lombok}")),
+                    lombok,
+                );
+            }
+        }
+    }
+}
+
+fn populate_bypassed_super(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    for (name, source) in [
+        ("Kind.java", "package sample; public enum Kind {ROOT,RIGHT}"),
+        (
+            "Root.java",
+            "package sample; public interface Root {default Kind choice(){return Kind.ROOT;} int number(); default int value(){return this.number();} default int arithmetic(){return 6+1;} default String opaque(){return \"root\"+System.nanoTime();}}",
+        ),
+        (
+            "Left.java",
+            "package sample; public interface Left extends Root {}",
+        ),
+        (
+            "Right.java",
+            "package sample; public interface Right extends Root {default Kind choice(){return Kind.RIGHT;} default int value(){return 99;} default String opaque(){return \"right\";}}",
+        ),
+        (
+            "Child.kt",
+            "package sample\ninterface Child:Left,Right {override fun choice():Kind=super<Left>.choice()\noverride fun value():Int=super<Left>.value()}\n",
+        ),
+        (
+            "Unsafe.kt",
+            "package sample\ninterface Unsafe:Left,Right {override fun opaque():String=super<Left>.opaque()}\n",
+        ),
+        (
+            "MarkerChild.kt",
+            "package sample\ninterface MarkerChild:Root,java.io.Serializable {override fun arithmetic():Int=super<Root>.arithmetic()}\n",
+        ),
+        (
+            "Runner.kt",
+            "package sample\nclass Impl:Child {var calls=0;override fun number():Int {calls++;return 7}}\nclass MarkerImpl:MarkerChild {override fun number():Int=7}\nfun main(){val i=Impl();println(\"${i.choice()}|${i.value()}|${i.calls}|${MarkerImpl().arithmetic()}\")}\n",
+        ),
+    ] {
+        fs::write(root.join(name), source).unwrap();
+    }
+}
+
+#[test]
+fn bypassed_super_uses_the_selected_body_and_retains_unproven_bodies() {
+    let scratch = Scratch::new();
+    for lombok in [false, true] {
+        let root = scratch.0.join(format!("bypassed-{lombok}"));
+        populate_bypassed_super(&root);
+        let result = translate(&root, lombok);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let java = fs::read_to_string(root.join("Child.java"))
+            .expect("selected source body can translate");
+        assert!(java.contains("sample.Kind.ROOT"), "{java}");
+        assert!(java.contains("this.number()"), "{java}");
+        assert!(!java.contains("Left.super"), "{java}");
+        assert!(root.join("MarkerChild.java").exists());
+        assert!(!root.join("MarkerChild.kt").exists());
+        assert!(root.join("Unsafe.kt").exists());
+        assert!(!root.join("Unsafe.java").exists());
+    }
+}
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin stdlib, Lombok, and its Kotlin compiler plugin"]
+fn real_toolchain_preserves_bypassed_super_body_and_virtual_dispatch() {
+    let stdlib = PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").unwrap());
+    let scratch = Scratch::new();
+    for mode in ["disable", "enable", "no-compatibility"] {
+        let run = |root: &Path, output: PathBuf, lombok| {
+            let mut config = jvm_config(root, output, &stdlib, lombok);
+            config
+                .kotlinc_args
+                .push(format!("-jvm-default={mode}").into());
+            let result = validate_jvm_sources(&config).unwrap();
+            assert_eq!(result.commands.last().unwrap().stdout.trim(), "ROOT|7|1|7");
+        };
+        let original = scratch.0.join(format!("original-bypass-{mode}"));
+        populate_bypassed_super(&original);
+        run(
+            &original,
+            scratch.0.join(format!("before-bypass-{mode}")),
+            false,
+        );
+        for lombok in [false, true] {
+            let root = scratch.0.join(format!("after-bypass-{mode}-{lombok}"));
+            populate_bypassed_super(&root);
+            let result = translate(&root, lombok);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(root.join("Child.java").exists());
+            run(
+                &root,
+                scratch.0.join(format!("classes-bypass-{mode}-{lombok}")),
+                lombok,
+            );
+        }
+    }
+}
+
+#[test]
+fn qualified_super_call_translates_past_an_overridden_ancestor() {
+    let scratch = Scratch::new();
+    for lombok in [false, true] {
+        let root = scratch.0.join(format!("qualified-{lombok}"));
+        populate_qualified_super(&root);
+        let output = translate(&root, lombok);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            root.join("Child.java").exists(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!root.join("Child.kt").exists());
+    }
+}
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin stdlib, Lombok, and its Kotlin compiler plugin"]
+fn real_toolchain_preserves_qualified_super_dispatch_in_every_mode() {
+    let stdlib =
+        PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_STDLIB").expect("NOTLIN_KOTLIN_STDLIB"));
+    let scratch = Scratch::new();
+    for mode in ["disable", "enable", "no-compatibility"] {
+        let configured = |root: &Path, output: PathBuf, lombok| {
+            let mut config = jvm_config(root, output, &stdlib, lombok);
+            config
+                .kotlinc_args
+                .push(format!("-jvm-default={mode}").into());
+            config.classpath.extend([
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/jetbrains-annotations.jar"),
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/jspecify-1.0.0.jar"),
+            ]);
+            config
+        };
+        let original = scratch.0.join(format!("original-{mode}"));
+        populate_qualified_super(&original);
+        let before = validate_jvm_sources(&configured(
+            &original,
+            scratch.0.join(format!("before-{mode}")),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(before.commands.last().unwrap().stdout.trim(), "left");
+        for lombok in [false, true] {
+            let root = scratch.0.join(format!("mixed-{mode}-{lombok}"));
+            populate_qualified_super(&root);
+            let translated = translate(&root, lombok);
+            assert!(
+                translated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&translated.stderr)
+            );
+            assert!(
+                root.join("Child.java").exists(),
+                "{}",
+                String::from_utf8_lossy(&translated.stderr)
+            );
+            let after = validate_jvm_sources(&configured(
+                &root,
+                scratch.0.join(format!("after-{mode}-{lombok}")),
+                lombok,
+            ))
+            .unwrap();
+            assert_eq!(after.commands.last().unwrap().stdout.trim(), "left");
+        }
+    }
+}
+
 fn translate(root: &Path, lombok_enabled: bool) -> std::process::Output {
     let mut kotlin = fs::read_dir(root)
         .unwrap()
@@ -117,7 +416,10 @@ fn translate(root: &Path, lombok_enabled: bool) -> std::process::Output {
         })
         .collect::<Vec<_>>();
     kotlin.sort();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_notlin"));
+    let mut command = Command::new(
+        std::env::var_os("NOTLIN_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into()),
+    );
     command
         .arg("--root")
         .arg(root)

@@ -113,29 +113,23 @@ fn parent_generic_override_of_java_method_remains_forwardable() {
 }
 
 #[test]
-fn default_method_parent_needs_a_jvm_default_bridge_plan() {
+fn default_method_parent_materializes_its_this_rooted_chain() {
     let (outputs, untranslated) = probe(
         "package sample.forward\ninterface Forwarded : Contract { fun label(): String }\n",
         "package sample.forward\ninterface Contract {\n fun key(): String\n fun labelText(): String = key()\n companion object { suspend fun remainKotlin() {} }\n}\n",
         &[],
     );
-    assert!(
-        !forwards(&outputs),
-        "{outputs:?}; retained={untranslated:?}"
-    );
+    assert!(forwards(&outputs), "{outputs:?}; retained={untranslated:?}");
 }
 
 #[test]
-fn property_parent_does_not_use_method_only_forwarding() {
+fn child_interface_inherits_abstract_property_contracts() {
     let (outputs, untranslated) = probe(
         "package sample.forward\ninterface Forwarded : Contract { fun label(): String }\n",
         "package sample.forward\ninterface Contract { val payload: String\n companion object { suspend fun remainKotlin() {} }\n}\n",
         &[],
     );
-    assert!(
-        !forwards(&outputs),
-        "{outputs:?}; retained={untranslated:?}"
-    );
+    assert!(forwards(&outputs), "{outputs:?}; retained={untranslated:?}");
 }
 
 #[test]
@@ -198,7 +192,7 @@ fn qualified_parent_is_not_rebound_to_a_same_named_local_contract() {
 }
 
 #[test]
-fn qualified_default_body_parent_does_not_borrow_a_local_abstract_contract_proof() {
+fn qualified_default_body_parent_materializes_its_own_contract() {
     let (outputs, untranslated) = probe(
         "package sample.forward\ninterface Forwarded<T> : other.Contract<T> {\n fun label(): String\n}\n",
         "package sample.forward\ninterface Contract<T> {\n fun payload(): T\n}\n",
@@ -207,10 +201,14 @@ fn qualified_default_body_parent_does_not_borrow_a_local_abstract_contract_proof
             "package other\ninterface Contract<T> {\n fun payload(): T\n fun key(): String = \"kept\"\n companion object {\n  suspend fun remainKotlin() {}\n }\n}\n",
         )],
     );
-    assert!(
-        !forwards(&outputs),
-        "{outputs:?}; retained={untranslated:?}"
-    );
+    assert!(forwards(&outputs), "{outputs:?}; retained={untranslated:?}");
+    let java = &outputs
+        .iter()
+        .find(|(name, _)| name.ends_with("Forwarded.java"))
+        .unwrap()
+        .1;
+    assert!(java.contains("extends other.Contract<T>"), "{java}");
+    assert!(java.contains("return \"kept\";"), "{java}");
 }
 
 #[test]

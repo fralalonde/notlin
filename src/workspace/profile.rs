@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
+static SOURCE_TREE_QUERIES: AtomicU64 = AtomicU64::new(0);
+static SOURCE_TREE_PARSES: AtomicU64 = AtomicU64::new(0);
+static SOURCE_TREE_NANOS: AtomicU64 = AtomicU64::new(0);
 static GETTER_CALLS: AtomicU64 = AtomicU64::new(0);
 static GETTER_NODES: AtomicU64 = AtomicU64::new(0);
 static GETTER_NANOS: AtomicU64 = AtomicU64::new(0);
@@ -16,6 +19,20 @@ static GETTER_CACHE_INVALIDATED: AtomicU64 = AtomicU64::new(0);
 /// Cached so ordinary runs pay only one branch at each profiling boundary.
 pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NOTLIN_PROFILE").is_some())
+}
+
+pub(crate) fn source_tree_query() {
+    if enabled() {
+        SOURCE_TREE_QUERIES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn source_tree_parsed(elapsed: std::time::Duration) {
+    SOURCE_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
+    SOURCE_TREE_NANOS.fetch_add(
+        elapsed.as_nanos().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
 }
 
 pub(crate) fn getter_cache_hit() {
@@ -78,6 +95,9 @@ pub(crate) fn report_getter_traversals(phase: &str) {
     if !enabled() {
         return;
     }
+    let syntax_queries = SOURCE_TREE_QUERIES.swap(0, Ordering::Relaxed);
+    let syntax_parses = SOURCE_TREE_PARSES.swap(0, Ordering::Relaxed);
+    let syntax_nanos = SOURCE_TREE_NANOS.swap(0, Ordering::Relaxed);
     let calls = GETTER_CALLS.swap(0, Ordering::Relaxed);
     let nodes = GETTER_NODES.swap(0, Ordering::Relaxed);
     let nanos = GETTER_NANOS.swap(0, Ordering::Relaxed);
@@ -86,7 +106,8 @@ pub(crate) fn report_getter_traversals(phase: &str) {
     let cache_reused = GETTER_CACHE_REUSED.swap(0, Ordering::Relaxed);
     let cache_invalidated = GETTER_CACHE_INVALIDATED.swap(0, Ordering::Relaxed);
     eprintln!(
-        "NOTLIN_PROFILE getter traversal {phase}: calls={calls} nodes={nodes} elapsed={:.3}s cache_hits={cache_hits} cache_misses={cache_misses} overlay_reused={cache_reused} overlay_invalidated={cache_invalidated}",
+        "NOTLIN_PROFILE getter traversal {phase}: calls={calls} nodes={nodes} elapsed={:.3}s cache_hits={cache_hits} cache_misses={cache_misses} overlay_reused={cache_reused} overlay_invalidated={cache_invalidated} syntax_queries={syntax_queries} syntax_parses={syntax_parses} syntax_elapsed={:.3}s",
         nanos as f64 / 1_000_000_000.0,
+        syntax_nanos as f64 / 1_000_000_000.0,
     );
 }

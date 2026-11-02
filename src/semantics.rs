@@ -723,7 +723,7 @@ fn plain_kotlin_property_getter(source: &str, node: tree_sitter::Node<'_>) -> bo
     readable_kotlin_property_getter(source, node, false) && !has_record_property_owner(source, node)
 }
 
-fn has_record_property_owner(source: &str, node: tree_sitter::Node<'_>) -> bool {
+pub(crate) fn has_record_property_owner(source: &str, node: tree_sitter::Node<'_>) -> bool {
     // Kotlin records expose component-name accessors, not the ordinary getX
     // ABI. Check the existing tree; no additional parse is needed per getter.
     if !source.contains("JvmRecord") {
@@ -2154,6 +2154,16 @@ pub trait SemanticProvider: Send + Sync {
             .filter(|symbol| symbol.id.file == file)
             .collect()
     }
+    fn select_inherited_method_candidates(
+        &self,
+        candidates: Vec<SymbolId>,
+    ) -> FactStatus<SymbolId> {
+        fact_from_candidates(candidates)
+    }
+    /// Proven strict nominal ancestry, independent of generic substitutions.
+    fn inherits_type(&self, _descendant: &SymbolId, _ancestor: &SymbolId) -> bool {
+        false
+    }
     fn symbols_named(&self, name: &str) -> Vec<&SemanticSymbol> {
         self.symbols()
             .iter()
@@ -2246,6 +2256,11 @@ pub trait SemanticProvider: Send + Sync {
     /// A source-backed, ordinary no-argument JVM method with an explicit,
     /// supported signature. This is independent of whether its owner migrates.
     fn has_stable_noarg_jvm_signature(&self, _member: &SymbolId) -> bool {
+        false
+    }
+    /// Exact source arity and exception declaration for a direct Java call.
+    /// This does not infer the return type or choose an overload.
+    fn has_plain_noarg_call_shape(&self, _member: &SymbolId) -> bool {
         false
     }
     /// Return the explicitly declared return type of a unique, public,
@@ -2432,6 +2447,15 @@ struct FileSemanticFacts {
 struct CallableShape {
     arity: Option<crate::workspace::CallableArity>,
     declares_throws: bool,
+}
+
+impl CallableShape {
+    fn is_plain_noarg(&self) -> bool {
+        !self.declares_throws
+            && self
+                .arity
+                .is_some_and(|arity| arity.fixed == 0 && !arity.vararg)
+    }
 }
 
 impl FileSemanticFacts {
@@ -3102,11 +3126,6 @@ impl SyntaxSemanticProvider {
                     // Kotlin and Java both expose, even through sibling parents.
                     if self.return_classifier_narrows(other, candidate) {
                         return true;
-                    }
-                    if !matches!((&candidate.ty, &other.ty),
-                        (FactStatus::Established(a), FactStatus::Established(b)) if a == b)
-                    {
-                        return false;
                     }
                     match (&owners[j], &owners[i]) {
                         (Some(descendant), Some(ancestor)) => {
@@ -3890,6 +3909,22 @@ impl SemanticProvider for SyntaxSemanticProvider {
         matches!(matches.as_slice(), [symbol] if self.nonsealed_interface_locations
             .contains(&(symbol.location.file.clone(), symbol.location.start_byte)))
     }
+    fn has_plain_noarg_call_shape(&self, member: &SymbolId) -> bool {
+        let matches = self
+            .symbols_named(&member.name)
+            .into_iter()
+            .filter(|symbol| symbol.id == *member)
+            .collect::<Vec<_>>();
+        let [symbol] = matches.as_slice() else {
+            return false;
+        };
+        self.source_for_file(&member.file).is_some_and(|source| {
+            *blake3::hash(source.as_bytes()).as_bytes() == symbol.location.snapshot_hash
+        }) && self
+            .callable_shapes
+            .get(&(member.file.clone(), symbol.location.start_byte))
+            .is_some_and(CallableShape::is_plain_noarg)
+    }
     fn has_stable_noarg_jvm_signature(&self, member: &SymbolId) -> bool {
         if !member.parameters.is_empty() || !self.is_public_instance_callable(member) {
             return false;
@@ -4334,6 +4369,34 @@ impl SemanticProvider for SyntaxSemanticProvider {
                 .collect();
         }
         Vec::new()
+    }
+    fn select_inherited_method_candidates(
+        &self,
+        mut candidates: Vec<SymbolId>,
+    ) -> FactStatus<SymbolId> {
+        candidates.sort();
+        candidates.dedup();
+        let mut members = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            let found = self
+                .symbols_named(&candidate.name)
+                .into_iter()
+                .filter(|symbol| symbol.id == *candidate)
+                .collect::<Vec<_>>();
+            let [member] = found.as_slice() else {
+                return FactStatus::Unknown;
+            };
+            members.push(*member);
+        }
+        fact_from_candidates(
+            self.discard_overridden_inherited_methods(members)
+                .into_iter()
+                .map(|member| member.id.clone())
+                .collect(),
+        )
+    }
+    fn inherits_type(&self, descendant: &SymbolId, ancestor: &SymbolId) -> bool {
+        SyntaxSemanticProvider::inherits_type(self, descendant, ancestor)
     }
     fn resolve_inherited_noarg_call(&self, owner: &SymbolId, name: &str) -> FactStatus<SymbolId> {
         inherited_calls::resolve(self, owner, name)
@@ -5811,7 +5874,7 @@ fn resolve_super_call<P: SemanticProvider + ?Sized>(
         };
         branch_candidates.extend(candidates);
     }
-    fact_from_candidates(branch_candidates)
+    provider.select_inherited_method_candidates(branch_candidates)
 }
 
 fn is_type_symbol(id: &SymbolId) -> bool {
@@ -7170,6 +7233,109 @@ fn lexical_parameter_is_declared(source: &str, call: tree_sitter::Node<'_>, name
     false
 }
 
+/// Resolve an explicitly typed local in its lexical block, then a parameter.
+/// An untyped binding still shadows an outer declaration. Sibling blocks and
+/// declarations after this use cannot supply its receiver type.
+pub(crate) fn lexical_binding_type(
+    source: &str,
+    expression: tree_sitter::Node<'_>,
+    name: &str,
+) -> Option<TypeRef> {
+    let mut ancestor = expression.parent();
+    while let Some(scope) = ancestor {
+        if matches!(
+            scope.kind(),
+            "lambda_literal"
+                | "function_literal"
+                | "anonymous_function"
+                | "catch_block"
+                | "catch_clause"
+                | "enhanced_for_statement"
+        ) {
+            return None;
+        }
+        if scope.kind() == "for_statement"
+            && scope.named_children(&mut scope.walk()).any(|binding| {
+                binding.kind() == "variable_declaration"
+                    && node_name(binding, source).as_deref() == Some(name)
+                    || binding.kind() == "multi_variable_declaration"
+                        && binding
+                            .named_children(&mut binding.walk())
+                            .any(|variable| node_name(variable, source).as_deref() == Some(name))
+            })
+        {
+            return None;
+        }
+        if matches!(scope.kind(), "block" | "constructor_body" | "for_statement") {
+            let mut cursor = scope.walk();
+            let mut binding = None;
+            for declaration in scope.named_children(&mut cursor) {
+                if declaration.end_byte() > expression.start_byte() {
+                    continue;
+                }
+                let variable = match declaration.kind() {
+                    "property_declaration" => declaration
+                        .named_children(&mut declaration.walk())
+                        .find(|child| child.kind() == "variable_declaration")
+                        .filter(|child| node_name(*child, source).as_deref() == Some(name)),
+                    "local_variable_declaration" => declaration
+                        .named_children(&mut declaration.walk())
+                        .find(|child| {
+                            child.kind() == "variable_declarator"
+                                && node_name(*child, source).as_deref() == Some(name)
+                        }),
+                    _ => None,
+                };
+                if let Some(variable) = variable {
+                    binding = Some((declaration, variable));
+                }
+            }
+            if let Some((declaration, variable)) = binding {
+                let ty = variable
+                    .child_by_field_name("type")
+                    .or_else(|| named_type_child(variable))
+                    .or_else(|| declaration.child_by_field_name("type"))
+                    .or_else(|| named_type_child(declaration))?;
+                let mut callable = scope.parent();
+                while callable.is_some_and(|node| {
+                    !matches!(
+                        node.kind(),
+                        "function_declaration"
+                            | "secondary_constructor"
+                            | "method_declaration"
+                            | "constructor_declaration"
+                    )
+                }) {
+                    callable = callable.and_then(|node| node.parent());
+                }
+                return Some(TypeRef::parse_with_type_parameters(
+                    ty.utf8_text(source.as_bytes()).ok()?,
+                    &callable
+                        .map(|node| declaration_type_parameters(source, node))
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        if matches!(
+            scope.kind(),
+            "function_declaration"
+                | "secondary_constructor"
+                | "method_declaration"
+                | "constructor_declaration"
+        ) {
+            return lexical_parameter_type(source, expression, name);
+        }
+        if matches!(
+            scope.kind(),
+            "class_declaration" | "interface_declaration" | "object_declaration" | "object_literal"
+        ) {
+            return None;
+        }
+        ancestor = scope.parent();
+    }
+    None
+}
+
 pub(crate) fn lexical_parameter_type(
     source: &str,
     call: tree_sitter::Node<'_>,
@@ -7195,7 +7361,10 @@ pub(crate) fn lexical_parameter_type(
         }
         if matches!(
             node.kind(),
-            "function_declaration" | "secondary_constructor"
+            "function_declaration"
+                | "secondary_constructor"
+                | "method_declaration"
+                | "constructor_declaration"
         ) {
             break node;
         }
@@ -7216,7 +7385,7 @@ pub(crate) fn lexical_parameter_type(
     let mut cursor = parameters.walk();
     let matches = parameters
         .named_children(&mut cursor)
-        .filter(|node| node.kind() == "parameter")
+        .filter(|node| matches!(node.kind(), "parameter" | "formal_parameter"))
         .filter(|node| node_name(*node, source).as_deref() == Some(name))
         .collect::<Vec<_>>();
     let [parameter] = matches.as_slice() else {

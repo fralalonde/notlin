@@ -787,7 +787,7 @@ fn declaration_binds_name(node: Node, name: &str, source: &str) -> bool {
 pub(crate) fn local_shadow(call: Node, name: &str, source: &str) -> bool {
     let mut scope = call.parent();
     while let Some(n) = scope {
-        if n.kind() == "function_declaration"
+        if matches!(n.kind(), "function_declaration" | "secondary_constructor")
             && kt::child(n, "function_value_parameters").is_some_and(|parameters| {
                 let mut cursor = parameters.walk();
                 parameters

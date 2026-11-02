@@ -51,6 +51,8 @@ fn public_reference_getters_preserve_platform_nullable_and_notnull_facts() {
         ("", Platform),
         ("@org.jetbrains.annotations.Nullable", Nullable),
         ("@org.jetbrains.annotations.NotNull", NonNull),
+        ("@org.jspecify.annotations.Nullable", Nullable),
+        ("@org.jspecify.annotations.NonNull", NonNull),
     ] {
         let source = format!(
             "package sample;\npublic class Box {{ {annotation} public String getLabel() {{ return null; }} }}"
@@ -62,6 +64,20 @@ fn public_reference_getters_preserve_platform_nullable_and_notnull_facts() {
         assert_eq!(fact.target.name, "getLabel");
         assert_eq!(fact.location.file, PathBuf::from("Box.java"));
     }
+}
+
+#[test]
+fn jspecify_imports_preserve_nullness_and_reject_custom_nonnull_annotations() {
+    for (name, expected) in [
+        ("NonNull", ReferenceReturnNullability::NonNull),
+        ("Nullable", ReferenceReturnNullability::Nullable),
+    ] {
+        let source = format!(
+            "package sample;\nimport org.jspecify.annotations.{name};\npublic class Box {{ @{name} public String getLabel() {{return null;}} }}"
+        );
+        assert_eq!(read(&source, "label").unwrap().nullability, expected);
+    }
+    assert!(read("package sample;\nimport custom.NonNull;\npublic class Box {@NonNull public String getLabel(){return null;}}","label").is_none());
 }
 
 #[test]

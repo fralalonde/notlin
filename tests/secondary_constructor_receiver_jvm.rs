@@ -123,6 +123,32 @@ class Snapshot private constructor(val first: UUID, val second: UUID) {
 "#,
         ),
         (
+            "Foreign.kt",
+            "package foreign\ninterface Contract\nopen class Parent<T>(val value: T)\n",
+        ),
+        (
+            "Imported.kt",
+            "package boundary\nimport foreign.Contract\nimport foreign.Parent\nclass Imported: Contract, Parent<String> {\n constructor(value: String): super(value)\n}\n",
+        ),
+        (
+            "Command.kt",
+            r#"package boundary
+class Context(val reason: String)
+class Command(@JvmField val id: String, val context: Context?) {
+    constructor(id: String, reason: String): this(id, Context(reason))
+    constructor(id: String): this(id, null)
+    fun getId(): String = id
+}
+open class Base(@JvmField val id: String)
+class Child: Base {
+    @JvmField var label: String = ""
+    constructor(id: String, label: String): super(id) {
+        this.label = label
+    }
+}
+"#,
+        ),
+        (
             "Runner.kt",
             r#"package boundary
 fun main() {
@@ -130,6 +156,8 @@ fun main() {
     val token = Token()
     val snapshot = Snapshot(PositionImpl(token))
     println(snapshot.first.toString() + "|" + snapshot.second.toString() + "|" + token.count + "|" + snapshot.marker)
+    val child = Child("child", "label")
+    println(Command("first", "reason").getId() + "|" + Command("second").getId() + "|" + child.id + "|" + child.label + "|" + Imported("imported").value)
 }
 "#,
         ),
@@ -145,10 +173,16 @@ fun main() {
         false,
     ))
     .expect("original Kotlin secondary constructor compiles and runs");
-    let expected = before.commands.last().unwrap().stdout.trim().to_owned();
+    let expected = before
+        .commands
+        .last()
+        .unwrap()
+        .stdout
+        .trim()
+        .replace("\r\n", "\n");
     assert_eq!(
         expected,
-        "00000000-0000-0000-0000-000000000001|00000000-0000-0000-0000-000000000002|2|7"
+        "00000000-0000-0000-0000-000000000001|00000000-0000-0000-0000-000000000002|2|7\nfirst|second|child|label|imported"
     );
 
     for lombok_enabled in [false, true] {
@@ -157,7 +191,10 @@ fun main() {
         for (name, source) in sources {
             fs::write(migrated.join(name), source).unwrap();
         }
-        let mut translation = std::process::Command::new(env!("CARGO_BIN_EXE_notlin"));
+        let mut translation = std::process::Command::new(
+            std::env::var_os("NOTLIN_TEST_BINARY")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into()),
+        );
         translation
             .arg("--root")
             .arg(&migrated)
@@ -204,7 +241,13 @@ fun main() {
         ))
         .expect("translated Java constructor and retained Kotlin token compile and run");
         assert_eq!(
-            after.commands.last().unwrap().stdout.trim(),
+            after
+                .commands
+                .last()
+                .unwrap()
+                .stdout
+                .trim()
+                .replace("\r\n", "\n"),
             expected,
             "mixed runtime output in Lombok mode {lombok_enabled}"
         );

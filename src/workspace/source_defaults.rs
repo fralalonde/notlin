@@ -1,4 +1,4 @@
-//! Receiver-independent default values, resolved in the provider's source scope.
+//! Source-backed default bodies, selected in the provider's scope.
 
 use super::default_getters::{
     exact_declaration_node, exact_member_node, expression_body, member_has_annotations,
@@ -6,18 +6,148 @@ use super::default_getters::{
 use super::{Declaration, DeclarationKind, MemberKind, SourceIndex, SourceLanguage};
 use crate::jvm_primitive::JvmPrimitive;
 use crate::semantics::{self, FactStatus, SemanticProvider, SymbolId};
-use crate::translation_plan::PlannedConstantValue;
+use crate::translation_plan::{PlannedConstantValue, PlannedDefaultGetterBody};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
-pub(crate) struct ConstantDefault {
+pub(crate) struct SourceDefault {
     pub target: SymbolId,
     pub method_name: String,
     pub return_type: String,
-    pub value: PlannedConstantValue,
+    pub body: PlannedDefaultGetterBody,
 }
 
 impl SourceIndex {
+    /// Copying a default onto an otherwise forwarding interface changes its
+    /// declaring owner. A descendant that also inherits an override on another
+    /// branch would then inherit unrelated defaults. Keep this interface Kotlin
+    /// until its provider supplies a Java default that can simply be inherited.
+    pub(crate) fn inherited_default_would_conflict(
+        &self,
+        owner: &Declaration,
+        target: &SymbolId,
+        method_name: &str,
+        provider: &dyn SemanticProvider,
+    ) -> bool {
+        if owner.kind != DeclarationKind::Interface {
+            return false;
+        }
+        let owner_id = semantics::workspace_symbol(self, owner);
+        let declares = |declaration: &Declaration| {
+            declaration.members.iter().any(|member| {
+                !member.is_static
+                    && member.visibility.as_deref() != Some("private")
+                    && (member.kind == MemberKind::Method
+                        && member.name == method_name
+                        && member.parameter_types.is_empty()
+                        || member.kind == MemberKind::Property
+                            && super::property_accessor_name(&member.name) == method_name)
+            })
+        };
+        let mut pending = self.direct_subtypes(owner);
+        let mut seen = HashSet::new();
+        while let Some(child) = pending.pop() {
+            if !seen.insert(semantics::workspace_symbol(self, child)) || declares(child) {
+                // An explicit override shadows the prospective copy too.
+                continue;
+            }
+            pending.extend(self.direct_subtypes(child));
+            let mut ancestors = vec![child];
+            let mut visited = HashSet::new();
+            while let Some(ancestor) = ancestors.pop() {
+                let id = semantics::workspace_symbol(self, ancestor);
+                if !visited.insert(id.clone()) {
+                    continue;
+                }
+                if id != owner_id
+                    && provider.inherits_type(&id, target)
+                    && !provider.inherits_type(&id, &owner_id)
+                    && declares(ancestor)
+                {
+                    return true;
+                }
+                if let Some(file) = self.declaration_source_file(ancestor) {
+                    ancestors.extend(
+                        ancestor
+                            .supertypes
+                            .iter()
+                            .filter_map(|spelling| self.resolve_type(file, spelling)),
+                    );
+                }
+            }
+        }
+        false
+    }
+
+    /// Java forbids bypassing an override in another direct parent, even when
+    /// Kotlin explicitly selects an ancestor body through a different branch.
+    pub(crate) fn can_call_interface_super(
+        &self,
+        owner: &Declaration,
+        qualifier: &Declaration,
+        name: &str,
+        provider: &dyn SemanticProvider,
+    ) -> bool {
+        let Some(file) = self.declaration_source_file(owner) else {
+            return false;
+        };
+        let Some((target, _)) = self.effective_interface_value_member(qualifier, file, name) else {
+            return false;
+        };
+        let qualifier_id = semantics::workspace_symbol(self, qualifier);
+        let target_id = semantics::workspace_symbol(self, target);
+        let mut pending = Vec::new();
+        for spelling in &owner.supertypes {
+            let Some(parent) = self.resolve_type(file, spelling) else {
+                if self.canonical_methodless_external_marker(file, spelling) {
+                    continue;
+                }
+                return false;
+            };
+            let id = semantics::workspace_symbol(self, parent);
+            if id == qualifier_id {
+                continue;
+            }
+            if provider.inherits_type(&id, &qualifier_id) {
+                return false;
+            }
+            pending.push(parent);
+        }
+        let mut seen = HashSet::new();
+        while let Some(parent) = pending.pop() {
+            let id = semantics::workspace_symbol(self, parent);
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if provider.inherits_type(&id, &target_id)
+                && parent.members.iter().any(|member| {
+                    !member.is_static
+                        && member.visibility.as_deref() != Some("private")
+                        && (member.kind == MemberKind::Method
+                            && member.name == name
+                            && member.parameter_types.is_empty()
+                            || member.kind == MemberKind::Property
+                                && super::property_accessor_name(&member.name) == name)
+                })
+            {
+                return false;
+            }
+            let Some(context) = self.declaration_source_file(parent) else {
+                return false;
+            };
+            for spelling in &parent.supertypes {
+                let Some(next) = self.resolve_type(context, spelling) else {
+                    if self.canonical_methodless_external_marker(context, spelling) {
+                        continue;
+                    }
+                    return false;
+                };
+                pending.push(next);
+            }
+        }
+        true
+    }
+
     /// Materializing a Java default can make the JVM initialize this interface
     /// when an implementing class is created. Keep observable companion state
     /// on its existing initialization path until the emitter models it lazily.
@@ -29,7 +159,9 @@ impl SourceIndex {
             return false;
         };
         let source = file.source_text();
-        let tree = crate::transpiler::parse_tree(source);
+        let Some(tree) = self.source_tree(file) else {
+            return false;
+        };
         let id = semantics::workspace_symbol(self, owner);
         let Some(decl) = exact_declaration_node(tree.root_node(), source, &file.path, &id) else {
             return false;
@@ -50,12 +182,12 @@ impl SourceIndex {
             })
     }
 
-    pub(crate) fn constant_interface_default(
+    pub(crate) fn source_interface_default(
         &self,
         parent: &Declaration,
         name: &str,
         provider: &dyn SemanticProvider,
-    ) -> Option<ConstantDefault> {
+    ) -> Option<SourceDefault> {
         if parent.kind != DeclarationKind::Interface {
             return None;
         }
@@ -79,15 +211,10 @@ impl SourceIndex {
             (parent, *member)
         } else {
             // An opaque branch could override or reabstract the known default.
-            self.constant_default_hierarchy(parent, None)?;
+            self.source_default_hierarchy(parent, None)?;
             self.effective_default_getter(parent, file, name)?
         };
-        if target.language != SourceLanguage::Kotlin
-            || !member.has_body
-            || member.is_nullable
-            || member.is_mutable
-            || member.is_jvm_field
-        {
+        if !member.has_body || member.is_nullable || member.is_mutable || member.is_jvm_field {
             return None;
         }
         let target_file = self.declaration_source_file(target)?;
@@ -121,15 +248,14 @@ impl SourceIndex {
         if !stable {
             return None;
         }
-        let tree = crate::transpiler::parse_tree(source);
+        let tree = self.source_tree(target_file)?;
         let declaration =
             exact_declaration_node(tree.root_node(), source, &target_file.path, &owner)?;
         let member_node = exact_member_node(declaration, source, member)?;
         if member_has_annotations(member_node) {
             return None;
         }
-        let expression =
-            expression_body(member_node, source).or_else(|| single_return(member_node))?;
+        let expression = expression_body(member_node, source)?;
         let return_type = super::default_getters::getter_return_type(self, target, member)?;
         let raw_type = return_type.as_ref();
         if super::declaration_type_parameter_shadows(target, raw_type) {
@@ -141,6 +267,42 @@ impl SourceIndex {
         };
         if !arguments.is_empty() {
             return None;
+        }
+        let return_type = if let Some(primitive) = identity
+            .strip_prefix("kotlin.")
+            .and_then(JvmPrimitive::kotlin)
+        {
+            primitive.java.to_owned()
+        } else if identity == "kotlin.String" {
+            "java.lang.String".to_owned()
+        } else if identity == "kotlin.Any" {
+            "java.lang.Object".to_owned()
+        } else {
+            let id: SymbolId = serde_json::from_str(identity).ok()?;
+            id.package
+                .split('.')
+                .filter(|part| !part.is_empty())
+                .chain(id.owner_path.iter().map(String::as_str))
+                .chain(std::iter::once(id.name.as_str()))
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        if let Some(body) = super::default_getters::proven_forwarding_expression(
+            self,
+            target,
+            member,
+            &expected,
+            expression,
+            Some(provider),
+        ) {
+            return Some(SourceDefault {
+                target: owner,
+                method_name: name.to_owned(),
+                return_type,
+                body: PlannedDefaultGetterBody::SourceForwarding {
+                    accessors: body.steps.into_iter().map(|step| step.accessor).collect(),
+                },
+            });
         }
         let raw = expression.utf8_text(source.as_bytes()).ok()?.trim();
         let scalar = match identity.as_str() {
@@ -178,7 +340,7 @@ impl SourceIndex {
                 return None;
             }
             let root = qualifier.split('.').next()?;
-            self.constant_default_hierarchy(target, Some(root))?;
+            self.source_default_hierarchy(target, Some(root))?;
             let spelling = semantics::annotation_reference_class(
                 source,
                 &target_file.path,
@@ -234,36 +396,19 @@ impl SourceIndex {
             }
             PlannedConstantValue::EnumEntry(entry.clone())
         };
-        let return_type = if let Some(primitive) = identity
-            .strip_prefix("kotlin.")
-            .and_then(JvmPrimitive::kotlin)
-        {
-            primitive.java.to_owned()
-        } else if identity == "kotlin.String" {
-            "java.lang.String".to_owned()
-        } else {
-            let id: SymbolId = serde_json::from_str(identity).ok()?;
-            id.package
-                .split('.')
-                .filter(|part| !part.is_empty())
-                .chain(id.owner_path.iter().map(String::as_str))
-                .chain(std::iter::once(id.name.as_str()))
-                .collect::<Vec<_>>()
-                .join(".")
-        };
-        Some(ConstantDefault {
+        Some(SourceDefault {
             target: owner,
             method_name: name.to_owned(),
             return_type,
-            value,
+            body: PlannedDefaultGetterBody::SourceConstant { value },
         })
     }
 
-    pub(crate) fn inherited_constant_defaults(
+    pub(crate) fn inherited_source_defaults(
         &self,
         owner: &Declaration,
         provider: &dyn SemanticProvider,
-    ) -> Vec<ConstantDefault> {
+    ) -> Vec<SourceDefault> {
         let Some(file) = self.declaration_source_file(owner) else {
             return Vec::new();
         };
@@ -318,14 +463,17 @@ impl SourceIndex {
                 })
             })
             .filter_map(|name| {
-                self.constant_default_hierarchy(owner, None)?;
+                self.source_default_hierarchy(owner, None)?;
                 let (target, _) = self.effective_default_getter(owner, file, &name)?;
-                self.constant_interface_default(target, &name, provider)
+                if target.language != SourceLanguage::Kotlin {
+                    return None;
+                }
+                self.source_interface_default(target, &name, provider)
             })
             .collect()
     }
 
-    fn constant_default_hierarchy(&self, owner: &Declaration, shadow: Option<&str>) -> Option<()> {
+    fn source_default_hierarchy(&self, owner: &Declaration, shadow: Option<&str>) -> Option<()> {
         let mut pending = vec![owner];
         let mut seen = HashSet::new();
         while let Some(current) = pending.pop() {
@@ -411,34 +559,6 @@ impl SourceIndex {
     }
 }
 
-fn single_return(member: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
-    let holder = if member.kind() == "property_declaration" {
-        crate::transpiler::kt::child(member, "getter")?
-    } else {
-        member
-    };
-    let body = crate::transpiler::kt::child(holder, "function_body")?;
-    let block = crate::transpiler::kt::child(body, "block")?;
-    let statements = block
-        .named_children(&mut block.walk())
-        .filter(|node| !node.is_extra())
-        .collect::<Vec<_>>();
-    let [statement] = statements.as_slice() else {
-        return None;
-    };
-    if statement.kind() != "return_expression" {
-        return None;
-    }
-    let values = statement
-        .named_children(&mut statement.walk())
-        .filter(|node| !node.is_extra())
-        .collect::<Vec<_>>();
-    let [value] = values.as_slice() else {
-        return None;
-    };
-    Some(*value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +584,84 @@ mod tests {
         let mut provider = SyntaxSemanticProvider::new([(path, source.into())]);
         provider.enrich_workspace_type_facts(&index);
         (index, provider)
+    }
+
+    #[test]
+    fn source_default_reads_the_current_overlay_body() {
+        let source = "package sample\ninterface Defaults { fun choice(): String = \"before\" }\n";
+        let (index, provider) = fixture(source);
+        let read = |index: &SourceIndex, provider: &SyntaxSemanticProvider| {
+            let owner = index
+                .declarations()
+                .find(|owner| owner.name == "Defaults")
+                .unwrap();
+            index
+                .source_interface_default(owner, "choice", provider)
+                .and_then(|value| value.body.source_expression("this"))
+        };
+        assert_eq!(read(&index, &provider).as_deref(), Some("\"before\""));
+        assert_eq!(read(&index, &provider).as_deref(), Some("\"before\""));
+        let path = index.files[0].path.clone();
+        for (source, expected) in [
+            (source.replace("before", "after"), Some("\"after\"")),
+            ("package sample\ninterface Defaults { fun choice(): String { println(\"effect\"); return \"after\" } }\n".into(), None),
+        ] {
+            let overlay = index.with_overlays(&[SourceOverlay::Replace {
+                path: path.clone(), language: SourceLanguage::Kotlin, source: source.clone(),
+            }]).unwrap();
+            let mut updated = SyntaxSemanticProvider::new([(path.clone(), source)]);
+            updated.enrich_workspace_type_facts(&overlay);
+            assert_eq!(read(&overlay, &updated).as_deref(), expected);
+            assert_eq!(read(&index, &provider).as_deref(), Some("\"before\""));
+        }
+    }
+
+    #[test]
+    fn java_defaults_share_typed_constant_and_virtual_body_proofs() {
+        let source = "package sample; public interface Defaults {default int answer(){return 42;} default String label(){return \"ok\";} default Kind choice(){return Kind.ONE;} int number(); default int forward(){return this.number();} String maybe(); default String platform(){return maybe();} default int effect(){System.out.println(1);return 42;}}";
+        let directory = std::env::current_dir().unwrap();
+        let sources = [
+            (directory.join("Defaults.java"), source.to_owned()),
+            (
+                directory.join("Kind.java"),
+                "package sample; public enum Kind {ONE}".to_owned(),
+            ),
+        ];
+        let index = SourceIndex::default()
+            .with_overlays(
+                &sources
+                    .iter()
+                    .map(|(path, source)| SourceOverlay::Replace {
+                        path: path.clone(),
+                        language: SourceLanguage::Java,
+                        source: source.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let mut provider = SyntaxSemanticProvider::new(sources);
+        provider.enrich_workspace_type_facts(&index);
+        let owner = index
+            .declarations()
+            .find(|owner| owner.name == "Defaults")
+            .unwrap();
+        for (name, expected) in [
+            ("answer", Some("42")),
+            ("label", Some("\"ok\"")),
+            ("choice", Some("sample.Kind.ONE")),
+            ("forward", Some("this.number()")),
+            ("platform", None),
+            ("effect", None),
+        ] {
+            assert_eq!(
+                index
+                    .source_interface_default(owner, name, &provider)
+                    .and_then(|value| value.body.source_expression("this"))
+                    .as_deref(),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -496,10 +694,14 @@ mod tests {
             ("kind", "sample.Kind", "sample.Kind.ONE"),
         ] {
             let found = index
-                .constant_interface_default(owner, name, &provider)
+                .source_interface_default(owner, name, &provider)
                 .unwrap_or_else(|| panic!("{name}"));
             assert_eq!(found.return_type, ty, "{name}");
-            assert_eq!(found.value.java_expression(), body, "{name}");
+            assert_eq!(
+                found.body.source_expression("this").unwrap(),
+                body,
+                "{name}"
+            );
         }
     }
 
@@ -529,10 +731,17 @@ mod tests {
             .iter()
             .find(|d| d.name == "Defaults")
             .unwrap();
-        for name in ["effect", "call", "renamed", "nullable", "kind"] {
+        let call = index
+            .source_interface_default(owner, "call", &provider)
+            .unwrap();
+        assert_eq!(
+            call.body.source_expression("this").unwrap(),
+            "this.compute()"
+        );
+        for name in ["effect", "renamed", "nullable", "kind"] {
             assert!(
                 index
-                    .constant_interface_default(owner, name, &provider)
+                    .source_interface_default(owner, name, &provider)
                     .is_none(),
                 "{name}"
             );
@@ -544,8 +753,130 @@ mod tests {
             .unwrap();
         assert!(
             index
-                .constant_interface_default(abstract_again, "kind", &provider)
+                .source_interface_default(abstract_again, "kind", &provider)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn inherited_generic_calls_properties_and_required_overloads_share_one_chain() {
+        let (index, provider) = fixture(
+            r#"
+            package sample
+            interface View
+            class Key(private val stored: String) : View {
+                val text: String get() = stored
+                fun render(): String = stored
+                fun render(value: Int): String = "argument"
+            }
+            interface Base<T : View> { fun key(): T }
+            interface Left<T : View> : Base<T>
+            interface Right<T : View> : Base<T>
+            interface Defaults : Left<Key>, Right<Key> {
+                fun getSelected(): Key = key()
+                val text: String get() = key().text
+                fun rendered(): String { return key().render() }
+                fun self(): Defaults = this
+                fun opaqueSelf(): Any = this
+                fun view(): View = key()
+            }
+        "#,
+        );
+        let owner = index.files[0]
+            .declarations
+            .iter()
+            .find(|d| d.name == "Defaults")
+            .unwrap();
+        for (name, expected) in [
+            ("getSelected", "this.key()"),
+            ("getText", "this.key().getText()"),
+            ("rendered", "this.key().render()"),
+            ("self", "this"),
+            ("opaqueSelf", "this"),
+            ("view", "this.key()"),
+        ] {
+            let body = index
+                .source_interface_default(owner, name, &provider)
+                .unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(
+                body.body.source_expression("this").unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_varargs_function_properties_and_checked_signatures_need_more_than_a_plain_call() {
+        for (declarations, body) in [
+            ("fun key(value: Int = 0): Key", "fun render(): Key = key()"),
+            (
+                "fun key(vararg values: Int): Key",
+                "fun render(): Key = key()",
+            ),
+            ("val key: () -> Key", "fun render(): Key = key()"),
+            ("fun key(): Unit", "fun render(): Any = key()"),
+            ("fun <T> key(): Key", "fun render(): Key = key<Key>()"),
+            (
+                "@Throws(java.io.IOException::class) fun key(): Key",
+                "fun render(): Key = key()",
+            ),
+            (
+                "suspend fun key(): Key",
+                "suspend fun render(): Key = key()",
+            ),
+            ("fun key(): Key?", "fun render(): Key? = key()"),
+        ] {
+            let source = format!(
+                "package sample\nclass Key\ninterface Defaults {{\n{declarations}\n{body}\n}}\n"
+            );
+            let (index, provider) = fixture(&source);
+            let owner = index.files[0]
+                .declarations
+                .iter()
+                .find(|d| d.name == "Defaults")
+                .unwrap();
+            assert!(
+                index
+                    .source_interface_default(owner, "render", &provider)
+                    .is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_components_and_ordinary_methods_keep_distinct_jvm_names() {
+        let (index, provider) = fixture(
+            r#"
+            package sample
+            class Key
+            @JvmRecord data class Envelope(val marker: Key) {
+                fun key(): Key = marker
+            }
+            interface Defaults {
+                val envelope: Envelope
+                fun component(): Key = envelope.marker
+                fun ordinary(): Key = envelope.key()
+            }
+        "#,
+        );
+        let owner = index.files[0]
+            .declarations
+            .iter()
+            .find(|d| d.name == "Defaults")
+            .unwrap();
+        assert!(
+            index
+                .source_interface_default(owner, "component", &provider)
+                .is_none()
+        );
+        let body = index
+            .source_interface_default(owner, "ordinary", &provider)
+            .unwrap();
+        assert_eq!(
+            body.body.source_expression("this").unwrap(),
+            "this.getEnvelope().key()"
         );
     }
 }

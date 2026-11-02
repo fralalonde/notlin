@@ -644,22 +644,34 @@ impl<'src, 'tree> Unit<'src, 'tree> {
 
     fn superclass_name(&self, decl: tree_sitter::Node<'tree>) -> Option<String> {
         let dc = kt::child(decl, "delegation_specifiers")?;
-        let spec = dc
-            .children(&mut dc.walk())
-            .find(|s| s.kind() == "delegation_specifier")?;
-        let ci = spec
-            .children(&mut spec.walk())
-            .find(|c| c.kind() == "constructor_invocation")?;
-        let ut = ci
-            .children(&mut ci.walk())
-            .find(|c| c.kind() == "user_type")?;
-        let mut last: Option<tree_sitter::Node<'tree>> = None;
-        for ch in ut.children(&mut ut.walk()) {
-            if ch.kind() == "identifier" {
-                last = Some(ch);
-            }
-        }
-        last.map(|n| self.text(n).to_string())
+        dc.named_children(&mut dc.walk()).find_map(|spec| {
+            let inner = spec.named_child(0)?;
+            let ty = match inner.kind() {
+                "constructor_invocation" => kt::child(inner, "user_type")?,
+                "user_type" if self.bare_supertype_is_class(inner) => inner,
+                _ => return None,
+            };
+            ty.named_children(&mut ty.walk())
+                .filter(|node| node.kind() == "identifier")
+                .last()
+                .map(|name| self.text(name).to_string())
+        })
+    }
+
+    /// A superclass constructor may be called by secondary constructors rather
+    /// than in the class header. Use the scoped type identity, not parentheses
+    /// or a name convention, to distinguish that class from an interface.
+    fn bare_supertype_is_class(&self, ty: tree_sitter::Node) -> bool {
+        let Some(provider) = self.semantic_provider else {
+            return false;
+        };
+        let file = self.workspace_file.as_deref().unwrap_or(self.file);
+        let package = crate::semantics::symbol_id_for_node(self.source, ty, file).package;
+        let raw = self.text(ty).split('<').next().unwrap_or("").trim();
+        matches!(
+            provider.resolve_type_in_file(file, &package, raw),
+            crate::semantics::FactStatus::Established(owner) if owner.kind == "class"
+        )
     }
 
     /// Records allow interfaces and delegating constructors, but no mutable
@@ -806,6 +818,13 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         // enclosing `Length`. Qualify the colliding name with its imported
         // FQN inside type-argument lists, where the two resolutions differ.
         let qualified = qualify_shadowing_type_arguments(&body, &own_names, imports);
+        let qualified = if self.annots == crate::transpiler::types::AnnotationSet::Jspecify {
+            crate::transpiler::types::place_jspecify_nullable_annotations(&qualified)
+        } else {
+            qualified
+        };
+        let (qualified, jspecify_non_null) =
+            crate::transpiler::types::import_jspecify_non_null(&qualified, imports);
         // Always rewrite the body region: the alias lowering above already
         // produced a replacement string, so the buffer's copy is stale.
         out.buf.truncate(import_anchor);
@@ -856,7 +875,6 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 "lombok.Getter",
                 "lombok.Setter",
                 "lombok.Value",
-                "lombok.NonNull",
                 "lombok.AllArgsConstructor",
                 "lombok.EqualsAndHashCode",
             ] {
@@ -870,13 +888,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         block.push_str("import java.util.*;\n");
         block.push_str("import java.util.stream.Stream;\n");
         block.push('\n');
+        let mut annotation_imports = Vec::new();
         if let Some(pkg) = crate::transpiler::types::nullable_import(self.annots) {
-            // Generated nullability uses only this short annotation name;
-            // non-null annotations are fully qualified. An unnecessary star
-            // import makes later planning snapshots' type identities unknown.
-            block.push_str(&format!("import {}.Nullable;\n", pkg));
-            block.push('\n');
+            annotation_imports.push(format!("{pkg}.Nullable"));
         }
+        if jspecify_non_null {
+            annotation_imports.push("org.jspecify.annotations.NonNull".to_owned());
+        }
+        for import in annotation_imports {
+            let line = format!("import {import};");
+            if !block.lines().any(|existing| existing == line) {
+                block.push_str(&line);
+                block.push('\n');
+            }
+        }
+        block.push('\n');
         out.buf.insert_str(import_anchor, &block);
     }
 
@@ -2156,12 +2182,18 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             "interface delegation `by` has no Java counterpart; emitted as plain implements",
                         );
                     }
-                    // `: Greeter` — bare supertype; can't tell class vs
-                    // interface without cross-file metadata, assume interface
+                    // `: Base` can name a class whose constructor is invoked
+                    // by secondary constructors. The same scoped fact drives
+                    // superclass bookkeeping and Lombok's callSuper choice.
                     "user_type" | "nullable_type" => {
                         let t = kt::java_type(inner, self.source).replace(" ", "");
                         if !t.starts_with("@") {
-                            parts.push(format!("iface:{}", t));
+                            let kind = if self.bare_supertype_is_class(inner) {
+                                "class"
+                            } else {
+                                "iface"
+                            };
+                            parts.push(format!("{kind}:{t}"));
                         }
                     }
                     other => {
@@ -2173,9 +2205,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
             if !parts.is_empty() {
-                // constructor_invocation => extends; everything else =>
-                // implements (a class superclass must come first, which the
-                // Kotlin grammar guarantees).
+                // Emit the proved superclass before all interface contracts.
                 let classes: Vec<&str> = parts
                     .iter()
                     .filter_map(|p| p.strip_prefix("class:"))
@@ -2387,7 +2417,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                                                         self.annots,
                                                     )
                                             {
-                                                out.line(annotation);
+                                                if self.annots == crate::transpiler::types::AnnotationSet::Jspecify {
+                                                    pty = crate::transpiler::types::non_null_type(&pty, self.annots);
+                                                } else { out.line(annotation); }
                                             }
                                             out.line(format!("{} {}();", pty, getter_name));
                                         }
@@ -2530,7 +2562,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     out.line(annotation);
                 }
                 let nullability = if is_non_null_reference(fname, ftype) {
-                    "@NonNull "
+                    "@lombok.NonNull "
                 } else {
                     ""
                 };
@@ -2568,7 +2600,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     .iter()
                     .map(|(_, _, n, t)| {
                         let nullability = if is_non_null_reference(n, t) {
-                            "@NonNull "
+                            "@lombok.NonNull "
                         } else {
                             ""
                         };
@@ -2628,23 +2660,21 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     // annotation on the type (e.g. `@Nullable Boolean` from a
                     // `Boolean?` property) already states nullability — keep it
                     // verbatim instead of prepending ours.
-                    let nullability = if ftype.starts_with('@') {
-                        String::new()
+                    let getter_type = if is_non_null_reference(fname, ftype) {
+                        crate::transpiler::types::non_null_type(ftype, self.annots)
                     } else {
-                        crate::transpiler::types::non_null_annotation(self.annots)
-                            .map(|annotation| format!("{annotation} "))
-                            .unwrap_or_default()
+                        ftype.clone()
                     };
                     out.line(format!(
-                        "{}public {} {}() {{ return {}; }}",
-                        nullability, ftype, getter, fname
+                        "public {} {}() {{ return {}; }}",
+                        getter_type, getter, fname
                     ));
                 }
 
                 for (_, is_mutable, fname, ftype) in &params {
                     if *is_mutable && ftype != "boolean" {
                         let nullability = if is_non_null_reference(fname, ftype) {
-                            "@NonNull "
+                            "@lombok.NonNull "
                         } else {
                             ""
                         };
@@ -3576,9 +3606,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// and without the call Lombok warns "generating equals/hashCode
     /// implementation but without a call to superclass" on every such class.
     ///
-    /// The predicate is `superclass_name`, which only matches a delegation
-    /// specifier shaped like `: Base(...)`, i.e. a real class supertype —
-    /// interfaces take no parentheses. Keying on the emitted `extends` text
+    /// The predicate is `superclass_name`, which recognizes a constructor call
+    /// or a bare supertype with a proved class identity. Emitted `extends` text
     /// instead would catch interface-only classes and buy the opposite
     /// complaint, Lombok's "supercall to java.lang.Object is pointless".
     fn emit_lombok_equals_call_super(&self, decl: tree_sitter::Node<'tree>, out: &mut JavaOut) {
@@ -5006,28 +5035,20 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
     ) {
         self.enum_types.insert(name.to_string());
         let mut default_bridges = Vec::<(String, String, String)>::new();
-        let constant_bridges = self
+        let source_bridges = self
             .default_getter_bridges
             .iter()
             .filter(|bridge| {
                 bridge.location.start_byte == decl.start_byte()
-                    && matches!(
-                        bridge.body,
-                        crate::translation_plan::PlannedDefaultGetterBody::SourceConstant { .. }
-                    )
+                    && bridge.body.source_expression("this").is_some()
             })
             .collect::<Vec<_>>();
-        for bridge in &constant_bridges {
+        for bridge in &source_bridges {
             assert_eq!(bridge.location.snapshot_hash, self.source_hash);
-            let crate::translation_plan::PlannedDefaultGetterBody::SourceConstant { value } =
-                &bridge.body
-            else {
-                unreachable!()
-            };
             default_bridges.push((
                 bridge.method_name.clone(),
                 bridge.return_type.clone(),
-                format!("return {};", value.java_expression()),
+                format!("return {};", bridge.body.source_expression("this").unwrap()),
             ));
         }
         if let Some(workspace) = self.workspace {
@@ -5067,7 +5088,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                 );
                 return;
             }
-            if !constant_bridges.is_empty() && !workspace.has_modern_kotlin_interface_defaults() {
+            if !source_bridges.is_empty() && !workspace.has_modern_kotlin_interface_defaults() {
                 let complete = self.semantic_provider.is_some_and(|provider| {
                     let Some(file) = workspace.source_file(declaring) else {
                         return false;
@@ -5097,7 +5118,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                         })
                 });
                 if !complete {
-                    self.diag_untranslatable(decl, "constant default bridge does not cover the complete inherited Kotlin contract in an unknown JVM-default mode");
+                    self.diag_untranslatable(decl, "source default bridge does not cover the complete inherited Kotlin contract in an unknown JVM-default mode");
                     return;
                 }
             }
@@ -6221,7 +6242,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                             .3
                             .replace("@Nullable ", "")
                             .replace("@NotNull ", "")
-                            .replace("@NonNull ", "");
+                            .replace("@lombok.NonNull ", "");
                         *value = format!("({cast_type}) null");
                     }
                 }
@@ -6662,7 +6683,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
         };
         fn raw_type(ty: &str) -> &str {
             ty.trim_start_matches("@Nullable ")
-                .trim_start_matches("@NonNull ")
+                .trim_start_matches("@lombok.NonNull ")
         }
         if !declares("equals") {
             out.open("@Override public boolean equals(Object other)");
@@ -6791,28 +6812,11 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                 crate::translation_plan::PlannedDefaultGetterBody::JavaSuperDelegation => {
                     format!("return {provider_name}.super.{}();", bridge.method_name)
                 }
-                crate::translation_plan::PlannedDefaultGetterBody::SourceForwarding {
-                    accessors,
-                } => {
-                    let mut call = String::from("this");
-                    for accessor in accessors {
-                        assert!(
-                            !accessor.is_empty()
-                                && accessor
-                                    .chars()
-                                    .all(|character| character.is_ascii_alphanumeric()
-                                        || character == '_'),
-                            "accepted forwarding accessor must be a plain method name"
-                        );
-                        call.push('.');
-                        call.push_str(accessor);
-                        call.push_str("()");
-                    }
-                    format!("return {call};")
-                }
-                crate::translation_plan::PlannedDefaultGetterBody::SourceConstant { value } => {
-                    format!("return {};", value.java_expression())
-                }
+                body => format!(
+                    "return {};",
+                    body.source_expression("this")
+                        .expect("materialized default has a source expression")
+                ),
             };
             out.line("@Override");
             out.open(format!(

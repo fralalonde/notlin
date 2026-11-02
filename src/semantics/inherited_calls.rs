@@ -105,8 +105,7 @@ pub(super) fn resolve(
                 return FactStatus::Unknown;
             }
             let Some(CallableShape {
-                arity: Some(arity),
-                declares_throws,
+                arity: Some(arity), ..
             }) = provider
                 .callable_shapes
                 .get(&(member.id.file.clone(), member.location.start_byte))
@@ -118,9 +117,7 @@ pub(super) fn resolve(
             }
             // A default or empty vararg is a competing source call, but its
             // Java lowering and overload priority need a separate proof.
-            if arity.fixed != 0
-                || arity.vararg
-                || *declares_throws
+            if !provider.has_plain_noarg_call_shape(&member.id)
                 || !member.id.parameters.is_empty()
                 || !provider.has_stable_noarg_jvm_signature(&member.id)
                 || !provider.is_java_callable_member(&member.id)
@@ -137,8 +134,8 @@ pub(super) fn resolve(
             candidates.push(*member);
         }
     }
-    // Only identical explicit return contracts with proven owner ancestry
-    // suppress an ancestor. Unproven covariance stays ambiguous.
+    // A declaration on a proven subtype overrides the ancestor's method.
+    // Unrelated providers still need a proven covariant return to select one.
     let effective = provider.discard_overridden_inherited_methods(candidates);
     if effective.iter().any(|member| {
         member

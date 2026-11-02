@@ -8,11 +8,12 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-mod constant_defaults;
 mod default_getters;
 pub(crate) mod header_facts;
 mod jvm_defaults;
+mod member_demand;
 pub(crate) mod profile;
+mod source_defaults;
 
 // 5: `Declaration::constructor_param_count` (primary-constructor arity, not a
 // property count — companion members and body properties both inflate that).
@@ -470,6 +471,9 @@ pub struct SourceIndex {
     /// Symbols are populated together for a file on its first retention query.
     /// Per-file cells avoid serializing independent Rayon planning workers.
     declaration_symbols: Vec<std::sync::OnceLock<HashMap<usize, crate::semantics::SymbolId>>>,
+    /// Exact lowerer parse trees, initialized once per file in this snapshot.
+    /// Independent cells keep unrelated planning workers concurrent.
+    source_trees: Vec<std::sync::OnceLock<tree_sitter::Tree>>,
     kotlin_subtypes: HashMap<String, Vec<PathBuf>>,
     /// Reverse subtype edges by SIMPLE name: `name -> [subtype simple names]`.
     /// Shallow but unambiguous enough for retention fixpointing: the
@@ -910,6 +914,9 @@ impl SourceIndex {
         let declaration_symbols = std::iter::repeat_with(std::sync::OnceLock::new)
             .take(files.len())
             .collect();
+        let source_trees = std::iter::repeat_with(std::sync::OnceLock::new)
+            .take(files.len())
+            .collect();
         let mut index = Self {
             files,
             kotlin_jvm_defaults: jvm_defaults::Configuration::default(),
@@ -917,6 +924,7 @@ impl SourceIndex {
             default_lombok_accessors: HashSet::new(),
             getter_bridge_cache: default_getters::BridgeCache::default(),
             declaration_symbols,
+            source_trees,
             kotlin_subtypes: HashMap::new(),
             subtype_names: HashMap::new(),
             all_subtype_names: HashMap::new(),
@@ -1294,6 +1302,34 @@ impl SourceIndex {
             .unwrap_or_default()
     }
 
+    /// Reuse each source language's parser, including Kotlin residue markers.
+    /// New indexes receive new cells, so overlays cannot reuse a stale tree.
+    pub(crate) fn source_tree(&self, file: &SourceFile) -> Option<&tree_sitter::Tree> {
+        let index = *self.file_paths.get(&file.path)?;
+        if !std::ptr::eq(self.files.get(index)?, file) {
+            return None;
+        }
+        let cell = self.source_trees.get(index)?;
+        profile::source_tree_query();
+        Some(cell.get_or_init(|| {
+            let started = profile::enabled().then(std::time::Instant::now);
+            let tree = match file.language {
+                SourceLanguage::Kotlin => crate::transpiler::parse_tree(file.source_text()),
+                SourceLanguage::Java => {
+                    let mut parser = tree_sitter::Parser::new();
+                    parser
+                        .set_language(&tree_sitter_java::LANGUAGE.into())
+                        .expect("Java grammar");
+                    parser.parse(file.source_text(), None).expect("Java tree")
+                }
+            };
+            if let Some(started) = started {
+                profile::source_tree_parsed(started.elapsed());
+            }
+            tree
+        }))
+    }
+
     pub fn source_file(&self, path: &Path) -> Option<&SourceFile> {
         default_getters::record_source_path(path);
         if let Some(&file_index) = self.file_paths.get(path) {
@@ -1648,13 +1684,14 @@ impl SourceIndex {
         let Some(own_file) = self.source_file(implementation_file) else {
             return false;
         };
-        if self.declaration_source_file(contract_owner).is_none() {
+        let Some(contract_file) = self.declaration_source_file(contract_owner) else {
             return false;
-        }
+        };
         matches!(
             classify_member_conflict(
                 self,
                 own_file,
+                contract_file,
                 contract_owner,
                 contract_type,
                 implementation_type,
@@ -1664,8 +1701,7 @@ impl SourceIndex {
             self,
             own_file,
             implementation_type,
-            self.declaration_source_file(contract_owner)
-                .unwrap_or(own_file),
+            contract_file,
             contract_type,
         )
     }
@@ -2279,6 +2315,10 @@ impl SourceIndex {
                         && om.parameter_types == parameter_types
                 }) && let Some(own_ty) = own_m.type_name.as_deref()
                 {
+                    let inherited_source = binding_sources
+                        .get(raw_sup_ty.trim().trim_end_matches('?'))
+                        .and_then(|path| self.source_file(path))
+                        .unwrap_or(sup_file);
                     conflicts.push(MemberConflict {
                         member_name: m.name.clone(),
                         kind: m.kind,
@@ -2293,7 +2333,12 @@ impl SourceIndex {
                         implementation_type: own_ty.to_string(),
                         parameter_types,
                         classification: classify_member_conflict(
-                            self, own_file, sup_decl, &sup_ty, own_ty,
+                            self,
+                            own_file,
+                            inherited_source,
+                            sup_decl,
+                            &sup_ty,
+                            own_ty,
                         ),
                         legacy_mismatch: own_ty != sup_ty
                             && !sup_decl
@@ -2301,10 +2346,18 @@ impl SourceIndex {
                                 .iter()
                                 .any(|param| param == sup_ty.trim_end_matches('?').trim())
                             && !is_java_compatible_narrow(
-                                self, own_file, sup_file, &sup_ty, own_ty,
+                                self,
+                                own_file,
+                                inherited_source,
+                                &sup_ty,
+                                own_ty,
                             )
                             && !projected_return_is_subtype(
-                                self, own_file, own_ty, sup_file, &sup_ty,
+                                self,
+                                own_file,
+                                own_ty,
+                                inherited_source,
+                                &sup_ty,
                             ),
                     });
                 }
@@ -2475,10 +2528,10 @@ impl SourceIndex {
             .collect()
     }
 
-    /// Retained enums need the same explicit default selection as emitted Java
-    /// enums. A Kotlin property contract must first become a method contract:
+    /// Conflicting inherited methods can require an explicit selection on a
+    /// Kotlin class, or on a Kotlin enum when the method is used. A Kotlin property contract must first become a method contract:
     /// `override fun getX()` cannot implement a still-Kotlin `val x`.
-    pub(crate) fn retained_enum_default_method_bridges(
+    pub(crate) fn retained_default_method_bridges(
         &self,
         declaring: &Path,
         name: &str,
@@ -2486,14 +2539,22 @@ impl SourceIndex {
         let Some(file) = self.source_file(declaring) else {
             return Vec::new();
         };
-        let Some(owner) = file
-            .declarations
-            .iter()
-            .find(|owner| owner.name == name && owner.kind == DeclarationKind::Enum)
-        else {
+        let Some(owner) = file.declarations.iter().find(|owner| {
+            owner.name == name
+                && matches!(owner.kind, DeclarationKind::Class | DeclarationKind::Enum)
+        }) else {
             return Vec::new();
         };
+        if owner.kind == DeclarationKind::Class
+            && owner.supertypes.iter().any(|ty| {
+                self.resolve_type(file, ty)
+                    .is_none_or(|parent| parent.kind != DeclarationKind::Interface)
+            })
+        {
+            return Vec::new();
+        }
         let mut properties = HashSet::new();
+        let mut ancestors = Vec::new();
         let mut pending = owner
             .supertypes
             .iter()
@@ -2510,6 +2571,7 @@ impl SourceIndex {
             if !visited.insert(crate::semantics::workspace_symbol(self, parent)) {
                 continue;
             }
+            ancestors.push(parent);
             let Some(context) = self.declaration_source_file(parent) else {
                 return Vec::new();
             };
@@ -2527,8 +2589,77 @@ impl SourceIndex {
         self.enum_default_property_bridges(declaring, name)
             .into_iter()
             .filter(|bridge| !properties.contains(&bridge.method_name))
+            .filter(|bridge| {
+                if owner.kind == DeclarationKind::Class {
+                    return true;
+                }
+                // javac also asks an emitted Java enum to override one default
+                // beside an unrelated abstract declaration. A retained Kotlin
+                // enum inherits that single JVM implementation normally. Only
+                // distinct concrete Java defaults can conflict at invocation.
+                let defaults = owner
+                    .supertypes
+                    .iter()
+                    .filter_map(|ty| self.resolve_type(file, ty))
+                    .filter_map(|parent| {
+                        self.effective_default_getter(parent, file, &bridge.method_name)
+                    })
+                    .filter(|(target, _)| target.language == SourceLanguage::Java)
+                    .collect::<Vec<_>>();
+                let mut selected = Vec::new();
+                for (target, member) in &defaults {
+                    if !defaults.iter().any(|(other, _)| {
+                        crate::semantics::workspace_symbol(self, other)
+                            != crate::semantics::workspace_symbol(self, target)
+                            && proven_reference_subtype(
+                                self,
+                                self.declaration_source_file(other).unwrap_or(file),
+                                &declaration_key(other),
+                                self.declaration_source_file(target).unwrap_or(file),
+                                &declaration_key(target),
+                            )
+                    }) {
+                        let Some(erased) = default_getters::erased_return(self, target, member)
+                        else {
+                            return false;
+                        };
+                        let value = (crate::semantics::workspace_symbol(self, target), erased);
+                        if !selected.contains(&value) {
+                            selected.push(value);
+                        }
+                    }
+                }
+                // Different JVM return descriptors can coexist and select
+                // different bodies. Do not replace that behavior with a
+                // speculative forwarding method.
+                selected.len() > 1 && selected.iter().all(|(_, erased)| erased == &selected[0].1)
+            })
             .filter_map(|mut bridge| {
                 let provider = self.resolve_type(file, &bridge.provider)?;
+                if owner.kind == DeclarationKind::Class {
+                    let target = self
+                        .effective_default_getter(provider, file, &bridge.method_name)?
+                        .0;
+                    if target.language == SourceLanguage::Kotlin
+                        && !ancestors.iter().any(|contract| {
+                            contract.members.iter().any(|member| {
+                                member.kind == MemberKind::Method
+                                    && member.name == bridge.method_name
+                                    && member.parameter_types.is_empty()
+                                    && !member.is_static
+                                    && member.visibility.as_deref() != Some("private")
+                            }) && !proven_reference_subtype(
+                                self,
+                                self.declaration_source_file(target).unwrap_or(file),
+                                &declaration_key(target),
+                                self.declaration_source_file(contract).unwrap_or(file),
+                                &declaration_key(contract),
+                            )
+                        })
+                    {
+                        return None;
+                    }
+                }
                 bridge.provider = declaration_key(provider);
                 Some(bridge)
             })
@@ -2539,6 +2670,16 @@ impl SourceIndex {
     /// direct interface branch. An abstract redeclaration deliberately returns
     /// no provider because it shadows a concrete ancestor.
     fn effective_default_getter<'a>(
+        &'a self,
+        provider: &'a Declaration,
+        fallback_file: &'a SourceFile,
+        method_name: &str,
+    ) -> Option<(&'a Declaration, &'a Member)> {
+        self.effective_interface_value_member(provider, fallback_file, method_name)
+            .filter(|(_, member)| member.has_body)
+    }
+
+    fn effective_interface_value_member<'a>(
         &'a self,
         provider: &'a Declaration,
         fallback_file: &'a SourceFile,
@@ -2588,7 +2729,7 @@ impl SourceIndex {
             })
         });
         let result = most_specific.next()?;
-        if most_specific.next().is_some() || !result.1.has_body {
+        if most_specific.next().is_some() {
             return None;
         }
         Some(result)
@@ -3557,7 +3698,7 @@ impl SourceIndex {
                                     inherited_member,
                                     inherited_type,
                                 ) && allow_repairs
-                                    && crate::default_getter_repair::can_repair_contract(
+                                    && crate::default_getter_repair::can_inherit_contract(
                                         self,
                                         descendant,
                                         provider,
@@ -4201,6 +4342,21 @@ impl SourceIndex {
                                 | "Double"
                                 | "Char"
                         );
+                    let contract_file = self
+                        .declaration_source_file(contract)
+                        .unwrap_or(source_file);
+                    let inherited_file = if bindings.contains_key(
+                        contract_member
+                            .type_name
+                            .as_deref()
+                            .unwrap_or("")
+                            .trim()
+                            .trim_end_matches('?'),
+                    ) {
+                        source_file
+                    } else {
+                        contract_file
+                    };
                     let classification = match (
                         contract_member.type_name.as_ref(),
                         member.type_name.as_ref(),
@@ -4208,20 +4364,18 @@ impl SourceIndex {
                         (Some(_), Some(_)) => classify_member_conflict(
                             self,
                             source_file,
+                            inherited_file,
                             contract,
                             &inherited_type,
                             implementation_type,
                         ),
                         _ => MemberConflictClass::UnknownType,
                     };
-                    let contract_file = self
-                        .declaration_source_file(contract)
-                        .unwrap_or(source_file);
                     let collection_covariance = declaration_covariant_return_is_subtype(
                         self,
                         source_file,
                         implementation_type,
-                        contract_file,
+                        inherited_file,
                         &inherited_type,
                     );
                     if !primitive_unboxing
@@ -7028,6 +7182,7 @@ fn is_java_compatible_narrow(
 fn classify_member_conflict(
     index: &SourceIndex,
     source_file: &SourceFile,
+    super_file: &SourceFile,
     super_decl: &Declaration,
     super_ty: &str,
     own_ty: &str,
@@ -7040,23 +7195,10 @@ fn classify_member_conflict(
     if super_decl.type_params.iter().any(|param| param == super_ty) {
         return MemberConflictClass::SupertypeTypeParameter;
     }
-    if index
-        .declaration_source_file(super_decl)
-        .is_some_and(|super_file| {
-            same_source_reference_type(index, source_file, own_ty, super_file, super_ty)
-        })
-    {
+    if same_source_reference_type(index, source_file, own_ty, super_file, super_ty) {
         return MemberConflictClass::Exact;
     }
-    if projected_return_is_subtype(
-        index,
-        source_file,
-        own_ty,
-        index
-            .declaration_source_file(super_decl)
-            .unwrap_or(source_file),
-        super_ty,
-    ) {
+    if projected_return_is_subtype(index, source_file, own_ty, super_file, super_ty) {
         return MemberConflictClass::JavaCovariantReturn;
     }
 
@@ -7910,12 +8052,16 @@ fn source_reference_return_is_subtype(
             continue;
         };
         for supertype in &current.supertypes {
-            // This proof does not perform generic substitution. Other
-            // non-generic source edges can still prove the path.
-            if supertype.contains(['<', '>', '?', '&', '(', ')', '[', ']']) {
+            // Both endpoints are nongeneric. Intermediate type arguments do
+            // not change nominal ancestry, and need no substitution here.
+            let ty = crate::semantics::TypeRef::parse(supertype);
+            if ty.nullable {
                 continue;
             }
-            if let Some(next) = exact_source_reference_type(index, current_file, supertype) {
+            let crate::semantics::KotlinType::Named { name, .. } = ty.ty else {
+                continue;
+            };
+            if let Some(next) = exact_source_reference_type(index, current_file, &name) {
                 pending.push(next);
             }
         }

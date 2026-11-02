@@ -171,6 +171,9 @@ fn config(root: &Path, output: PathBuf, mode: &str, lombok: bool) -> JvmValidati
     config
         .classpath
         .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/jetbrains-annotations.jar"));
+    config
+        .classpath
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/jspecify-1.0.0.jar"));
     if lombok {
         config.classpath.push(
             std::env::var_os("NOTLIN_LOMBOK")
@@ -504,6 +507,7 @@ enum class Kind { PRIMARY }
 interface PropertyRoot {
  val category: Kind
 }
+
 interface Defaulted : PropertyRoot {
  override val category: Kind get() = Kind.PRIMARY
 }
@@ -646,6 +650,246 @@ fun main() {
                 after.commands.last().unwrap().stdout.trim(),
                 expected,
                 "mode {mode}, Lombok {lombok}"
+            );
+        }
+    }
+}
+
+fn populate_method_chains(root: &Path) {
+    fs::create_dir_all(root).unwrap();
+    for (name, source) in [
+        (
+            "Contracts.kt",
+            r#"package sample
+interface View
+interface Wide { fun getSelected(): View }
+class Key(private var stored: String) : View {
+    var text: String
+        get() { Trace.textRead(); return stored }
+        set(value) { stored = value }
+    fun render(): String { Trace.renderRead(); return stored }
+    fun render(value: Int): String = "argument"
+}
+interface Base<T : View> : Platform {
+    override fun key(): T
+    val description: String
+}
+interface Left<T : View> : Base<T>
+interface Right<T : View> : Base<T>
+interface Provider : Wide, Left<Key>, Right<Key> {
+    private fun unusedImplementationDetail(): String = "private"
+    override fun getSelected(): Key = key()
+    val text: String get() = key().text
+    fun render(): String { return key().render() }
+    fun self(): Provider = this
+    fun opaqueSelf(): Any = this
+    fun view(): View = key()
+}
+"#,
+        ),
+        (
+            "Owners.kt",
+            r#"package sample
+class Subject(private val stored: Key) : Provider {
+    override val description: String get() = "desc"
+    override fun key(): Key { Trace.keyRead(); return stored }
+}
+class Explicit(private val stored: Key) : Provider {
+    override val description: String get() = "desc"
+    override fun key(): Key { Trace.keyRead(); return stored }
+    override fun render(): String = super<Provider>.render()
+}
+enum class Choice(private val stored: Key) : Provider {
+    ONE(Key("value"));
+    override val description: String get() = "desc"
+    override fun key(): Key { Trace.keyRead(); return stored }
+}
+interface Forwarded : Provider { fun own(): String }
+interface GenericForwarded<T : View> : Base<T> { fun own(): String }
+"#,
+        ),
+        (
+            "Kept.kt",
+            r#"package sample
+class Kept(private val stored: Key) : Forwarded {
+    override val description: String get() = "desc"
+    override fun key(): Key { Trace.keyRead(); return stored }
+    override fun own(): String = "own"
+}
+class KeptGeneric(private val stored: Key) : GenericForwarded<Key> {
+    override fun key(): Key = stored
+    override val description: String get() = "desc"
+    override fun own(): String = "own"
+}
+@JvmInline value class ValueConsumer(val subject: Forwarded) {
+    fun read(): String = subject.render()
+}
+"#,
+        ),
+        (
+            "PlatformRoot.java",
+            r#"package sample;
+public interface PlatformRoot { String legacy(); View key(); }
+"#,
+        ),
+        (
+            "Platform.java",
+            r#"package sample;
+public interface Platform extends PlatformRoot {
+    String KIND = "platform";
+    default String legacy() { return "java"; }
+    default String legacy(int value) { return "java" + value; }
+    default View forwardedKey() { return key(); }
+}
+"#,
+        ),
+        (
+            "Trace.java",
+            r#"package sample;
+public class Trace {
+    public static int keys, texts, renders;
+    public static int keyRead() { return ++keys; }
+    public static int textRead() { return ++texts; }
+    public static int renderRead() { return ++renders; }
+    public static void reset() { keys = texts = renders = 0; }
+}
+"#,
+        ),
+        (
+            "Probe.java",
+            r#"package sample;
+public class Probe {
+    public static String read(Provider p) {
+        Wide wide = p;
+        return p.getText() + "/" + p.render() + "/" + p.getSelected().getText()
+            + "/" + p.getDescription() + "/" + (p.self() == p) + "/" + (wide.getSelected() == p.getSelected())
+            + "/" + (p.opaqueSelf() == p) + "/" + (p.view() == p.getSelected())
+            + "/" + p.legacy() + "/" + p.legacy(2) + "/" + Platform.KIND + "/" + (p.forwardedKey() == p.getSelected());
+    }
+}
+"#,
+        ),
+        (
+            "Runner.kt",
+            r#"package sample
+fun main() {
+    val kept = Kept(Key("value"))
+    for (value in listOf(Subject(Key("value")), Explicit(Key("value")), Choice.ONE, kept)) {
+        value.key().text = "changed"
+        Trace.reset()
+        println("${Probe.read(value)}|${Trace.keys}|${Trace.texts}|${Trace.renders}")
+    }
+    println(ValueConsumer(kept).read())
+    val generic: Base<Key> = KeptGeneric(Key("value"))
+    println("${generic.key().text}/${generic.description}")
+}
+"#,
+        ),
+    ] {
+        fs::write(root.join(name), source).unwrap();
+    }
+}
+
+fn translate_method_chains(root: &Path, lombok: bool) {
+    let before = ["Contracts.kt", "Kept.kt"].map(|name| (name, fs::read(root.join(name)).unwrap()));
+    let binary = std::env::var_os("NOTLIN_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into());
+    let mut command = std::process::Command::new(binary);
+    command.current_dir(root).arg("--in-place");
+    if lombok {
+        command.arg("--lombok");
+    }
+    let result = command.arg("Owners.kt").output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for name in [
+        "Subject",
+        "Explicit",
+        "Choice",
+        "Forwarded",
+        "GenericForwarded",
+    ] {
+        assert!(
+            root.join(format!("{name}.java")).exists(),
+            "{name}: {}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            fs::read_to_string(root.join("Owners.kt")).unwrap_or_default()
+        );
+    }
+    for (name, expected) in before {
+        assert_eq!(
+            fs::read(root.join(name)).unwrap(),
+            expected,
+            "{name}: no Kotlin bridges are needed"
+        );
+    }
+    for name in ["Subject", "Explicit", "Choice", "Forwarded"] {
+        let java = fs::read_to_string(root.join(format!("{name}.java"))).unwrap();
+        assert!(java.contains("this.key().render()"), "{java}");
+        assert!(java.contains("this.key().getText()"), "{java}");
+    }
+}
+
+#[test]
+fn source_method_chains_translate_classes_enums_and_child_interfaces() {
+    let scratch = Scratch::new();
+    populate_method_chains(&scratch.0);
+    translate_method_chains(&scratch.0, false);
+}
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin stdlib, Lombok and its Kotlin plugin"]
+fn method_chains_preserve_generic_dispatch_receivers_and_effects() {
+    let scratch = Scratch::new();
+    for mode in ["disable", "enable", "no-compatibility"] {
+        let original = scratch.0.join(format!("original-{mode}"));
+        populate_method_chains(&original);
+        let before = validate_jvm_sources(&config(
+            &original,
+            scratch.0.join(format!("original-classes-{mode}")),
+            mode,
+            false,
+        ))
+        .unwrap();
+        let expected = before
+            .commands
+            .last()
+            .unwrap()
+            .stdout
+            .trim()
+            .replace('\r', "");
+        assert_eq!(
+            expected,
+            format!(
+                "{}changed\nvalue/desc",
+                "changed/changed/changed/desc/true/true/true/true/java/java2/platform/true|9|2|1\n"
+                    .repeat(4)
+            )
+        );
+        for lombok in [false, true] {
+            let migrated = scratch.0.join(format!("mixed-{mode}-{lombok}"));
+            populate_method_chains(&migrated);
+            translate_method_chains(&migrated, lombok);
+            let after = validate_jvm_sources(&config(
+                &migrated,
+                scratch.0.join(format!("mixed-classes-{mode}-{lombok}")),
+                mode,
+                lombok,
+            ))
+            .unwrap();
+            assert_eq!(
+                after
+                    .commands
+                    .last()
+                    .unwrap()
+                    .stdout
+                    .trim()
+                    .replace('\r', ""),
+                expected,
+                "{mode}, Lombok {lombok}"
             );
         }
     }

@@ -1,6 +1,83 @@
 # Translation frontier
 
-## Current checkpoint — 2026-11-01 (compact member parsing)
+## Current checkpoint — 2026-11-01 (shared source defaults and JSpecify)
+
+The clean standard conversion translates **4909** and retains
+**1462** of **6371 original owners**:
+**+418 / -0** against accepted main. The accepted-baseline
+trial gains **411**, reaching **4902**. Complete ownership sets
+are compared; the fresh-only owners are recorded in the acceptance evidence.
+Both full Gradle builds pass. Both Hastings runs import all **9,113 records**
+and remain free of errors and stack traces for at least **105 seconds** after
+the complete dataset marker. Both disposable applications are stopped.
+
+Properties and ordinary zero-argument methods share a typed virtual-call chain
+proof and body renderer. For example, a retained interface's
+`fun render(): String = key().text` can become Java returning
+`this.key().getText()`. Single-return blocks, inherited generic receivers,
+constants, enums, classes and explicit interface super calls use the same path.
+Boxing, reference covariance, overload shape, exceptions, record accessors,
+annotations and observable companion initialization retain their own checks.
+
+Inherited defaults follow declaring-type ancestry. A forwarding Java interface
+must not receive a copied default when a descendant inherits a more specific
+override on another branch: that copy would create unrelated Java defaults.
+The forwarding interface waits until its provider supplies an inheritable Java
+default. Physical defaults remain available where Kotlin's older JVM-default
+modes require them. Controls cover all three modes and both Lombok settings.
+
+Kotlin compatibility methods require actual consumers or a concrete mixed-build
+obligation. A narrower return alone is insufficient. Demand follows explicitly
+typed Kotlin and Java locals in their lexical scopes; untyped and nested
+bindings cannot borrow an outer type. Both reference audits find **zero new
+Kotlin files or compatibility forwarders**. Existing method repairs and
+property-to-getter replacements are recorded separately.
+
+Secondary constructor parameters participate in the existing lexical binding
+rule, including delegation arguments before initialization. Bare superclass
+headers use resolved class identity, so secondary `super(...)` calls emit
+`extends`; interface-first headers and imported generic parents share that fact.
+
+Generated nullability defaults to JSpecify `@NonNull` and `@Nullable`. Qualified
+types and array dimensions receive legal outer-type annotation placement.
+Annotation imports are deduplicated, string literals are preserved, and name
+collisions keep qualified annotation names. Lombok runtime checks use the
+qualified `@lombok.NonNull` spelling. Semantic readers recognize both dialects.
+
+In-place Gradle migrations configure JSpecify for affected projects, including
+already translated Java. Both DSLs use `api` when available and `implementation`
+otherwise, following the [JSpecify guidance](https://jspecify.dev/docs/using/).
+The runtime dependency remains available to consumers. Dependency edits check
+all original build snapshots before writing, preserve existing content and
+line endings, and remain idempotent. Seven real Gradle scenarios cover both
+DSLs, library export, runtime availability, aggregate projects without module
+scripts and build-script selection. Other build systems supply the dependency.
+
+Source-default queries share lazily parsed trees within each immutable indexed
+snapshot. A preceding functional checkpoint used **37.1% less CPU** in the
+focused comparison, with all 7,444 files and 313 gained owners equivalent;
+that measurement is not a timing claim for this larger conversion. Evidence:
+`target/cpu-syntax-20261101/benchmark.json`. The original source-file I/O
+implementation is preserved. The CLI adds only the functional build-dependency
+planning/application hook; `io-preservation.json` verifies the original code.
+
+Formatting, clippy, all four sample javac cases, **59 native controls**
+and **78 bridge-obligation controls** pass. The Windows Rust sweep is
+**1663 pass / 62 known fail / 156 ignored**,
+with no previously unseen failure names. Every compiler and test input hash
+is unchanged since the binary freeze.
+
+Evidence: `target/method-defaults-v12-20261101/acceptance.json`.
+Frozen SHA256: `3fcb4ac3bd4148da3a813974d456f28132fddad9b9438347665fac7092655045`.
+Installation still requires successful Linux CI on the exact main commit.
+
+The frontier remains active. Qualified Java type-use nullability is a measured
+next case: a caller of `java.util.@NonNull UUID` compiles as Kotlin but is still
+retained by the shared Java return reader. The requested CPU pass follows this
+gate, before further translation expansion. The separately parked enum case
+remains outside this work.
+
+## Previous checkpoint — 2026-11-01 (compact member parsing)
 
 One shared scanner rule now lets a closing brace terminate a Kotlin class member
 without a trailing newline or semicolon. For example,

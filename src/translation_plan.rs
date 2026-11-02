@@ -319,11 +319,38 @@ pub enum PlannedDefaultGetterBody {
     #[default]
     JavaSuperDelegation,
     /// Re-create the Kotlin default's own body, which was proven to be a chain
-    /// of public zero-argument accessors rooted at `this`. The listed accessors
-    /// are exactly the steps of that proven chain.
+    /// of public zero-argument virtual methods rooted at `this`, including
+    /// property getters. The listed names are exactly that proven chain.
     SourceForwarding { accessors: Vec<String> },
     /// A selected Kotlin default whose value is independent of its receiver.
     SourceConstant { value: PlannedConstantValue },
+}
+
+impl PlannedDefaultGetterBody {
+    /// One rendering for materialized inherited defaults and explicit super
+    /// calls. The proven chain evaluates each receiver exactly once.
+    pub(crate) fn source_expression(&self, receiver: &str) -> Option<String> {
+        match self {
+            Self::JavaSuperDelegation => None,
+            Self::SourceConstant { value } => Some(value.java_expression()),
+            Self::SourceForwarding { accessors } => {
+                let mut call = receiver.to_owned();
+                for accessor in accessors {
+                    assert!(
+                        !accessor.is_empty()
+                            && accessor
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                        "accepted forwarding call must have a plain Java name"
+                    );
+                    call.push('.');
+                    call.push_str(accessor);
+                    call.push_str("()");
+                }
+                Some(call)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -74,8 +74,11 @@ fn object_override_function_is_an_instance_method() {
     assert!(output.status.success(), "notlin failed: {output:?}");
 
     let java = fs::read_to_string(root.join("Singleton.java")).unwrap();
-    assert!(java.contains("public String getType()"), "{java}");
-    assert!(!java.contains("static String getType()"), "{java}");
+    assert!(java.contains("public @NonNull String getType()"), "{java}");
+    assert!(
+        !java.contains("public static @NonNull String getType()"),
+        "{java}"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

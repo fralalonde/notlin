@@ -2,6 +2,70 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+#[test]
+fn secondary_constructor_parameters_shadow_fields_in_delegation_and_body() {
+    let scratch = Path::new("tests/tmp_scratch_secondary_ctor_parameter_shadow");
+    let _ = fs::remove_dir_all(scratch);
+    for lombok in [false, true] {
+        let root = scratch.join(if lombok { "lombok" } else { "plain" });
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Foreign.kt"),
+            "package foreign\ninterface Contract\nopen class Parent<T>(val value: T)\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Imported.kt"),
+            "package neutral.secondary\nimport foreign.Contract\nimport foreign.Parent\nclass Imported: Contract, Parent<String> {\n constructor(value: String): super(value)\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Command.kt"),
+            r#"package neutral.secondary
+class Context(val reason: String)
+class Command(@JvmField val id: String, val context: Context?) {
+    constructor(id: String, reason: String): this(id, Context(reason))
+    constructor(id: String): this(id, null)
+    fun getId(): String = id
+}
+open class Base(@JvmField val id: String)
+class Child: Base {
+    @JvmField var label: String = ""
+    constructor(id: String, label: String): super(id) {
+        this.label = label
+    }
+}
+"#,
+        )
+        .unwrap();
+        let mut command = Command::new(
+            std::env::var_os("NOTLIN_TEST_BINARY")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into()),
+        );
+        command.args(["--root", root.to_str().unwrap(), "--in-place"]);
+        if lombok {
+            command.arg("--lombok");
+        }
+        let output = command.arg(&root).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let java = fs::read_to_string(root.join("Command.java")).unwrap();
+        assert!(java.contains("this(id, new Context(reason));"), "{java}");
+        assert!(java.contains("this(id, (Context) null);"), "{java}");
+        assert!(!java.contains("this(this.id"), "{java}");
+        let child = fs::read_to_string(root.join("Child.java")).unwrap();
+        assert!(child.contains("extends Base"), "{child}");
+        assert!(!child.contains("implements Base"), "{child}");
+        assert!(child.contains("super(id);"), "{child}");
+        assert!(child.contains("this.label = label;"), "{child}");
+        let imported = fs::read_to_string(root.join("Imported.java")).unwrap();
+        assert!(
+            imported.contains("extends Parent<String> implements Contract"),
+            "{imported}"
+        );
+    }
+    let _ = fs::remove_dir_all(scratch);
+}
+
 /// A bodyless Kotlin secondary constructor that delegates to the primary
 /// constructor has a direct Java representation: an overload using `this`.
 #[test]
@@ -93,7 +157,9 @@ fn bodyless_secondary_constructor_delegates_to_superclass() {
         "supported super-delegating constructor retained:\n{stderr}"
     );
     assert!(
-        java.contains("public Child()") && java.contains("super(\"fallback\");"),
+        java.contains("extends Base")
+            && java.contains("public Child()")
+            && java.contains("super(\"fallback\");"),
         "secondary constructor must emit a Java super-delegating overload:\n{java}"
     );
     assert!(

@@ -120,6 +120,9 @@ with real compilers. `DEV.md` has the environment variables and corpus layout.
 
 In development. JDK 25 is the CI baseline (27 locally). Lombok, commons-lang3
 and StreamEx may live on the receiving classpath; notlin uses them.
+Generated nullability annotations use JSpecify by default. In-place Gradle
+migrations configure `org.jspecify:jspecify` in affected projects; other builds
+must supply that dependency.
 
 ## LICENSE
 

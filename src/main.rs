@@ -682,6 +682,18 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 }
                 eprint!("{}", notlin::translation_advice::render(&advice, 10));
             }
+            let build_dependencies = notlin::build_dependencies::plan_jspecify_dependencies(
+                cli,
+                plan.generated_java
+                    .iter()
+                    .map(|output| (output.origin.as_path(), output.source.as_str()))
+                    .chain(
+                        index
+                            .java_files()
+                            .map(|file| (file.path.as_path(), file.source_text())),
+                    ),
+                &workspace_root,
+            )?;
             if let Some(config_path) = &cli.validation_config {
                 notlin::migration_pipeline::validate_workspace_plan(
                     &plan,
@@ -697,6 +709,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 )?;
             }
             notlin::migration_pipeline::verify_original_snapshots(&plan)?;
+            build_dependencies.apply()?;
             let apply_migration = cli.migrates_in_place();
             progress_start(
                 "write",

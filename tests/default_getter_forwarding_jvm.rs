@@ -102,7 +102,7 @@ interface WideSource {
 interface DefaultSource : WideSource {
     val envelope: Envelope
 
-    override fun getMarker(): Marker = envelope.marker
+    override fun getMarker(): Marker { return envelope.marker }
 }
 "#,
     ),
@@ -218,13 +218,16 @@ fn translate(root: &Path) -> std::process::Output {
         .filter(|path| path.extension().is_some_and(|extension| extension == "kt"))
         .collect::<Vec<_>>();
     kotlin.sort();
-    Command::new(env!("CARGO_BIN_EXE_notlin"))
-        .arg("--root")
-        .arg(root)
-        .args(["--in-place", "--annotations", "none"])
-        .args(kotlin)
-        .output()
-        .expect("run notlin")
+    Command::new(
+        std::env::var_os("NOTLIN_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_notlin").into()),
+    )
+    .arg("--root")
+    .arg(root)
+    .args(["--in-place", "--annotations", "none"])
+    .args(kotlin)
+    .output()
+    .expect("run notlin")
 }
 
 fn tool(variable: &str, fallback: &str) -> PathBuf {
@@ -318,7 +321,7 @@ fn the_cli_forwarding_bridge_replaces_java_super_delegation() {
     );
     let provider = fs::read_to_string(root.join("DefaultSource.kt")).unwrap();
     assert!(
-        provider.contains("override fun getMarker(): Marker = envelope.marker"),
+        provider.contains("override fun getMarker(): Marker { return envelope.marker }"),
         "the retained provider keeps its Kotlin default:\n{provider}"
     );
 }
@@ -332,7 +335,7 @@ fn unsupported_unicode_forwarding_accessors_are_retained_not_panicked() {
         let source = fs::read_to_string(root.join(name))
             .unwrap()
             .replace("val envelope:", "val réceptacle:")
-            .replace("= envelope.marker", "= réceptacle.marker");
+            .replace("envelope.marker", "réceptacle.marker");
         fs::write(root.join(name), source).unwrap();
     }
     let translated = translate(&root);

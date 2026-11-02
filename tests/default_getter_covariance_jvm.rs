@@ -690,12 +690,11 @@ fn generic_return_with_concrete_first_bound_translates_and_keeps_the_bridge() {
     assert!(root.join("IndirectRetainedChild.kt").is_file());
     assert!(!root.join("IndirectRetainedChild.java").exists());
     // This class has no intrinsic blocker, but the independent retained-supertype
-    // rule still keeps it Kotlin. It needs the same accessor repair.
+    // rule still keeps it Kotlin. Ordinary inheritance needs no extra method.
     assert!(!root.join("IndirectChild.java").exists());
     let indirect_child = fs::read_to_string(root.join("IndirectChild.kt")).unwrap();
     assert!(
-        indirect_child.contains("override fun getKey(): sample.JavaKey")
-            && indirect_child.contains("super<sample.Intermediate>.getKey()"),
+        !indirect_child.contains("override fun getKey()"),
         "the inherited retention boundary still needs its concrete getter:\n{indirect_child}"
     );
     let provider = fs::read_to_string(root.join("GenericProvider.java")).unwrap();
@@ -712,18 +711,15 @@ fn generic_return_with_concrete_first_bound_translates_and_keeps_the_bridge() {
     );
     let retained = fs::read_to_string(root.join("RetainedChild.kt")).unwrap();
     assert!(
-        retained.contains("override fun getKey(): sample.JavaKey")
-            && retained.contains("super<sample.GenericProvider>.getKey()"),
-        "the retained class needs a narrow bridge to the Java interface:\n{retained}"
+        !retained.contains("override fun getKey()"),
+        "the retained class inherits the Java default without a speculative bridge:\n{retained}"
     );
     let intermediate = fs::read_to_string(root.join("Intermediate.kt")).unwrap();
     assert!(intermediate.contains("suspend fun retainedIntermediateMarker()"));
     let indirect = fs::read_to_string(root.join("IndirectRetainedChild.kt")).unwrap();
     assert!(
-        indirect.contains("override fun getKey(): sample.JavaKey")
-            && indirect.contains("super<sample.Intermediate>.getKey()")
-            && !indirect.contains("notlinProperty"),
-        "the retained child needs a concrete bridge through its direct interface:\n{indirect}"
+        !indirect.contains("override fun getKey()") && !indirect.contains("notlinProperty"),
+        "the retained child inherits through its direct interface:\n{indirect}"
     );
     let java_child = fs::read_to_string(root.join("JavaChild.java")).unwrap();
     assert!(
@@ -778,25 +774,19 @@ fn real_toolchain_preserves_generic_bound_getter_dispatch() {
         assert!(!migrated.join("IndirectChild.java").exists());
         let indirect_child = fs::read_to_string(migrated.join("IndirectChild.kt")).unwrap();
         assert!(
-            indirect_child.contains("super<sample.Intermediate>.getKey()"),
+            !indirect_child.contains("override fun getKey()"),
             "{indirect_child}"
         );
         let provider = fs::read_to_string(migrated.join("GenericProvider.java")).unwrap();
         assert!(provider.contains("T getKey()"), "{provider}");
         let retained = fs::read_to_string(migrated.join("RetainedChild.kt")).unwrap();
-        assert!(
-            retained.contains("override fun getKey(): sample.JavaKey")
-                && retained.contains("super<sample.GenericProvider>.getKey()"),
-            "{retained}"
-        );
+        assert!(!retained.contains("override fun getKey()"), "{retained}");
         let intermediate = fs::read_to_string(migrated.join("Intermediate.kt")).unwrap();
         assert!(intermediate.contains("suspend fun retainedIntermediateMarker()"));
         let indirect = fs::read_to_string(migrated.join("IndirectRetainedChild.kt")).unwrap();
         assert!(
-            indirect.contains("override fun getKey(): sample.JavaKey")
-                && indirect.contains("super<sample.Intermediate>.getKey()")
-                && !indirect.contains("notlinProperty"),
-            "the child through a retained generic intermediate needs a concrete bridge:\n{indirect}"
+            !indirect.contains("override fun getKey()") && !indirect.contains("notlinProperty"),
+            "the child inherits through the retained generic intermediate:\n{indirect}"
         );
         let after = validate_jvm_sources(&jvm_config(
             &migrated,

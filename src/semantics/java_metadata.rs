@@ -23,7 +23,10 @@ impl Binding {
     pub fn neutral_for_nullness(&self) -> bool {
         !matches!(
             self.canonical.as_str(),
-            "org.jetbrains.annotations.NotNull" | "org.jetbrains.annotations.Nullable"
+            "org.jetbrains.annotations.NotNull"
+                | "org.jetbrains.annotations.Nullable"
+                | "org.jspecify.annotations.NonNull"
+                | "org.jspecify.annotations.Nullable"
         )
     }
 
@@ -109,7 +112,9 @@ fn preserves_members(name: &str) -> bool {
         | "java.lang.FunctionalInterface"
         | "javax.annotation.processing.Generated"
         | "org.jetbrains.annotations.NotNull"
-        | "org.jetbrains.annotations.Nullable" => true,
+        | "org.jetbrains.annotations.Nullable"
+        | "org.jspecify.annotations.NonNull"
+        | "org.jspecify.annotations.Nullable" => true,
         name if name.starts_with("com.fasterxml.jackson.annotation.") => matches!(
             name.trim_start_matches("com.fasterxml.jackson.annotation."),
             "JacksonAnnotation"

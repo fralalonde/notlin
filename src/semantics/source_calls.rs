@@ -345,9 +345,11 @@ enum JavaNullnessAnnotation {
 fn java_nullness_annotation(source: &str, spelling: &str) -> Option<JavaNullnessAnnotation> {
     const NOT_NULL: &str = "org.jetbrains.annotations.NotNull";
     const NULLABLE: &str = "org.jetbrains.annotations.Nullable";
+    const JSPECIFY_NON_NULL: &str = "org.jspecify.annotations.NonNull";
+    const JSPECIFY_NULLABLE: &str = "org.jspecify.annotations.Nullable";
     match spelling {
-        NOT_NULL => return Some(JavaNullnessAnnotation::NonNull),
-        NULLABLE => return Some(JavaNullnessAnnotation::Nullable),
+        NOT_NULL | JSPECIFY_NON_NULL => return Some(JavaNullnessAnnotation::NonNull),
+        NULLABLE | JSPECIFY_NULLABLE => return Some(JavaNullnessAnnotation::Nullable),
         "java.lang.Override" => return Some(JavaNullnessAnnotation::Override),
         "Override" => {
             let conflicting_import = source
@@ -361,22 +363,25 @@ fn java_nullness_annotation(source: &str, spelling: &str) -> Option<JavaNullness
         }
         _ => {}
     }
-    let canonical = match spelling {
-        "NotNull" => NOT_NULL,
-        "Nullable" => NULLABLE,
-        _ => return None,
-    };
+    if !matches!(spelling, "NotNull" | "Nullable" | "NonNull") {
+        return None;
+    }
     let matching_imports = source
         .lines()
         .filter_map(|line| line.trim().strip_prefix("import "))
         .map(|import| import.trim_end_matches(';').trim())
         .filter(|import| import.rsplit('.').next() == Some(spelling))
         .collect::<Vec<_>>();
-    matches!(matching_imports.as_slice(), [import] if *import == canonical).then_some(
-        if spelling == "NotNull" {
-            JavaNullnessAnnotation::NonNull
-        } else {
-            JavaNullnessAnnotation::Nullable
-        },
-    )
+    match matching_imports.as_slice() {
+        [import]
+            if spelling == "NotNull" && *import == NOT_NULL
+                || spelling == "NonNull" && *import == JSPECIFY_NON_NULL =>
+        {
+            Some(JavaNullnessAnnotation::NonNull)
+        }
+        [import] if spelling == "Nullable" && matches!(*import, NULLABLE | JSPECIFY_NULLABLE) => {
+            Some(JavaNullnessAnnotation::Nullable)
+        }
+        _ => None,
+    }
 }

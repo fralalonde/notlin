@@ -348,6 +348,9 @@ fn config(root: &Path, output: PathBuf, lombok: bool) -> JvmValidationConfig {
     config
         .classpath
         .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/jetbrains-annotations.jar"));
+    config
+        .classpath
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/jspecify-1.0.0.jar"));
     if lombok {
         config.classpath.push(
             std::env::var_os("NOTLIN_LOMBOK")

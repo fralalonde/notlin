@@ -58,11 +58,11 @@ data class WithBody(val id: String) {
         "an all-val data class must not be mutable @Data:\n{immutable}"
     );
     assert!(
-        immutable.contains("@NonNull String id;"),
+        immutable.contains("@lombok.NonNull String id;"),
         "a non-null Kotlin reference must use Lombok @NonNull on the field:\n{immutable}"
     );
     assert!(
-        !immutable.contains("@NonNull int count;"),
+        !immutable.contains("@lombok.NonNull int count;"),
         "a primitive does not need Lombok @NonNull:\n{immutable}"
     );
     assert!(
@@ -74,8 +74,9 @@ data class WithBody(val id: String) {
         "translated data classes must retain constructor-property names for reflection-based binders:\n{immutable}"
     );
     assert!(
-        immutable
-            .contains("public Immutable(@NonNull String id, int count, @Nullable String note)"),
+        immutable.contains(
+            "public Immutable(@lombok.NonNull String id, int count, @Nullable String note)"
+        ),
         "the constructor must be explicit so its property-name contract survives without Kotlin metadata:\n{immutable}"
     );
     assert!(
@@ -93,25 +94,28 @@ data class WithBody(val id: String) {
         "a data class with a writable property must not be immutable @Value:\n{mutable}"
     );
     assert!(
-        mutable.contains("@NonNull private final String id;"),
+        mutable.contains("@lombok.NonNull private final String id;"),
         "explicit Lombok forms must mark non-null final fields:\n{mutable}"
     );
     assert!(
-        mutable.contains("@NonNull private String label;"),
+        mutable.contains("@lombok.NonNull private String label;"),
         "explicit Lombok forms must mark non-null mutable fields:\n{mutable}"
     );
     assert!(
-        mutable.contains("@NonNull String id") && mutable.contains("@NonNull String label"),
+        mutable.contains("@lombok.NonNull String id")
+            && mutable.contains("@lombok.NonNull String label"),
         "explicit constructors must enforce Kotlin non-null parameters:\n{mutable}"
     );
     assert!(
-        mutable.contains("setLabel(@NonNull String label)"),
+        mutable.contains("setLabel(@lombok.NonNull String label)"),
         "explicit setters must enforce Kotlin non-null assignments:\n{mutable}"
     );
 
     let with_secondary = emitted(root, "WithSecondary");
     assert!(
-        with_secondary.contains("public WithSecondary(@NonNull String id, @NonNull String label)"),
+        with_secondary.contains(
+            "public WithSecondary(@lombok.NonNull String id, @lombok.NonNull String label)"
+        ),
         "secondary constructors need an explicit checked primary constructor:\n{with_secondary}"
     );
 

@@ -349,6 +349,9 @@ pub(crate) struct CovariantDefaultGetterBridge {
     /// Inherited property declarations among the contracts. A retained Kotlin
     /// property cannot be overridden by a source method bridge.
     pub property_contract_owners: Vec<SymbolId>,
+    /// Erased return slots absent from the selected Java provider and its
+    /// javac bridges. Kotlin needs code only for actual consumers of a slot.
+    pub missing_kotlin_contract_owners: Vec<SymbolId>,
     pub method_name: String,
     /// The exact source FQName of the selected default's reference return.
     pub return_type: String,
@@ -537,7 +540,7 @@ fn canonical_return(
     canonical_type_ref(index, owner, &source)
 }
 
-fn erased_return(
+pub(super) fn erased_return(
     index: &SourceIndex,
     owner: &Declaration,
     member: &Member,
@@ -828,25 +831,17 @@ fn source_value_member<'a>(
     })
 }
 
-/// Prove that a Kotlin default getter body is exactly a chain of public
-/// zero-argument property accessors rooted at implicit `this`.
-///
-/// This is the narrowest shape a Java child can re-create without knowing how
-/// the retained Kotlin provider was compiled: every step is a virtual accessor
-/// call, so the dispatched methods, their order and their side effects are the
-/// ones the Kotlin default already performs. Everything else stays unproven:
-/// annotations (including accessor renames), non-public or static members,
-/// mutable or nullable steps, safe calls, `!!`, calls, casts, `super`/outer or
-/// labelled receivers, and steps whose types require generic substitution.
+/// Re-create a this-rooted chain of public virtual calls. Property reads and
+/// explicit no-argument calls share receiver binding, inherited type arguments
+/// and evaluation order. Explicit calls additionally require the provider's
+/// stable JVM signature fact; the cached syntax-only getter query can still
+/// establish its existing property-only bodies without that provider.
 fn proven_forwarding_getter_body(
     index: &SourceIndex,
     target: &Declaration,
     member: &Member,
     expected_return: &super::CanonicalGetterType,
 ) -> Option<ForwardingGetterBody> {
-    // An unrelated owner type parameter does not change a concrete accessor
-    // chain. Each step below still has to establish its exact return type
-    // without substituting type parameters or manufacturing casts.
     if target.language != SourceLanguage::Kotlin {
         return None;
     }
@@ -859,73 +854,303 @@ fn proven_forwarding_getter_body(
         return None;
     }
     let source = file.source_text();
-    let tree = crate::transpiler::parse_tree(source);
+    let tree = index.source_tree(file)?;
     let declaration = exact_declaration_node(tree.root_node(), source, &file.path, &symbol)?;
     let member_node = exact_member_node(declaration, source, member)?;
     if member_has_annotations(member_node) {
         return None;
     }
-    let names = accessor_chain(expression_body(member_node, source)?, source)?;
-    let mut owner = target;
-    let mut steps = Vec::with_capacity(names.len());
-    for (position, name) in names.iter().enumerate() {
-        let accessor = property_accessor_name(name);
-        let candidates = owner
-            .members
-            .iter()
-            .filter(|candidate| match candidate.kind {
-                MemberKind::Property => candidate.name == *name,
-                // A property with a block accessor body is indexed as its
-                // physical getter method. Both shapes perform the same JVM
-                // call, so a step is resolvable through either.
-                MemberKind::Method => {
-                    candidate.name == accessor && is_physical_zero_arg_getter(candidate, &accessor)
-                }
-                _ => false,
-            })
-            .collect::<Vec<_>>();
-        // Inherited, shadowed or duplicated: the accessor the Kotlin default
-        // resolves is not this declaration's, so refuse to guess.
-        let [property] = candidates.as_slice() else {
+    proven_forwarding_expression(
+        index,
+        target,
+        member,
+        expected_return,
+        expression_body(member_node, source)?,
+        None,
+    )
+}
+
+/// The general default planner already owns this expression's parsed snapshot.
+/// Reuse that tree instead of parsing its provider file again for every child.
+pub(super) fn proven_forwarding_expression(
+    index: &SourceIndex,
+    target: &Declaration,
+    member: &Member,
+    expected_return: &super::CanonicalGetterType,
+    expression: Node<'_>,
+    provider: Option<&dyn semantics::SemanticProvider>,
+) -> Option<ForwardingGetterBody> {
+    let file = index.declaration_source_file(target)?;
+    record_file(&file.path);
+    let source = file.source_text();
+    let names = accessor_chain(expression, source)?;
+    let mut receiver = Some(InstantiatedOwner {
+        declaration: target,
+        bindings: scoped_type_ref_bindings(index, target),
+    });
+    if names.is_empty() {
+        let identity = canonical_return(
+            index,
+            target,
+            &super::declaration_key(target),
+            &BTreeMap::new(),
+        )?;
+        if identity != *expected_return
+            && !canonical_reference_subtype(index, &identity, expected_return)
+        {
             return None;
-        };
-        let property = *property;
-        if position == 0 && property.name == member.name {
+        }
+    }
+    let mut steps = Vec::with_capacity(names.len());
+    for (position, access) in names.iter().enumerate() {
+        let accessor = access.method_name();
+        let (owner, property, canonical) =
+            forwarding_step(index, receiver.take()?, access, provider)?;
+        if position == 0
+            && accessor
+                == if member.kind == MemberKind::Property {
+                    property_accessor_name(&member.name)
+                } else {
+                    member.name.clone()
+                }
+        {
             // The default would read itself through the bridge.
             return None;
         }
-        if step_declaration_has_annotations(index, owner, property) {
+        if step_has_unsupported_declaration(
+            index,
+            owner,
+            property,
+            matches!(access, ForwardingAccess::Property(_)),
+        ) {
             // An annotation may rename the accessor (`@get:JvmName`) or carry a
             // framework contract a re-created body would silently drop.
             return None;
         }
         if property.is_static
-            || property.is_mutable
             || property.is_jvm_field
             || property.is_nullable
             || !getter_is_public(property, owner)
-            || !plain_accessor_name(&accessor)
+            || !plain_method_name(&accessor)
         {
             return None;
         }
-        let declared = getter_return_type(index, owner, property)?;
-        let declared = declared.trim();
-        // Generic and nullable spellings need projection or null handling this
-        // slice cannot prove; decline instead of manufacturing a cast.
-        if declared.is_empty() || declared.ends_with('?') || declared.contains('<') {
-            return None;
-        }
-        let canonical = canonical_return(index, owner, declared, &BTreeMap::new())?;
         steps.push(ForwardingGetterStep { accessor });
         if position + 1 == names.len() {
-            if canonical != *expected_return {
+            if canonical != *expected_return
+                && !canonical_reference_subtype(index, &canonical, expected_return)
+            {
                 return None;
             }
         } else {
-            owner = source_reference_declaration(index, &canonical)?;
+            receiver = Some(instantiated_reference(index, &canonical)?);
         }
     }
     Some(ForwardingGetterBody { steps })
+}
+
+#[derive(Debug)]
+enum ForwardingAccess {
+    Property(String),
+    Method(String),
+}
+
+impl ForwardingAccess {
+    fn conflicts(&self, owner: &Declaration, member: &Member) -> bool {
+        let Self::Method(name) = self else {
+            return false;
+        };
+        if member.name != *name {
+            return false;
+        }
+        match member.kind {
+            MemberKind::Method => member
+                .callable_arity
+                .is_none_or(|arity| arity.accepts_arity(0) && (arity.fixed != 0 || arity.vararg)),
+            MemberKind::Field
+                if owner.language == SourceLanguage::Java && !getter_is_public(member, owner) =>
+            {
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn method_name(&self) -> String {
+        match self {
+            Self::Property(name) => property_accessor_name(name),
+            Self::Method(name) => name.clone(),
+        }
+    }
+
+    fn matches(&self, member: &Member) -> bool {
+        match self {
+            Self::Property(name) => {
+                member.kind == MemberKind::Property && member.name == *name
+                    || member.kind == MemberKind::Method
+                        && is_physical_zero_arg_getter(member, &self.method_name())
+            }
+            Self::Method(name) => {
+                member.kind == MemberKind::Method
+                    && member.name == *name
+                    && member.parameter_types.is_empty()
+            }
+        }
+    }
+}
+
+fn forwarding_step<'a>(
+    index: &'a SourceIndex,
+    receiver: InstantiatedOwner<'a>,
+    access: &ForwardingAccess,
+    provider: Option<&dyn semantics::SemanticProvider>,
+) -> Option<(&'a Declaration, &'a Member, super::CanonicalGetterType)> {
+    let file = index.declaration_source_file(receiver.declaration)?;
+    record_name(&access.method_name());
+    let own = receiver
+        .declaration
+        .members
+        .iter()
+        .any(|m| access.matches(m));
+    let routes = if own {
+        vec![receiver]
+    } else {
+        let mut profile = super::profile::GetterTraversal::start();
+        let (routes, incomplete) = instantiated_routes(index, receiver, file, &mut profile);
+        if incomplete {
+            return None;
+        }
+        routes
+    };
+    let mut candidates = Vec::new();
+    for route in &routes {
+        record_file(&index.declaration_source_file(route.declaration)?.path);
+        if route
+            .declaration
+            .members
+            .iter()
+            .any(|m| access.conflicts(route.declaration, m))
+        {
+            return None;
+        }
+        for member in route
+            .declaration
+            .members
+            .iter()
+            .filter(|m| access.matches(m))
+        {
+            let value = source_value_member(index, route.declaration, member)?;
+            let canonical = canonical_return(
+                index,
+                route.declaration,
+                &value.return_type,
+                &route.bindings,
+            )?;
+            candidates.push((route.declaration, member, canonical));
+        }
+    }
+    let mut selected = candidates.iter().filter(|(owner, _, _)| {
+        !candidates.iter().any(|(other, _, _)| {
+            semantics::workspace_symbol(index, owner) != semantics::workspace_symbol(index, other)
+                && super::proven_reference_subtype(
+                    index,
+                    index.declaration_source_file(other).unwrap_or(file),
+                    &super::declaration_key(other),
+                    index.declaration_source_file(owner).unwrap_or(file),
+                    &super::declaration_key(owner),
+                )
+        })
+    });
+    let (owner, member, ty) = selected.next()?;
+    // Repeated diamond routes are harmless only with the same instantiated
+    // return and exact declaration. Unrelated candidates are never guessed.
+    if selected.any(|(other, m, value)| {
+        semantics::workspace_symbol(index, other) != semantics::workspace_symbol(index, owner)
+            || !std::ptr::eq(*m, *member)
+            || value != ty
+    }) {
+        return None;
+    }
+    if matches!(access, ForwardingAccess::Method(_)) || owner.language == SourceLanguage::Java {
+        let provider = provider?;
+        let id = semantics::workspace_symbol(index, owner);
+        let mut path = id.owner_path.clone();
+        path.push(id.name.clone());
+        let methods = provider
+            .symbols_named(&member.name)
+            .into_iter()
+            .filter(|s| {
+                s.id.file == id.file
+                    && s.id.owner_path == path
+                    && matches!(s.id.kind.as_str(), "function" | "method")
+                    && s.id.parameters.is_empty()
+            })
+            .collect::<Vec<_>>();
+        let [method] = methods.as_slice() else {
+            return None;
+        };
+        if !provider.has_stable_noarg_jvm_signature(&method.id)
+            || !provider.has_plain_noarg_call_shape(&method.id)
+        {
+            return None;
+        }
+        if owner.language == SourceLanguage::Java
+            && !matches!(ty, super::CanonicalGetterType::Named(name, _) if name.strip_prefix("kotlin.").and_then(crate::jvm_primitive::JvmPrimitive::kotlin).is_some())
+            && provider.reference_return_nullability(&method.id)
+                != Some(semantics::ReferenceReturnNullability::NonNull)
+        {
+            // A Java platform result may need a Kotlin call assertion. Until
+            // that check is represented in the body plan, require established
+            // non-null metadata rather than silently dropping the assertion.
+            return None;
+        }
+    }
+    Some((owner, member, ty.clone()))
+}
+
+fn instantiated_reference<'a>(
+    index: &'a SourceIndex,
+    ty: &super::CanonicalGetterType,
+) -> Option<InstantiatedOwner<'a>> {
+    use super::CanonicalGetterType as C;
+    fn type_ref(ty: &C) -> Option<TypeRef> {
+        let C::Named(identity, arguments) = ty else {
+            return None;
+        };
+        Some(TypeRef {
+            ty: KotlinType::Named {
+                name: format!("$canonical${identity}"),
+                arguments: arguments
+                    .iter()
+                    .map(|ty| {
+                        Some(TypeArgument {
+                            variance: Variance::Invariant,
+                            ty: Some(type_ref(ty)?.ty),
+                        })
+                    })
+                    .collect::<Option<_>>()?,
+            },
+            nullable: false,
+        })
+    }
+    let C::Named(identity, arguments) = ty else {
+        return None;
+    };
+    let declaration = source_declaration_for_identity(index, identity)?;
+    if declaration.is_jvm_value_class || declaration.type_params.len() != arguments.len() {
+        return None;
+    }
+    let bindings = declaration
+        .type_params
+        .iter()
+        .cloned()
+        .zip(arguments.iter().map(type_ref))
+        .map(|(name, ty)| Some((name, ty?)))
+        .collect::<Option<_>>()?;
+    Some(InstantiatedOwner {
+        declaration,
+        bindings,
+    })
 }
 
 /// The one class-like syntax node whose exact symbol identity is `symbol`.
@@ -967,7 +1192,7 @@ pub(super) fn exact_member_node<'t>(
 ) -> Option<Node<'t>> {
     let body = declaration
         .named_children(&mut declaration.walk())
-        .find(|child| child.kind() == "class_body")?;
+        .find(|child| matches!(child.kind(), "class_body" | "interface_body"))?;
     let mut pending = vec![body];
     let mut matches = Vec::new();
     while let Some(node) = pending.pop() {
@@ -986,6 +1211,10 @@ pub(super) fn exact_member_node<'t>(
             (MemberKind::Method, "function_declaration") => {
                 member_function_name(node, source) == Some(member.name.as_str())
                     && function_parameter_count(node) == 0
+            }
+            (MemberKind::Method, "method_declaration") => {
+                member_function_name(node, source) == Some(member.name.as_str())
+                    && node.child_by_field_name("parameters")?.named_child_count() == 0
             }
             _ => false,
         };
@@ -1046,13 +1275,14 @@ pub(super) fn member_has_annotations(member: Node<'_>) -> bool {
         })
 }
 
-/// Whether the exact source declaration of one forwarding step carries any
-/// annotation. An unresolvable declaration counts as annotated: the proof
-/// never falls back to a same-named declaration elsewhere.
-fn step_declaration_has_annotations(
+/// Require an exact ordinary getter/call declaration. Member annotations and
+/// record component getters need distinct JVM naming contracts. An unresolved
+/// declaration never falls back to a same-named member elsewhere.
+fn step_has_unsupported_declaration(
     index: &SourceIndex,
     owner: &Declaration,
     property: &Member,
+    property_access: bool,
 ) -> bool {
     let Some(file) = index.declaration_source_file(owner) else {
         return true;
@@ -1063,7 +1293,9 @@ fn step_declaration_has_annotations(
         return true;
     }
     let source = file.source_text();
-    let tree = crate::transpiler::parse_tree(source);
+    let Some(tree) = index.source_tree(file) else {
+        return true;
+    };
     let Some(declaration) = exact_declaration_node(tree.root_node(), source, &file.path, &symbol)
     else {
         return true;
@@ -1072,11 +1304,35 @@ fn step_declaration_has_annotations(
         return true;
     };
     member_has_annotations(node)
+        || property_access
+            && owner.language == SourceLanguage::Kotlin
+            && semantics::has_record_property_owner(source, node)
 }
 
-/// The single expression a getter body `= expr` evaluates. Block bodies and
-/// non-value bodies are unproven: they may contain arbitrary statements.
+/// A single value expression, written as `= expr` or `{ return expr }`.
+/// Additional statements and labelled returns are not equivalent bodies.
 pub(super) fn expression_body<'t>(member: Node<'t>, _source: &str) -> Option<Node<'t>> {
+    if member.kind() == "method_declaration" {
+        let body = member.child_by_field_name("body")?;
+        let statements = body
+            .named_children(&mut body.walk())
+            .filter(|node| !node.is_extra())
+            .collect::<Vec<_>>();
+        let [statement] = statements.as_slice() else {
+            return None;
+        };
+        if statement.kind() != "return_statement" {
+            return None;
+        }
+        let values = statement
+            .named_children(&mut statement.walk())
+            .filter(|node| !node.is_extra())
+            .collect::<Vec<_>>();
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        return Some(*value);
+    }
     let holder = if member.kind() == "property_declaration" {
         member
             .named_children(&mut member.walk())
@@ -1088,36 +1344,88 @@ pub(super) fn expression_body<'t>(member: Node<'t>, _source: &str) -> Option<Nod
         .named_children(&mut holder.walk())
         .find(|child| child.kind() == "function_body")?;
     let mut cursor = body.walk();
-    let mut expressions = body.named_children(&mut cursor);
+    let mut expressions = body.named_children(&mut cursor).filter(|n| !n.is_extra());
     let expression = expressions.next()?;
-    if expressions.next().is_some() || matches!(expression.kind(), "block") {
+    if expressions.next().is_some() {
         return None;
     }
-    Some(expression)
+    if expression.kind() != "block" {
+        return Some(expression);
+    }
+    let statements = expression
+        .named_children(&mut expression.walk())
+        .filter(|n| !n.is_extra())
+        .collect::<Vec<_>>();
+    let [statement] = statements.as_slice() else {
+        return None;
+    };
+    if statement.kind() != "return_expression" {
+        return None;
+    }
+    let values = statement
+        .named_children(&mut statement.walk())
+        .filter(|n| !n.is_extra())
+        .collect::<Vec<_>>();
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    Some(*value)
 }
 
-/// Flatten `a.b.c`, `this.a.b` into its identifier steps. Anything that is not
-/// plain `.` member access (calls, safe calls, `!!`, casts, labels, `super`,
-/// outer receivers, indexing) is unproven.
-fn accessor_chain(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+/// Flatten this-rooted property reads and empty calls into typed steps. Safe
+/// navigation, arguments, type arguments, casts, labels and indexing require
+/// additional evaluation or JVM contracts and are not this chain shape.
+fn accessor_chain(node: Node<'_>, source: &str) -> Option<Vec<ForwardingAccess>> {
     match node.kind() {
         "identifier" => {
             let name = node.utf8_text(source.as_bytes()).ok()?;
-            plain_identifier(name).then(|| vec![name.to_owned()])
+            plain_identifier(name).then(|| vec![ForwardingAccess::Property(name.to_owned())])
         }
-        "this_expression" => {
+        "this_expression" | "this" => {
             let text = node.utf8_text(source.as_bytes()).ok()?;
             (text.trim() == "this" && node.named_child_count() == 0).then(Vec::new)
+        }
+        "method_invocation" => {
+            let arguments = node.child_by_field_name("arguments")?;
+            if arguments
+                .named_children(&mut arguments.walk())
+                .any(|node| !node.is_extra())
+                || node.child_by_field_name("type_arguments").is_some()
+            {
+                return None;
+            }
+            let name = node
+                .child_by_field_name("name")?
+                .utf8_text(source.as_bytes())
+                .ok()?;
+            if !plain_method_name(name) {
+                return None;
+            }
+            let mut chain = match node.child_by_field_name("object") {
+                Some(receiver) if matches!(receiver.kind(), "this" | "method_invocation") => {
+                    accessor_chain(receiver, source)?
+                }
+                Some(_) => return None,
+                None => Vec::new(),
+            };
+            chain.push(ForwardingAccess::Method(name.to_owned()));
+            Some(chain)
         }
         "navigation_expression" => {
             let mut receiver = None;
             let mut member = None;
             for index in 0..node.child_count() {
                 let child = node.child(index)?;
+                if child.is_extra() {
+                    continue;
+                }
                 match child.kind() {
                     "." => {}
                     "identifier" if receiver.is_some() && member.is_none() => member = Some(child),
-                    "identifier" | "this_expression" | "navigation_expression"
+                    "identifier"
+                    | "this_expression"
+                    | "navigation_expression"
+                    | "call_expression"
                         if receiver.is_none() =>
                     {
                         receiver = Some(child);
@@ -1131,7 +1439,30 @@ fn accessor_chain(node: Node<'_>, source: &str) -> Option<Vec<String>> {
                 return None;
             }
             let mut chain = accessor_chain(receiver?, source)?;
-            chain.push(name.to_owned());
+            chain.push(ForwardingAccess::Property(name.to_owned()));
+            Some(chain)
+        }
+        "call_expression" => {
+            let parts = node
+                .named_children(&mut node.walk())
+                .filter(|n| !n.is_extra())
+                .collect::<Vec<_>>();
+            let [callee, arguments] = parts.as_slice() else {
+                return None;
+            };
+            if arguments.kind() != "value_arguments"
+                || arguments
+                    .named_children(&mut arguments.walk())
+                    .any(|n| !n.is_extra())
+            {
+                return None;
+            }
+            let mut chain = accessor_chain(*callee, source)?;
+            let last = chain.last_mut()?;
+            let ForwardingAccess::Property(name) = last else {
+                return None;
+            };
+            *last = ForwardingAccess::Method(name.clone());
             Some(chain)
         }
         _ => None,
@@ -1146,23 +1477,14 @@ fn plain_identifier(name: &str) -> bool {
         && characters.all(|character| character == '_' || character.is_alphanumeric())
 }
 
-/// A plain JavaBean accessor spelling. Kotlin renames an accessor through
-/// `@get:JvmName`, which the annotation guard already rejects; this keeps a
-/// mangled or non-getter name from reaching the emitter. The spelling must be
-/// Java's ASCII identifier alphabet as well: the Kotlin proof may read a
-/// Unicode property name, but the Java emitter cannot re-create that accessor,
-/// so it has to be declined here rather than asserted at emission time.
-fn plain_accessor_name(accessor: &str) -> bool {
-    let mut characters = accessor.chars();
+/// The emitter currently recreates plain ASCII Java method names. Decline
+/// unsupported spellings at proof time rather than asserting while emitting.
+fn plain_method_name(name: &str) -> bool {
+    let mut characters = name.chars();
     characters
         .next()
         .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
         && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
-        && accessor
-            .strip_prefix("get")
-            .or_else(|| accessor.strip_prefix("is"))
-            .and_then(|suffix| suffix.chars().next())
-            .is_some_and(|first| first.is_ascii_uppercase())
 }
 
 fn external_root(name: &str) -> bool {
@@ -1311,23 +1633,37 @@ impl SourceIndex {
             if route.declaration.kind != DeclarationKind::Interface {
                 return false;
             }
-            for member in route
-                .declaration
-                .members
-                .iter()
-                .filter(|member| !member.is_static)
-            {
-                let Some(contract) = source_value_member(self, route.declaration, member) else {
-                    return false;
-                };
-                if member.is_mutable || member.is_nullable || member.is_jvm_field {
-                    return false;
+            for member in route.declaration.members.iter().filter(|member| {
+                !member.is_static && member.visibility.as_deref() != Some("private")
+            }) {
+                // These bodies already exist in Java bytecode. Requiring a
+                // copied Kotlin body or an own override would reject ordinary
+                // mixed hierarchies, including parameterized Java defaults.
+                if route.declaration.language == SourceLanguage::Java
+                    && (member.kind == MemberKind::Field || member.has_body)
+                {
+                    continue;
                 }
                 let name = if member.kind == MemberKind::Property {
                     property_accessor_name(&member.name)
                 } else {
                     member.name.clone()
                 };
+                if member.parameter_types.is_empty()
+                    && self
+                        .effective_interface_value_member(child, file, &name)
+                        .is_some_and(|(selected, implementation)| {
+                            selected.language == SourceLanguage::Java && implementation.has_body
+                        })
+                {
+                    continue;
+                }
+                let Some(contract) = source_value_member(self, route.declaration, member) else {
+                    return false;
+                };
+                if member.is_mutable || member.is_nullable || member.is_jvm_field {
+                    return false;
+                }
                 if member.kind == MemberKind::Method {
                     let Some(method_file) = self.declaration_source_file(route.declaration) else {
                         return false;
@@ -1368,6 +1704,16 @@ impl SourceIndex {
                 ) else {
                     return false;
                 };
+                if child.kind == DeclarationKind::Interface
+                    && self
+                        .effective_interface_value_member(child, file, &name)
+                        .is_some_and(|(_, selected)| !selected.has_body)
+                {
+                    // A Java child interface can inherit an abstract contract.
+                    // Concrete defaults still need a physical body; merely
+                    // inheriting Kotlin metadata cannot establish that body.
+                    continue;
+                }
                 let matches = |candidate: &super::CanonicalGetterType| {
                     candidate == &contract_type
                         || canonical_reference_subtype(self, candidate, &contract_type)
@@ -2020,6 +2366,34 @@ impl SourceIndex {
                 .into_iter()
                 .collect::<Vec<_>>();
             property_contract_owners.sort_by_key(SymbolId::stable_key);
+            let mut missing_kotlin_contract_owners = Vec::new();
+            if target.language == SourceLanguage::Java {
+                for contract in &contracts {
+                    let Some(required) = contract.erased_return.as_ref() else {
+                        continue;
+                    };
+                    let covered = required == &default_erased_return
+                        || contracts.iter().any(|supplied| {
+                            supplied.erased_return.as_ref() == Some(required)
+                                && (semantics::workspace_symbol(self, supplied.owner)
+                                    == semantics::workspace_symbol(self, target)
+                                    || super::proven_reference_subtype(
+                                        self,
+                                        self.declaration_source_file(target).unwrap_or(file),
+                                        &super::declaration_key(target),
+                                        self.declaration_source_file(supplied.owner)
+                                            .unwrap_or(file),
+                                        &super::declaration_key(supplied.owner),
+                                    ))
+                        });
+                    if !covered {
+                        missing_kotlin_contract_owners
+                            .push(semantics::workspace_symbol(self, contract.owner));
+                    }
+                }
+            }
+            missing_kotlin_contract_owners.sort_by_key(SymbolId::stable_key);
+            missing_kotlin_contract_owners.dedup();
             let return_type = super::declaration_key(return_decl);
             bridges.push(CovariantDefaultGetterBridge {
                 owner: semantics::workspace_symbol(self, owner),
@@ -2027,6 +2401,7 @@ impl SourceIndex {
                 target: semantics::workspace_symbol(self, target),
                 contract_owners,
                 property_contract_owners,
+                missing_kotlin_contract_owners,
                 method_name,
                 return_type_ref: TypeRef::parse(&return_type),
                 return_type,
@@ -3616,24 +3991,21 @@ mod tests {
     }
 
     #[test]
-    fn calls_casts_labelled_receivers_and_block_bodies_stay_unproven() {
+    fn calls_without_jvm_facts_casts_labels_and_additional_statements_stay_unproven() {
         for body in [
             "override fun getMarker(): Marker = envelope.pick()",
             "override fun getMarker(): Marker = envelope as Marker",
             "override fun getMarker(): Marker = this@Provider.envelope.marker",
             "override fun getMarker(): Marker = Outer(this).envelope.marker",
-            "override fun getMarker(): Marker { return envelope.marker }",
+            "override fun getMarker(): Marker { println(\"effect\"); return envelope.marker }",
         ] {
             assert_bridge_without_forwarding_body(&provider_with(body));
         }
     }
 
     #[test]
-    fn non_public_or_mutable_steps_stay_unproven() {
-        for (label, marker) in [
-            ("private", "private val marker: Marker get() = stored"),
-            ("mutable", "var marker: Marker get() = stored"),
-        ] {
+    fn non_public_steps_stay_unproven() {
+        for (label, marker) in [("private", "private val marker: Marker get() = stored")] {
             let providers = format!(
                 "package sample\n\
                  interface View {{ val text: String }}\n\
@@ -3647,8 +4019,7 @@ mod tests {
                      override fun getMarker(): Marker = envelope.marker\n\
                  }}\n"
             );
-            // A private step has no readable accessor at all, so the chain is
-            // unresolvable; a mutable step is refused by the proof itself.
+            // A private step has no readable accessor at all.
             let bridges =
                 forwarding_bridges(&providers).unwrap_or_else(|error| panic!("{label}: {error}"));
             assert!(
@@ -3656,6 +4027,25 @@ mod tests {
                 "{label} step must stay unproven: {bridges:?}"
             );
         }
+    }
+
+    #[test]
+    fn mutable_property_reads_use_the_same_virtual_getter() {
+        let source = provider_with("override fun getMarker(): Marker = envelope.marker").replace(
+            "val marker: Marker get() = stored",
+            "var marker: Marker = stored",
+        );
+        let bridges = forwarding_bridges(&source).unwrap();
+        assert!(
+            bridges
+                .iter()
+                .any(|bridge| bridge.body.as_ref().is_some_and(|body| {
+                    body.steps
+                        .iter()
+                        .map(|s| s.accessor.as_str())
+                        .eq(["getEnvelope", "getMarker"])
+                }))
+        );
     }
 
     #[test]

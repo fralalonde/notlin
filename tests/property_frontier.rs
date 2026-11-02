@@ -481,6 +481,8 @@ fn config(root: &Path, output: PathBuf, lombok: bool) -> JvmValidationConfig {
     // uses. Casts must compile against this version as well as modern jars.
     cfg.classpath
         .push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/jetbrains-annotations.jar"));
+    cfg.classpath
+        .push(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/jspecify-1.0.0.jar"));
     for name in [
         "NOTLIN_KOTLIN_STDLIB",
         "NOTLIN_KOTLIN_REFLECT",

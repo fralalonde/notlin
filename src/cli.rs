@@ -55,7 +55,7 @@ pub struct Cli {
     pub coverage_report: Option<PathBuf>,
 
     /// Nullability annotation set to emit
-    #[arg(long, value_enum, default_value = "jetbrains")]
+    #[arg(long, value_enum, default_value = "jspecify")]
     pub annotations: Annotations,
 
     /// Use Lombok annotations where they preserve the planned Java behavior.
@@ -125,7 +125,7 @@ pub enum UntranslatableMode {
 pub enum Annotations {
     /// org.jetbrains.annotations @Nullable / @NotNull
     Jetbrains,
-    /// org.jspecify.annotations Nullable / @NullMarked
+    /// org.jspecify.annotations @Nullable / @NonNull
     Jspecify,
     /// No nullability annotations emitted
     None,

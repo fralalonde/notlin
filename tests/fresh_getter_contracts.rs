@@ -120,8 +120,8 @@ fn fresh_java_util_wildcard_keeps_uuid_default_method_translatable() {
         java.contains("UUID"),
         "UUID signature should be preserved: {java}"
     );
-    assert!(java.contains("import org.jetbrains.annotations.Nullable;"));
-    assert!(!java.contains("import org.jetbrains.annotations.*;"));
+    assert!(java.contains("import org.jspecify.annotations.Nullable;"));
+    assert!(!java.contains("import org.jspecify.annotations.*;"));
     assert!(fixture.0.join("UuidChild.kt").is_file());
 }
 

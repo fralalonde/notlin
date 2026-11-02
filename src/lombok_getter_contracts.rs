@@ -572,8 +572,12 @@ fn field_nullability(
         let canonical = resolve_annotation(&name, imports)?;
         let current = match canonical.as_str() {
             "lombok.NonNull" => Some(ReferenceReturnNullability::NonNull),
-            "org.jetbrains.annotations.NotNull" => Some(ReferenceReturnNullability::NonNull),
-            "org.jetbrains.annotations.Nullable" => Some(ReferenceReturnNullability::Nullable),
+            "org.jetbrains.annotations.NotNull" | "org.jspecify.annotations.NonNull" => {
+                Some(ReferenceReturnNullability::NonNull)
+            }
+            "org.jetbrains.annotations.Nullable" | "org.jspecify.annotations.Nullable" => {
+                Some(ReferenceReturnNullability::Nullable)
+            }
             _ => None,
         };
         if field(annotation, "arguments").is_some() {
@@ -622,7 +626,10 @@ fn lombok_imports(unit: &JavaSyntaxNode) -> BTreeMap<String, String> {
 }
 
 fn resolve_annotation(name: &str, imports: &BTreeMap<String, String>) -> Option<String> {
-    if name.starts_with("lombok.") || name.starts_with("org.jetbrains.annotations.") {
+    if name.starts_with("lombok.")
+        || name.starts_with("org.jetbrains.annotations.")
+        || name.starts_with("org.jspecify.annotations.")
+    {
         return Some(name.to_owned());
     }
     imports.get(name).cloned()

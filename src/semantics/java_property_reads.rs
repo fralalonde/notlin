@@ -118,8 +118,16 @@ pub(super) fn collect(
                 .utf8_text(source.as_bytes())
                 .ok()?;
             let canonical = match name {
+                "Nullable"
+                    if metadata.binding(annotation).is_some_and(|binding| {
+                        binding.canonical == "org.jspecify.annotations.Nullable"
+                    }) =>
+                {
+                    "org.jspecify.annotations.Nullable"
+                }
                 "Nullable" => "org.jetbrains.annotations.Nullable",
                 "NotNull" => "org.jetbrains.annotations.NotNull",
+                "NonNull" => "org.jspecify.annotations.NonNull",
                 "Override" => "java.lang.Override",
                 _ => continue,
             };

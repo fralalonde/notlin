@@ -385,30 +385,30 @@ class Example"#;
 #[test]
 fn annotations_option_controls_import() {
     let source = r#"val x: Int = 1"#;
-    let cli_jet = notlin::cli::Cli::parse_from(vec!["notlin", "-o", "/tmp", "X.kt"]);
-    let (files, _) = {
+    for (selected, package) in [
+        (None, Some("org.jspecify.annotations")),
+        (Some("jspecify"), Some("org.jspecify.annotations")),
+        (Some("jetbrains"), Some("org.jetbrains.annotations")),
+        (Some("none"), None),
+    ] {
+        let mut args = vec!["notlin"];
+        if let Some(selected) = selected {
+            args.extend(["--annotations", selected]);
+        }
+        args.push("X.kt");
+        let cli = notlin::cli::Cli::parse_from(args);
         let path = PathBuf::from("X.kt");
-        let (_, errors, _, _) = notlin::transpiler::transpile(source, &path, &cli_jet);
-        let _ = errors;
-        (notlin::transpiler::transpile(source, &path, &cli_jet).0, 0)
-    };
-    let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
-    assert!(all.contains("import org.jetbrains.annotations.Nullable;"));
-
-    let cli_none = notlin::cli::Cli::parse_from(vec![
-        "notlin",
-        "-o",
-        "/tmp",
-        "--annotations",
-        "none",
-        "X.kt",
-    ]);
-    let (files2, _, _, _) = {
-        let path = PathBuf::from("X.kt");
-        notlin::transpiler::transpile(source, &path, &cli_none)
-    };
-    let all2 = files2.iter().map(|(_, c)| c.as_str()).collect::<String>();
-    assert!(!all2.contains("org.jetbrains"));
+        let (files, errors, _, _) = notlin::transpiler::transpile(source, &path, &cli);
+        assert_eq!(errors, 0);
+        let all = files.iter().map(|(_, c)| c.as_str()).collect::<String>();
+        for candidate in ["org.jspecify.annotations", "org.jetbrains.annotations"] {
+            assert_eq!(
+                all.contains(&format!("import {candidate}.Nullable;")),
+                package == Some(candidate),
+                "selected {selected:?}: {all}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -464,20 +464,20 @@ fn lombok_flag_emits_mutable_data_class() {
     // delegate without depending on annotation processing.
     assert!(all.contains("@Data"), "missing @Data");
     assert!(all.contains("import lombok.Data;"));
-    assert!(all.contains("import lombok.NonNull;"));
+    assert!(!all.contains("import lombok.NonNull;"));
     assert!(
         all.contains("private int x;"),
         "var component must stay mutable"
     );
     assert!(
-        all.contains("@NonNull private final String y;"),
+        all.contains("@lombok.NonNull private final String y;"),
         "val component is final"
     );
     // Lombok owns equals/hashCode/toString; the constructor and accessors are
     // explicit so Java overloads and kotlinc's cross-language resolution do
     // not depend on annotation processing (see class.rs comments).
     assert!(
-        all.contains("public Point(int x, @NonNull String y)"),
+        all.contains("public Point(int x, @lombok.NonNull String y)"),
         "data class must provide a real primary constructor"
     );
 

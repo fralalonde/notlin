@@ -316,7 +316,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
     }
 
     fn call_body(&mut self, node: tree_sitter::Node) -> String {
-        if let Some(value) = self.retained_constant_super_call(node) {
+        if let Some(value) = self.source_super_call(node) {
             return value;
         }
         if let Some((receiver, separator, string_elements)) =
@@ -2559,7 +2559,7 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
 }
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
-    fn retained_constant_super_call(&self, call: tree_sitter::Node<'_>) -> Option<String> {
+    fn source_super_call(&mut self, call: tree_sitter::Node<'_>) -> Option<String> {
         let children = call
             .named_children(&mut call.walk())
             .filter(|node| !node.is_extra())
@@ -2607,6 +2607,17 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .map(|node| self.unit.text(node).to_owned())
             .or_else(|| index.direct_supertype_for_member(declaring, &owner_name, name))?;
         let parent = index.resolve_type(file, &qualifier)?;
+        if parent.kind == crate::workspace::DeclarationKind::Interface
+            && !index.can_call_interface_super(owner, parent, name, provider)
+        {
+            if let Some(body) = index.source_interface_default(parent, name, provider) {
+                return body.body.source_expression("this");
+            }
+            self.unit.diag_untranslatable(call, format!(
+                "`super<{qualifier}>.{name}()` bypasses another parent's override and its selected body is not proven for Java"
+            ));
+            return Some("null".to_owned());
+        }
         if parent.language != crate::workspace::SourceLanguage::Kotlin
             || !owner.supertypes.iter().any(|ty| {
                 index.resolve_type(file, ty).is_some_and(|d| {
@@ -2644,8 +2655,8 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         {
             return None;
         }
-        let body = index.constant_interface_default(parent, name, provider)?;
-        Some(body.value.java_expression())
+        let body = index.source_interface_default(parent, name, provider)?;
+        body.body.source_expression("this")
     }
 }
 

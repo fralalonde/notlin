@@ -5,8 +5,14 @@ Developer documentation. For user-facing usage see README.md.
 ## What it is
 
 notlin transpiles Kotlin source to Java (27+). `.kt` in, `.java` file(s) out.
-Nullability is annotated (`@Nullable`/`@NotNull` from vendor/jetbrains-annotations.jar
-by default), not enforced. Optional integrations on the receiving Java classpath
+Nullability uses JSpecify `@Nullable`/`@NonNull` by default; the receiving Java
+classpath needs `org.jspecify:jspecify`. Lombok retains its runtime null checks.
+In-place Gradle migrations configure the dependency in affected projects, using
+`api` when available and `implementation` otherwise, following the
+[JSpecify guidance](https://jspecify.dev/docs/using/). Existing JSpecify source
+also participates, so a subsequent migration can repair a missing dependency.
+Other builds supply the dependency themselves. The sample gates use
+`vendor/jspecify-1.0.0.jar`. Optional integrations on the receiving Java classpath
 include Lombok and StreamEx; when Lombok is enabled, prefer emitting its annotations
 instead of hand-rolling getters, setters, and statics.
 
@@ -340,7 +346,7 @@ not wired into a runner; probe them by hand:
 ```sh
 mkdir -p /tmp/probe && cp tests/fixtures/audit/probe13.kt /tmp/probe/
 target/debug/notlin -o /tmp/probe /tmp/probe/probe13.kt
-~/.local/java/jdk-27/bin/javac -cp vendor/jetbrains-annotations.jar /tmp/probe/*.java
+~/.local/java/jdk-27/bin/javac -cp vendor/jspecify-1.0.0.jar /tmp/probe/*.java
 ```
 
 Several probes deliberately contain untranslatables (suspend, coroutines,

@@ -160,7 +160,7 @@ data class Ref(
 
     let java = emitted(root, "Ref");
     assert!(
-        java.contains("public Ref(@Parent(\"site\") @NonNull String id)"),
+        java.contains("public Ref(@Parent(\"site\") @lombok.NonNull String id)"),
         "a PARAMETER-only annotation must follow Kotlin's use-site selection:\n{java}"
     );
     let field = java

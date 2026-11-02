@@ -109,8 +109,8 @@ pub(super) fn plan_default_getters(
     // Materialize defaults whose JVM presence cannot be inherited from retained
     // Kotlin. Selection is shared with explicit super calls; only the body
     // representation differs from the existing Java-super bridge.
-    let mut constant_bridges = Vec::new();
-    let mut initialization_boundaries = HashSet::new();
+    let mut materialized_bridges = Vec::new();
+    let mut blocked_materializations = HashMap::new();
     if let Some(provider) = provider {
         for class in &classes {
             if boundary_decisions.get(&class.boundary) != Some(&BackendOwner::Java) {
@@ -129,12 +129,23 @@ pub(super) fn plan_default_getters(
             let [indexed] = indexed.as_slice() else {
                 continue;
             };
-            for body in index.inherited_constant_defaults(indexed, provider) {
+            for body in index.inherited_source_defaults(indexed, provider) {
                 if java_default_owner(&body.target) {
                     continue;
                 }
+                if index.inherited_default_would_conflict(
+                    indexed,
+                    &body.target,
+                    &body.method_name,
+                    provider,
+                ) {
+                    blocked_materializations.insert(class.boundary.clone(),
+                        "materializing an inherited default would introduce competing implementations in a descendant");
+                    break;
+                }
                 if !index.interface_default_initialization_is_safe(indexed) {
-                    initialization_boundaries.insert(class.boundary.clone());
+                    blocked_materializations.insert(class.boundary.clone(),
+                        "materialized interface defaults would change observable companion initialization timing");
                     break;
                 }
                 let location = SourceLocation {
@@ -143,7 +154,7 @@ pub(super) fn plan_default_getters(
                     start_byte: class.start,
                     end_byte: class.end,
                 };
-                constant_bridges.push((
+                materialized_bridges.push((
                     class.boundary.clone(),
                     PlannedDefaultGetterBridge {
                         owner: class.symbol.clone(),
@@ -153,7 +164,7 @@ pub(super) fn plan_default_getters(
                         method_name: body.method_name,
                         return_type_ref: crate::semantics::TypeRef::parse(&body.return_type),
                         return_type: body.return_type,
-                        body: PlannedDefaultGetterBody::SourceConstant { value: body.value },
+                        body: body.body,
                     },
                 ));
             }
@@ -225,8 +236,8 @@ pub(super) fn plan_default_getters(
                         let target = file.declarations.iter().find(|declaration| {
                             crate::semantics::workspace_symbol(index, declaration) == bridge.target
                         })?;
-                        let body = index.constant_interface_default(target, &bridge.method_name, provider)?;
-                        (body.target == bridge.target).then_some(PlannedDefaultGetterBody::SourceConstant { value: body.value })
+                        let body = index.source_interface_default(target, &bridge.method_name, provider)?;
+                        (body.target == bridge.target).then_some(body.body)
                     });
                     let Some(body) = body else {
                         let target = &bridge.target;
@@ -264,13 +275,9 @@ pub(super) fn plan_default_getters(
 
     let ambiguous_boundaries = affected_ambiguous_boundaries;
     let mut failed_boundaries = ambiguous_boundaries.clone();
-    for boundary in initialization_boundaries {
+    for (boundary, message) in blocked_materializations {
         failed_boundaries.insert(boundary.clone());
-        retain_boundary(
-            plan,
-            &boundary,
-            "materialized interface defaults would change observable companion initialization timing",
-        );
+        retain_boundary(plan, &boundary, message);
     }
     let mut error_boundaries = HashSet::new();
     let mut successful = Vec::new();
@@ -320,7 +327,7 @@ pub(super) fn plan_default_getters(
                 });
         }
     }
-    for (boundary, bridge) in constant_bridges {
+    for (boundary, bridge) in materialized_bridges {
         if failed_boundaries.contains(&boundary)
             || plan.default_getter_bridges.iter().any(|existing| {
                 existing.owner == bridge.owner && existing.method_name == bridge.method_name
@@ -328,8 +335,11 @@ pub(super) fn plan_default_getters(
         {
             continue;
         }
-        plan.record_generated_bridge(&bridge.owner, format!("constant-interface-default:{}", bridge.method_name),
-            "re-create the selected retained Kotlin constant default without JVM-default assumptions");
+        plan.record_generated_bridge(
+            &bridge.owner,
+            format!("source-interface-default:{}", bridge.method_name),
+            "re-create the selected retained Kotlin source body without JVM-default assumptions",
+        );
         plan.default_getter_bridges.push(bridge);
     }
 }

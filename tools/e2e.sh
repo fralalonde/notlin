@@ -3,7 +3,7 @@
 # Usage: tools/e2e.sh [javac-path]  (default JDK 25 temurin — see DEV.md)
 set -u
 JAVAC="${1:-$HOME/.rsdk/tools/java/25.0.4-tem/bin/javac}"
-ANN_JAR="${ANN_JAR:-$(dirname "$0")/../vendor/jetbrains-annotations.jar}"
+ANN_JAR="${ANN_JAR:-$(dirname "$0")/../vendor/jspecify-1.0.0.jar}"
 NOTLIN="$(cd "$(dirname "$0")/.." && pwd)/target/debug/notlin"
 OUT=/tmp/notlin-e2e
 

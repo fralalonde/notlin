@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $samplesDir = Join-Path $repoRoot 'samples'
-$annotationsJar = Join-Path $repoRoot 'vendor/jetbrains-annotations.jar'
+$annotationsJar = Join-Path $repoRoot 'vendor/jspecify-1.0.0.jar'
 $outputRoot = Join-Path $repoRoot (Join-Path 'target/javac-e2e' ([Guid]::NewGuid().ToString('N')))
 
 if (-not (Test-Path -LiteralPath $Javac -PathType Leaf)) {

@@ -120,6 +120,149 @@ pub fn non_null_annotation(set: AnnotationSet) -> Option<&'static str> {
     }
 }
 
+/// JSpecify annotates the outer return type, including qualified names and
+/// arrays. A declaration annotation before a qualified package name is illegal.
+pub(crate) fn non_null_type(java_type: &str, set: AnnotationSet) -> String {
+    let Some(annotation) = non_null_annotation(set) else {
+        return java_type.to_owned();
+    };
+    if set != AnnotationSet::Jspecify {
+        return format!("{annotation} {java_type}");
+    }
+    let (position, array) = outer_type_annotation_position(java_type);
+    if array {
+        format!(
+            "{} {annotation} {}",
+            java_type[..position].trim_end(),
+            &java_type[position..]
+        )
+    } else {
+        format!(
+            "{}{annotation} {}",
+            &java_type[..position],
+            &java_type[position..]
+        )
+    }
+}
+
+fn outer_type_annotation_position(java_type: &str) -> (usize, bool) {
+    let mut depth = 0;
+    let mut last_dot = None;
+    for (position, character) in java_type.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            '.' if depth == 0 => last_dot = Some(position),
+            '[' if depth == 0 => {
+                return (position, true);
+            }
+            _ => {}
+        }
+    }
+    (last_dot.map_or(0, |dot| dot + 1), false)
+}
+
+/// Nullable types are kept in prefix form during planning. Place JSpecify's
+/// type-use annotation on the outer type only after all type rewrites finish.
+pub(crate) fn place_jspecify_nullable_annotations(body: &str) -> String {
+    if !body.contains("@Nullable") {
+        return body.to_owned();
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .expect("Java grammar");
+    let Some(tree) = parser.parse(body, None) else {
+        return body.to_owned();
+    };
+    let mut pending = vec![tree.root_node()];
+    let mut edits = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.kind() == "marker_annotation"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| name.utf8_text(body.as_bytes()).ok() == Some("Nullable"))
+            && let Some(parent) = node.parent()
+        {
+            let ty = match parent.kind() {
+                "modifiers" => parent
+                    .parent()
+                    .and_then(|decl| decl.child_by_field_name("type")),
+                "annotated_type" => parent
+                    .named_children(&mut parent.walk())
+                    .find(|child| !matches!(child.kind(), "annotation" | "marker_annotation")),
+                _ => None,
+            };
+            if let Some(ty) = ty {
+                let text = &body[ty.byte_range()];
+                let (position, array) = outer_type_annotation_position(text);
+                if position > 0 {
+                    let at = ty.start_byte() + position;
+                    edits.push((node.start_byte(), node.end_byte(), ""));
+                    edits.push((at, at, if array { " @Nullable " } else { "@Nullable " }));
+                }
+            }
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    edits.sort_unstable();
+    let mut result = body.to_owned();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        result.replace_range(start..end, replacement);
+    }
+    result
+}
+
+/// Shorten annotation syntax only, never string literals or user type names.
+/// A conflicting NonNull binding keeps the qualified spelling instead.
+pub(crate) fn import_jspecify_non_null(body: &str, imports: &[String]) -> (String, bool) {
+    const NAME: &str = "org.jspecify.annotations.NonNull";
+    if !body.contains(NAME)
+        || imports
+            .iter()
+            .any(|import| import.rsplit('.').next() == Some("NonNull") && import != NAME)
+    {
+        return (body.to_owned(), false);
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .expect("Java grammar");
+    let Some(tree) = parser.parse(body, None) else {
+        return (body.to_owned(), false);
+    };
+    let imported = imports.iter().any(|import| import == NAME);
+    let mut pending = vec![tree.root_node()];
+    let mut spans = Vec::new();
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "annotation" | "marker_annotation")
+            && let Some(name) = node.child_by_field_name("name")
+            && name.utf8_text(body.as_bytes()).ok() == Some(NAME)
+        {
+            spans.push((name.start_byte(), name.end_byte()));
+        }
+        if matches!(node.kind(), "identifier" | "type_identifier")
+            && node.utf8_text(body.as_bytes()).ok() == Some("NonNull")
+            && node.parent().is_some_and(|parent| {
+                !matches!(
+                    parent.kind(),
+                    "scoped_identifier" | "scoped_type_identifier"
+                ) && !(imported && matches!(parent.kind(), "annotation" | "marker_annotation"))
+            })
+        {
+            return (body.to_owned(), false);
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    let used = !spans.is_empty();
+    spans.sort_unstable();
+    let mut result = body.to_owned();
+    for (start, end) in spans.into_iter().rev() {
+        result.replace_range(start..end, "NonNull");
+    }
+    (result, used)
+}
+
 /// Box Kotlin primitive abbreviations inside a `type_arguments` text blob
 /// (`<Op, Int>` -> `<Op, Integer>`). Splits on `<`, `,`, `>` and maps the
 /// standalone primitive names.

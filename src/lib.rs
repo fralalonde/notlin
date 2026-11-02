@@ -3,6 +3,7 @@
 //! Exposes the transpiler as a library so integration tests and other tools
 //! can use it in-process; the `notlin` binary is a thin CLI wrapper.
 
+pub mod build_dependencies;
 pub mod cli;
 pub mod coverage;
 pub mod ctor_defaults;

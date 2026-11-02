@@ -199,6 +199,9 @@ fn jvm_config(
     config
         .classpath
         .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/jetbrains-annotations.jar"));
+    config
+        .classpath
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/jspecify-1.0.0.jar"));
     if lombok_enabled {
         config.classpath.push(PathBuf::from(
             std::env::var_os("NOTLIN_LOMBOK").expect("NOTLIN_LOMBOK"),
@@ -242,7 +245,7 @@ fn reified_class_argument_rewrites_only_the_proven_bounded_call() {
             "{caller}"
         );
         assert!(
-            caller.contains("@Nullable sample.Entry inferred("),
+            caller.contains("sample.@Nullable Entry inferred("),
             "{caller}"
         );
         assert!(scratch.0.join("Store.kt").is_file());

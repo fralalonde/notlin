@@ -749,7 +749,11 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         if non_null_override_return
             && let Some(annotation) = crate::transpiler::types::non_null_annotation(self.annots)
         {
-            out.line(annotation);
+            if self.annots == crate::transpiler::types::AnnotationSet::Jspecify {
+                ret = crate::transpiler::types::non_null_type(&ret, self.annots);
+            } else {
+                out.line(annotation);
+            }
         }
         if !has_body {
             // Bodyless: signature-only (abstract / interface method)

@@ -119,6 +119,66 @@ class Child : Middle()
 }
 
 #[test]
+fn qualified_super_calls_share_the_normal_override_selection() {
+    for parents in ["Left,Root", "Left,Right"] {
+        let source = "package inherited\nclass Child:Branch {override fun getId():String=super<Branch>.getId()}\n";
+        let branch = format!("package inherited; public interface Branch extends {parents} {{}}");
+        let index = provider(&[
+            (
+                "Root.java",
+                "package inherited; public interface Root {String getId();}",
+            ),
+            (
+                "Left.java",
+                "package inherited; public interface Left extends Root {@org.jetbrains.annotations.NotNull default String getId(){return \"left\";}}",
+            ),
+            (
+                "Right.java",
+                "package inherited; public interface Right extends Root {@org.jetbrains.annotations.NotNull default String getId(){return \"right\";}}",
+            ),
+            ("Branch.java", &branch),
+            ("Child.kt", source),
+        ]);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = Path::new("Child.kt");
+        let mut plan = notlin::translation_plan::analyze(source, tree.root_node(), file);
+        plan_required_calls(source, &tree, file, &index, false, &mut plan);
+        let calls = plan
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.spelling == "getId")
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        if parents == "Left,Root" {
+            assert_eq!(
+                calls[0].resolution,
+                FactStatus::Established(member(&index, "Left", "getId"))
+            );
+        } else {
+            assert!(matches!(calls[0].resolution, FactStatus::Ambiguous(_)));
+        }
+    }
+}
+
+#[test]
+fn qualified_return_spelling_does_not_hide_a_declared_override() {
+    for (wide, narrow) in [("Code", "inherited.Code"), ("inherited.Code", "Code")] {
+        let source = format!(
+            "package inherited\nclass Code\ninterface Root {{ fun getId(): {wide} }}\ninterface Middle : Root {{ override fun getId(): {narrow} }}\nclass Child : Middle\n"
+        );
+        let index = provider(&[("QualifiedReturn.kt", &source)]);
+        assert_eq!(
+            inherited(&index, "Child", "getId"),
+            FactStatus::Established(member(&index, "Middle", "getId"))
+        );
+    }
+}
+
+#[test]
 fn covariant_override_uses_the_declared_return_hierarchy() {
     let source = r#"package inherited
 open class Id

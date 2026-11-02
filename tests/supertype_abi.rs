@@ -3,6 +3,119 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+#[test]
+fn nongeneric_covariant_returns_can_cross_generic_ancestor_edges() {
+    use notlin::workspace::{SourceLanguage, SourceOverlay};
+    let path = |name: &str| {
+        std::env::temp_dir()
+            .join("notlin-generic-ancestry")
+            .join(name)
+    };
+    let files = [
+        (
+            "Marker.kt",
+            "package contract\ninterface Marker\ninterface Wide { fun getValue(): Marker }\n",
+        ),
+        (
+            "Middle.kt",
+            "package middle\ninterface Generic<T> : contract.Marker\n",
+        ),
+        (
+            "Specific.kt",
+            "package model\nclass Specific : middle.Generic<String>\n",
+        ),
+    ];
+    let index = SourceIndex::default()
+        .with_overlays(
+            &files
+                .into_iter()
+                .map(|(name, source)| SourceOverlay::Replace {
+                    path: path(name),
+                    language: SourceLanguage::Kotlin,
+                    source: source.to_owned(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let wide = index
+        .declarations()
+        .find(|owner| owner.name == "Wide")
+        .unwrap();
+    assert!(index.property_getter_return_compatible(
+        &path("Specific.kt"),
+        "Specific",
+        wide,
+        "Marker"
+    ));
+    assert!(!index.property_getter_return_compatible(
+        &path("Specific.kt"),
+        "middle.Generic<String>",
+        wide,
+        "middle.Generic<Any>"
+    ));
+}
+
+#[test]
+fn inherited_type_arguments_keep_the_scope_where_they_were_supplied() {
+    use notlin::workspace::{MemberConflictClass, SourceLanguage, SourceOverlay};
+    for (result, expected) in [
+        ("model.Id", MemberConflictClass::Exact),
+        ("other.Id", MemberConflictClass::UnrelatedReturnTypes),
+    ] {
+        let path = |name: &str| {
+            std::env::temp_dir()
+                .join("notlin-generic-origin")
+                .join(name)
+        };
+        let files = [
+            (
+                "Root.kt",
+                "package contract\ninterface Root<T> { fun getId(): T }\n".to_owned(),
+            ),
+            (
+                "Through.kt",
+                "package model\nclass Id\ninterface Through : contract.Root<Id>\n".to_owned(),
+            ),
+            ("Other.kt", "package other\nclass Id\n".to_owned()),
+            (
+                "Child.kt",
+                format!(
+                    "package model\nclass Child : Through {{ override fun getId(): {result} = TODO() }}\n"
+                ),
+            ),
+        ];
+        let index = SourceIndex::default()
+            .with_overlays(
+                &files
+                    .into_iter()
+                    .map(|(name, source)| SourceOverlay::Replace {
+                        path: path(name),
+                        language: SourceLanguage::Kotlin,
+                        source,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let conflicts = index.retained_supertype_member_conflicts_in_file(
+            &path("Child.kt"),
+            &["Through".to_owned()],
+            "Child",
+        );
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].classification, expected);
+        assert!(conflicts[0].inherited_type_source.ends_with("Through.kt"));
+        let mismatches = index.retained_supertype_member_mismatches_in_file(
+            &path("Child.kt"),
+            &["Through".to_owned()],
+            "Child",
+        );
+        assert_eq!(
+            mismatches.is_empty(),
+            expected == MemberConflictClass::Exact
+        );
+    }
+}
+
 fn migrate_fixture(root: &Path, files: &[(&str, &str)]) -> String {
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
