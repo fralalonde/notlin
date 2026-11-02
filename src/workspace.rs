@@ -474,6 +474,9 @@ pub struct SourceIndex {
     /// Exact lowerer parse trees, initialized once per file in this snapshot.
     /// Independent cells keep unrelated planning workers concurrent.
     source_trees: Vec<std::sync::OnceLock<tree_sitter::Tree>>,
+    /// Structural imports belong to this exact source snapshot, including
+    /// malformed headers whose text can prevent an otherwise guessed binding.
+    structural_imports: Vec<std::sync::OnceLock<Vec<StructuralImport>>>,
     kotlin_subtypes: HashMap<String, Vec<PathBuf>>,
     /// Reverse subtype edges by SIMPLE name: `name -> [subtype simple names]`.
     /// Shallow but unambiguous enough for retention fixpointing: the
@@ -917,6 +920,9 @@ impl SourceIndex {
         let source_trees = std::iter::repeat_with(std::sync::OnceLock::new)
             .take(files.len())
             .collect();
+        let structural_imports = std::iter::repeat_with(std::sync::OnceLock::new)
+            .take(files.len())
+            .collect();
         let mut index = Self {
             files,
             kotlin_jvm_defaults: jvm_defaults::Configuration::default(),
@@ -925,6 +931,7 @@ impl SourceIndex {
             getter_bridge_cache: default_getters::BridgeCache::default(),
             declaration_symbols,
             source_trees,
+            structural_imports,
             kotlin_subtypes: HashMap::new(),
             subtype_names: HashMap::new(),
             all_subtype_names: HashMap::new(),
@@ -8417,7 +8424,62 @@ fn canonical_getter_named_identity(
     Some(builtin.to_owned())
 }
 
+#[derive(Debug, Clone)]
+enum StructuralImport {
+    Parsed(crate::semantics::java_member_calls::ImportHeader),
+    Unparsed(String),
+}
+
+impl SourceIndex {
+    fn structural_imports(&self, file: &SourceFile) -> std::borrow::Cow<'_, [StructuralImport]> {
+        let collect = || {
+            let source = file.source_text();
+            // Preserve the existing Kotlin-parser projection for Java inputs.
+            // The Java lowerer's cached tree has different import node kinds.
+            let tree = if file.language == SourceLanguage::Kotlin {
+                self.source_tree(file).map(std::borrow::Cow::Borrowed)
+            } else {
+                None
+            }
+            .unwrap_or_else(|| std::borrow::Cow::Owned(crate::transpiler::parse_tree(source)));
+            let mut imports = Vec::new();
+            let mut nodes = vec![tree.root_node()];
+            while let Some(node) = nodes.pop() {
+                if node.kind() != "import" {
+                    nodes.extend(node.named_children(&mut node.walk()));
+                    continue;
+                }
+                imports.push(
+                    crate::semantics::java_member_calls::import_header(source, node).map_or_else(
+                        || {
+                            StructuralImport::Unparsed(
+                                node.utf8_text(source.as_bytes()).unwrap_or("").to_owned(),
+                            )
+                        },
+                        StructuralImport::Parsed,
+                    ),
+                );
+            }
+            imports
+        };
+        let cell = self
+            .file_paths
+            .get(&file.path)
+            .filter(|&&position| {
+                self.files
+                    .get(position)
+                    .is_some_and(|indexed| std::ptr::eq(indexed, file))
+            })
+            .and_then(|&position| self.structural_imports.get(position));
+        match cell {
+            Some(cell) => std::borrow::Cow::Borrowed(cell.get_or_init(collect)),
+            None => std::borrow::Cow::Owned(collect()),
+        }
+    }
+}
+
 /// How a written type name is bound by this file's structural imports.
+#[derive(Debug, PartialEq, Eq)]
 enum WrittenImport {
     /// No import header binds the name.
     NotApplicable,
@@ -8432,7 +8494,11 @@ enum WrittenImport {
 ///
 /// The indexed `file.imports` strings are only a cheap prefilter: an alias is
 /// proven by the parsed header path, never by splitting the string on ` as `.
-fn structural_import_binding(file: &SourceFile, written: &str) -> WrittenImport {
+fn structural_import_binding(
+    index: &SourceIndex,
+    file: &SourceFile,
+    written: &str,
+) -> WrittenImport {
     let (root, rest) = written
         .split_once('.')
         .map_or((written, None), |(root, rest)| (root, Some(rest)));
@@ -8443,17 +8509,12 @@ fn structural_import_binding(file: &SourceFile, written: &str) -> WrittenImport 
     // `file.imports` is a Legacy line-reader projection. Absence there is not
     // evidence of absence in Kotlin syntax (e.g. a tab after `import`).
     // Classifier binding must always consult the structural header reader.
-    let source = file.source_text();
-    let tree = crate::transpiler::parse_tree(source);
-    let mut nodes = vec![tree.root_node()];
     let mut target = None;
-    while let Some(node) = nodes.pop() {
-        if node.kind() != "import" {
-            nodes.extend(node.named_children(&mut node.walk()));
-            continue;
-        }
-        let Some(header) = crate::semantics::java_member_calls::import_header(source, node) else {
-            if kt_text_contains(node, source, root) {
+    for import in index.structural_imports(file).iter() {
+        let StructuralImport::Parsed(header) = import else {
+            if let StructuralImport::Unparsed(text) = import
+                && text.contains(root)
+            {
                 return WrittenImport::Unknown;
             }
             continue;
@@ -8470,7 +8531,7 @@ fn structural_import_binding(file: &SourceFile, written: &str) -> WrittenImport 
         }
         let qualified = match rest {
             Some(rest) => format!("{}.{rest}", header.path),
-            None => header.path,
+            None => header.path.clone(),
         };
         if target.as_ref().is_some_and(|prior| prior != &qualified) {
             return WrittenImport::Unknown;
@@ -8478,11 +8539,6 @@ fn structural_import_binding(file: &SourceFile, written: &str) -> WrittenImport 
         target = Some(qualified);
     }
     target.map_or(WrittenImport::NotApplicable, WrittenImport::Bound)
-}
-
-fn kt_text_contains(node: tree_sitter::Node<'_>, source: &str, needle: &str) -> bool {
-    node.utf8_text(source.as_bytes())
-        .is_ok_and(|text| text.contains(needle))
 }
 
 /// A written type name's canonical source binding, selected by stable identity.
@@ -8515,7 +8571,7 @@ pub(crate) fn canonical_type_binding<'a>(
     if file.type_aliases.contains_key(first) {
         return None;
     }
-    let qualified = match structural_import_binding(file, &head) {
+    let qualified = match structural_import_binding(index, file, &head) {
         WrittenImport::Bound(qualified) => qualified,
         WrittenImport::Unknown => return None,
         WrittenImport::NotApplicable if head.contains('.') => {
@@ -8633,7 +8689,7 @@ pub(crate) fn property_receiver_type_binding<'a>(
     if head.contains('.')
         || file.type_aliases.contains_key(&head)
         || !matches!(
-            structural_import_binding(file, &head),
+            structural_import_binding(index, file, &head),
             WrittenImport::NotApplicable
         )
         || index
@@ -8642,16 +8698,9 @@ pub(crate) fn property_receiver_type_binding<'a>(
     {
         return None;
     }
-    let source = file.source_text();
-    let tree = crate::transpiler::parse_tree(source);
-    let mut nodes = vec![tree.root_node()];
     let mut selected: Option<CanonicalTypeBinding<'a>> = None;
-    while let Some(node) = nodes.pop() {
-        if node.kind() != "import" {
-            nodes.extend(node.named_children(&mut node.walk()));
-            continue;
-        }
-        let Some(header) = crate::semantics::java_member_calls::import_header(source, node) else {
+    for import in index.structural_imports(file).iter() {
+        let StructuralImport::Parsed(header) = import else {
             continue;
         };
         if !header.wildcard || header.alias.is_some() {
@@ -8691,6 +8740,9 @@ fn enum_typed_candidate(ws: &SourceIndex, candidates: &[String]) -> Option<Strin
     }
     None
 }
+
+#[cfg(test)]
+mod structural_import_cache_tests;
 
 #[cfg(test)]
 mod declaration_symbol_cache_tests {

@@ -428,6 +428,7 @@ fn declared_receiver_owner<P: SemanticProvider + ?Sized>(
 /// backticks removed (they escape the identifier, they are not part of the
 /// spelled name); `wildcard` records a `.*` import, which binds no specific
 /// name.
+#[derive(Debug, Clone)]
 pub(crate) struct ImportHeader {
     pub(crate) path: String,
     pub(crate) alias: Option<String>,
