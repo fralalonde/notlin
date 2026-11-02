@@ -1,35 +1,64 @@
 # Translation frontier
 
-The accepted 2026-11-02 conversion uses clean `exp/kotlin-killer2` commit
+The latest accepted 2026-11-02 conversion uses clean `exp/kotlin-killer2` commit
 `3382c909b00c61725c80892cd26acc5917b4c7b6`. The standard root conversion with
 `--in-place --lombok` translates **4158 / 6694 original declarations (62.1%)**,
 retains 2536, deletes 420 Kotlin files and trims 578. Nine Kotlin files remain
 untouched. No generated source is hand-edited.
 
+The verified compiler changes are `5453702` (structural import caching) and
+`e3952bf` (idiomatic Java in plain and Lombok modes), both on `main`.
 The complete Gradle build passes: 97 tasks execute and 32 come from cache.
 Its 3070 passing and 76 skipped test cases have exactly the same identities
 and outcomes as the verified unconverted reference. Hastings imports all
-**9745 records**, then stays free of errors and stack traces for **106 seconds**.
-The owned app is stopped afterward. All 20 focused release-profile controls
-pass against the exact CLI binary; formatting and CI Clippy pass. The Rust
-comparison records 1684 passes and the same 62 known Windows failures, with
-no new failures.
+**9745 records**, then stays free of errors and stack traces for **105.2 seconds**.
+The owned app is stopped afterward. All 22 focused release controls and 17 getter
+contract controls pass; formatting and CI Clippy pass. The Rust comparison has
+the same 62 known Windows failures after rerunning 39 sandbox-restricted failures
+outside that sandbox. There are no new failures.
 
-Acceptance evidence is `target/current-reference-release-20261102/acceptance.json`.
+Acceptance evidence is `target/idiomatic-java-gate-20261102/acceptance.json`.
 The release binary SHA256 is
-`37508a26efe1fed75ad7d1a12ae657f39910c0a7c314f209b598cf681c7bacba`;
-all 379 compiler inputs stay unchanged through the gate. The conversion takes
-97m42s with two workers and profiling enabled. Ten migration rounds include a
-complete restart when speculative collection-contract groups shrink from 22
-to four. This is a correctness retry, not a failed convergence check. A sampled
-64-second planning interval uses 68.8 CPU seconds with no reads and only 1725
-bytes written. The next CPU pass must keep source I/O unchanged, measure its
-specific hot paths and prove identical ownership and generated sources.
+`dcd3332717ac9440625ea900bbd88fe0cf06a6c649dbfbe54b787d1481f45515`;
+all 382 compiler inputs match their frozen copies and the committed sources.
+The conversion takes 62m49s with two workers and profiling enabled. Other
+validation jobs overlap, so this is not a controlled speed comparison. The
+shared Java cleanup also passes a 4158-file corpus control: it removes 4918
+imports, preserves every non-import body token, remains valid Java and is
+idempotent. Native controls compare original Kotlin, plain Java and Lombok Java.
+
+The independently gated CPU candidate preserves every generated Java byte,
+ownership decision and retention-category count. Its twelve differing Kotlin
+files vary only in absolute workspace roots inside parsed generated NOTLIN
+diagnostic comments; the comparator verifies that scope and does not normalize
+literals or ordinary comments. Its full Gradle build and 9745-record Hastings
+run pass too. Evidence is `target/cpu-import-bindings-gate-20261102/acceptance.json`.
+The lookup microbenchmarks measure the cached operation only. Source I/O stays
+unchanged; do not infer a whole-translator speedup from those microbenchmarks.
 
 The final coverage has no ownership-cycle diagnostics. Four unstable owners
 appear in an intermediate probe only; do not report them as a final blocker.
 The 150 descendants retained for independent getter dispatch remain the next
-coordinated physical-name/caller migration case, after the CPU pass.
+accessor-normalization case. New isolated JVM controls expose two current bugs:
+translated `child.id` can invoke the independent narrower `getId()` function,
+and bound/unbound function references can stop compiling after the source-name
+split. Kotlin represents those references as `navigation_expression` nodes with
+`::`, not only as `callable_reference` nodes.
+
+Renaming only the narrower method is insufficient: it preserves explicit
+callers but changes both MapStruct mapping and Jackson JSON from lookup IDs to
+stored IDs. A controlled layout with a separate physical wide accessor
+(`readId()` in the probe) and the original JavaBean `getId()` view preserves
+explicit calls, property reads, mutation, callable references, MapStruct and
+Jackson behavior while allowing a Java descendant. This layout is verified as
+a strategy, **not yet implemented in notlin**. Logical property and backing-field
+names remain unchanged. Generic `getId(Class<T>)` overloads can stay unchanged
+for this descendant case; the control compiles and preserves their behavior.
+Evidence and negative controls are under
+`target/hierarchy-physical-rename-20261102/`, especially `results.json`,
+`bean-view-results.json` and `bean-consumer-results.json`. Implement scoped getter
+names and their source/bean roles before removing the current descendant guard;
+do not replace it with a naive narrow-method rename.
 
 On 2026-11-02 the user confirmed that unconverted `exp/kotlin-killer2` defines
 the required application behavior. Its latest production commit is
