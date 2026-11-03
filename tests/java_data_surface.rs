@@ -131,7 +131,7 @@ fn translate(root: &Path, lombok: bool) {
     if lombok {
         let visibility = fs::read_to_string(root.join("Visibility.java")).unwrap();
         assert!(
-            visibility.contains("@lombok.Getter(onMethod_ = {@JsonIgnore(false)})"),
+            visibility.contains("@Getter(onMethod_ = {@JsonIgnore(false)})"),
             "{visibility}"
         );
         let flag = fs::read_to_string(root.join("Flag.java")).unwrap();

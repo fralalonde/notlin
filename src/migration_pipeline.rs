@@ -30,6 +30,10 @@ pub struct WorkspaceMigrationPlan {
     /// Deleted sources are absent from this map.
     pub final_kotlin_sources: HashMap<PathBuf, String>,
     pub generated_java: Vec<GeneratedJava>,
+    /// Existing Java callers/adapters changed by a coordinated preparation.
+    pub supporting_java: HashMap<PathBuf, String>,
+    /// Original compiler bindings whose inputs must remain current through apply.
+    pub java_bindings: Vec<crate::java_bindings::JavaBindings>,
     pub final_plans: Vec<transpiler::fixpoint::FilePlan>,
     /// Per-original-file ownership decisions retained across speculative
     /// rounds, including declarations removed before the final pass.
@@ -44,6 +48,51 @@ pub struct WorkspaceMigrationPlan {
 /// Resolve a workspace fixpoint without writing any files. The callback is
 /// called with human-readable progress detail after each speculative round.
 pub fn plan_workspace_migration<F>(
+    sources: Vec<(PathBuf, String)>,
+    cli: &Cli,
+    index: &SourceIndex,
+    translation_roots: &[PathBuf],
+    mut progress: F,
+) -> Result<WorkspaceMigrationPlan, String>
+where
+    F: FnMut(String),
+{
+    let preparation =
+        crate::getter_normalization::workspace::prepare(&sources, cli, index, &mut progress)?;
+    let Some(mut preparation) = preparation else {
+        return plan_workspace_migration_prepared(sources, cli, index, translation_roots, progress);
+    };
+    loop {
+        let prepared_sources = preparation.kotlin_sources(&sources);
+        let prepared_index = index.with_overlays(&preparation.overlays)?;
+        let mut plan = plan_workspace_migration_prepared(
+            prepared_sources,
+            cli,
+            &prepared_index,
+            translation_roots,
+            &mut progress,
+        )?;
+        let strict = matches!(cli.untranslatable, UntranslatableMode::Error);
+        preparation.verify_strict_vetoes(&plan, strict)?;
+        if preparation.retain_used_families(&plan, index)? {
+            progress("discarding getter preparations unused by accepted Java outputs".into());
+            if preparation.overlays.is_empty() {
+                return plan_workspace_migration_prepared(
+                    sources,
+                    cli,
+                    index,
+                    translation_roots,
+                    progress,
+                );
+            }
+            continue;
+        }
+        preparation.finish(&mut plan, sources, index, strict)?;
+        return Ok(plan);
+    }
+}
+
+fn plan_workspace_migration_prepared<F>(
     sources: Vec<(PathBuf, String)>,
     cli: &Cli,
     index: &SourceIndex,
@@ -1086,6 +1135,8 @@ where
         original_snapshots,
         final_kotlin_sources: final_map,
         generated_java,
+        supporting_java: HashMap::new(),
+        java_bindings: Vec::new(),
         final_plans,
         translation_plans,
         migration_proposals,
@@ -1511,6 +1562,9 @@ pub fn verify_original_snapshots(plan: &WorkspaceMigrationPlan) -> Result<(), St
 }
 
 fn verify_original_snapshots_inner(plan: &WorkspaceMigrationPlan) -> Result<(), String> {
+    for bindings in &plan.java_bindings {
+        bindings.verify_inputs()?;
+    }
     for (path, expected) in &plan.original_snapshots {
         let current = match std::fs::read(path) {
             Ok(bytes) => Some(bytes),
@@ -1701,7 +1755,13 @@ pub fn validate_workspace_plan(
             if generated_paths.contains(&key) {
                 continue;
             }
-            let text = snapshot_text(path)?;
+            let text = plan
+                .supporting_java
+                .iter()
+                .find_map(|(candidate, source)| {
+                    (normalized(candidate) == key).then_some(source.clone())
+                })
+                .map_or_else(|| snapshot_text(path), Ok)?;
             java.push(stage_text(path, &text, "java")?);
         }
         // Explicit module sources can include supporting sources outside the

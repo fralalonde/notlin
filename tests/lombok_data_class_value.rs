@@ -17,6 +17,58 @@ fn emitted(root: &Path, name: &str) -> String {
 }
 
 #[test]
+fn generated_annotation_imports_preserve_application_types_with_the_same_names() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!(
+            "lombok-type-collisions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Types.kt"),
+        r#"package clash
+class Value
+class Data
+class Getter
+data class Immutable(val value:Value)
+data class Mutable(val value:Value,var data:Data,val getter:Getter)
+class Ordinary(val value:Value,val getter:Getter)
+"#,
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_notlin"))
+        .args(["--in-place", "--lombok", "--root"])
+        .arg(&root)
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let immutable = emitted(&root, "Immutable");
+    assert!(immutable.contains("@lombok.Value"), "{immutable}");
+    assert!(!immutable.contains("import lombok.Value;"), "{immutable}");
+    let mutable = emitted(&root, "Mutable");
+    assert!(mutable.contains("@lombok.Data"), "{mutable}");
+    for name in ["Immutable", "Mutable", "Ordinary"] {
+        let java = emitted(&root, name);
+        for annotation in ["Value", "Data", "Getter"] {
+            assert!(
+                !java.contains(&format!("import lombok.{annotation};")),
+                "{java}"
+            );
+        }
+    }
+}
+
+#[test]
 fn data_class_lombok_annotation_follows_mutability() {
     let root = Path::new("tests/tmp_scratch_lombok_value");
     let _ = fs::remove_dir_all(root);

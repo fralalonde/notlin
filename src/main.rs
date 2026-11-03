@@ -765,6 +765,12 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
                 }
             }
             if apply_migration {
+                for (path, source) in &plan.supporting_java {
+                    migrate::apply_migration_proposal(
+                        path,
+                        &migrate::MigrationProposal::Rewrite(source.clone()),
+                    )?;
+                }
                 for (path, _) in &plan.original_sources {
                     let proposal = plan.migration_proposals.get(path).ok_or_else(|| {
                         format!(

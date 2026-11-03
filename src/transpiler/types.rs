@@ -264,7 +264,11 @@ pub(crate) fn import_nullable_annotation(
 /// Generated annotations carry their identity until the final import decision.
 /// An existing annotation or ordinary type with the same short name keeps its
 /// own binding. Only annotation-name nodes are shortened; literals stay data.
-fn import_generated_annotation(body: &str, imports: &[String], name: &str) -> (String, bool) {
+pub(crate) fn import_generated_annotation(
+    body: &str,
+    imports: &[String],
+    name: &str,
+) -> (String, bool) {
     let simple = name.rsplit('.').next().unwrap();
     if !body.contains(name)
         || imports

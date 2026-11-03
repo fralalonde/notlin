@@ -3498,6 +3498,13 @@ impl SourceIndex {
                 && member.visibility.as_deref() != Some("private"))
             .then_some((member, name))
         }) {
+            let getter_name = match property.kind {
+                MemberKind::Property => self
+                    .property_accessor_names(provider, property)
+                    .getter(&property.name),
+                MemberKind::Method => Some(property.name.clone()),
+                _ => None,
+            };
             let inferred_property_type = property
                 .type_name
                 .is_none()
@@ -3531,9 +3538,20 @@ impl SourceIndex {
                     };
                     let retained_descendant = self.declaration_retained(descendant, retained)
                         || !self.is_selected(&descendant_file.path, translation_roots);
-                    if !retained_descendant
-                        || declaration_declares_property_getter(descendant, &property_name)
-                    {
+                    if !retained_descendant {
+                        continue;
+                    }
+                    let Some(getter_name) = getter_name.as_deref() else {
+                        return Some(DefaultGetterConflict {
+                            provider: crate::semantics::workspace_symbol(self, provider),
+                            implementation: crate::semantics::workspace_symbol(self, descendant),
+                            competing_owner: crate::semantics::workspace_symbol(self, provider),
+                            property: property_name.clone(),
+                            provider_type: property_type.map(str::to_owned),
+                            competing_type: None,
+                        });
+                    };
+                    if declaration_declares_property_getter(self, descendant, getter_name) {
                         continue;
                     }
 
@@ -3656,16 +3674,24 @@ impl SourceIndex {
                                 &owner_bindings,
                             );
                             for inherited in parent.members.iter().filter(|member| {
-                                member_is_property_getter(member, &property_name)
+                                member_is_property_getter(self, parent, member, getter_name)
                                     && !member.is_static
                             }) {
                                 let inherited_type = inherited.type_name.clone().or_else(|| {
                                     self.inferred_simple_property_type(parent, inherited)
                                         .map(|(ty, _)| ty)
                                 });
-                                let effective_type = inherited_type.as_deref().and_then(|ty| {
-                                    canonical_getter_type(self, parent, ty, &parent_bindings)
-                                });
+                                let unknown_getter_name = inherited.kind == MemberKind::Property
+                                    && self
+                                        .property_accessor_names(parent, inherited)
+                                        .getter(&inherited.name)
+                                        .is_none();
+                                let effective_type = inherited_type
+                                    .as_deref()
+                                    .filter(|_| !unknown_getter_name)
+                                    .and_then(|ty| {
+                                        canonical_getter_type(self, parent, ty, &parent_bindings)
+                                    });
                                 inherited_getters.push((
                                     parent,
                                     inherited_type,
@@ -3677,6 +3703,21 @@ impl SourceIndex {
                             parent_path.insert(parent_identity);
                             ancestors.push((parent, parent_bindings, parent_path));
                         }
+                    }
+
+                    let class_contracts = inherited_getters
+                        .iter()
+                        .map(|(owner, _, canonical, member)| {
+                            default_getters::GetterContract::new(
+                                self,
+                                owner,
+                                member,
+                                canonical.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if default_getters::class_method_implements_getters(self, &class_contracts) {
+                        continue;
                     }
 
                     // A single provider declaration without any competing
@@ -3802,7 +3843,7 @@ impl SourceIndex {
                                         self,
                                         descendant,
                                         provider,
-                                        &property_accessor_name(&property_name),
+                                        getter_name,
                                         retained,
                                         translation_roots,
                                     ))
@@ -5164,14 +5205,6 @@ fn declaration_key(declaration: &Declaration) -> String {
     }
 }
 
-fn property_getter_name(property: &str) -> String {
-    let mut chars = property.chars();
-    match chars.next() {
-        Some(first) => format!("get{}{}", first.to_uppercase(), chars.as_str()),
-        None => "get".to_string(),
-    }
-}
-
 fn property_name_from_getter(getter: &str) -> Option<String> {
     let suffix = getter.strip_prefix("get")?;
     let mut chars = suffix.chars();
@@ -5196,21 +5229,37 @@ fn member_property_contract_name(member: &Member) -> Option<String> {
     }
 }
 
-fn member_is_property_getter(member: &Member, property: &str) -> bool {
+fn member_is_property_getter(
+    index: &SourceIndex,
+    owner: &Declaration,
+    member: &Member,
+    getter: &str,
+) -> bool {
     !member.is_static
         && member.visibility.as_deref() != Some("private")
-        && (member.kind == MemberKind::Property && member.name == property
+        && (member.kind == MemberKind::Property
+            && index
+                .property_accessor_names(owner, member)
+                .getter(&member.name)
+                .is_none_or(|name| name == getter)
             || member.kind == MemberKind::Method
                 && member.parameter_types.is_empty()
-                && property_name_from_getter(&member.name).as_deref() == Some(property)
-                && member.name == property_getter_name(property))
+                && member.name == getter)
 }
 
-fn declaration_declares_property_getter(declaration: &Declaration, property: &str) -> bool {
-    declaration
-        .members
-        .iter()
-        .any(|member| member_is_property_getter(member, property))
+fn declaration_declares_property_getter(
+    index: &SourceIndex,
+    declaration: &Declaration,
+    getter: &str,
+) -> bool {
+    declaration.members.iter().any(|member| {
+        member_is_property_getter(index, declaration, member, getter)
+            && (member.kind != MemberKind::Property
+                || index
+                    .property_accessor_names(declaration, member)
+                    .getter(&member.name)
+                    .is_some())
+    })
 }
 
 fn paths_match(left: &Path, right: &Path) -> bool {

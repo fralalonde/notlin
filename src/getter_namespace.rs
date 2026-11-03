@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use tree_sitter::Node;
 
+mod references;
+
 #[derive(Default)]
 pub(crate) struct NameSplits {
     edits: HashMap<PathBuf, Vec<Edit>>,
@@ -310,7 +312,7 @@ struct Split {
 /// Kotlin rejects @JvmName on plugin-opened methods even though the JVM supports
 /// the independent descriptors. Preserve virtual dispatch and scope the opt-out
 /// to that diagnostic; merge an existing annotation instead of repeating it.
-fn name_suppression(
+pub(crate) fn name_suppression(
     index: &SourceIndex,
     file: &crate::workspace::SourceFile,
     function: Node<'_>,
@@ -598,17 +600,29 @@ pub(crate) fn plan(
             {
                 continue;
             }
-            if node.kind() == "callable_reference"
-                && node.utf8_text(source.as_bytes()).ok().is_some_and(|text| {
-                    method_names
-                        .iter()
-                        .any(|name| text.trim_end().ends_with(name))
-                })
-            {
-                return Err(format!(
-                    "getter namespace repair needs a bound callable-reference plan in {}",
-                    file.path.display()
-                ));
+            if let Some(selector) = references::selector(node, source) {
+                let name = selector
+                    .utf8_text(source.as_bytes())
+                    .unwrap_or("")
+                    .trim_matches('`');
+                if !method_names.contains(name) {
+                    continue;
+                }
+                let target = references::resolve(index, file, source, node, name, &provider)?;
+                if let Some(split) = splits.get(&target) {
+                    if !selected.contains_key(&file.path) {
+                        return Err(format!(
+                            "getter namespace reference is outside selected sources: {}",
+                            file.path.display()
+                        ));
+                    }
+                    edits.entry(file.path.clone()).or_default().push(Edit {
+                        start: selector.start_byte(),
+                        end: selector.end_byte(),
+                        text: split.alias.clone(),
+                    });
+                }
+                continue;
             }
             if node.kind() != "call_expression" || semantics::call_argument_count(node) != 0 {
                 continue;

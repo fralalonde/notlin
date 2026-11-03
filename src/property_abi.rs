@@ -3996,6 +3996,23 @@ pub(crate) fn repaired_callsite_contracts_with_persisted(
                 let Some((property, getter)) = getter_property(&method.name) else {
                     continue;
                 };
+                if index
+                    .property_in_type(&source_file.path, &owner_type, &property)
+                    .is_some_and(|(property_owner, property_member)| {
+                        property_owner.language == SourceLanguage::Kotlin
+                            && index
+                                .property_accessor_names(property_owner, property_member)
+                                .getter(&property)
+                                .as_deref()
+                                != Some(method.name.as_str())
+                    })
+                {
+                    // A live property and an independent bean-shaped method
+                    // have separate Kotlin roles. The method is not evidence
+                    // that this property's getter was repaired in an earlier
+                    // round, including when the property is inherited.
+                    continue;
+                }
                 let Some(type_name) = method.type_name.as_deref() else {
                     continue;
                 };
@@ -6461,6 +6478,105 @@ mod tests {
 
     fn api_java() -> &'static str {
         "// NOTLIN: generated from Api.kt\npackage sample;\npublic interface Api { String getName(); boolean getEnabled(); void setEnabled(boolean value); }\n"
+    }
+
+    #[test]
+    fn parallel_property_getter_role_is_not_recovered_from_a_bean_function() {
+        for inherited in [false, true] {
+            let fixture = Fixture::new();
+            let source = if inherited {
+                "package sample\nclass Wide(val value:String)\ninterface Root { @kotlin.Suppress(\"INAPPLICABLE_JVM_NAME\") @get:kotlin.jvm.JvmName(\"readId\") val id:Wide }\ninterface Api:Root {fun getId():Wide=id;fun value():String=id.value}\n@kotlin.Suppress(\"INAPPLICABLE_JVM_NAME\") class Owner(@get:kotlin.jvm.JvmName(\"readId\") override val id:Wide):Api {override fun getId():Wide=id}\n"
+            } else {
+                "package sample\nclass Wide(val value:String)\ninterface Api { @kotlin.Suppress(\"INAPPLICABLE_JVM_NAME\") @get:kotlin.jvm.JvmName(\"readId\") val id:Wide;fun getId():Wide=id;fun value():String=id.value}\n@kotlin.Suppress(\"INAPPLICABLE_JVM_NAME\") class Owner(@get:kotlin.jvm.JvmName(\"readId\") override val id:Wide):Api {override fun getId():Wide=id}\n"
+            };
+            let path = fixture.write("Api.kt", source);
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let contracts = repaired_callsite_contracts(&index, &HashSet::new());
+            assert!(
+                !contracts
+                    .iter()
+                    .any(|contract| contract.owner_type == "sample.Api"
+                        && contract.property == "id"
+                        && contract.getter == "getId"),
+                "a bean function is independent of the live Kotlin property: {contracts:?}"
+            );
+            let (repaired, _) =
+                crate::property_callsite::rewrite_file(&index, &path, source, &contracts);
+            assert!(
+                repaired.contains("fun value():String=id.value"),
+                "{repaired}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_former_property_method_still_recovers_its_real_backing_bridge() {
+        let fixture = Fixture::new();
+        fixture.write("Api.kt", "package sample\nclass Wide\ninterface Api {fun getId():Wide}\nclass Owner(@JvmField val id:Wide):Api {override fun getId():Wide=id}\n");
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let contracts = repaired_callsite_contracts(&index, &HashSet::new());
+        assert!(
+            contracts
+                .iter()
+                .any(|contract| contract.owner_type == "sample.Api"
+                    && contract.property == "id"
+                    && contract.getter == "getId"),
+            "{contracts:?}"
+        );
+    }
+
+    #[test]
+    fn physical_property_interface_stays_bridgeable_while_its_base_remains_kotlin() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "Api.kt",
+            r#"package sample
+open class Wide
+class Narrow:Wide()
+@kotlin.Suppress("INAPPLICABLE_JVM_NAME")
+interface Api {
+    @get:kotlin.jvm.JvmName("readId") var id:Wide
+    fun getId():Wide=id
+}
+@kotlin.Suppress("INAPPLICABLE_JVM_NAME")
+open class Base(@get:kotlin.jvm.JvmName("readId") override var id:Wide):Api {
+    suspend fun keep() {}
+    override fun getId():Wide=id
+}
+open class Child(id:Wide):Base(id) { override fun getId():Narrow=Narrow() }
+interface Marker:Api
+class Leaf(id:Wide):Child(id),Marker
+"#,
+        );
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let target = index
+            .declarations()
+            .find(|declaration| declaration.name == "Api")
+            .unwrap();
+        assert!(is_property_interface_candidate(target), "{target:#?}");
+        let retained = index
+            .kotlin_files()
+            .flat_map(|file| &file.declarations)
+            .map(|owner| crate::semantics::workspace_symbol(&index, owner))
+            .collect();
+        let result =
+            retained_subtypes_bridge(&index, target, &retained, std::slice::from_ref(&fixture.0));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            index
+                .covariant_default_getter_bridges(&fixture.0.join("Api.kt"), "Leaf")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            index
+                .default_property_getter_conflict(
+                    target,
+                    &retained,
+                    std::slice::from_ref(&fixture.0)
+                )
+                .is_none()
+        );
     }
 
     #[test]

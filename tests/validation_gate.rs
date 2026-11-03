@@ -77,6 +77,8 @@ fn plan(
             source: generated_java.to_owned(),
             owners: Vec::new(),
         }],
+        supporting_java: HashMap::new(),
+        java_bindings: Vec::new(),
         final_plans: Vec::new(),
         translation_plans: HashMap::new(),
         migration_proposals: HashMap::new(),

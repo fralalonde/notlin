@@ -13,6 +13,8 @@ mod eager_collection_helpers;
 pub mod facts;
 pub mod function_callsite;
 mod getter_namespace;
+pub mod getter_normalization;
+pub mod java_bindings;
 pub mod java_ir;
 mod jvm_primitive;
 pub mod jvm_validation;

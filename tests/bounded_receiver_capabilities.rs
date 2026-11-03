@@ -83,6 +83,42 @@ fn assert_not_established<T: std::fmt::Debug>(fact: FactStatus<T>, context: &str
 }
 
 #[test]
+fn a_property_type_parameter_exposes_its_bound_methods() {
+    let file = "Node.kt";
+    let source = r#"package capability
+interface Id
+interface HasId<I:Id> { fun getId():I }
+interface Lookup<I:Id>:HasId<I>
+interface Node<T:Lookup<I>,I:Id>:Lookup<I> {
+    val data:T
+    override fun getId():I=data.getId()
+}
+"#;
+    let index = provider(&[(file, source)]);
+    let target = required_call(source, file, &index, "getId");
+    assert!(matches!(target, FactStatus::Established(_)), "{target:?}");
+}
+
+#[test]
+fn a_bounded_property_does_not_supply_a_shadowed_or_unreadable_receivers_methods() {
+    for (declaration, body) in [
+        ("val data:T?", "data.getId()"),
+        (
+            "@get:kotlin.jvm.JvmName(\"renamed\") val data:T",
+            "data.getId()",
+        ),
+        ("val data:T", "run { val data=Other();data.getId() }"),
+    ] {
+        let file = "Node.kt";
+        let source = format!(
+            "package capability\ninterface Id\ninterface HasId<I:Id>{{ fun getId():I }}\nclass Other\ninterface Node<T:HasId<I>,I:Id>{{ {declaration};fun value():I={body} }}\n"
+        );
+        let index = provider(&[(file, &source)]);
+        assert_not_established(required_call(&source, file, &index, "getId"), &source);
+    }
+}
+
+#[test]
 fn bounded_type_parameter_return_grants_only_member_lookup_capability() {
     let file = "GenericOwner.kt";
     let source = r#"package capability

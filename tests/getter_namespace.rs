@@ -6,14 +6,13 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 const ROOT: &str = "package sample\ninterface Root { var id:Any }\n";
 const BASE: &str = "package sample\nimport jakarta.persistence.MappedSuperclass\n@MappedSuperclass abstract class Base(override var id:Any):Root\n";
-const CHILD: &str = "package sample\nclass Before\nopen class Child(id:Any):Base(id) {var calls:Int=0\nfun getId():String {calls++;return id.toString()+\"/narrow\"}\nsuspend fun keep() {} }\nclass After\n";
-const LEAF: &str =
-    "package sample\nclass Leaf(id:Any):Child(id)\nclass Unrelated(val label:String)\n";
-const CALLER: &str = "package sample\nclass Caller { fun read(child:Child,base:Base):String=base.id.toString()+\"/\"+child.getId()\nsuspend fun keep() {} }\n";
+const CHILD: &str = "package sample\nclass Before\nopen class Child(id:Any):Base(id) {var calls:Int=0\nfun getId():String {calls++;return id.toString()+\"/narrow\"}\nfun getId(kind:String):String {calls++;return id.toString()+\"/\"+kind}\nfun ownReference():String {val ref:()->String=::getId;return ref()}\nsuspend fun keep() {} }\nclass After\n";
+const LEAF: &str = "package sample\nclass Leaf(id:Any):Child(id)\nclass Unrelated(val label:String) {fun getId():String=label}\n";
+const CALLER: &str = "package sample\nclass Caller { fun read(child:Child,base:Base):String=base.id.toString()+\"/\"+child.getId()\nfun references(child:Child):String {\nval bound:()->String=child::getId\nval unbound:(Child)->String=Child::getId\nval inherited:(Leaf)->String=Leaf::getId\nval typed:(String)->String=child::getId\nval unrelated:(Unrelated)->String=Unrelated::getId\nreturn bound()+\"|\"+unbound(child)+\"|\"+inherited(child as Leaf)+\"|\"+typed(\"T\")+\"|\"+unrelated(Unrelated(\"other\"))\n}\nsuspend fun keep() {} }\n";
 const JAVA_CALLER: &str =
     "package sample\nclass JavaCaller {fun read(child:Child):String=child.getId()}\n";
 const PROBE: &str = "package sample; public class Probe {public static String read(Child child,Base base){return base.getId()+\"/\"+child.getId();}}\n";
-const RUNNER: &str = "package sample\nfun main(){val child:Child=Leaf(\"wide\");val base:Base=child;println(Caller().read(child,base));println(JavaCaller().read(child));println(Probe.read(child,base));base.id=\"set\";println(Caller().read(child,base));println(Probe.read(child,base));println(child.calls)}\n";
+const RUNNER: &str = "package sample\nfun main(){val child:Child=Leaf(\"wide\");val base:Base=child;println(Caller().read(child,base));println(JavaCaller().read(child));println(Probe.read(child,base));base.id=\"set\";println(Caller().read(child,base));println(Probe.read(child,base));println(Caller().references(child));println(child.ownReference());println(child.calls)}\n";
 const ANNOTATION: &str = "package jakarta.persistence; @java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE) public @interface MappedSuperclass {}\n";
 
 fn root(label: &str) -> PathBuf {
@@ -90,6 +89,19 @@ fn translate(root: &Path, lombok: bool) {
     assert!(child.contains("@kotlin.jvm.JvmName(\"getId\")"), "{child}");
     assert!(child.contains("fun notlinGetId()"), "{child}");
     assert!(caller.contains("child.notlinGetId()"), "{caller}");
+    for reference in [
+        "child::notlinGetId",
+        "Child::notlinGetId",
+        "Leaf::notlinGetId",
+    ] {
+        assert!(caller.contains(reference), "{caller}");
+    }
+    assert!(
+        caller.contains("val typed:(String)->String=child::getId"),
+        "{caller}"
+    );
+    assert!(caller.contains("Unrelated::getId"), "{caller}");
+    assert!(child.contains("::notlinGetId"), "{child}");
     assert_eq!(fs::read_to_string(root.join("Runner.kt")).unwrap(), RUNNER);
 }
 
@@ -103,7 +115,7 @@ fn fresh_conversion_splits_getter_names_before_property_calls_are_rewritten() {
 }
 
 #[test]
-#[ignore = "requires JVM tools, Kotlin stdlib, all-open plugin and Lombok in NOTLIN_* variables"]
+#[ignore = "requires JVM tools, Kotlin stdlib, all-open, Kotlin Lombok plugin and Lombok in NOTLIN_* variables"]
 fn real_toolchain_preserves_wide_and_narrow_getters_for_kotlin_and_java_callers() {
     let base = root("native");
     let jars = ["NOTLIN_KOTLIN_STDLIB", "NOTLIN_LOMBOK"]
@@ -152,6 +164,12 @@ fn real_toolchain_preserves_wide_and_narrow_getters_for_kotlin_and_java_callers(
         if all_open {
             kotlin.arg(format!("-Xplugin={}", PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_ALLOPEN_PLUGIN").unwrap()).display())).args(["-P", "plugin:org.jetbrains.kotlin.allopen:annotation=jakarta.persistence.MappedSuperclass"]);
         }
+        if lombok {
+            kotlin.arg(format!(
+                "-Xplugin={}",
+                PathBuf::from(std::env::var_os("NOTLIN_KOTLIN_LOMBOK_PLUGIN").unwrap()).display()
+            ));
+        }
         run(&root, "kotlinc", kotlin.args(&files));
         run(
             &root,
@@ -180,7 +198,7 @@ fn real_toolchain_preserves_wide_and_narrow_getters_for_kotlin_and_java_callers(
             .replace("\r\n", "\n");
         assert_eq!(
             output,
-            "wide/wide/narrow\nwide/narrow\nwide/wide/narrow\nset/set/narrow\nset/set/narrow\n5\n",
+            "wide/wide/narrow\nwide/narrow\nwide/wide/narrow\nset/set/narrow\nset/set/narrow\nset/narrow|set/narrow|set/narrow|set/T|other\nset/narrow\n10\n",
             "{label}"
         );
         if let Some(original) = &original {

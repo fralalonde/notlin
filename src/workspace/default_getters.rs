@@ -391,11 +391,156 @@ struct Getter<'a> {
 }
 
 #[derive(Clone)]
-struct GetterContract<'a> {
+pub(super) struct GetterContract<'a> {
     owner: &'a Declaration,
     member: &'a Member,
     canonical_return: Option<super::CanonicalGetterType>,
     erased_return: Option<super::CanonicalGetterType>,
+}
+
+impl<'a> GetterContract<'a> {
+    pub(super) fn new(
+        index: &SourceIndex,
+        owner: &'a Declaration,
+        member: &'a Member,
+        canonical_return: Option<super::CanonicalGetterType>,
+    ) -> Self {
+        let canonical_return = if member.kind == MemberKind::Method
+            && index.declaration_source_file(owner).is_none_or(|file| {
+                !super::getter_has_no_method_type_parameters(file, owner, &member.name)
+            }) {
+            None
+        } else {
+            canonical_return
+        };
+        Self {
+            owner,
+            member,
+            canonical_return,
+            erased_return: erased_return(index, owner, member),
+        }
+    }
+}
+
+/// A class implementation wins over interface defaults. Different erased
+/// returns also need a bridge already supplied by that class's own override;
+/// inheriting an unrelated same-spelled Kotlin property does not prove one.
+pub(super) fn class_method_implements_getters(
+    index: &SourceIndex,
+    contracts: &[GetterContract<'_>],
+) -> bool {
+    let owner_is_subtype = |implementation: &Declaration, contract: &Declaration| {
+        let (Some(implementation_file), Some(contract_file)) = (
+            index.declaration_source_file(implementation),
+            index.declaration_source_file(contract),
+        ) else {
+            return false;
+        };
+        semantics::workspace_symbol(index, implementation)
+            == semantics::workspace_symbol(index, contract)
+            || super::proven_reference_subtype(
+                index,
+                implementation_file,
+                &super::declaration_key(implementation),
+                contract_file,
+                &super::declaration_key(contract),
+            )
+    };
+    contracts.iter().any(|implementation| {
+        if implementation.owner.kind == DeclarationKind::Interface
+            || implementation.member.kind != MemberKind::Method
+            || !implementation.member.has_body
+            || implementation.member.is_nullable
+            || !getter_is_public(implementation.member, implementation.owner)
+            || contracts.iter().any(|contract| {
+                contract.owner.kind != DeclarationKind::Interface
+                    && !owner_is_subtype(implementation.owner, contract.owner)
+            })
+        {
+            return false;
+        }
+        let (Some(result), Some(erasure)) = (
+            &implementation.canonical_return,
+            &implementation.erased_return,
+        ) else {
+            return false;
+        };
+        if contracts.iter().all(|contract| {
+            !contract.member.is_nullable
+                && contract.canonical_return.as_ref() == Some(result)
+                && contract.erased_return.as_ref() == Some(erasure)
+        }) {
+            return true;
+        }
+        if source_reference_declaration(index, result).is_none_or(|owner| owner.is_jvm_value_class)
+            || plain_method_override_status(index, implementation) != Some(true)
+        {
+            return false;
+        }
+        contracts.iter().all(|contract| {
+            let (Some(contract_result), Some(contract_erasure)) =
+                (&contract.canonical_return, &contract.erased_return)
+            else {
+                return false;
+            };
+            if result != contract_result
+                && !canonical_reference_subtype(index, result, contract_result)
+            {
+                return false;
+            }
+            if erasure == contract_erasure {
+                return true;
+            }
+            // A Kotlin function overrides functions, not a property with a
+            // coincidentally identical JVM getter name. A Java function can
+            // directly implement the compiled property contract as well.
+            contracts.iter().any(|bridge| {
+                bridge.erased_return.as_ref() == Some(contract_erasure)
+                    && (bridge.member.kind == MemberKind::Method
+                        || implementation.owner.language == SourceLanguage::Java)
+                    && (bridge.member.kind != MemberKind::Method
+                        || plain_method_override_status(index, bridge).is_some())
+                    && owner_is_subtype(implementation.owner, bridge.owner)
+            })
+        })
+    })
+}
+
+fn plain_method_override_status(
+    index: &SourceIndex,
+    contract: &GetterContract<'_>,
+) -> Option<bool> {
+    let file = index.declaration_source_file(contract.owner)?;
+    if !super::getter_has_no_method_type_parameters(file, contract.owner, &contract.member.name) {
+        return None;
+    }
+    let tree = index.source_tree(file)?;
+    let source = file.source_text();
+    let symbol = semantics::workspace_symbol(index, contract.owner);
+    let owner = exact_declaration_node(tree.root_node(), source, &file.path, &symbol)?;
+    let method = exact_member_node(owner, source, contract.member)?;
+    let mut pending = method
+        .named_children(&mut method.walk())
+        .filter(|node| node.kind() == "modifiers")
+        .collect::<Vec<_>>();
+    let mut overrides = contract.owner.language == SourceLanguage::Java;
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "annotation" | "marker_annotation") {
+            if contract.owner.language == SourceLanguage::Kotlin {
+                return None;
+            }
+            continue;
+        }
+        if node.child_count() == 0 {
+            match source[node.byte_range()].trim() {
+                "override" => overrides = true,
+                "suspend" | "external" | "expect" | "actual" => return None,
+                _ => {}
+            }
+        }
+        pending.extend(node.children(&mut node.walk()));
+    }
+    Some(overrides)
 }
 
 #[derive(Clone)]
@@ -2065,6 +2210,9 @@ impl SourceIndex {
                     "mutable getter contract `{method_name}` cannot be repaired with a getter bridge"
                 ));
             }
+            if !incomplete_hierarchy && class_method_implements_getters(self, &contracts) {
+                continue;
+            }
             // Generic arguments do not create a different JVM return
             // descriptor. Leave their compatibility to override planning;
             // only a change in the erased reference needs this bridge pass.
@@ -3601,6 +3749,26 @@ mod tests {
         assert!(
             index
                 .covariant_default_getter_bridges(&path, "NoGetter")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn identical_superclass_contract_needs_no_interface_default_bridge() {
+        let (_root, path, index) = index_for(
+            r#"
+            package sample
+            class Code {}
+            interface Api { fun getCode(): Code = Code() }
+            open class Base: Api { override fun getCode(): Code = Code() }
+            interface Marker: Api {}
+            class Child: Base(), Marker {}
+            "#,
+        );
+        assert!(
+            index
+                .covariant_default_getter_bridges(&path, "Child")
                 .unwrap()
                 .is_empty()
         );

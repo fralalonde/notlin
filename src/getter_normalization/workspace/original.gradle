@@ -1,0 +1,42 @@
+import groovy.json.JsonOutput
+
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+    def pairs = []
+    root.allprojects.each { project ->
+        def sets = project.extensions.findByName('sourceSets')
+        if (sets != null) sets.each { sourceSet -> pairs.add([project, sourceSet]) }
+    }
+    root.tasks.register('notlinOriginalGetterContexts') {
+        dependsOn pairs.collect { pair -> pair[0].tasks.named(pair[1].classesTaskName) }
+        doLast {
+            def contexts = []
+            pairs.each { pair ->
+                def project = pair[0]
+                def sourceSet = pair[1]
+                def compile = project.tasks.named(sourceSet.compileJavaTaskName).get()
+                def sources = sourceSet.allJava.files.findAll { it.name.endsWith('.java') }.sort { it.absolutePath }
+                if (!sources.isEmpty()) {
+                    def unsupported = compile.options.compilerArgs.findAll {
+                        !(it in ['-parameters', '-Werror', '-g', '-nowarn', '-Xlint', '--enable-preview']) &&
+                        !it.startsWith('-Xlint:') && !it.startsWith('-A')
+                    }
+                    if (!unsupported.isEmpty()) throw new GradleException("Unsupported Java attribution options: ${unsupported}")
+                    def compiler = compile.javaCompiler.get()
+                    def java = new File(compiler.executablePath.asFile.parentFile,
+                        System.getProperty('os.name').toLowerCase().contains('windows') ? 'java.exe' : 'java')
+                    contexts.add([
+                        sources: sources.collect { it.absolutePath },
+                        classpath: (sourceSet.output.classesDirs.files + sourceSet.compileClasspath.files).collect { it.absolutePath },
+                        processor_path: compile.options.annotationProcessorPath?.files?.collect { it.absolutePath } ?: [],
+                        java: java.absolutePath,
+                        release: compile.options.release.orNull ?: Integer.parseInt(compile.targetCompatibility.replace('1.', '')),
+                        enable_preview: compile.options.compilerArgs.contains('--enable-preview')
+                    ])
+                }
+            }
+            new File(System.getProperty('notlin.getter.contexts')).text = JsonOutput.toJson(contexts)
+            println("Compiled original sources and exported ${contexts.size()} Java contexts")
+        }
+    }
+}

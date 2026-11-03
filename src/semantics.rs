@@ -2751,6 +2751,17 @@ impl FileSemanticFacts {
                 let ty = explicit
                     .map(FactStatus::Established)
                     .unwrap_or(FactStatus::Unknown);
+                if id.kind == "property"
+                    && facts
+                        .plain_kotlin_getter_locations
+                        .contains(&(file.to_path_buf(), node.start_byte()))
+                    && let FactStatus::Established(ty) = &ty
+                    && let Some(bound) = returned_parameter_bound(source, node, ty)
+                {
+                    facts
+                        .return_bound_locations
+                        .insert((file.to_path_buf(), node.start_byte()), bound);
+                }
                 if let Some(nullability) = source_calls::reference_return_nullability(
                     source,
                     node,
@@ -7561,11 +7572,22 @@ fn resolve_capability_receiver_call<P: SemanticProvider + ?Sized>(
     name: &str,
     provider: &P,
 ) -> FactStatus<SymbolId> {
-    let Some(receiver) = explicit_receiver_node(call, callee)
-        .filter(|receiver| receiver.kind() == "call_expression")
-    else {
+    let Some(receiver) = explicit_receiver_node(call, callee) else {
         return FactStatus::Unknown;
     };
+    if matches!(receiver.kind(), "identifier" | "simple_identifier") {
+        let Some(property) = bounded_receiver_property(source, receiver, file, provider) else {
+            return FactStatus::Unknown;
+        };
+        let FactStatus::Established(capability) = provider.returned_receiver_capability(&property)
+        else {
+            return FactStatus::Unknown;
+        };
+        return resolve_public_instance_call(&capability.owner, call, name, provider);
+    }
+    if receiver.kind() != "call_expression" {
+        return FactStatus::Unknown;
+    }
     let Some(inner_callee) = call_callee_node(receiver) else {
         return FactStatus::Unknown;
     };
@@ -7603,6 +7625,38 @@ fn resolve_capability_receiver_call<P: SemanticProvider + ?Sized>(
         return FactStatus::Unknown;
     };
     resolve_public_instance_call(&capability.owner, call, name, provider)
+}
+
+/// Bind the actual property in the current dispatch owner before consulting
+/// its declared bound. A local, parameter or additional receiver cannot borrow
+/// a same-spelled property's capability.
+fn bounded_receiver_property<P: SemanticProvider + ?Sized>(
+    source: &str,
+    receiver: tree_sitter::Node<'_>,
+    file: &Path,
+    provider: &P,
+) -> Option<SymbolId> {
+    let name = receiver.utf8_text(source.as_bytes()).ok()?;
+    if is_proven_local_shadow(receiver, name, source) {
+        return None;
+    }
+    let owner = enclosing_dispatch_owner(source, receiver, file, provider)?;
+    let mut path = owner.owner_path.clone();
+    path.push(owner.name.clone());
+    let candidates = provider
+        .symbols_named(name)
+        .into_iter()
+        .filter(|member| {
+            member.id.file == owner.file
+                && member.id.owner_path == path
+                && member.id.kind == "property"
+                && member.id.receiver.is_none()
+        })
+        .collect::<Vec<_>>();
+    let [property] = candidates.as_slice() else {
+        return None;
+    };
+    Some(property.id.clone())
 }
 
 fn resolve_public_instance_call<P: SemanticProvider + ?Sized>(

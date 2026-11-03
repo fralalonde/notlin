@@ -61,24 +61,24 @@ fn property_interfaces_and_selected_descendants_translate() {
 
 #[test]
 fn retained_property_interface_names_the_first_unbridgeable_descendant() {
-    // Final getter collisions can be split. An open method family still needs
-    // coordinated descendant and caller repairs before its parent can move.
+    // Incompatible return types cannot become one Java override family.
+    // Preserve the first descendant's actionable bridge failure in the report.
     let root = Path::new("tests/tmp_scratch_property_interface_reason");
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root).unwrap();
     fs::write(
         root.join("enabled.kt"),
-        "package neutral.interfaces\ninterface IEnabledAware { val enabled: Any }\n",
+        "package neutral.interfaces\ninterface IEnabledAware { val enabled: Int }\n",
     )
     .unwrap();
     fs::write(
         root.join("middle.kt"),
-        "package neutral.interfaces\nopen class Middle(override val enabled: Any) : IEnabledAware\n",
+        "package neutral.interfaces\nopen class Middle(override val enabled: Int) : IEnabledAware\n",
     )
     .unwrap();
     fs::write(
         root.join("leaf.kt"),
-        "package neutral.interfaces\nopen class Leaf(enabled: Any) : Middle(enabled) { open fun getEnabled(): String = enabled.toString(); companion object Named }\n",
+        "package neutral.interfaces\nopen class Leaf(enabled: Int) : Middle(enabled) { open fun getEnabled(): String = enabled.toString(); companion object Named }\n",
     )
     .unwrap();
 

@@ -918,6 +918,26 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             crate::transpiler::types::import_jspecify_non_null(&qualified, imports);
         let (qualified, nullable_annotation) =
             crate::transpiler::types::import_nullable_annotation(&qualified, imports, self.annots);
+        let mut qualified = qualified;
+        let mut lombok_imports = Vec::new();
+        if self.lombok {
+            for name in [
+                "lombok.Data",
+                "lombok.Getter",
+                "lombok.Setter",
+                "lombok.Value",
+                "lombok.AllArgsConstructor",
+                "lombok.EqualsAndHashCode",
+            ] {
+                let (rewritten, used) = crate::transpiler::types::import_generated_annotation(
+                    &qualified, imports, name,
+                );
+                qualified = rewritten;
+                if used {
+                    lombok_imports.push(name);
+                }
+            }
+        }
         // Always rewrite the body region: the alias lowering above already
         // produced a replacement string, so the buffer's copy is stale.
         out.buf.truncate(import_anchor);
@@ -959,21 +979,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             }
             block.push_str(&format!("import {};\n", want));
         }
-        // Under --lombok the emitted @Data/@AllArgsConstructor need their
-        // imports; user-declared lombok imports (Lombok-flagged source) may
-        // already provide some — add only what's missing, exactly once.
-        if self.lombok {
-            for want in [
-                "lombok.Data",
-                "lombok.Getter",
-                "lombok.Setter",
-                "lombok.Value",
-                "lombok.AllArgsConstructor",
-                "lombok.EqualsAndHashCode",
-            ] {
-                if !imports.iter().any(|i| i == want) {
-                    block.push_str(&format!("import {};\n", want));
-                }
+        // Import only generated annotations that can use their short names.
+        // An unused import must not rebind an application type named Value,
+        // Data, Getter, etc. Conflicts retain the qualified annotation name.
+        for want in lombok_imports {
+            if !imports.iter().any(|i| i == want) {
+                block.push_str(&format!("import {};\n", want));
             }
         }
         // Keep source wildcard binding unchanged. Otherwise import only the
@@ -2639,7 +2650,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 params.iter().all(|(_, is_mutable, _, _)| !*is_mutable),
             );
             let primary_constructor_annotations = self.primary_constructor_annotations(decl);
-            let use_lombok_generated_members = lombok_annotation == "@Value"
+            let use_lombok_generated_members = lombok_annotation == "@lombok.Value"
                 && !self.primary_constructor_has_defaults(decl)
                 && primary_constructor_annotations.is_empty()
                 && !jpa_no_arg
@@ -3216,9 +3227,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 // Ordinary Kotlin classes inherit identity equality unless
                 // they explicitly override it. @Data would introduce value
                 // equality, hashing, and toString as an unintended side effect.
-                out.line("@Getter");
+                out.line("@lombok.Getter");
                 if lombok_class_setters {
-                    out.line("@Setter");
+                    out.line("@lombok.Setter");
                 }
                 // @AllArgsConstructor's synthesized ctor collides with the
                 // explicit super-forwarding ctor emitted below — only
@@ -3229,10 +3240,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 {
                     if let Some(contract) = self.constructor_property_contract(decl, &params) {
                         out.line(format!(
-                            "@AllArgsConstructor(onConstructor_ = {{{contract}}})"
+                            "@lombok.AllArgsConstructor(onConstructor_ = {{{contract}}})"
                         ));
                     } else {
-                        out.line("@AllArgsConstructor");
+                        out.line("@lombok.AllArgsConstructor");
                     }
                 }
             }
@@ -3256,7 +3267,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 // FIELD, which is the element the ORM reads.
                 let mut annotations = self.param_annotations(decl, fname);
                 if lombok_accessors && *is_mutable && !lombok_class_setters {
-                    annotations.push("@Setter".into());
+                    annotations.push("@lombok.Setter".into());
                 }
                 for annotation in annotations {
                     out.line(annotation);
@@ -3754,9 +3765,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
         ctor_props_all_final: bool,
     ) -> &'static str {
         if ctor_props_all_final && !self.class_body_declares_instance_fields(decl) {
-            "@Value"
+            "@lombok.Value"
         } else {
-            "@Data"
+            "@lombok.Data"
         }
     }
 
@@ -3771,7 +3782,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// complaint, Lombok's "supercall to java.lang.Object is pointless".
     fn emit_lombok_equals_call_super(&self, decl: tree_sitter::Node<'tree>, out: &mut JavaOut) {
         if self.superclass_name(decl).is_some() {
-            out.line("@EqualsAndHashCode(callSuper = true)");
+            out.line("@lombok.EqualsAndHashCode(callSuper = true)");
         }
     }
 
@@ -5575,7 +5586,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                 _ => false,
             });
         if lombok_accessors {
-            out.line("@Getter");
+            out.line("@lombok.Getter");
         }
         // Java-native declaration annotations pass through verbatim
         // (collected during the modifiers scan above).
@@ -5629,7 +5640,7 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
                     // Lombok supports type-level @Getter on enums, but its
                     // @Setter handler accepts only classes and fields.
                     if *is_mutable && self.param_setter_annotations(decl, fname).is_empty() {
-                        out.line("@Setter");
+                        out.line("@lombok.Setter");
                     }
                 }
                 out.line(format!("private {}{} {};", final_kw, ftype, fname));
