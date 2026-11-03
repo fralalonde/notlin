@@ -37,6 +37,7 @@ mod platform_constructors;
 mod platform_members;
 mod property_getter_equivalence;
 mod reified_calls;
+pub(crate) mod source_cache;
 mod source_calls;
 pub(crate) mod string_join;
 pub use source_calls::OrdinarySourceCall;
@@ -2451,7 +2452,7 @@ pub struct SyntaxSemanticProvider {
 /// Facts from one source parse, before any workspace name resolution.
 /// Collect independently, then merge in input order to preserve symbol and
 /// duplicate-location ordering. No parser tree survives collection.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FileSemanticFacts {
     symbols: Vec<SemanticSymbol>,
     aliases: BTreeMap<(String, String), TypeAliasDefinition>,
@@ -2942,7 +2943,7 @@ impl AnalyzedSource {
 /// Syntax-only relations from one parse. Resolve their byte locations against
 /// the complete provider after module identities and all file indexes exist.
 /// Keeping compact facts here avoids retaining whole syntax trees.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FileRelations {
     supertypes: Vec<(usize, Vec<String>)>,
     companions: Vec<CompanionLocation>,
@@ -2950,6 +2951,7 @@ struct FileRelations {
     jackson_defaults: jackson_defaults::FileRelations,
 }
 
+#[derive(Clone)]
 struct CompanionLocation {
     owner_start: usize,
     start: usize,
@@ -2958,6 +2960,26 @@ struct CompanionLocation {
 }
 
 impl SyntaxSemanticProvider {
+    /// Reuse only facts derived from each exact file snapshot. Name resolution,
+    /// inheritance, constructor metadata and Jackson relationships are rebuilt
+    /// against all files in the current workspace on every call.
+    pub(crate) fn from_workspace(index: &crate::workspace::SourceIndex) -> Self {
+        let started = std::time::Instant::now();
+        let analyzed = index.semantic_sources.collect(&index.files);
+        let collection_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let provider = Self::from_analyzed_sources(String::new(), analyzed);
+        if std::env::var_os("NOTLIN_PROFILE").is_some() {
+            eprintln!(
+                "NOTLIN_PROFILE semantic facts ({} files): collect {:.3}s, resolve {:.3}s",
+                index.files.len(),
+                collection_time.as_secs_f64(),
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        provider
+    }
+
     fn standard_type_has_plain_jvm_name(&self, source: &str, name: &str) -> bool {
         standard_external_type(source, self, name, false).is_some_and(|canonical| {
             canonical.starts_with("java.")

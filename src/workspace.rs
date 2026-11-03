@@ -463,6 +463,9 @@ impl SourceFile {
 #[derive(Debug, Default)]
 pub struct SourceIndex {
     pub files: Vec<SourceFile>,
+    /// Pure syntax facts for exact source snapshots, shared across overlays.
+    /// This process-local cache does not change the disk cache or source I/O.
+    pub(crate) semantic_sources: crate::semantics::source_cache::SourceAnalysisCache,
     kotlin_jvm_defaults: jvm_defaults::Configuration,
     /// Accepted generated-member facts, never inferred from arbitrary Java text.
     generated_getters: Vec<crate::lombok_getter_contracts::GeneratedGetterContract>,
@@ -925,8 +928,10 @@ impl SourceIndex {
         let structural_imports = std::iter::repeat_with(std::sync::OnceLock::new)
             .take(files.len())
             .collect();
+        let semantic_sources = crate::semantics::source_cache::SourceAnalysisCache::new(&files);
         let mut index = Self {
             files,
+            semantic_sources,
             kotlin_jvm_defaults: jvm_defaults::Configuration::default(),
             generated_getters: Vec::new(),
             default_lombok_accessors: HashSet::new(),
@@ -1190,6 +1195,9 @@ impl SourceIndex {
             );
         }
         let mut index = Self::from_files(files);
+        index
+            .semantic_sources
+            .carry_from(&cache_source.semantic_sources);
         index.kotlin_jvm_defaults = self.kotlin_jvm_defaults.clone();
         index.set_generated_getters(cache_source.generated_getters.iter().cloned());
         index.set_default_lombok_accessors(cache_source.default_lombok_accessors.iter().cloned());

@@ -7,9 +7,9 @@ rest Kotlin. The output is a mixed source tree that compiles and runs — a
 partial migration, not an all-or-nothing sweep. Re-run it as the engine
 improves or as you edit blockers away; coverage climbs, the Kotlin shrinks.
 
-One engine makes every decision. A single file, a directory, or a whole repo
-reach the same verdict: there is no "fast mode" that splits a Java child from
-its Kotlin parent.
+Single-file, directory and repository commands use the same workspace planner.
+It checks parents and actual callers before selecting declarations; proven JVM
+default methods can let a Java class inherit a retained Kotlin implementation.
 
 ## Install
 
@@ -65,11 +65,11 @@ iterations; non-convergence fails the run without writing.
 
 ## What holds declarations back, and why the design looks like this
 
-The honest answer: **notlin has no Kotlin type checker.** The semantic provider
-extracts declaration, inheritance, and companion facts from the syntax — one
-parse per file, cross-file resolution by indexed identity — and grades every
-fact established, inferred, ambiguous, or unknown. Required unknowns retain
-their declaration. That single constraint explains everything else:
+The core planner is syntax driven. Its semantic provider collects declaration,
+inheritance and companion facts, resolves cross-file references by indexed
+identity, and can add observations from an optional JVM helper. Every fact is
+established, inferred, ambiguous or unknown; required unknowns retain their
+declaration. That constraint explains the migration boundaries:
 
 - **Ownership is a fixpoint, not a per-file choice.** Translating a class
   changes what its parents, children, and callers can do. The planner iterates
@@ -79,8 +79,8 @@ their declaration. That single constraint explains everything else:
 - **Hierarchy closure.** A retained Kotlin descendant cannot implement a
   translated-away parent's ABI (enum entries, `DefaultImpls`, KClass bridges);
   a declaration cannot move to Java ahead of a Kotlin parent that stays,
-  except through proven getter/method-ABI bridges. Parents and children move
-  together or stay together.
+  except through proven getter/method contracts or real JVM default methods.
+  Other parent/child families move together or stay together.
 - **Uncertain declarations stay Kotlin.** `suspend`/coroutines have no Java
   lowering and are retained outright. `value class`, `Nothing`, Kotlin
   constructor reflection (`callBy`), Jackson missing-vs-null, boxed numeric
@@ -99,8 +99,8 @@ their declaration. That single constraint explains everything else:
 So expect: high coverage on data/model/service shapes, interfaces and classes
 that translate as families, and an exact list of every declaration that didn't
 move with the reason it stayed. Don't expect: coroutine code, `inline value
-class` wrappers, or inferred types — those need the JVM-compiler analysis
-stage the architecture reserves a serializable contract for.
+class` wrappers, or unresolved inferred types — those need additional semantic
+or JVM-compiler facts.
 
 ## Verification
 
@@ -118,7 +118,7 @@ with real compilers. `DEV.md` has the environment variables and corpus layout.
 
 ## Status
 
-In development. JDK 25 is the CI baseline (27 locally). Lombok, commons-lang3
+In development. JDK 25 is the CI and native javac baseline. Lombok, commons-lang3
 and StreamEx may live on the receiving classpath; notlin uses them.
 Generated nullability annotations use JSpecify by default. In-place Gradle
 migrations configure `org.jspecify:jspecify` in affected projects; other builds

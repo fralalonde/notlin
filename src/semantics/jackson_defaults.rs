@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct FileRelations {
     classes: Vec<ClassFact>,
 }

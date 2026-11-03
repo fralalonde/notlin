@@ -14,25 +14,28 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct MetadataRelations {
     readers: Vec<ReaderSyntax>,
     factories: Vec<FactorySyntax>,
     concrete_classes: Vec<ConcreteClassSyntax>,
 }
 
+#[derive(Clone)]
 struct ReaderSyntax {
     owner_start: usize,
     reflection_start: usize,
     reflection_end: usize,
 }
 
+#[derive(Clone)]
 struct FactorySyntax {
     start: usize,
     builder_name: String,
     bound_name: String,
 }
 
+#[derive(Clone)]
 struct ConcreteClassSyntax {
     start: usize,
 }

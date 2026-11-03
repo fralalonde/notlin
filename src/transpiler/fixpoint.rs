@@ -367,12 +367,7 @@ fn plan_workspace_cold_mode(
         .map(|(file, _)| std::fs::canonicalize(file).ok())
         .collect();
     let semantic_started = std::time::Instant::now();
-    let mut semantic_provider = crate::semantics::SyntaxSemanticProvider::new(
-        index
-            .files
-            .iter()
-            .map(|file| (file.path.clone(), file.source_text().to_owned())),
-    );
+    let mut semantic_provider = crate::semantics::SyntaxSemanticProvider::from_workspace(index);
     let semantic_collect_elapsed = semantic_started.elapsed();
     let enrich_started = std::time::Instant::now();
     semantic_provider.enrich_workspace_type_facts(index);

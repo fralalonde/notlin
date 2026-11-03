@@ -4,7 +4,9 @@ Developer documentation. For user-facing usage see README.md.
 
 ## What it is
 
-notlin transpiles Kotlin source to Java (27+). `.kt` in, `.java` file(s) out.
+notlin transpiles Kotlin source to Java. `.kt` in, `.java` file(s) out.
+JDK 25 is the CI and native javac baseline; reference Gradle gates use the
+receiving project's configured Java toolchain.
 Nullability uses JSpecify `@Nullable`/`@NonNull` by default; the receiving Java
 classpath needs `org.jspecify:jspecify`. Lombok retains its runtime null checks.
 In-place Gradle migrations configure the dependency in affected projects, using
@@ -29,11 +31,14 @@ Behavior contract:
   change production behavior to satisfy assertions that already fail on the
   unconverted reference. Keep those failures visible and separate from new
   translation regressions; a failing Gradle build is still a failing gate.
-- **Reference build gate.** Acceptance requires exporting the clean reference
-  commit from `exp/kotlin-killer2`, running `notlin --in-place --lombok .` from
-  its root, and passing the
-  complete Gradle `build` on the resulting tree. Incremental translation trials
-  are useful for iteration but do not establish that a full conversion builds.
+- **Reference build gate.** Pin the clean reference commit from
+  `exp/kotlin-killer2` and establish its original behavior. For faster iteration,
+  start from its accepted translation baseline and run
+  `notlin --in-place --lombok .` from that copy's root. Preserve the previously
+  accepted declaration identities and Java files, then pass the complete Gradle
+  `build` on the resulting mixed tree. Label this evidence incremental; it does
+  not establish that a fresh conversion of pristine Kotlin builds. Claim a
+  pristine conversion only after that separate conversion and build pass.
   Do not hand-fix generated sources in the acceptance copy. Run Hastings dev
   startup after the build and inspect its runtime log for stack traces. Wait
   for `Done loading dev resources [customers/hastings/hastings-dev.csv]`;
@@ -90,6 +95,16 @@ The run has five boundaries:
    strictly parses candidates into `java_ir.rs` before accepting output.
 5. `migration_pipeline.rs` stages repairs and replans; `migrate.rs` applies the
    accepted transaction. Optional `jvm_validation.rs` compiles the staged tree.
+
+The workspace semantic cache stores only unresolved, file-local syntax facts.
+Entries are keyed by exact path and BLAKE3 source content and shared across
+compatible overlays. Each provider gets owned copies before module assignment
+and rebuilds name resolution, inheritance, companions and metadata relationships
+against the complete current workspace. Changed/deleted files and ambiguous
+parents therefore cannot reuse resolved answers from an older round. Publicly
+replaced `SourceIndex.files` snapshots are hash-checked and use fresh collection
+when the cache has no matching entry. The cache is process-local: `SourceFile`
+serialization, source discovery and disk-cache I/O are unchanged.
 
 `main.rs` and `cli.rs` provide the CLI. `translation_plan.rs` holds decisions,
 retention, and proof obligations; `coverage.rs` and `translation_advice.rs`
@@ -391,6 +406,39 @@ destructuring): their expected result is a **warning, not a failure** — see
 ```sh
 cargo fmt && cargo test && tools/e2e.sh
 ```
+
+## Semantic cache verification and performance
+
+`cargo test --lib semantics::source_cache` compares complete cached and fresh
+provider state, including cold/warm overlays, changed/deleted parents and aliases,
+duplicate classifiers, module identity, same-length edits and manually replaced
+public source snapshots. The ignored benchmark
+`benchmark_reference_semantic_collection_without_source_io` accepts
+`NOTLIN_SEMANTIC_BENCH_REFERENCE` and `NOTLIN_SEMANTIC_BENCH_REPORT`. Point it at a
+writable, isolated workspace copy and run:
+
+```sh
+cargo test --release --lib semantics::source_cache::tests::benchmark_reference_semantic_collection_without_source_io -- --ignored --exact --nocapture
+```
+
+Normal discovery happens before timing; every cold/warm provider must have the
+same complete-state fingerprint.
+
+Use `NOTLIN_PROFILE=1` to distinguish source indexing, semantic collection,
+workspace resolution, ownership preparation and caller repairs. Compare identical
+inputs and worker limits; stage speedups are not whole-run speedups. Record CPU,
+wall time and peak memory together. Syntax reuse trades retained facts for less
+repeated parsing, so the reference comparison records its memory cost too.
+
+On native Windows, POSIX helper-script tests can fail before their protocol is
+exercised. Keep the exact failing test identities visible and compare them with
+the accepted compiler; matching aggregate counts alone are insufficient. The
+concurrent-deletion scan test also has a scheduling-dependent warning assertion
+and can encounter Windows delete-pending `Access is denied` errors. Preserve
+initial failures and any unchanged reruns or accepted-binary controls. Neither a
+baseline failure nor a successful retry should be reported as an unconditional
+full-suite pass. CI's Linux suite and the native JVM comparison controls provide
+separate evidence.
 
 ## Debugging tips
 

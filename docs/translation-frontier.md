@@ -1,5 +1,55 @@
 # Translation frontier
 
+## CPU stabilization closeout — 2026-11-03
+
+The accepted incremental baseline remains **5336 / 6694 declarations (79.7%)**,
+with **8113 prior Java files preserved byte for byte**. This batch adds no
+translations. Control and candidate executable source bytes and full coverage
+agree; only absolute workspace paths inside 12 parsed generated diagnostic
+comments are normalized for comparison. Code, literals and other comments are
+preserved. The reference remains `exp/kotlin-killer2` at
+`3382c909b00c61725c80892cd26acc5917b4c7b6`. The live checkout was accessed read-only;
+validation uses isolated baseline copies and does not require changing its branch.
+
+Only unresolved file-local semantic collection is cached by path and content.
+Workspace resolution and metadata relationships are rebuilt on every round.
+Source discovery, disk-cache I/O and serialized `SourceFile` data are unchanged.
+Complete-state tests cover dependency changes, deletions, ambiguity, aliases,
+module names, same-length edits and public snapshot replacement. Top-down
+architecture and bottom-up implementation findings are in `architecture-review.md`.
+
+On 8500 source files, median semantic rebuilding is 11.985s fresh versus
+6.919s warm (42.3% less time). One complete two-worker
+baseline comparison measures 227.141s versus 215.860s
+wall time and 322.594s versus 303.562s parent
+CPU. Peak working set rises by
+240.3 MiB;
+peak private commit rises by
+248.5 MiB. The semantic
+speedup is not a whole-translation speedup.
+
+The complete Gradle build passes in 404.6s. All **3146 original
+test identities and outcomes match** (3070 pass, 76 skip). Hastings imports
+**9745 records**, then remains free of errors and stack traces for
+**105.9 seconds**. The tagged app is stopped and the
+independent cleanup check passes. Formatting, Clippy, all **16 native JVM
+controls** and all **four javac samples** pass. The Windows Rust run has
+**1730 passes, 63 baseline failures and 190 ignored tests**; failure identities
+match the accepted parent's initial run exactly. The additional concurrent-delete
+race is reproduced directly with the accepted compiler. Initial failures,+unchanged rerun and baseline control remain visible; this is not an all-green
+Rust suite. Linux CI is checked on the pushed closeout commit.
+
+Acceptance evidence: `target/cpu-semantic-reference-gate-20261103/acceptance.json`.
+Compiler evidence and reviews: `target/cpu-semantic-snapshots-20261103`.
+Binary SHA256: `5ddfff95493f7821f6057a98841d5c4c1521b2ec53357a20f9d32a1e884aec45`.
+All 470 runtime/test/tool inputs remain frozen through the gate.
+This accepts an incremental baseline conversion, not a fresh pristine conversion.
+The separate wildcard-import prototype is uncompiled and unaccepted; it stays
+isolated for a future resume. The translation goal is paused after commit/push
+at the user's request.
+
+## Previous accepted translation gain
+
 The accepted 2026-11-03 incremental conversion translates **5336 / 6694
 original declarations (79.7%)**, adding **979** to the 4357-owner
 baseline. Every accepted owner and all 7134 prior Java files are preserved.

@@ -390,3 +390,53 @@ Evidence is under `target/coverage-boost-20261027`: `clean-v3-input.json`,
 `clean-runtime-v3-validation.json`, `defaults-context-native.log` and
 `library-comparison.json`. The release binary SHA256 is
 `c0061c243b7b37426b30cc93d947d6945a47fca54799807da057549ed89d7ba0`.
+
+## Stabilization review — 2026-11-03
+
+The top-down pass followed source discovery, semantic collection/resolution,
+ownership convergence, Java acceptance and transaction application. The useful
+CPU boundary is unresolved per-file collection: it can be reused by exact source
+identity while inherited/default/getter contracts and caller binding are resolved
+against the current workspace. Caching resolved answers here would require a
+second dependency graph and could preserve obsolete parents or aliases. The
+existing planner, Java parser and source-receipt checks remain the write boundary.
+
+The bottom-up pass checked every runtime change in the semantic-cache batch:
+`SourceIndex` construction and overlays, path/content guards, `OnceLock`/`Arc`
+sharing, fact cloning, input order, module assignment, constructor/Jackson
+relations and the fixpoint integration. There is no global cache and no parser
+tree in an entry. Facts are shared only while their source indexes are live;
+owned clones enter the existing resolver. Replaced public snapshots fall back
+to fresh collection. Complete-state tests exercise stale/deleted dependencies,
+alias changes, duplicate declarations, moved paths and same-length edits.
+
+The 8,500-file release benchmark measured median semantic rebuilds of 11.985s
+fresh and 6.919s warm (42.3% less time). In one complete, two-worker baseline
+comparison, translation took 227.141s versus 215.860s (5.0% less wall time),
+with parent-process CPU of 322.594s versus 303.562s (5.9% less). Peak working
+set increased from 861,200,384 to 1,113,198,592 bytes, about 240 MiB. Peak private
+commit increased by about 248 MiB. These are stage-specific and single-pair
+end-to-end measurements, not a claim that every conversion is 42% faster.
+
+Source indexing and disk I/O remain unchanged. The remaining profile is dominated
+by static ownership preparation and property/caller repairs, rather than file
+reads. Future work should measure shared prepared facts across unchanged rounds
+and the cost of selected-source providers. Such reuse must include their semantic
+and ownership dependencies; an unchanged file hash alone cannot validate a
+resolved answer. Reducing duplicate owned identity/type storage is a possible
+memory improvement, but needs separate measurement and API review.
+
+Formatting, Clippy, all 16 native Kotlin/Java controls and four javac samples pass.
+The Windows Rust run has 1,730 passes, 190 ignored tests and 63 pre-existing
+failure identities matching the accepted parent's initial run exactly. The
+concurrent-deletion test first missed its timing-dependent warning; an unchanged
+rerun and the accepted compiler both hit Windows delete-pending access denial
+before semantic analysis. Both failure modes and the accepted-binary control
+remain recorded. This is baseline-equivalence evidence, not an all-green Rust
+suite. The accepted parent also passed the Linux CI check. Full application-gate
+results and the final accepted compiler belong in `translation-frontier.md`.
+
+The separate wildcard-import prototype has source and tests but is uncompiled
+and unaccepted. It remains outside production for a future resume. The requested
+closeout is the reviewed CPU batch, documentation, a passing application gate,
+commit/push and a paused translation goal.
