@@ -757,6 +757,12 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             let previous_returns_value = self.current_function_returns_value;
             let previous_return_type = self.current_function_return_type.replace("void".to_owned());
             self.current_function_returns_value = false;
+            let parameter_name = setter
+                .and_then(|setter| kt::child(setter, "identifier"))
+                .map(|parameter| self.text(parameter).to_owned())
+                .unwrap_or_else(|| name.clone());
+            let previous_bindings = std::mem::take(&mut self.var_types);
+            self.var_types.insert(parameter_name.clone(), ty.clone());
             // Kotlin `private set`: the setter exists but is private;
             // otherwise its visibility matches the property's.
             let set_vis = if setter
@@ -779,7 +785,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 if make_static { "static " } else { "" },
                 setter_name,
                 ty,
-                name
+                parameter_name
             ));
             match setter_body {
                 Some(sb) => {
@@ -796,7 +802,20 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                             && c.kind() != "="
                             && !matches!(c.kind(), "line_comment" | "block_comment")
                         {
-                            self.diag_untranslatable(c, "expression setters not yet supported");
+                            if matches!(
+                                c.kind(),
+                                "call_expression"
+                                    | "assignment"
+                                    | "if_expression"
+                                    | "throw_expression"
+                            ) {
+                                self.transpile_statement(c, out);
+                            } else {
+                                self.diag_untranslatable(
+                                    c,
+                                    "setter expression has no established void statement",
+                                );
+                            }
                         }
                     }
                 }
@@ -818,6 +837,7 @@ impl<'src, 'tree> Unit<'src, 'tree> {
             out.close();
             self.current_function_returns_value = previous_returns_value;
             self.current_function_return_type = previous_return_type;
+            self.var_types = previous_bindings;
         }
     }
 

@@ -304,24 +304,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     continue;
                 }
                 let id = kt::child(t, "identifier");
-                let bound = kt::child(t, "user_type").or_else(|| kt::child(t, "nullable_type"));
-                match (id, bound) {
-                    (Some(id), Some(bound)) => {
-                        let id_text = self.text(id).to_string();
-                        let bound = kt::java_type_ann(bound, self.source, self.annots);
-                        if bound == "Object" || bound == "Any" {
-                            parts.push(id_text);
-                        } else {
-                            parts.push(format!("{} extends {}", id_text, bound));
-                        }
-                    }
-                    (Some(id), None) => {
-                        // unbounded type param: `<T>` is valid Java
-                        parts.push(self.text(id).to_string());
-                    }
-                    (None, _) => {
-                        self.diag_untranslatable(t, "type parameter without a name");
-                    }
+                if let Some(parameter) = self.type_parameter_declaration(decl, t) {
+                    parts.push(parameter);
+                } else if id.is_none() {
+                    self.diag_untranslatable(t, "type parameter without a name");
                 }
                 // reified has no Java counterpart (inline-only); approximate
                 for m in t.children(&mut t.walk()) {

@@ -34,4 +34,5 @@ pub mod top_level_property_callsite;
 pub mod translation_advice;
 pub mod translation_plan;
 pub mod transpiler;
+mod type_parameter_bounds;
 pub mod workspace;

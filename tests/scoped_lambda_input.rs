@@ -565,7 +565,8 @@ fun <T> T.customLet(block: (Parcel) -> T): T = block(Parcel())
     }
 }
 
-/// Non-read positions and unproven bindings never gain a getter call.
+/// Typed collection elements can prove reads; references and unknown element
+/// types must not acquire that proof.
 #[test]
 fn non_read_positions_and_unproven_bindings_are_declined() {
     let scratch = Scratch::new("positions");
@@ -579,8 +580,11 @@ class Positions(val info: DerivedInfo) : Keyed {
 
     fun reference(): KProperty0<Key> = info.let { it::key }
 
-    fun throughUnknown(values: List<DerivedInfo>): Key = values.map { it.key }.first()
+    fun throughKnown(values: List<DerivedInfo>): Key = values.map { it.key }.first()
+    fun throughUnknown(unknown: List<Any?>): Key = unknown.map { it.key }.first()
 }
+
+private val Any?.key: Key get() = Key("extension")
 "#,
     );
     let files = c4().into_iter().chain([consumer]).collect::<Vec<_>>();
@@ -597,8 +601,12 @@ class Positions(val info: DerivedInfo) : Keyed {
         "a property reference is not a read position:\n{text}"
     );
     assert!(
-        text.contains("values.map { it.key }"),
-        "`map` binds its element, not its receiver, so the read is unproven:\n{text}"
+        text.contains("values.map { it.getKey() }"),
+        "the declared element type proves the property contract:\n{text}"
+    );
+    assert!(
+        text.contains("unknown.map { it.key }"),
+        "an unrelated extension on an unknown element is not that contract:\n{text}"
     );
 }
 

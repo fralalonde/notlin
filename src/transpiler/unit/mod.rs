@@ -21,6 +21,7 @@ pub(crate) use class::{
 };
 mod function;
 mod property;
+mod type_parameters;
 mod types_infer;
 
 pub(crate) use types_infer::{instance_property_count, primitive_array_factory};

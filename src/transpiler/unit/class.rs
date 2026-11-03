@@ -2161,23 +2161,8 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 if t.kind() != "type_parameter" {
                     continue;
                 }
-                if let Some(id) = kt::child(t, "identifier") {
-                    let id_text = self.text(id).to_string();
-                    match kt::child(t, "user_type").or_else(|| kt::child(t, "nullable_type")) {
-                        Some(bound) => {
-                            // A nullable Kotlin bound (`T : Foo?`) erases to
-                            // the same Java bound as `T : Foo`. Declaration
-                            // annotations are not valid between `extends` and
-                            // the bound for common annotation sets.
-                            let b = kt::java_type(bound, self.source);
-                            if b == "Object" || b == "Any" {
-                                parts.push(id_text);
-                            } else {
-                                parts.push(format!("{} extends {}", id_text, b));
-                            }
-                        }
-                        None => parts.push(id_text),
-                    }
+                if let Some(parameter) = self.type_parameter_declaration(decl, t) {
+                    parts.push(parameter);
                 }
                 // variance/reified modifiers inside type_parameter: untranslatable
                 for extra in t.children(&mut t.walk()) {
@@ -7233,6 +7218,17 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
             )
         }) {
             owner = owner.and_then(kt::parent_of);
+        }
+        let accessor_names = self.property_accessor_names(owner?, &property);
+        if (if getter {
+            accessor_names.getter(&property)
+        } else {
+            accessor_names.setter(&property)
+        })
+        .as_deref()
+            != Some(name)
+        {
+            return None;
         }
         let constructor_property = owner
             .and_then(|class| kt::child(class, "primary_constructor"))

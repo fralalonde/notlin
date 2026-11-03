@@ -42,6 +42,17 @@ impl<'a, 'src, 'tree> Stmt<'a, 'src, 'tree> {
             "line_comment" | "block_comment" | "multiline_comment" => {}
             "property_declaration" => self.transpile_local_property(stmt, out),
             "assignment" => self.transpile_assignment(stmt, out),
+            "unary_expression" => {
+                let mut expression = Expr { unit: self.unit };
+                let statements = expression
+                    .increment_statement(stmt)
+                    .unwrap_or_else(|| vec![expression.transpile(stmt)]);
+                for java in statements {
+                    if !java.is_empty() {
+                        out.line(format!("{java};"));
+                    }
+                }
+            }
             "return_expression" => self.transpile_return(stmt, out),
             "if_expression" => self.transpile_if(stmt, out),
             "for_statement" => self.transpile_for(stmt, out),

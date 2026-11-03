@@ -795,6 +795,20 @@ fn source_getter<'a>(
     source_value_member(index, owner, member)
 }
 
+pub(super) fn value_method_name(
+    index: &SourceIndex,
+    owner: &Declaration,
+    member: &Member,
+) -> Option<String> {
+    match member.kind {
+        MemberKind::Property => index
+            .property_accessor_names(owner, member)
+            .getter(&member.name),
+        MemberKind::Method => Some(member.name.clone()),
+        _ => None,
+    }
+}
+
 fn source_value_member<'a>(
     index: &SourceIndex,
     owner: &'a Declaration,
@@ -903,17 +917,11 @@ pub(super) fn proven_forwarding_expression(
     }
     let mut steps = Vec::with_capacity(names.len());
     for (position, access) in names.iter().enumerate() {
-        let accessor = access.method_name();
         let (owner, property, canonical) =
             forwarding_step(index, receiver.take()?, access, provider)?;
-        if position == 0
-            && accessor
-                == if member.kind == MemberKind::Property {
-                    property_accessor_name(&member.name)
-                } else {
-                    member.name.clone()
-                }
-        {
+        let accessor = value_method_name(index, owner, property)?;
+        record_name(&accessor);
+        if position == 0 && Some(&accessor) == value_method_name(index, target, member).as_ref() {
             // The default would read itself through the bridge.
             return None;
         }
@@ -1644,10 +1652,8 @@ impl SourceIndex {
                 {
                     continue;
                 }
-                let name = if member.kind == MemberKind::Property {
-                    property_accessor_name(&member.name)
-                } else {
-                    member.name.clone()
+                let Some(name) = value_method_name(self, route.declaration, member) else {
+                    return false;
                 };
                 if member.parameter_types.is_empty()
                     && self
@@ -1736,11 +1742,7 @@ impl SourceIndex {
                             return None;
                         }
                         let getter = source_value_member(self, child, own)?;
-                        let own_name = if own.kind == MemberKind::Property {
-                            property_accessor_name(&own.name)
-                        } else {
-                            own.name.clone()
-                        };
+                        let own_name = value_method_name(self, child, own)?;
                         (own_name == name
                             && !own.is_mutable
                             && !own.is_nullable
@@ -2001,7 +2003,7 @@ impl SourceIndex {
             .iter()
             .filter(|member| !member.is_static)
             .filter_map(|member| match member.kind {
-                MemberKind::Property => Some(property_accessor_name(&member.name)),
+                MemberKind::Property => value_method_name(self, owner, member),
                 MemberKind::Method if member.parameter_types.is_empty() => {
                     Some(member.name.clone())
                 }
@@ -2013,10 +2015,9 @@ impl SourceIndex {
         for ancestor in &hierarchy {
             for member in &ancestor.declaration.members {
                 if let Some(getter) = source_getter(self, ancestor.declaration, member) {
-                    let method_name = if member.kind == MemberKind::Property {
-                        property_accessor_name(&member.name)
-                    } else {
-                        member.name.clone()
+                    let Some(method_name) = value_method_name(self, ancestor.declaration, member)
+                    else {
+                        return Err(format!("unknown physical getter for `{}`", member.name));
                     };
                     if !own_getters.contains(&method_name) {
                         let canonical_return = if member.kind == MemberKind::Method
@@ -2134,11 +2135,8 @@ impl SourceIndex {
                 else {
                     blocked_default |= provider.members.iter().any(|member| {
                         source_getter(self, provider, member).is_some_and(|getter| {
-                            if getter.member.kind == MemberKind::Property {
-                                property_accessor_name(&getter.member.name) == method_name
-                            } else {
-                                getter.member.name == method_name
-                            }
+                            value_method_name(self, provider, getter.member).as_deref()
+                                == Some(method_name.as_str())
                         })
                     });
                     continue;
@@ -2466,6 +2464,45 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(index.getter_bridge_cache.entries.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn physical_property_names_do_not_merge_with_independent_bean_defaults() {
+        let (_root, path, index) = index_for(
+            r#"package sample
+            open class Wide
+            interface Stored {
+                @get:kotlin.jvm.JvmName("readId") var id: Wide
+            }
+            interface Bean { fun getId(): Wide = Wide() }
+            abstract class Leaf : Stored, Bean
+            "#,
+        );
+        assert!(
+            index
+                .covariant_default_getter_bridges(&path, "Leaf")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(index.enum_default_obligations(&path, "Leaf").is_empty());
+    }
+
+    #[test]
+    fn an_unknown_physical_property_name_is_not_guessed_from_the_logical_name() {
+        let (_root, path, index) = index_for(
+            r#"package sample
+            open class Wide
+            interface Stored { @get:kotlin.jvm.JvmName(computed) val id: Wide }
+            interface Bean { fun getId(): Wide = Wide() }
+            abstract class Leaf : Stored, Bean
+            "#,
+        );
+        assert!(
+            index
+                .covariant_default_getter_bridges(&path, "Leaf")
+                .unwrap_err()
+                .contains("unknown physical getter")
+        );
     }
 
     #[test]

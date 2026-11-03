@@ -230,6 +230,25 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 }
             }
             "navigation_expression" => self.infer_navigation(expr),
+            "unary_expression"
+                if expr
+                    .children(&mut expr.walk())
+                    .any(|child| matches!(self.text(child).trim(), "++" | "--")) =>
+            {
+                let Some(operand) = expr.named_children(&mut expr.walk()).next() else {
+                    return "Object".into();
+                };
+                let ty = self.infer_type(operand);
+                if JvmPrimitive::java(&ty).is_some_and(|primitive| primitive.java != "boolean") {
+                    ty
+                } else {
+                    self.diag_untranslatable(
+                        expr,
+                        "increment result has no established primitive representation",
+                    );
+                    "Object".into()
+                }
+            }
             // elvis arrives as binary_expression with `?:` — its Kotlin type
             // is the RIGHT arm's type (`a ?: 0` -> Int). Inferred BEFORE the
             // generic infix arm (match order).

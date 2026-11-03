@@ -64,11 +64,7 @@ pub(crate) fn remember_emitted_property_contracts(
         .java_files()
         .filter(|file| generated_java.contains(&file.path))
     {
-        for owner in file
-            .declarations
-            .iter()
-            .filter(|owner| owner.kind == DeclarationKind::Interface)
-        {
+        for owner in &file.declarations {
             let symbol = crate::semantics::workspace_symbol(index, owner);
             let mut path = symbol.owner_path.clone();
             path.push(symbol.name);
@@ -4028,6 +4024,32 @@ pub(crate) fn repaired_callsite_contracts_with_persisted(
                     property,
                     getter,
                     setter,
+                });
+            }
+        }
+    }
+    // A source property can coexist with a bean-shaped function of the same
+    // logical name. Keep the source-derived accessor role after emission;
+    // rediscovering `getId` must not override an established `id -> readId`.
+    for file in &index.files {
+        for owner in &file.declarations {
+            let symbol = crate::semantics::workspace_symbol(index, owner);
+            let mut path = symbol.owner_path;
+            path.push(symbol.name);
+            let owner_type = if symbol.package.is_empty() {
+                path.join(".")
+            } else {
+                format!("{}.{}", symbol.package, path.join("."))
+            };
+            for known in persisted_index.for_owner(file, owner) {
+                contracts.retain(|contract| {
+                    contract.owner_type != owner_type || contract.property != known.contract.name
+                });
+                contracts.push(PropertyAccessorContract {
+                    owner_type: owner_type.clone(),
+                    property: known.contract.name.clone(),
+                    getter: known.contract.getter.clone(),
+                    setter: known.contract.setter.clone(),
                 });
             }
         }

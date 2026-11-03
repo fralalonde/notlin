@@ -548,3 +548,138 @@ fn real_toolchain_preserves_generic_forwarding_beside_an_unrelated_named_getter(
         );
     }
 }
+
+#[test]
+#[ignore = "requires JVM tools, Kotlin stdlib and Lombok in NOTLIN_* variables"]
+fn generic_bounds_and_numeric_updates_preserve_accessor_effects() {
+    for (mode, converted, lombok) in [
+        ("bounds-effects-original", false, false),
+        ("bounds-effects-plain", true, false),
+        ("bounds-effects-lombok", true, true),
+    ] {
+        let root = scratch(mode);
+        let mut runner = None;
+        for (name, source) in [
+            (
+                "Contract.kt",
+                r#"@file:Suppress("INAPPLICABLE_JVM_NAME")
+package sample
+interface Contract {
+ @get:kotlin.jvm.JvmName("readText") val text:String
+}
+class Stored(@get:kotlin.jvm.JvmName("readText") override val text:String):Contract {
+ suspend fun retained() {}
+}
+"#,
+            ),
+            (
+                "Readers.kt",
+                r#"package sample
+class Readers {
+ fun <T:Contract> read(value:T):String=value.text
+ fun <T> constrained(value:T):String where T:Contract=value.text
+}
+class RetainedReaders {
+ fun <T:Contract> read(value:T):String=value.text
+ fun <T> constrained(value:T):String where T:Contract=value.text
+ fun <T:Contract> mapped(values:List<T>):String=values.map {it.text}.joinToString(",")
+ suspend fun keep() {}
+}
+"#,
+            ),
+            (
+                "Counter.kt",
+                r#"package sample
+open class BaseCode(val text:String)
+interface Tag
+class Code(text:String):BaseCode(text),Tag
+class BoundBox<T>(val current:T) where T:Tag,T:BaseCode {fun label():String=current.text}
+class Counter {
+ var reads:Int=0
+ var writes:Int=0
+ private var stored:Int=0
+ var value:Int
+  get() {reads++;return stored}
+  set(newValue) {writes++;stored=newValue}
+ var tiny:Byte=127
+ var lastRecorded:Int=0
+ var delegated:Int=0
+  set(incoming)=record(incoming)
+ private fun record(incoming:Int) {lastRecorded=incoming}
+ fun advance() {value++;++value;tiny++}
+ fun locals():Int {var value=3;val before=value++;val after=++value;return before*100+after}
+}
+"#,
+            ),
+            (
+                "Globals.kt",
+                r#"package sample
+var calls=0
+fun bump() {calls++;++calls}
+fun read():Int=calls
+"#,
+            ),
+            (
+                "Runner.java",
+                r#"package sample;
+public class Runner {
+ public static void main(String[] args) {
+  Stored stored=new Stored("proof");Readers readers=new Readers();RetainedReaders retained=new RetainedReaders();
+  System.out.println(readers.read(stored)+"|"+readers.constrained(stored));
+  System.out.println(retained.read(stored)+"|"+retained.constrained(stored)+"|"+retained.mapped(java.util.List.of(stored)));
+  Counter counter=new Counter();counter.advance();counter.setDelegated(7);
+  System.out.println(counter.getReads()+"|"+counter.getWrites()+"|"+counter.getValue()+"|"+counter.getTiny()+"|"+counter.locals()
+   +"|"+new BoundBox<Code>(new Code("bound")).label()+"|"+counter.getLastRecorded()+"|"+counter.getDelegated());
+  try {
+   Class<?> globals;
+   try {globals=Class.forName("sample.Globals");} catch(ClassNotFoundException original) {globals=Class.forName("sample.GlobalsKt");}
+   globals.getMethod("bump").invoke(null);System.out.println(globals.getMethod("read").invoke(null));
+  } catch(ReflectiveOperationException failure) {throw new AssertionError(failure);}
+ }
+}
+"#,
+            ),
+        ] {
+            if name == "Runner.java" {
+                runner = Some(source);
+            } else {
+                fs::write(root.join(name), source).unwrap();
+            }
+        }
+        if converted {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_notlin"));
+            command.current_dir(&root).args([
+                "--in-place",
+                "--jvm-facts",
+                "off",
+                "--annotations",
+                "none",
+            ]);
+            if lombok {
+                command.arg("--lombok");
+            }
+            let output = command.arg(".").output().unwrap();
+            fs::write(root.join("translation.stdout"), &output.stdout).unwrap();
+            fs::write(root.join("translation.stderr"), &output.stderr).unwrap();
+            assert!(
+                output.status.success(),
+                "{root:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for owner in ["Readers", "BoundBox", "Counter", "Globals"] {
+                assert!(
+                    root.join(format!("{owner}.java")).exists(),
+                    "{owner} retained: {root:?}"
+                );
+            }
+        }
+        // This harness compares the two facade names; it is not a source
+        // caller that the migration is being asked to repair.
+        fs::write(root.join("Runner.java"), runner.unwrap()).unwrap();
+        assert_eq!(
+            run_native(&root, lombok, "sample.Runner", false),
+            "proof|proof\nproof|proof|proof\n3|2|2|-128|305|bound|7|0\n2\n",
+            "{mode}"
+        );
+    }
+}

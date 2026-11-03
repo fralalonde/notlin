@@ -2153,7 +2153,12 @@ impl SourceIndex {
         if !collection_base_is_unshadowed(self, file, base) {
             return false;
         }
-        let getter = property_accessor_name(property);
+        let Some(getter) = self
+            .property_accessor_names(owner, contract)
+            .getter(property)
+        else {
+            return false;
+        };
         let owner_key = declaration_key(owner);
         let mut pending = self.direct_subtypes(owner);
         let mut seen = HashSet::new();
@@ -2471,21 +2476,17 @@ impl SourceIndex {
         let Some(owner) = file.declarations.iter().find(|d| d.name == name) else {
             return Vec::new();
         };
-        let signature = |m: &Member| {
-            (
-                if m.kind == MemberKind::Property {
-                    property_accessor_name(&m.name)
-                } else {
-                    m.name.clone()
-                },
+        let signature = |decl: &Declaration, m: &Member| {
+            Some((
+                default_getters::value_method_name(self, decl, m)?,
                 m.parameter_types.clone(),
-            )
+            ))
         };
         let own: HashSet<_> = owner
             .members
             .iter()
             .filter(|m| !m.is_static)
-            .map(&signature)
+            .filter_map(|member| signature(owner, member))
             .collect();
         let mut groups: BTreeMap<_, Vec<(&Declaration, &Member)>> = BTreeMap::new();
         let mut pending: Vec<_> = owner.supertypes.iter().map(|s| (file, s)).collect();
@@ -2509,7 +2510,9 @@ impl SourceIndex {
                 {
                     continue;
                 }
-                let key = signature(member);
+                let Some(key) = signature(decl, member) else {
+                    return vec![format!("unknown physical getter for `{}`", member.name)];
+                };
                 if !own.contains(&key) {
                     groups.entry(key).or_default().push((decl, member));
                 }
@@ -2667,7 +2670,10 @@ impl SourceIndex {
                         .members
                         .iter()
                         .filter(|member| member.kind == MemberKind::Property && !member.is_static)
-                        .map(|member| property_accessor_name(&member.name)),
+                        .filter_map(|member| {
+                            self.property_accessor_names(parent, member)
+                                .getter(&member.name)
+                        }),
                 );
             }
             pending.extend(parent.supertypes.iter().map(|ty| (context, ty)));
@@ -2790,7 +2796,11 @@ impl SourceIndex {
                 (!member.is_static
                     && member.visibility.as_deref() != Some("private")
                     && (member.kind == MemberKind::Property
-                        && property_accessor_name(&member.name) == method_name
+                        && self
+                            .property_accessor_names(declaration, member)
+                            .getter(&member.name)
+                            .as_deref()
+                            == Some(method_name)
                         || (member.kind == MemberKind::Method
                             && member.name == method_name
                             && member.parameter_types.is_empty()
@@ -2840,7 +2850,11 @@ impl SourceIndex {
                 .any(|member| {
                     member.name == member_name
                         || (member.kind == MemberKind::Property
-                            && property_accessor_name(&member.name) == member_name)
+                            && self
+                                .property_accessor_names(target, member)
+                                .getter(&member.name)
+                                .as_deref()
+                                == Some(member_name))
                 })
                 .then(|| {
                     supertype

@@ -857,18 +857,42 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         {
             return None;
         }
-        let receiver = if self.unit.text(base).trim() == "this" {
-            self.enclosing_type_name()?
-        } else {
-            self.probe_receiver_java_type(base)?
-        };
         let file = self
             .unit
             .workspace_file
             .as_deref()
-            .unwrap_or(self.unit.file);
-        let (owner, member) = workspace.property_in_type(file, &receiver, &property)?;
+            .unwrap_or(self.unit.file)
+            .to_path_buf();
+        let source_file = workspace.source_file(&file)?;
+        let receivers = if self.unit.text(base).trim() == "this" {
+            vec![self.enclosing_type_name()?]
+        } else {
+            let binding = crate::property_callsite::receiver_binding_at(
+                workspace,
+                source_file,
+                self.unit.source,
+                base,
+            );
+            match binding.member_capabilities() {
+                Some(bounds) => bounds.to_vec(),
+                None => vec![self.probe_receiver_java_type(base)?],
+            }
+        };
+        let mut candidates = receivers
+            .iter()
+            .filter_map(|receiver| workspace.property_in_type(&file, receiver, &property));
+        let (owner, member) = candidates.next()?;
         let names = workspace.property_accessor_names(owner, member);
+        if candidates.any(|(other, property)| {
+            workspace
+                .property_accessor_names(other, property)
+                .getter(&property.name)
+                != names.getter(&member.name)
+        }) {
+            self.unit
+                .diag_untranslatable(node, "generic bounds expose incompatible property getters");
+            return Some("null".into());
+        }
         if member.is_jvm_field || names.getter == crate::workspace::AccessorName::Default {
             return None;
         }

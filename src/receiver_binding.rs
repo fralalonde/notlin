@@ -88,6 +88,10 @@ pub(crate) struct Lookup {
     /// answered. Only such a name is *shadowed*; the enclosing member and the
     /// file-wide table answer the type of an implicit receiver, not a shadow.
     pub lexical: bool,
+    /// Upper bounds authorize member selection only. They never answer `ty`
+    /// or `canonical_ty`, and cannot prove a stdlib extension call.
+    member_capabilities: Option<Vec<String>>,
+    collection_elements: Option<Vec<String>>,
 }
 
 impl Lookup {
@@ -106,6 +110,8 @@ impl Lookup {
             resolution: Resolution::Bound { ty, evidence },
             opaque_receiver,
             lexical: true,
+            member_capabilities: None,
+            collection_elements: None,
         }
     }
 
@@ -114,6 +120,8 @@ impl Lookup {
             resolution: Resolution::Unknown,
             opaque_receiver,
             lexical: true,
+            member_capabilities: None,
+            collection_elements: None,
         }
     }
 
@@ -122,6 +130,8 @@ impl Lookup {
             resolution: Resolution::Unbound,
             opaque_receiver: false,
             lexical: false,
+            member_capabilities: None,
+            collection_elements: None,
         }
     }
 
@@ -132,6 +142,8 @@ impl Lookup {
             resolution: Resolution::Unknown,
             opaque_receiver: true,
             lexical: false,
+            member_capabilities: None,
+            collection_elements: None,
         }
     }
 
@@ -142,6 +154,8 @@ impl Lookup {
             resolution,
             opaque_receiver: false,
             lexical: false,
+            member_capabilities: None,
+            collection_elements: None,
         }
     }
 
@@ -155,6 +169,8 @@ impl Lookup {
             },
             opaque_receiver: false,
             lexical: false,
+            member_capabilities: None,
+            collection_elements: None,
         }
     }
 
@@ -175,6 +191,25 @@ impl Lookup {
             Resolution::Bound { ty, .. } => Some(ty),
             Resolution::Unknown | Resolution::Unbound => None,
         }
+    }
+
+    pub(crate) fn capabilities(bounds: Vec<String>, opaque_receiver: bool, lexical: bool) -> Self {
+        Self {
+            resolution: Resolution::Unknown,
+            opaque_receiver,
+            lexical,
+            member_capabilities: Some(bounds),
+            collection_elements: None,
+        }
+    }
+
+    pub(crate) fn member_capabilities(&self) -> Option<&[String]> {
+        self.member_capabilities.as_deref()
+    }
+
+    pub(crate) fn with_collection_elements(mut self, bounds: Option<Vec<String>>) -> Self {
+        self.collection_elements = bounds;
+        self
     }
 
     /// The type, only when a declared or indexed proof established it. This is
@@ -311,6 +346,9 @@ pub(crate) enum Binding<'t> {
     Bound(String),
     /// A proven stdlib value-scope call binds `name` to this receiver.
     Value(Node<'t>),
+    /// A proved collection callback passes one element with these member
+    /// bounds. Its concrete runtime classifier is deliberately not claimed.
+    Capabilities(Vec<String>),
 }
 
 /// The binding one lambda establishes, with its exact source span.
@@ -364,7 +402,13 @@ pub(crate) fn binding<'t>(
                 span,
                 binding: Binding::Value(receiver),
             },
-            None => unknown,
+            None => collection_binding(index, file, source, lambda, receiver_type).map_or(
+                unknown,
+                |bounds| LambdaInput {
+                    span,
+                    binding: Binding::Capabilities(bounds),
+                },
+            ),
         };
     };
 
@@ -409,7 +453,13 @@ pub(crate) fn binding<'t>(
                 span,
                 binding: Binding::Value(receiver),
             },
-            None => unknown,
+            None => collection_binding(index, file, source, lambda, receiver_type).map_or(
+                unknown,
+                |bounds| LambdaInput {
+                    span,
+                    binding: Binding::Capabilities(bounds),
+                },
+            ),
         },
     }
 }
@@ -541,6 +591,92 @@ fn value_receiver<'t>(
     lambda: Node<'t>,
     receiver_type: &dyn ReceiverTypes,
 ) -> Option<Node<'t>> {
+    let (call, receiver, name) = selected_lambda_call(lambda, source)?;
+    if !VALUE_SCOPE.contains(&name) {
+        return None;
+    }
+    // The call namespace has to be closed before the name means the stdlib
+    // function: an opaque implicit receiver can own a member extension.
+    if opaque_call_environment(index, file, source, call, receiver_type) {
+        return None;
+    }
+    let binding = receiver_type.lookup(receiver);
+    let receiver_ty = binding.canonical_ty()?;
+    let declaration = index.resolve_type(file, receiver_ty)?;
+    if hierarchy_declares(index, file, declaration, name) {
+        return None;
+    }
+    for owner in enclosing_declarations(file, source, call) {
+        if hierarchy_declares(index, file, owner, name)
+            || nested_classifier_claims(index, owner, name)
+        {
+            return None;
+        }
+    }
+    if !stdlib_name_is_unclaimed(index, file, source, call, name) {
+        return None;
+    }
+    Some(receiver)
+}
+
+fn collection_binding(
+    index: &SourceIndex,
+    file: &SourceFile,
+    source: &str,
+    lambda: Node<'_>,
+    receiver_type: &dyn ReceiverTypes,
+) -> Option<Vec<String>> {
+    let (call, receiver, name) = selected_lambda_call(lambda, source)?;
+    if !matches!(
+        name,
+        "map"
+            | "mapNotNull"
+            | "filter"
+            | "filterNot"
+            | "forEach"
+            | "onEach"
+            | "any"
+            | "all"
+            | "none"
+            | "count"
+            | "first"
+            | "firstOrNull"
+            | "last"
+            | "lastOrNull"
+            | "single"
+            | "singleOrNull"
+            | "find"
+            | "findLast"
+            | "takeWhile"
+            | "dropWhile"
+            | "sortedBy"
+            | "sortedByDescending"
+            | "associateBy"
+            | "associateWith"
+            | "groupBy"
+            | "distinctBy"
+            | "maxByOrNull"
+            | "minByOrNull"
+            | "sumOf"
+    ) || opaque_call_environment(index, file, source, call, receiver_type)
+        || !stdlib_name_is_unclaimed(index, file, source, call, name)
+    {
+        return None;
+    }
+    for owner in enclosing_declarations(file, source, call) {
+        if hierarchy_declares(index, file, owner, name)
+            || nested_classifier_claims(index, owner, name)
+        {
+            return None;
+        }
+    }
+    receiver_type.lookup(receiver).collection_elements
+}
+
+fn selected_lambda_call<'t, 'src>(
+    lambda: Node<'t>,
+    source: &'src str,
+) -> Option<(Node<'t>, Node<'t>, &'src str)> {
     let mut argument = lambda;
     let mut call = lambda.parent()?;
     if call.kind() == "annotated_lambda" {
@@ -570,41 +706,10 @@ fn value_receiver<'t>(
     }
     let name = kt::text(*selected_name, source);
     let name = name.trim_matches('`');
-    if !VALUE_SCOPE.contains(&name) {
-        return None;
-    }
     if &source[receiver.end_byte()..selected_name.start_byte()] != "." {
         return None;
     }
-    // The call namespace has to be closed before the name means the stdlib
-    // function: an opaque implicit receiver in the environment can own a member
-    // extension of exactly this name.
-    if opaque_call_environment(index, file, source, call, receiver_type) {
-        return None;
-    }
-    let binding = receiver_type.lookup(*receiver);
-    // The receiver's *identity* may be a lexical binder while its type is only
-    // a legacy inference (a loop element hint, the file-wide table). Binding
-    // the block parameter to it needs declared or indexed evidence.
-    let receiver_ty = binding.canonical_ty()?;
-    let declaration = index.resolve_type(file, receiver_ty)?;
-    if hierarchy_declares(index, file, declaration, name) {
-        return None;
-    }
-    // A member extension declared (or inherited) by any enclosing declaration
-    // is an implicit receiver's candidate for this call, so the name is not the
-    // stdlib one even when the value receiver's own hierarchy is clean.
-    for owner in enclosing_declarations(file, source, call) {
-        if hierarchy_declares(index, file, owner, name)
-            || nested_classifier_claims(index, owner, name)
-        {
-            return None;
-        }
-    }
-    if !stdlib_name_is_unclaimed(index, file, source, call, name) {
-        return None;
-    }
-    Some(*receiver)
+    Some((call, *receiver, name))
 }
 
 /// True when the call sits inside a scope whose implicit receiver was not

@@ -1122,6 +1122,53 @@ struct RewriteContext<'a> {
     inheritance_cache: RefCell<HashMap<(usize, usize), bool>>,
 }
 
+/// Share the canonical lexical receiver proof with other source repairs.
+/// File-wide hints remain marked Legacy and cannot establish a call target.
+pub(crate) fn receiver_binding_at(
+    index: &SourceIndex,
+    source_file: &SourceFile,
+    source: &str,
+    receiver: Node<'_>,
+) -> Lookup {
+    let bindings = HashMap::new();
+    let context = RewriteContext {
+        index,
+        source_file,
+        source,
+        bindings: &bindings,
+        contracts_by_property: HashMap::new(),
+        inheritance_cache: RefCell::new(HashMap::new()),
+    };
+    match receiver.kind() {
+        "identifier" => scoped_binding_at(&context, receiver, kt::text(receiver, source)),
+        "parenthesized_expression" => receiver
+            .named_child(0)
+            .map(|inner| receiver_binding_at(index, source_file, source, inner))
+            .unwrap_or_else(|| Lookup::unknown(false)),
+        "this_expression" => {
+            if kt::text(receiver, source) != "this" {
+                return Lookup::unknown(false);
+            }
+            let mut parent = receiver.parent();
+            while let Some(node) = parent {
+                if matches!(node.kind(), "lambda_literal" | "object_literal")
+                    || crate::receiver_binding::extension_receiver_scope(node)
+                {
+                    return Lookup::opaque_unknown();
+                }
+                if matches!(node.kind(), "class_declaration" | "object_declaration") {
+                    break;
+                }
+                parent = node.parent();
+            }
+            enclosing_declaration_type(source_file, source, receiver)
+                .map(|ty| Lookup::bound(ty, false))
+                .unwrap_or_else(|| Lookup::unknown(false))
+        }
+        _ => Lookup::unknown(false),
+    }
+}
+
 impl<'a> RewriteContext<'a> {
     fn inherits_exactly(&self, receiver: &Declaration, owner: &Declaration) -> bool {
         let key = (
@@ -1165,10 +1212,15 @@ fn contract_for<'a>(
     receiver: &str,
     property: &str,
 ) -> Option<&'a PropertyAccessorContract> {
-    let receiver_type = receiver_type_at(context, node, receiver)?;
-    let receiver_decl = context
-        .index
-        .resolve_type(context.source_file, &receiver_type)?;
+    let lookup = scoped_binding_at(context, node, receiver);
+    let receiver_types = match lookup.member_capabilities() {
+        Some(bounds) => bounds.to_vec(),
+        None => vec![lookup.ty()?.to_owned()],
+    };
+    let receiver_decls = receiver_types
+        .iter()
+        .filter_map(|ty| context.index.resolve_type(context.source_file, ty))
+        .collect::<Vec<_>>();
     let matching = context
         .contracts_for(property)
         .filter(|contract| {
@@ -1178,7 +1230,9 @@ fn contract_for<'a>(
             else {
                 return false;
             };
-            context.inherits_exactly(receiver_decl, owner)
+            receiver_decls
+                .iter()
+                .any(|receiver| context.inherits_exactly(receiver, owner))
         })
         .collect::<Vec<_>>();
     compatible_accessor_contract(matching)
@@ -1501,6 +1555,14 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
                 if let Some((declaration, ty)) = binding {
                     return resolved(context, declaration, ty, opaque);
                 }
+                if let Some(parameters) = kt::child(parent, "lambda_parameters") {
+                    for parameter in parameters.named_children(&mut parameters.walk()) {
+                        if let Some((_, Some(ty))) = declared_binding_named(parameter, name, source)
+                        {
+                            return resolved(context, parameter, Some(ty), opaque);
+                        }
+                    }
+                }
                 // The lambda's own binders are the shared proof's answer. A
                 // name it does not bind still depends on how the block treats
                 // bare identifiers, and that answer comes from the same
@@ -1529,6 +1591,9 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
                         }
                     }
                     Binding::Unknown => return Lookup::unknown(opaque),
+                    Binding::Capabilities(bounds) => {
+                        return Lookup::capabilities(bounds, opaque, true);
+                    }
                     // A declared lambda parameter type is canonical evidence
                     // only when this file provably binds the name; the proof
                     // must not be reminted from the spelling by a wider lookup.
@@ -1620,6 +1685,9 @@ fn scoped_binding_at(context: &RewriteContext<'_>, node: Node<'_>, name: &str) -
     if opaque {
         return Lookup::opaque_unknown();
     }
+    if let Some(bounds) = enclosing_member_capabilities(context, node, name) {
+        return Lookup::capabilities(bounds, false, false);
+    }
     match enclosing_member_resolution(context, node, name) {
         // A declared or inherited member answered: canonical evidence, carried
         // through rather than reminted from the type string.
@@ -1643,7 +1711,27 @@ fn resolved(
     ty: Option<String>,
     opaque: bool,
 ) -> Lookup {
-    match ty {
+    if let Some(ty) = &ty
+        && let Some(bounds) = crate::type_parameter_bounds::member_capabilities(
+            context.index,
+            context.source_file,
+            context.source,
+            origin,
+            ty,
+        )
+    {
+        return Lookup::capabilities(bounds, opaque, true);
+    }
+    let elements = ty.as_deref().and_then(|ty| {
+        crate::type_parameter_bounds::collection_element_capabilities(
+            context.index,
+            context.source_file,
+            context.source,
+            origin,
+            ty,
+        )
+    });
+    let lookup = match ty {
         Some(ty)
             if crate::receiver_binding::file_scoped_type_reference(origin, &ty, context.source) =>
         {
@@ -1651,7 +1739,57 @@ fn resolved(
         }
         Some(ty) => Lookup::legacy_bound(ty, opaque),
         None => Lookup::unknown(opaque),
+    };
+    lookup.with_collection_elements(elements)
+}
+
+fn enclosing_member_capabilities(
+    context: &RewriteContext<'_>,
+    node: Node<'_>,
+    name: &str,
+) -> Option<Vec<String>> {
+    let enclosing = enclosing_declaration(context, node)?;
+    let owner_type = crate::semantics::workspace_symbol(context.index, enclosing);
+    let owner_type = [owner_type.package.as_str()]
+        .into_iter()
+        .chain(owner_type.owner_path.iter().map(String::as_str))
+        .chain([owner_type.name.as_str()])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+    let (owner, property) =
+        context
+            .index
+            .property_in_type(&context.source_file.path, &owner_type, name)?;
+    let ty = property.type_name.as_deref()?;
+    let symbol = crate::semantics::workspace_symbol(context.index, owner);
+    if symbol.owner_path.is_empty()
+        && !owner
+            .type_params
+            .iter()
+            .any(|parameter| parameter == ty.trim().trim_end_matches('?'))
+    {
+        return None;
     }
+    let file = context.index.declaration_source_file(owner)?;
+    let tree = context.index.source_tree(file)?;
+    let mut pending = vec![tree.root_node()];
+    while let Some(candidate) = pending.pop() {
+        if crate::semantics::declaration_node_kind(candidate.kind())
+            && crate::semantics::symbol_id_for_node(file.source_text(), candidate, &file.path)
+                == symbol
+        {
+            return crate::type_parameter_bounds::member_capabilities(
+                context.index,
+                file,
+                file.source_text(),
+                candidate,
+                ty,
+            );
+        }
+        pending.extend(candidate.named_children(&mut candidate.walk()));
+    }
+    None
 }
 
 /// Canonical evidence for a declared type spelling: the file must provably bind
@@ -2275,6 +2413,181 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn generic_bounds_authorize_members_without_becoming_exact_receiver_types() {
+        let fixture = Fixture::new();
+        let source = r#"package sample
+interface Api {fun readId():String}
+interface Tag
+class T:Api {override fun readId():String="unrelated"}
+fun <T:Api> direct(value:T)=value.id
+fun <T> constrained(value:T) where T:Api,T:Tag = value.id
+fun <T:Api,U:T> chained(value:U)=value.id
+class Box<T:Api>(val value:T) {fun <T:Tag> read()=value.id}
+fun <T:Api> typed(value:T)=listOf(value).map {item:T -> item.id}
+fun <T> unbounded(value:T)=value.id
+fun <T:Missing> unresolved(value:T)=value.id
+fun <T:U,U:T> cyclic(value:T)=value.id
+"#;
+        let path = fixture.write("Model.kt", source);
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let contract = PropertyAccessorContract {
+            owner_type: "sample.Api".into(),
+            property: "id".into(),
+            getter: "readId".into(),
+            setter: None,
+        };
+        let (rewritten, count) = rewrite_file(&index, &path, source, &[contract]);
+        assert_eq!(count, 5, "{rewritten}");
+        for expected in [
+            "direct(value:T)=value.readId()",
+            "where T:Api,T:Tag = value.readId()",
+            "chained(value:U)=value.readId()",
+            "fun <T:Tag> read()=value.readId()",
+            "item:T -> item.readId()",
+            "unbounded(value:T)=value.id",
+            "unresolved(value:T)=value.id",
+            "cyclic(value:T)=value.id",
+        ] {
+            assert!(
+                rewritten.contains(expected),
+                "missing {expected}: {rewritten}"
+            );
+        }
+        let tree = crate::transpiler::parse_tree(source);
+        let mut nodes = vec![tree.root_node()];
+        let mut direct = None;
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "function_declaration"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| kt::text(name, source) == "direct")
+            {
+                direct = Some(node);
+                break;
+            }
+            nodes.extend(node.named_children(&mut node.walk()));
+        }
+        let mut nodes = vec![direct.unwrap()];
+        let receiver = loop {
+            let node = nodes.pop().unwrap();
+            if node.kind() == "navigation_expression" {
+                break node.named_child(0).unwrap();
+            }
+            nodes.extend(node.named_children(&mut node.walk()));
+        };
+        let binding =
+            receiver_binding_at(&index, index.source_file(&path).unwrap(), source, receiver);
+        assert!(binding.canonical_ty().is_none());
+        assert!(binding.ty().is_none());
+        assert_eq!(
+            binding.member_capabilities(),
+            Some(["sample.Api".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn conflicting_bounds_and_nearer_values_do_not_borrow_an_outer_contract() {
+        let fixture = Fixture::new();
+        let source = r#"package sample
+interface Api
+interface Other
+class T:Api
+fun <T:Api> shadow(value:T) {run {val value=unknown();println(value.id)}}
+fun <T> conflict(value:T) where T:Api,T:Other = value.id
+fun <T:Api> opaque(value:T)=value.let {it.id}
+"#;
+        let path = fixture.write("Model.kt", source);
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let contracts = [
+            PropertyAccessorContract {
+                owner_type: "sample.Api".into(),
+                property: "id".into(),
+                getter: "readId".into(),
+                setter: None,
+            },
+            PropertyAccessorContract {
+                owner_type: "sample.Other".into(),
+                property: "id".into(),
+                getter: "otherId".into(),
+                setter: None,
+            },
+        ];
+        let (rewritten, count) = rewrite_file(&index, &path, source, &contracts);
+        assert_eq!(count, 0, "{rewritten}");
+        assert_eq!(rewritten, source);
+    }
+
+    #[test]
+    fn collection_callbacks_keep_generic_element_member_capabilities_scoped() {
+        let fixture = Fixture::new();
+        let source = r#"package sample
+interface Api
+fun <T:Api> mapped(values:List<T>)=values.map {it.id}
+fun <T:Api> filtered(values:MutableList<T>)=values.filter {entry -> entry.id=="id"}
+fun <T:Api> unrelated(values:List<T>, other:Any)=values.map {other.id}
+fun <T:Api> opaque(values:List<T>)=unknown {values.map {it.id}}
+"#;
+        let path = fixture.write("Model.kt", source);
+        let index = SourceIndex::discover(&fixture.0).unwrap();
+        let contract = PropertyAccessorContract {
+            owner_type: "sample.Api".into(),
+            property: "id".into(),
+            getter: "readId".into(),
+            setter: None,
+        };
+        let (rewritten, count) = rewrite_file(&index, &path, source, &[contract]);
+        assert_eq!(count, 2, "{rewritten}");
+        assert!(
+            rewritten.contains("values.map {it.readId()}"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("values.filter {entry -> entry.readId()=="),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("values.map {other.id}"), "{rewritten}");
+        assert!(
+            rewritten.contains("unknown {values.map {it.id}}"),
+            "{rewritten}"
+        );
+    }
+
+    #[test]
+    fn collection_callback_names_and_classifiers_require_their_own_bindings() {
+        for (label, source) in [
+            (
+                "member extension",
+                "package sample\ninterface Api\nclass Uses {fun List<Api>.map(block:(String)->String)=block(\"foreign\");fun use(values:List<Api>)=values.map {it.id}}\n",
+            ),
+            (
+                "foreign classifier",
+                "package sample\nimport foreign.List\ninterface Api\nfun use(values:List<Api>)=values.map {it.id}\n",
+            ),
+            (
+                "alias",
+                "package sample\nimport foreign.Values as List\ninterface Api\nfun use(values:List<Api>)=values.map {it.id}\n",
+            ),
+            (
+                "foreign wildcard",
+                "package sample\nimport foreign.*\ninterface Api\nfun use(values:List<Api>)=values.map {it.id}\n",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let path = fixture.write("Model.kt", source);
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let contract = PropertyAccessorContract {
+                owner_type: "sample.Api".into(),
+                property: "id".into(),
+                getter: "readId".into(),
+                setter: None,
+            };
+            let (rewritten, count) = rewrite_file(&index, &path, source, &[contract]);
+            assert_eq!(count, 0, "{label}: {rewritten}");
+            assert_eq!(rewritten, source, "{label}");
+        }
+    }
 
     #[test]
     fn candidate_scan_matches_identifier_boundaries_in_one_pass() {

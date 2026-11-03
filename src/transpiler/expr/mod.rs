@@ -1213,10 +1213,10 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
         }
         // Other postfix/prefix unary forms: map operator -> text directly.
         let mut op = String::new();
-        let mut arg_text = None;
+        let mut argument = None;
         for c in &kids {
             if c.is_named() {
-                arg_text = Some(self.transpile(*c));
+                argument = Some(*c);
             } else {
                 let t = self.unit.text(*c).trim().to_string();
                 match t.as_str() {
@@ -1225,16 +1225,191 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
                 }
             }
         }
-        let Some(arg_text) = arg_text else {
+        let Some(argument) = argument else {
             return "null".to_string();
+        };
+        let arg_text = if matches!(op.as_str(), "++" | "--") {
+            if argument.kind() == "identifier"
+                && !crate::function_callsite::local_shadow(
+                    argument,
+                    self.unit.text(argument),
+                    self.unit.source,
+                )
+                && self
+                    .unit
+                    .self_getters
+                    .contains_key(self.unit.text(argument))
+            {
+                self.unit.diag_untranslatable(
+                    node,
+                    "a property increment used as a value needs an ordered getter/setter result",
+                );
+                return "0".into();
+            }
+            let target = self.transpile_target(argument);
+            if std::mem::take(&mut self.unit.pending_setter) {
+                self.unit.diag_untranslatable(
+                    node,
+                    "a property increment used as a value needs an ordered getter/setter result",
+                );
+                return "0".into();
+            }
+            target
+        } else {
+            self.transpile(argument)
         };
         if op.is_empty() {
             arg_text
         } else if op == "++" || op == "--" {
-            format!("{}{}", arg_text, op)
+            if node.start_byte() < argument.start_byte() {
+                format!("{op}{arg_text}")
+            } else {
+                format!("{arg_text}{op}")
+            }
         } else {
             format!("{}{}", op, arg_text)
         }
+    }
+
+    /// A discarded increment has no old/new result to retain. Accessors still
+    /// run in getter-then-setter order, and an explicit receiver is evaluated
+    /// once; complex receivers stay on the diagnosed expression path.
+    pub(crate) fn increment_statement(&mut self, node: tree_sitter::Node) -> Option<Vec<String>> {
+        let operator = node
+            .children(&mut node.walk())
+            .find(|child| matches!(self.unit.text(*child).trim(), "++" | "--"))?;
+        let argument = node.named_children(&mut node.walk()).next()?;
+        if argument.kind() == "navigation_expression" {
+            let (receiver, _) = self.unit.nav_base_member(argument)?;
+            if !matches!(receiver.kind(), "identifier" | "this_expression") {
+                return None;
+            }
+            if receiver.kind() == "identifier"
+                && !crate::function_callsite::local_shadow(
+                    receiver,
+                    self.unit.text(receiver),
+                    self.unit.source,
+                )
+            {
+                return None;
+            }
+        }
+        let mut target = self.transpile_target(argument);
+        let mut setter = std::mem::take(&mut self.unit.pending_setter);
+        // The setter registry also contains static properties. Only a known
+        // instance getter authorizes an implicit `this` accessor update.
+        if argument.kind() == "identifier"
+            && self
+                .unit
+                .self_getters
+                .contains_key(self.unit.text(argument))
+            && !crate::function_callsite::local_shadow(
+                argument,
+                self.unit.text(argument),
+                self.unit.source,
+            )
+            && let Some(name) = self
+                .unit
+                .class_props
+                .get(self.unit.text(argument))
+                .filter(|name| !name.is_empty())
+        {
+            target = format!("this.{name}(");
+            setter = true;
+        }
+        if !setter {
+            return Some(vec![if operator.start_byte() < argument.start_byte() {
+                format!("{}{target}", self.unit.text(operator))
+            } else {
+                format!("{target}{}", self.unit.text(operator))
+            }]);
+        }
+        let ty = self
+            .increment_property_type(argument)
+            .or_else(|| self.probe_receiver_java_type(argument));
+        let ty = ty
+            .as_deref()
+            .map(crate::transpiler::types::strip_nullable_prefix)
+            .map(str::trim)
+            .unwrap_or("");
+        let cast = match ty {
+            "byte" | "Byte" | "java.lang.Byte" => Some("byte"),
+            "short" | "Short" | "java.lang.Short" => Some("short"),
+            "char" | "Character" | "java.lang.Character" => Some("char"),
+            "int" | "Integer" | "java.lang.Integer" | "long" | "Long" | "java.lang.Long"
+            | "float" | "Float" | "java.lang.Float" | "double" | "Double" | "java.lang.Double" => {
+                None
+            }
+            _ => {
+                self.unit.diag_untranslatable(
+                    node,
+                    "property increment has no established numeric representation",
+                );
+                return Some(Vec::new());
+            }
+        };
+        let read = self.transpile(argument);
+        let operation = if self.unit.text(operator) == "++" {
+            "+"
+        } else {
+            "-"
+        };
+        let value = format!("{read} {operation} 1");
+        let value = cast.map_or_else(|| value.clone(), |ty| format!("({ty}) ({value})"));
+        let mut statements = vec![format!("{target}{value})")];
+        if operator.start_byte() < argument.start_byte() {
+            // Kotlin evaluates the updated property again for a prefix
+            // operation, even when its result is discarded. A custom getter
+            // can make that read observable.
+            statements.push(read);
+        }
+        Some(statements)
+    }
+
+    fn increment_property_type(&mut self, argument: tree_sitter::Node) -> Option<String> {
+        let (receiver, property) = if argument.kind() == "identifier" {
+            (
+                self.enclosing_type_name()?,
+                self.unit.text(argument).to_owned(),
+            )
+        } else {
+            let (receiver, property) = self.unit.nav_base_member(argument)?;
+            let ty = if self.unit.text(receiver) == "this" {
+                self.enclosing_type_name()?
+            } else {
+                self.probe_receiver_java_type(receiver)?
+            };
+            (ty, property)
+        };
+        let index = self.unit.workspace?;
+        let (owner, member) = index.property_in_type(
+            self.unit
+                .workspace_file
+                .as_deref()
+                .unwrap_or(self.unit.file),
+            &receiver,
+            &property,
+        )?;
+        let ty = member.type_name.clone().or_else(|| {
+            index
+                .inferred_simple_property_type(owner, member)
+                .map(|(ty, _)| ty)
+        })?;
+        let file = index.declaration_source_file(owner)?;
+        if let Some(descriptor) = index.builtin_getter_descriptor_in_file(&file.path, &ty)
+            && let Some(primitive) =
+                crate::jvm_primitive::JvmPrimitive::kotlin(ty.rsplit('.').next()?)
+            && primitive.getter_descriptor == descriptor
+        {
+            return Some(primitive.java.to_owned());
+        }
+        let binding = crate::workspace::property_receiver_type_binding(index, file, &ty)?;
+        binding
+            .qualified
+            .strip_prefix("kotlin.")
+            .and_then(crate::jvm_primitive::JvmPrimitive::kotlin)
+            .or_else(|| crate::jvm_primitive::JvmPrimitive::qualified_boxed(&binding.qualified))
+            .map(|primitive| primitive.java.to_owned())
     }
     /// `x in lo..hi` when-condition -> `x >= lo && x <= hi` (`!in` negated).
     /// The subject is the when-expression's subject, not part of the node.
