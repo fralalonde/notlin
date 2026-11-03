@@ -1588,10 +1588,9 @@ impl<'src, 'tree> Unit<'src, 'tree> {
     /// *implements* the interface's JVM obligations instead of inheriting them
     /// from Kotlin metadata, which makes the retained provider harmless.
     ///
-    /// Any method without such a bridge (an extra default method, a `suspend`
-    /// member, a renamed accessor) leaves the parent incompatible:
-    /// whether such a member is abstract in the JVM interface depends on the
-    /// retained provider's `-jvm-default` mode, which this run cannot know.
+    /// A known modern configuration also proves ordinary Kotlin default methods
+    /// can remain inherited. Otherwise every obligation needs a concrete body:
+    /// Kotlin metadata alone does not establish a Java default method.
     fn forwarding_bridge_covers_retained_interface(
         &self,
         workspace: &crate::workspace::SourceIndex,
@@ -1606,6 +1605,26 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                 provider,
             )
         })
+    }
+
+    fn retains_independent_getter_descriptors(&mut self, decl: tree_sitter::Node<'_>) -> bool {
+        let conflict = self.workspace.is_some_and(|index| {
+            let declaring = self.workspace_file.as_deref().unwrap_or(self.file);
+            let Some(file) = index.source_file(declaring) else {
+                return false;
+            };
+            let symbol = crate::semantics::symbol_id_for_node(file.source_text(), decl, &file.path);
+            file.declarations
+                .iter()
+                .find(|owner| crate::semantics::workspace_symbol(index, owner) == symbol)
+                .is_some_and(|owner| {
+                    crate::getter_namespace::inherits_independent_getters(index, owner)
+                })
+        });
+        if conflict {
+            self.diag_untranslatable(decl, "independent JVM property and function getters require coordinated caller migration");
+        }
+        conflict
     }
 
     /// A JVM class with an explicit open/abstract boundary and a complete
@@ -2099,18 +2118,10 @@ impl<'src, 'tree> Unit<'src, 'tree> {
                     .or_insert_with(|| format!("get{}", capitalize(&property)));
             }
         }
-        let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
-        if !is_interface
-            && self.workspace.is_some_and(|index| {
-                crate::getter_namespace::inherits_independent_getters(index, indexed_path, &name)
-            })
-        {
-            self.diag_untranslatable(
-                decl,
-                "inherited independent JVM getter descriptors would acquire a Java covariant bridge",
-            );
+        if !is_interface && self.retains_independent_getter_descriptors(decl) {
             return;
         }
+        let indexed_path = self.workspace_file.as_deref().unwrap_or(self.file);
         if self.has_companion_operator_invoke(decl)
             && self.workspace.is_some_and(|workspace| {
                 // Kotlin class-call ABI `Type(...)`: only Kotlin that stays
@@ -5262,6 +5273,9 @@ private static final class __DESER__Instantiator extends com.fasterxml.jackson.d
         out: &mut JavaOut,
     ) {
         self.enum_types.insert(name.to_string());
+        if self.retains_independent_getter_descriptors(decl) {
+            return;
+        }
         let mut default_bridges = Vec::<(String, String, String)>::new();
         let source_bridges = self
             .default_getter_bridges

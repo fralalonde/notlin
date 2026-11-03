@@ -1,5 +1,49 @@
 # Translation frontier
 
+The accepted 2026-11-03 incremental conversion translates **5336 / 6694
+original declarations (79.7%)**, adding **979** to the 4357-owner
+baseline. Every accepted owner and all 7134 prior Java files are preserved.
+The gains comprise 143 enums, 324 interfaces and 512 classes.
+The reference is clean `exp/kotlin-killer2` at
+`3382c909b00c61725c80892cd26acc5917b4c7b6`. Generated source is never hand-edited.
+
+Groovy slashy and dollar-slashy pattern literals no longer obscure the declared
+Kotlin JVM-default mode. Plain reference interpolation remains pattern content;
+dynamic configuration stays unproved. When modern JVM defaults are proved,
+classes and enums inherit the retained Kotlin interface's real default methods.
+The shared rule covers ordinary, parameterized and generic methods. Kotlin
+property getter and setter obligations still require separate proofs.
+
+Classes and enums keep independent property/function getter roles until their
+physical names and callers can be migrated together. This avoids both javac
+return-type errors and silent dispatch changes from Java covariant bridges.
+Kotlin callers can also lose an inherited `getX()` on a Java receiver when
+property `x` has a renamed physical getter; an explicit Java forwarder does not
+restore that lookup. Such families stay Kotlin until their callers migrate
+together. Noncolliding custom accessors still translate. Original and mixed
+plain/Lombok programs agree across modern and legacy JVM modes. Source indexing
+and cache I/O are unchanged. Physical storage getter and setter bodies retain
+their field access even when a different JavaBean alias becomes visible; this
+prevents recursive virtual dispatch.
+
+The full Gradle build passes in 408.0 seconds. All **3146 original
+test identities and outcomes match** (3070 pass, 76 skip). Hastings imports
+**9745 records** and stays free of errors and stack traces for
+**105.1 seconds** after import. The tagged app is stopped;
+an independent cleanup check passes. The live reference remains unchanged.
+Formatting, Clippy, the native JVM matrix and all four javac samples pass.
+The Rust comparison has 1728 passes and the same 62 known Windows helper
+failures, with no new failures after one unchanged rerun of a timing-sensitive
+vanishing-file warning control. Its initial failure and successful rerun are
+preserved. All 469 compiler inputs remain frozen.
+
+Acceptance evidence is `target/physical-storage-reference-gate-20261103/acceptance.json`.
+The binary SHA256 is `a1a64d92db3f8c5a13a553d8c0bbd4c80d5217d60e0589adfd7229cfdd2db1fa`.
+This accepts an incremental baseline conversion; a fresh pristine conversion
+with this binary has not completed this gate.
+
+## Previous accepted baseline
+
 The accepted 2026-11-03 baseline conversion of clean `exp/kotlin-killer2`
 commit `3382c909b00c61725c80892cd26acc5917b4c7b6` translates **4357 / 6694
 original declarations (65.1%)** and retains 2337. It preserves all 4158

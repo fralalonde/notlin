@@ -286,7 +286,7 @@ pub fn rewrite_file(
             continue;
         };
         if receiver_node.kind() == "this_expression"
-            && inside_canonical_accessor(node, source, contract)
+            && inside_canonical_accessor(&context, node, contract)
         {
             continue;
         }
@@ -361,7 +361,7 @@ pub fn rewrite_file(
             continue;
         };
         if receiver_node.kind() == "this_expression"
-            && inside_canonical_accessor(node, source, contract)
+            && inside_canonical_accessor(&context, node, contract)
         {
             continue;
         }
@@ -563,21 +563,74 @@ struct Edit {
 }
 
 fn inside_canonical_accessor(
+    context: &RewriteContext<'_>,
     mut node: Node<'_>,
-    source: &str,
     contract: &PropertyAccessorContract,
 ) -> bool {
+    let source = context.source;
     while let Some(parent) = node.parent() {
         if parent.kind() == "function_declaration" {
             let Some(name) = parent.child_by_field_name("name") else {
                 return false;
             };
             let arity = crate::workspace::member_callable_arity(parent, SourceLanguage::Kotlin);
-            return is_canonical_accessor(kt::text(name, source), arity, contract);
+            let method = kt::text(name, source);
+            if is_canonical_accessor(method, arity, contract) {
+                return true;
+            }
+            let Some(owner_node) = std::iter::successors(parent.parent(), |node| node.parent())
+                .find(|node| {
+                    matches!(
+                        node.kind(),
+                        "class_declaration" | "enum_class_declaration" | "object_declaration"
+                    )
+                })
+            else {
+                return false;
+            };
+            let owner_id =
+                crate::semantics::symbol_id_for_node(source, owner_node, &context.source_file.path);
+            return context
+                .source_file
+                .declarations
+                .iter()
+                .find(|owner| crate::semantics::workspace_symbol(context.index, owner) == owner_id)
+                .is_some_and(|owner| {
+                    is_physical_storage_accessor(context.index, owner, method, arity, contract)
+                });
         }
         node = parent;
     }
     false
+}
+
+/// A persisted storage bridge may use a different physical getter name than
+/// the JavaBean alias now visible on its interface. Redirecting its field read
+/// to that virtual alias can recurse or select a descendant's independent body.
+fn is_physical_storage_accessor(
+    index: &SourceIndex,
+    owner: &Declaration,
+    method: &str,
+    arity: Option<crate::workspace::CallableArity>,
+    contract: &PropertyAccessorContract,
+) -> bool {
+    owner
+        .members
+        .iter()
+        .filter(|member| {
+            member.kind == crate::workspace::MemberKind::Property
+                && member.name == contract.property
+                && member.visibility.as_deref() == Some("private")
+                && !member.is_static
+                && !member.is_jvm_field
+        })
+        .any(|member| {
+            let names = index.property_accessor_names(owner, member);
+            (names.getter(&member.name).as_deref() == Some(method)
+                && arity.is_none_or(|shape| shape.accepts_arity(0)))
+                || (names.setter(&member.name).as_deref() == Some(method)
+                    && arity.is_none_or(|shape| shape.accepts_arity(1)))
+        })
 }
 
 fn is_canonical_accessor(
@@ -811,10 +864,10 @@ fn rewrite_implicit_this_accesses(
             for contract in &declaration_contracts {
                 // Canonical accessor bodies must keep their storage access;
                 // a disjoint overload still needs normal virtual dispatch.
-                if method_name
-                    .as_deref()
-                    .is_some_and(|method| is_canonical_accessor(method, arity, contract))
-                {
+                if method_name.as_deref().is_some_and(|method| {
+                    is_canonical_accessor(method, arity, contract)
+                        || is_physical_storage_accessor(index, declaration, method, arity, contract)
+                }) {
                     continue;
                 }
                 for node in facts
@@ -3341,6 +3394,39 @@ class Child : Api {
             updated.contains("val payload = \"local\"; return payload"),
             "{updated}"
         );
+    }
+
+    #[test]
+    fn renamed_storage_accessors_keep_field_reads_and_writes_beside_a_bean_alias() {
+        let fixture = Fixture::new();
+        fixture.write("Api.java", "package sample; public interface Api {Object readId(); default Object getId(){return readId();} void writeId(Object value); default void setId(Object value){writeId(value);}}\n");
+        for explicit in [false, true] {
+            let field = if explicit { "this.id" } else { "id" };
+            let path = fixture.write("Base.kt", &format!("package sample\n@kotlin.Suppress(\"INAPPLICABLE_JVM_NAME\")\nopen class Base(@get:kotlin.jvm.JvmName(\"readId\") @set:kotlin.jvm.JvmName(\"writeId\") private var id:Any):Api {{\n override fun readId():Any={field}\n override fun writeId(value:Any){{{field}=value}}\n fun readId(type:Int):Any=id\n fun ordinary():Any=id\n}}\n"));
+            let index = SourceIndex::discover(&fixture.0).unwrap();
+            let source = fs::read_to_string(&path).unwrap();
+            let contract = PropertyAccessorContract {
+                owner_type: "sample.Api".into(),
+                property: "id".into(),
+                getter: "getId".into(),
+                setter: Some("setId".into()),
+            };
+            let (updated, count) = rewrite_file(&index, &path, &source, &[contract]);
+            assert_eq!(count, 2, "{updated}");
+            assert!(
+                updated.contains(&format!("override fun readId():Any={field}")),
+                "{updated}"
+            );
+            assert!(
+                updated.contains(&format!("override fun writeId(value:Any){{{field}=value}}")),
+                "{updated}"
+            );
+            assert!(
+                updated.contains("fun readId(type:Int):Any=getId()"),
+                "{updated}"
+            );
+            assert!(updated.contains("fun ordinary():Any=getId()"), "{updated}");
+        }
     }
 
     #[test]

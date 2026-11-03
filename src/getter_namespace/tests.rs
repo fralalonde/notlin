@@ -50,21 +50,28 @@ fn descendants_detect_original_and_split_getters_through_scoped_ancestry() {
             ),
         ]);
         let index = SourceIndex::discover(&fixture.0).unwrap();
+        let owner = |file: &str, name: &str| {
+            index
+                .source_file(&fixture.0.join(file))
+                .unwrap()
+                .declarations
+                .iter()
+                .find(|owner| owner.name == name)
+                .unwrap()
+        };
         for name in ["Middle", "Leaf"] {
             assert!(
-                inherits_independent_getters(&index, &fixture.0.join("Leaf.kt"), name),
+                inherits_independent_getters(&index, owner("Leaf.kt", name)),
                 "{child}: {name}"
             );
         }
         assert!(!inherits_independent_getters(
             &index,
-            &fixture.0.join("Leaf.kt"),
-            "Unrelated"
+            owner("Leaf.kt", "Unrelated")
         ));
         assert!(!inherits_independent_getters(
             &index,
-            &fixture.0.join("Child.kt"),
-            "Child"
+            owner("Child.kt", "Child")
         ));
     }
 }

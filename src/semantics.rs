@@ -692,7 +692,7 @@ fn declaration_has_modifier(source: &str, node: tree_sitter::Node<'_>, wanted: &
     false
 }
 
-fn public_kotlin_callable(source: &str, node: tree_sitter::Node<'_>) -> bool {
+pub(crate) fn public_kotlin_callable(source: &str, node: tree_sitter::Node<'_>) -> bool {
     let companion_member = std::iter::successors(node.parent(), |owner| owner.parent())
         .find(|owner| {
             matches!(

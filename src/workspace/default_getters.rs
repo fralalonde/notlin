@@ -1722,10 +1722,45 @@ fn imported_marker_alias(index: &SourceIndex, file: &SourceFile, base: &str) -> 
 }
 
 impl SourceIndex {
+    /// Matching source types and erasures prove one getter slot, rather than two
+    /// independently dispatched Kotlin property/function methods. Unknowns and
+    /// mangled value-class returns cannot establish that equivalence.
+    pub(crate) fn getter_signatures_equivalent(
+        &self,
+        left_owner: &Declaration,
+        left: &Member,
+        right_owner: &Declaration,
+        right: &Member,
+    ) -> bool {
+        if left.is_nullable != right.is_nullable {
+            return false;
+        }
+        let (Some(left_type), Some(right_type)) = (
+            getter_return_type(self, left_owner, left),
+            getter_return_type(self, right_owner, right),
+        ) else {
+            return false;
+        };
+        let (Some(left_canonical), Some(right_canonical), Some(left_erased), Some(right_erased)) = (
+            canonical_return(self, left_owner, &left_type, &BTreeMap::new()),
+            canonical_return(self, right_owner, &right_type, &BTreeMap::new()),
+            erased_return(self, left_owner, left),
+            erased_return(self, right_owner, right),
+        ) else {
+            return false;
+        };
+        left_canonical == right_canonical
+            && left_erased == right_erased
+            && source_reference_declaration(self, &left_erased)
+                .is_none_or(|owner| !owner.is_jvm_value_class)
+    }
+
     /// Check the complete retained interface after substituting the concrete
-    /// child's type arguments. Every instance obligation must be a zero-argument
-    /// value method or property implemented by an own public member or a planned
-    /// source body, independent of the provider's JVM-default mode.
+    /// child's type arguments. Proven JVM default methods can be inherited.
+    /// Every remaining obligation must be a zero-argument value method or
+    /// property implemented by an own public member or a planned source body.
+    /// Without a modern configuration fact, Kotlin defaults need such a body
+    /// too: their implementation may exist only in DefaultImpls.
     pub(crate) fn concrete_getters_cover_retained_interface(
         &self,
         child: &Declaration,
@@ -1782,6 +1817,13 @@ impl SourceIndex {
         if incomplete {
             return false;
         }
+        let has_jvm_default_body = |owner: &Declaration, member: &Member| {
+            member.has_body
+                && (owner.language == SourceLanguage::Java
+                    || owner.language == SourceLanguage::Kotlin
+                        && self.has_modern_kotlin_interface_defaults()
+                        && member.kind == MemberKind::Method)
+        };
         for route in routes {
             if route.declaration.kind != DeclarationKind::Interface {
                 return false;
@@ -1789,11 +1831,13 @@ impl SourceIndex {
             for member in route.declaration.members.iter().filter(|member| {
                 !member.is_static && member.visibility.as_deref() != Some("private")
             }) {
-                // These bodies already exist in Java bytecode. Requiring a
-                // copied Kotlin body or an own override would reject ordinary
-                // mixed hierarchies, including parameterized Java defaults.
+                // A known JVM default already supplies the whole callable,
+                // including parameterized and generic methods. Kotlin property
+                // accessors still need separate proofs: a var can have only one
+                // concrete accessor, leaving its other obligation abstract.
                 if route.declaration.language == SourceLanguage::Java
-                    && (member.kind == MemberKind::Field || member.has_body)
+                    && member.kind == MemberKind::Field
+                    || has_jvm_default_body(route.declaration, member)
                 {
                     continue;
                 }
@@ -1804,7 +1848,7 @@ impl SourceIndex {
                     && self
                         .effective_interface_value_member(child, file, &name)
                         .is_some_and(|(selected, implementation)| {
-                            selected.language == SourceLanguage::Java && implementation.has_body
+                            has_jvm_default_body(selected, implementation)
                         })
                 {
                     continue;

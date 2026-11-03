@@ -427,10 +427,18 @@ fn assert_migrated_with_mode(root: &Path, output: &std::process::Output, modern:
         root.join("Facets.kt").exists(),
         "facet implementations stay Kotlin"
     );
-    assert!(
-        !root.join("DefaultFacetMarker.java").exists(),
-        "an inherited getter body still requires the existing bridge proof"
+    assert_eq!(
+        root.join("DefaultFacetMarker.java").exists(),
+        modern,
+        "the copied getter needs its bridge proof and the remaining Kotlin defaults need a modern mode"
     );
+    if modern {
+        let facade = fs::read_to_string(root.join("DefaultFacetMarker.java")).unwrap();
+        assert!(
+            facade.contains("getLabel()") && facade.contains("return \"default\";"),
+            "the inherited property body must have an explicit constant bridge: {facade}"
+        );
+    }
     let subject = fs::read_to_string(root.join("Subject.java")).unwrap();
     assert!(
         subject.contains("return this.getIdentifier();"),

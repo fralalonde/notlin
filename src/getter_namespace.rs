@@ -7,7 +7,9 @@ use crate::property_abi::PlannedAccessorRepairs;
 use crate::semantics::{self, FactStatus, OriginMap, SymbolId, SyntaxSemanticProvider};
 use crate::smart_cast::Edit;
 use crate::translation_plan::PlannedRepair;
-use crate::workspace::{Declaration, DeclarationKind, MemberKind, SourceIndex, SourceLanguage};
+use crate::workspace::{
+    Declaration, DeclarationKind, Member, MemberKind, SourceIndex, SourceLanguage,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use tree_sitter::Node;
@@ -101,19 +103,19 @@ fn retained_context(
     index.symbol_retained(&semantics::symbol_id_for_node(source, node, path), retained)
 }
 
-fn getter_names(
-    index: &SourceIndex,
-    owner: &Declaration,
+fn getter_members<'a>(
+    index: &'a SourceIndex,
+    owner: &'a Declaration,
     properties_only: bool,
-) -> BTreeSet<String> {
+) -> Vec<(&'a Declaration, &'a Member, String)> {
     let mut pending = vec![owner];
     let mut seen = HashSet::new();
-    let mut names = BTreeSet::new();
+    let mut names = Vec::new();
     while let Some(owner) = pending.pop() {
         let Some(file) = index.declaration_source_file(owner) else {
             continue;
         };
-        if !seen.insert((file.path.clone(), owner.name.clone())) {
+        if !seen.insert(semantics::workspace_symbol(index, owner)) {
             continue;
         }
         for member in &owner.members {
@@ -124,17 +126,19 @@ fn getter_names(
                 && member.kind == MemberKind::Property
                 && !member.is_jvm_field
             {
-                names.insert(
+                names.push((
+                    owner,
+                    member,
                     index
                         .property_accessor_names(owner, member)
                         .getter(&member.name)
                         .unwrap_or_else(|| crate::workspace::property_accessor_name(&member.name)),
-                );
+                ));
             } else if !properties_only
                 && member.kind == MemberKind::Method
                 && member.parameter_types.is_empty()
             {
-                names.insert(member.name.clone());
+                names.push((owner, member, member.name.clone()));
             }
         }
         for parent in &owner.supertypes {
@@ -149,27 +153,28 @@ fn getter_names(
     names
 }
 
-/// javac adds a covariant bridge even to an otherwise empty subclass of a
-/// Kotlin class with independent wide/narrow getter descriptors. That bridge
-/// redirects wide property reads to the narrow method, potentially recursing.
-/// Keep descendants in Kotlin until both physical names and Java callers can
-/// be migrated together. Reuse cached syntax and scoped ancestry; no file I/O.
-pub(crate) fn inherits_independent_getters(
+fn getter_names(
     index: &SourceIndex,
-    path: &std::path::Path,
-    name: &str,
-) -> bool {
-    let Some(file) = index.source_file(path) else {
+    owner: &Declaration,
+    properties_only: bool,
+) -> BTreeSet<String> {
+    getter_members(index, owner, properties_only)
+        .into_iter()
+        .map(|(_, _, name)| name)
+        .collect()
+}
+
+/// A property getter and an independent inherited Kotlin function may use the
+/// same method name with different JVM returns. A Java class or enum can reject
+/// that pair or merge its dispatch through a covariant bridge. A renamed
+/// physical accessor can also hide the inherited function from Kotlin callers
+/// on a Java receiver. Preserve these roles until names and callers migrate
+/// together.
+pub(crate) fn inherits_independent_getters(index: &SourceIndex, owner: &Declaration) -> bool {
+    let Some(file) = index.declaration_source_file(owner) else {
         return false;
     };
-    let owners = file
-        .declarations
-        .iter()
-        .filter(|owner| owner.name == name)
-        .collect::<Vec<_>>();
-    let [owner] = owners.as_slice() else {
-        return false;
-    };
+    let properties = getter_members(index, owner, true);
     let mut pending = owner
         .supertypes
         .iter()
@@ -183,21 +188,20 @@ pub(crate) fn inherits_independent_getters(
         let Some(file) = index.declaration_source_file(parent) else {
             continue;
         };
-        if !seen.insert((file.path.clone(), parent.name.clone())) {
+        if !seen.insert(semantics::workspace_symbol(index, parent)) {
             continue;
         }
         pending.extend(parent.supertypes.iter().filter_map(|ancestor| {
             crate::workspace::property_receiver_type_binding(index, file, ancestor)
                 .and_then(|binding| binding.declaration)
         }));
-        if parent.language != SourceLanguage::Kotlin || parent.kind != DeclarationKind::Class {
+        if parent.language != SourceLanguage::Kotlin {
             continue;
         }
         let Some(tree) = index.source_tree(file) else {
             continue;
         };
         let source = file.source_text();
-        let properties = getter_names(index, parent, true);
         let mut nodes = vec![tree.root_node()];
         while let Some(node) = nodes.pop() {
             if node.kind() != "class_declaration"
@@ -223,21 +227,52 @@ pub(crate) fn inherits_independent_getters(
                 if has_physical_getter_collision(index, &file.path, function, source) {
                     return true;
                 }
-                if properties.contains(&id.name)
-                    && !crate::transpiler::kt::child(function, "modifiers").is_some_and(
-                        |modifiers| {
-                            modifiers
-                                .named_children(&mut modifiers.walk())
-                                .any(|modifier| {
-                                    matches!(
-                                        modifier.utf8_text(source.as_bytes()).unwrap_or("").trim(),
-                                        "override" | "private"
-                                    )
-                                })
-                        },
-                    )
+                let methods = parent
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member.kind == MemberKind::Method
+                            && member.name == id.name
+                            && member.parameter_types.is_empty()
+                            && !member.is_static
+                    })
+                    .collect::<Vec<_>>();
+                if matches!(methods.as_slice(), [method] if method.visibility.as_deref() == Some("private"))
                 {
-                    return true;
+                    continue;
+                }
+                let collisions = properties
+                    .iter()
+                    .filter(|(_, property, name)| {
+                        name == &id.name
+                            || crate::workspace::property_accessor_name(&property.name) == id.name
+                    })
+                    .collect::<Vec<_>>();
+                if !collisions.is_empty() {
+                    let shared_slot = collisions.iter().all(|(_, _, name)| name == &id.name)
+                        && !function.has_error()
+                        && crate::transpiler::kt::child(function, "type_parameters").is_none()
+                        && semantics::public_kotlin_callable(source, function)
+                        && function.named_children(&mut function.walk()).all(|child| {
+                            child.is_extra()
+                                || matches!(
+                                    child.kind(),
+                                    "modifiers"
+                                        | "identifier"
+                                        | "simple_identifier"
+                                        | "function_value_parameters"
+                                        | "user_type"
+                                        | "nullable_type"
+                                        | "function_type"
+                                        | "function_body"
+                                )
+                        })
+                        && matches!(methods.as_slice(), [method] if collisions.iter().any(|(property_owner, property, _)| {
+                            index.getter_signatures_equivalent(property_owner, property, parent, method)
+                        }));
+                    if !shared_slot {
+                        return true;
+                    }
                 }
             }
         }

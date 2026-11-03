@@ -20,6 +20,100 @@ enum Token {
     Symbol(u8),
 }
 
+fn slashy_position(tokens: &[Token]) -> bool {
+    match tokens.last() {
+        None => true,
+        Some(Token::Symbol(b'(' | b',' | b'=' | b'~' | b'[' | b'{' | b':' | b'?')) => true,
+        Some(Token::Word(word))
+            if matches!(word.as_str(), "return" | "throw" | "case" | "assert") =>
+        {
+            tokens.iter().rev().nth(1) != Some(&Token::Symbol(b'.'))
+        }
+        _ => false,
+    }
+}
+
+// https://groovy-lang.org/syntax.html#_slashy_string
+// Slashy strings only escape '/', while dollar-slashy strings escape '$' and
+// '/' with '$'. Reference interpolation is pattern data. Expressions that can
+// execute build configuration still leave the compiler mode unproved.
+fn reference_identifier_end(source: &str, start: usize) -> Option<usize> {
+    let mut characters = source.get(start..)?.char_indices();
+    let (_, first) = characters.next()?;
+    if !first.is_alphabetic() && first != '_' {
+        return None;
+    }
+    let mut end = start + first.len_utf8();
+    for (offset, character) in characters {
+        if !character.is_alphanumeric() && character != '_' {
+            break;
+        }
+        end = start + offset + character.len_utf8();
+    }
+    Some(end)
+}
+
+fn reference_interpolation_end(source: &str, start: usize) -> Option<usize> {
+    if source.as_bytes().get(start + 1) == Some(&b'{') {
+        let expression_start = start + 2;
+        let close = expression_start + source.get(expression_start..)?.find('}')?;
+        let expression = source.get(expression_start..close)?.trim();
+        let plain_reference = expression.split('.').all(|part| {
+            let part = part.trim();
+            reference_identifier_end(part, 0) == Some(part.len())
+        });
+        return plain_reference.then_some(close + 1);
+    }
+    let mut end = reference_identifier_end(source, start + 1)?;
+    while source.as_bytes().get(end) == Some(&b'.') {
+        let Some(next) = reference_identifier_end(source, end + 1) else {
+            break;
+        };
+        end = next;
+    }
+    Some(end)
+}
+
+fn slashy_literal(source: &str, start: usize, dollar: bool) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    let mut index = start + if dollar { 2 } else { 1 };
+    let mut value = Vec::new();
+    while index < bytes.len() {
+        if bytes[index] == b'/' && (!dollar || bytes.get(index + 1) == Some(&b'$')) {
+            if value.is_empty() {
+                return None;
+            }
+            return Some((
+                String::from_utf8(value).ok()?,
+                index + if dollar { 2 } else { 1 },
+            ));
+        }
+        let escape = if dollar { b'$' } else { b'\\' };
+        if bytes[index] == escape
+            && bytes
+                .get(index + 1)
+                .is_some_and(|next| *next == b'/' || dollar && *next == b'$')
+        {
+            value.push(bytes[index + 1]);
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'$'
+            && bytes.get(index + 1).is_some_and(|next| {
+                next.is_ascii_alphabetic() || matches!(*next, b'_' | b'{' | b'$' | 128..=255)
+            })
+        {
+            let end = reference_interpolation_end(source, index)?;
+            value.extend_from_slice(&bytes[index..end]);
+            index = end;
+            continue;
+        }
+        value.push(bytes[index]);
+        index += 1;
+    }
+    None
+}
+
 fn tokens(source: &str) -> Option<Vec<Token>> {
     let bytes = source.as_bytes();
     let mut index = 0;
@@ -71,6 +165,15 @@ fn tokens(source: &str) -> Option<Vec<Token>> {
             }
             result.push(Token::Quoted(source.get(start..index)?.to_owned()));
             index += width;
+        } else if bytes[index..].starts_with(b"$/") {
+            // A quoted member name is an indirect configuration write, not a
+            // harmless pattern literal. Do not hide it from mode detection.
+            if result.last() == Some(&Token::Symbol(b'.')) {
+                return None;
+            }
+            let (value, end) = slashy_literal(source, index, true)?;
+            result.push(Token::Quoted(value));
+            index = end;
         } else if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') {
             let start = index;
             while index < bytes.len()
@@ -80,9 +183,14 @@ fn tokens(source: &str) -> Option<Vec<Token>> {
             }
             result.push(Token::Word(source.get(start..index)?.to_owned()));
         } else if byte == b'/' {
-            // Groovy slashy strings and arbitrary arithmetic need a fuller
-            // build-language evaluator; neither can establish this fact.
-            return None;
+            if !slashy_position(&result) {
+                // Division and ambiguous command expressions still need a
+                // fuller build-language evaluator.
+                return None;
+            }
+            let (value, end) = slashy_literal(source, index, false)?;
+            result.push(Token::Quoted(value));
+            index = end;
         } else {
             result.push(Token::Symbol(byte));
             index += 1;
@@ -337,6 +445,78 @@ mod tests {
             &script,
             &BTreeMap::from([("kotlinVersion".into(), None)])
         ));
+    }
+
+    #[test]
+    fn groovy_pattern_literals_do_not_hide_the_declared_compiler_mode() {
+        let build = r#"plugins { id 'org.jetbrains.kotlin.jvm' version '2.3.21' }
+def entries = (source =~ /entry\(([\w.]+)\.class,\s*"([^"]+)"\)/)
+def stripped = source.replaceAll(/(?s)\/\*.*?\*\//, '').replaceAll(/(?m)\/\/.*$/, '')
+def ignored = /jvmDefault = JvmDefaultMode.DISABLE; freeCompilerArgs.addAll(dynamic)/
+def multiline = /first line
+last line $5 $()/
+"#;
+        assert!(modern(build));
+        assert!(!modern(&format!(
+            "{build}\nkotlin {{ compilerOptions {{ jvmDefault = JvmDefaultMode.DISABLE }} }}"
+        )));
+        assert!(!modern(&format!(
+            "{build}\nkotlin {{ compilerOptions {{ freeCompilerArgs.addAll(dynamic) }} }}"
+        )));
+    }
+
+    #[test]
+    fn dollar_slashy_literals_keep_escaped_delimiters_out_of_compiler_settings() {
+        let build = r#"plugins { id 'org.jetbrains.kotlin.jvm' version '2.3.21' }
+def ignored = $/jvmDefault = JvmDefaultMode.DISABLE
+escaped dollar $$; slash $/; closing delimiter $/$$; regex \w+/$
+"#;
+        assert!(modern(build));
+        assert!(!modern(&format!(
+            "{build}\nkotlin {{ compilerOptions {{ jvmDefault = JvmDefaultMode.DISABLE }} }}"
+        )));
+    }
+
+    #[test]
+    fn pattern_reference_interpolation_does_not_obscure_the_compiler_mode() {
+        let build = "plugins { id 'org.jetbrains.kotlin.jvm' version '2.3.21' }\n";
+        for expression in [
+            r"def pattern = /class\s+${name}\b/",
+            r"def pattern = /class\s+${ name }\b/",
+            r"def pattern = /class\s+$name\b/",
+            "def pattern = /$name.*/",
+            "def pattern = /${model.name}/",
+            "def pattern = /${ model . name }/",
+            "def pattern = /$model.name/",
+            "def pattern = /$变量/",
+            "def pattern = $/class ${name}/$",
+            "def pattern = $/class $name/$",
+        ] {
+            assert!(modern(&format!("{build}{expression}")), "{expression}");
+        }
+    }
+
+    #[test]
+    fn executable_pattern_interpolation_and_division_do_not_establish_a_mode() {
+        let build = "plugins { id 'org.jetbrains.kotlin.jvm' version '2.3.21' }\n";
+        for expression in [
+            "def pattern = /${compilerOptions.jvmDefault.set(JvmDefaultMode.DISABLE)}/",
+            "def pattern = /${name()}/",
+            "def pattern = /${name++}/",
+            "def pattern = /${-> name}/",
+            "def pattern = /${name[0]}/",
+            "def pattern = /${compilerOptions.jvmDefault = JvmDefaultMode.DISABLE}/",
+            r"def pattern = /\${compilerOptions.jvmDefault.set(JvmDefaultMode.DISABLE)}/",
+            "def pattern = $/${compilerOptions.jvmDefault.set(JvmDefaultMode.DISABLE)}/$",
+            "def pattern = $/${name()}/$",
+            "def pattern = /unterminated",
+            "def pattern = $/unterminated",
+            "def half = total / 2",
+            "compilerOptions./jvmDefault/ = JvmDefaultMode.DISABLE",
+            "compilerOptions.$/jvmDefault/$ = JvmDefaultMode.DISABLE",
+        ] {
+            assert!(!modern(&format!("{build}{expression}")), "{expression}");
+        }
     }
 
     #[test]
