@@ -190,6 +190,10 @@ explicit capability proof; recognizing an annotation is insufficient.
   An indexed source wildcard that declares no conflicting name can preserve a
   standard type binding. Indexed Java member stars use complete declaration,
   field and ancestor facts too. Unknown library or member scopes remain guarded.
+- Explicit `super` selectors are inherited member lookups. A parameter or local
+  with the same name cannot shadow them; unqualified local function values keep
+  their lexical binding. The shared shadow proof covers this before member
+  resolution, including type-qualified super calls.
 - Fixed-arity `super` calls share source-call ABI and exact overload planning.
   Interface defaults select a proven direct parent; legacy or uncertain sibling
   dispatch stays Kotlin. Source calls carry range-checked Byte/Short literal

@@ -9977,6 +9977,26 @@ fn declaration_identifier<'a>(
     })
 }
 fn is_proven_local_shadow(node: tree_sitter::Node, name: &str, source: &str) -> bool {
+    // `super.member(...)` names an inherited member, even when a local or
+    // parameter has the same name. It cannot invoke a local extension value.
+    let call = node.parent().and_then(|parent| {
+        if parent.kind() == "navigation_expression" {
+            parent.parent()
+        } else {
+            Some(parent)
+        }
+    });
+    if call.is_some_and(|call| {
+        matches!(call.kind(), "call_expression" | "method_invocation")
+            && explicit_receiver_node(call, node).is_some_and(|receiver| {
+                matches!(receiver.kind(), "super_expression" | "super")
+                    && receiver
+                        .utf8_text(source.as_bytes())
+                        .is_ok_and(|text| !text.contains('@'))
+            })
+    }) {
+        return false;
+    }
     let mut scope = node.parent();
     while let Some(owner) = scope {
         if matches!(

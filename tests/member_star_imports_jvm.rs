@@ -246,7 +246,7 @@ fn populate_call_families(root: &Path, mode: &str) {
         ),
         (
             "NarrowChild.kt",
-            "package sample\nclass NarrowChild:NarrowParent(){fun run():Byte=super.value(127)\nfun minus():Byte=super.value(-128)\nfun shortValue():Short=super.small(32767)\nfun typed(input:Byte):Byte=super.value(input)}\n",
+            "package sample\nclass NarrowChild:NarrowParent(){fun run():Byte=super.value(127)\nfun minus():Byte=super.value(-128)\nfun shortValue():Short=super.small(32767)\nfun typed(value:Byte):Byte=super.value(value)}\n",
         ),
         (
             "NarrowCaller.kt",
@@ -267,7 +267,7 @@ fn populate_call_families(root: &Path, mode: &str) {
         ),
         (
             "Child.kt",
-            "package sample\nclass Child:Middle(){fun run(input:Input):String=super.value(input)}\n",
+            "package sample\nclass Child:Middle(){fun run(value:Input):String=super.value(value)}\n",
         ),
         (
             "Overloaded.kt",
@@ -291,11 +291,11 @@ fn populate_call_families(root: &Path, mode: &str) {
         ),
         (
             "InterfaceChild.kt",
-            "package sample\ninterface InterfaceChild:Parent {override fun value(input:Input):String=super.value(input)}\n",
+            "package sample\ninterface InterfaceChild:Parent {override fun value(value:Input):String=super.value(value)}\n",
         ),
         (
             "Qualified.kt",
-            "package sample\nclass Qualified:Left,Right {override fun value(input:Input):String=super<Right>.value(input)}\n",
+            "package sample\nclass Qualified:Left,Right {override fun value(value:Input):String=super<Right>.value(value)}\n",
         ),
         (
             "Factory.kt",

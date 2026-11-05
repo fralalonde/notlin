@@ -477,3 +477,21 @@ wildcard fixture preserves custom static methods and callable fields named
 
 The nested Kotlin interface-parent probe remains unresolved before Java emission;
 it is a separate follow-up, not a claimed gain in this batch.
+
+## Explicit super binding — 2026-11-05
+
+The same-named-parameter workflow failure was a lexical binding bug before
+member lookup, not a missing hierarchy or method contract. The source-fact probe
+proved complete ancestry, public visibility, fixed arity and plain parameter ABI
+for both real calls. A tiny original compiler control reproduced the failure.
+The shared shadow predicate now recognizes supported explicit-super dispatch;
+ordinary unqualified function values retain lexical shadowing. This applies to
+parameters, local variables and explicitly qualified parent branches without
+project-specific method names or a second resolver.
+
+The accepted reference gain is 18 interfaces and the WebhookType enum. The prior
+batch's generic plan boundary category was initially misread as a source class
+kind; its actual gain is six classes and three interfaces. Coverage summaries
+now use symbol.kind for that breakdown. Build/test/runtime evidence is recorded
+in translation-frontier.md; the disk-space failure and unchanged-input retry
+remain visible.

@@ -1,9 +1,58 @@
 # Translation frontier
 
+## Explicit super selectors — 2026-11-05
+
+The accepted incremental baseline now translates **5364 / 6694 original
+declarations (80.1%)**, retaining 1330. This batch adds **18 interfaces and one
+enum (`WebhookType`)**, including `IWorkflowResourceType` and
+`IWorkflowWorkerType`. Together with the preceding batch, this is **28 new
+declarations: 21 interfaces, six classes and one enum**. All **8122 prior Java
+files** are preserved byte for byte; the accepted tree now has 8141 Java files.
+The standard root conversion converges in four rounds and takes 374.8 seconds.
+This is baseline acceptance, not a new pristine conversion.
+
+The shared local-shadow check no longer mistakes an explicit `super` method
+selector for a same-named local or parameter. `super.properties(properties)`
+selects the inherited method; the argument still selects the parameter. Ordinary
+local function values keep their existing lexical binding. Plain and explicitly
+type-qualified super calls are covered, including typed Byte arguments. Labeled
+super expressions retain their existing separate proof guard. Source discovery
+and disk-cache I/O are unchanged.
+
+The complete Gradle build passes after a disk-space retry in **218.9 seconds**;
+all **3146 original test identities and outcomes match** (3070 pass, 76 skip,
+zero fail). Hastings imports **9745 records** and remains free of errors and
+stack traces for **105.9 seconds** after import. The tagged app is stopped and
+independently checked. The live reference remains unchanged.
+
+The first build exhausted D: while writing archives, test directories and
+MapStruct outputs. Its log is preserved. Removing 91 reproducible archives from
+old validation copies reclaims 16 GiB; source snapshots, logs, class files and
+test results remain. Compiler and translated source hashes match for the retry.
+No application source is patched by hand.
+
+Formatting, Clippy, native original/mixed controls, the release build and all
+four javac samples pass. The old accepted compiler fails the new native shadow
+regression; the candidate passes in plain/Lombok output and all JVM-default
+modes. The Windows Rust run has **1744 passes, 63 recorded baseline failures and
+192 ignored tests**, with no new failure identities. The count includes the
+previously reproduced concurrent-deletion race; it is not relabelled as a pass.
+All 473 compiler/runtime/test/tool inputs stay frozen through the final gate.
+
+Receiving and inventory data classes still depend on retained property
+interfaces. Their chain reaches `IProperties`, whose collection and constructor
+reflection operations remain unresolved. The modern-default and abstract-method
+inheritance proofs are the next place to inspect before translating that whole
+DSL. Nested Kotlin interface-parent lookup remains separate.
+
+Evidence: `target/super-selector-reference-gate-20261105/acceptance.json` and
+`target/super-selector-shadow-20261105`. The reference behavior baseline remains
+`exp/kotlin-killer2` at `3382c909b00c61725c80892cd26acc5917b4c7b6`.
+
 ## Call resolution acceptance — 2026-11-05
 
 The accepted incremental conversion now translates **5345 / 6694 original
-declarations (79.9%)**, adding **nine classes** to the 5336-owner baseline and
+declarations (79.9%)**, adding **six classes and three interfaces** to the 5336-owner baseline and
 retaining 1349. Examples include `AmrPickingProperties`, `CartPickingProperties`
 and `AtlasDriverConfiguration`. All **8113 prior Java files** remain byte for
 byte identical. The conversion writes nine Java files in 375.6 seconds and

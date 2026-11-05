@@ -238,6 +238,35 @@ class Child : Parent() { fun run(x: Input): String = super.value(x) }
 }
 
 #[test]
+fn super_members_are_not_shadowed_by_same_named_parameters_or_locals() {
+    for body in [
+        "fun run(value:Input):String=super.value(value)",
+        "fun run(input:Input):String{val value=input;return super.value(value)}",
+        "fun run(value:(Input)->String,input:Input):String=super.value(input)",
+    ] {
+        let source = format!(
+            "package p\ninterface Input\nopen class Parent{{open fun value(input:Input):String=\"parent\"}}\nclass Child:Parent(){{{body}}}\n"
+        );
+        assert_eq!(
+            resolve_super(&source, "value"),
+            FactStatus::Established(expected_member(&source, "Parent")),
+            "{source}"
+        );
+    }
+    let qualified = "package p\ninterface Input\ninterface Parent{fun value(input:Input):String=\"parent\"}\ninterface Child:Parent{override fun value(value:Input):String=super<Parent>.value(value)}\n";
+    assert_eq!(
+        resolve_super(qualified, "value"),
+        FactStatus::Established(expected_member(qualified, "Parent"))
+    );
+}
+
+#[test]
+fn ordinary_function_values_keep_their_lexical_shadow() {
+    let source = "package p\ninterface Input\nfun value(input:Input):String=\"global\"\nfun run(value:(Input)->String,input:Input):String=value(input)\n";
+    assert_eq!(resolve_super(source, "value"), FactStatus::Unknown);
+}
+
+#[test]
 fn contextual_narrow_super_arguments_require_a_proven_in_range_cast() {
     for (parameter, argument) in [
         ("Byte", "128"),
