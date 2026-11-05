@@ -314,6 +314,10 @@ fn exact_argument_type<P: SemanticProvider + ?Sized>(
     }
 
     match expression.kind() {
+        "number_literal" | "integer_literal" | "long_literal" => {
+            return JvmPrimitive::integer_literal(expression.utf8_text(source.as_bytes()).ok()?)
+                .map(|primitive| ExactType::Primitive(primitive.kotlin));
+        }
         "string_literal" => return Some(ExactType::Reference("java.lang.String")),
         "character_literal" | "char_literal" => {
             return Some(ExactType::Primitive("Char"));
@@ -367,7 +371,9 @@ fn canonical_type<P: SemanticProvider + ?Sized>(
                 } else {
                     alias.trim()
                 };
-                (path.ends_with(".*") && !super::is_known_jdk_wildcard(path))
+                (path.ends_with(".*")
+                    && !super::is_known_jdk_wildcard(path)
+                    && !super::source_wildcard_does_not_declare(path, name, provider))
                     || (visible == name && path != format!("kotlin.{name}"))
             })
             && !provider
@@ -394,6 +400,41 @@ fn canonical_type<P: SemanticProvider + ?Sized>(
 
 fn primitive(name: &str) -> Option<ExactType> {
     JvmPrimitive::kotlin(name).map(|ty| ExactType::Primitive(ty.kotlin))
+}
+
+pub(super) fn primitive_parameter<P: SemanticProvider + ?Sized>(
+    target: &SymbolId,
+    spelling: &str,
+    provider: &P,
+) -> Option<&'static JvmPrimitive> {
+    let source = provider.source_for_file(&target.file)?;
+    let java = target
+        .file
+        .extension()
+        .is_some_and(|extension| extension == "java");
+    if java && let Some(primitive) = JvmPrimitive::java(spelling) {
+        return Some(primitive);
+    }
+    let ty = TypeRef::parse(spelling);
+    let ExactType::Primitive(name) = canonical_type(source, &target.file, &ty.ty, java, provider)?
+    else {
+        return None;
+    };
+    JvmPrimitive::kotlin(name)
+}
+
+pub(super) fn primitive_argument<P: SemanticProvider + ?Sized>(
+    source: &str,
+    file: &Path,
+    call: Node<'_>,
+    argument: Node<'_>,
+    provider: &P,
+) -> Option<&'static JvmPrimitive> {
+    let ExactType::Primitive(name) = exact_argument_type(source, file, call, argument, provider)?
+    else {
+        return None;
+    };
+    JvmPrimitive::kotlin(name)
 }
 
 fn candidate_parameter_types<P: SemanticProvider + ?Sized>(

@@ -39,7 +39,9 @@ mod property_getter_equivalence;
 mod reified_calls;
 pub(crate) mod source_cache;
 mod source_calls;
+mod source_import_scope;
 pub(crate) mod string_join;
+mod super_calls;
 pub use source_calls::OrdinarySourceCall;
 mod stdlib_import;
 pub(crate) mod string_case;
@@ -2298,7 +2300,11 @@ pub trait SemanticProvider: Send + Sync {
     /// Exact source arity and exception declaration for a direct Java call.
     /// This does not infer the return type or choose an overload.
     fn has_plain_noarg_call_shape(&self, _member: &SymbolId) -> bool {
-        false
+        self.plain_fixed_callable_arity(_member) == Some(0)
+    }
+    /// Snapshot-bound fixed arity without defaults, varargs or declared throws.
+    fn plain_fixed_callable_arity(&self, _member: &SymbolId) -> Option<usize> {
+        None
     }
     /// Return the explicitly declared return type of a unique, public,
     /// nongeneric Kotlin instance method whose source/JVM signature is stable.
@@ -2389,6 +2395,11 @@ pub trait SemanticProvider: Send + Sync {
         _property: &str,
     ) -> Vec<&'a SemanticSymbol> {
         Vec::new()
+    }
+    /// Parsed declarations and their annotations do not hide generated members.
+    /// Fields and inherited scopes still need their own completeness proofs.
+    fn has_complete_declared_member_scope(&self, _owner: &SymbolId) -> bool {
+        false
     }
     fn is_java_static_member(&self, _symbol: &SymbolId) -> bool {
         false
@@ -2487,11 +2498,10 @@ struct CallableShape {
 }
 
 impl CallableShape {
-    fn is_plain_noarg(&self) -> bool {
-        !self.declares_throws
-            && self
-                .arity
-                .is_some_and(|arity| arity.fixed == 0 && !arity.vararg)
+    fn plain_fixed_arity(&self) -> Option<usize> {
+        let arity = self.arity?;
+        (!self.declares_throws && !arity.vararg && arity.required == arity.fixed)
+            .then_some(arity.fixed)
     }
 }
 
@@ -4004,21 +4014,23 @@ impl SemanticProvider for SyntaxSemanticProvider {
         matches!(matches.as_slice(), [symbol] if self.nonsealed_interface_locations
             .contains(&(symbol.location.file.clone(), symbol.location.start_byte)))
     }
-    fn has_plain_noarg_call_shape(&self, member: &SymbolId) -> bool {
+    fn plain_fixed_callable_arity(&self, member: &SymbolId) -> Option<usize> {
         let matches = self
             .symbols_named(&member.name)
             .into_iter()
             .filter(|symbol| symbol.id == *member)
             .collect::<Vec<_>>();
         let [symbol] = matches.as_slice() else {
-            return false;
+            return None;
         };
-        self.source_for_file(&member.file).is_some_and(|source| {
+        if !self.source_for_file(&member.file).is_some_and(|source| {
             *blake3::hash(source.as_bytes()).as_bytes() == symbol.location.snapshot_hash
-        }) && self
-            .callable_shapes
+        }) {
+            return None;
+        }
+        self.callable_shapes
             .get(&(member.file.clone(), symbol.location.start_byte))
-            .is_some_and(CallableShape::is_plain_noarg)
+            .and_then(CallableShape::plain_fixed_arity)
     }
     fn has_stable_noarg_jvm_signature(&self, member: &SymbolId) -> bool {
         if !member.parameters.is_empty() || !self.is_public_instance_callable(member) {
@@ -4625,6 +4637,9 @@ impl SemanticProvider for SyntaxSemanticProvider {
             })
             && self.parameters_have_plain_jvm_names(member)
     }
+    fn has_complete_declared_member_scope(&self, owner: &SymbolId) -> bool {
+        self.java_metadata_preserves_members(owner)
+    }
     fn is_java_static_member(&self, symbol: &SymbolId) -> bool {
         self.symbols_named(&symbol.name).into_iter().any(|indexed| {
             indexed.id == *symbol
@@ -5114,7 +5129,7 @@ pub fn plan_required_calls(
                         && !locally_shadowed
                         && (established_platform_constructor(source, file, node, provider)
                             .is_some()
-                            || known_collection_factory_from_java_util_wildcard(
+                            || known_collection_factory_from_proven_wildcards(
                                 source, node, callee, &name, provider,
                             ))
                         || matches!(fact, FactStatus::Unknown)
@@ -5166,20 +5181,31 @@ pub fn plan_required_calls(
                                 // A helper fact names an external callee, not a
                                 // user declaration: it cannot shadow a builtin
                                 // *with a declaration of its own*.
-                                if known_builtin(&name)
+                                let narrow_arguments =
+                                    source_calls::requires_narrow_argument_plan(target);
+                                if (known_builtin(&name)
+                                    || narrow_arguments
+                                    || call_argument_count(node) != 0
+                                        && explicit_receiver_node(node, callee).is_some_and(
+                                            |receiver| receiver.kind() == "super_expression",
+                                        ))
                                     && !crate::facts::is_fact_symbol(target)
                                     && let Some(call) = source_calls::ordinary_call(
                                         source, file, node, target, provider,
                                     )
                                 {
                                     plan.ordinary_source_calls.push(call);
-                                } else if known_builtin(&name)
+                                } else if (known_builtin(&name) || narrow_arguments)
                                     && !crate::facts::is_fact_symbol(target)
                                 {
                                     let decision = &mut plan.declarations[index];
                                     let reason = crate::translation_plan::RetentionReason::PreparationBlocker {
                                         kind: crate::translation_plan::PreparationBlockerKind::UnresolvedAssumption,
-                                        message: format!("user declaration `{name}` shadows a builtin call lowered specially by the Java backend"),
+                                        message: if narrow_arguments {
+                                            format!("call `{name}` needs a proven Byte/Short argument conversion")
+                                        } else {
+                                            format!("user declaration `{name}` shadows a builtin call lowered specially by the Java backend")
+                                        },
                                     };
                                     if !decision.retention_reasons.contains(&reason) {
                                         decision.retention_reasons.push(reason);
@@ -5828,7 +5854,7 @@ fn resolved_call_candidates<P: SemanticProvider + ?Sized>(
     fact_from_candidates(candidates)
 }
 
-/// Resolve a no-argument super call against the indexed direct parents of the
+/// Resolve a super call against the indexed direct parents of the
 /// nearest lexical class, respecting an explicit supertype qualifier. The emitter still decides
 /// whether a resolved Kotlin default method has a Java-visible bridge.
 fn resolve_super_call<P: SemanticProvider + ?Sized>(
@@ -5840,7 +5866,7 @@ fn resolve_super_call<P: SemanticProvider + ?Sized>(
     provider: &P,
 ) -> FactStatus<SymbolId> {
     let receiver_text = receiver.utf8_text(source.as_bytes()).unwrap_or_default();
-    if call_argument_count(call) != 0 || receiver_text.contains('@') {
+    if receiver_text.contains('@') {
         return FactStatus::Unknown;
     }
     let mut cursor = receiver.parent();
@@ -5895,6 +5921,10 @@ fn resolve_super_call<P: SemanticProvider + ?Sized>(
             return FactStatus::Unknown;
         }
         direct_parents = vec![parent];
+    }
+
+    if call_argument_count(call) != 0 {
+        return super_calls::with_arguments(source, file, call, direct_parents, name, provider);
     }
 
     // Search every branch independently, including forks farther up the tree.
@@ -9222,7 +9252,7 @@ fn has_wildcard_import(source: &str) -> bool {
 /// do not shadow the factory. Library and member stars still need binding facts.
 /// Populated calls also need the emitter's structural proof. Kotlin read-only
 /// collections intentionally map to ordinary mutable Java collections.
-fn known_collection_factory_from_java_util_wildcard<P: SemanticProvider + ?Sized>(
+fn known_collection_factory_from_proven_wildcards<P: SemanticProvider + ?Sized>(
     source: &str,
     call: tree_sitter::Node,
     callee: tree_sitter::Node,
@@ -9238,14 +9268,14 @@ fn known_collection_factory_from_java_util_wildcard<P: SemanticProvider + ?Sized
         return false;
     }
 
-    let mut saw_java_util_wildcard = false;
+    let mut saw_wildcard = false;
     for import in kotlin_import_lines(source) {
         let path = import.split(" as ").next().unwrap_or(import).trim();
         if path.ends_with(".*") {
             if import.contains(" as ") || !source_wildcard_does_not_declare(path, name, provider) {
                 return false;
             }
-            saw_java_util_wildcard = true;
+            saw_wildcard = true;
         } else {
             let imported_name = import
                 .split_once(" as ")
@@ -9257,7 +9287,7 @@ fn known_collection_factory_from_java_util_wildcard<P: SemanticProvider + ?Sized
             }
         }
     }
-    saw_java_util_wildcard
+    saw_wildcard
         && if empty_factory {
             call_argument_count(call) == 0
                 && !is_proven_local_shadow(callee, name, source)
@@ -9394,8 +9424,8 @@ pub(crate) fn known_collection_factory_shape<P: SemanticProvider + ?Sized>(
     })
 }
 
-/// Source packages are indexed as a whole. A star importing one does not
-/// hide a default-imported name unless that package actually declares it. Unknown library packages and object/member stars still need facts.
+/// Prove that an indexed package or member star cannot hide this name.
+/// External library scopes keep their existing platform-specific proof.
 fn source_wildcard_does_not_declare<P: SemanticProvider + ?Sized>(
     path: &str,
     name: &str,
@@ -9404,14 +9434,8 @@ fn source_wildcard_does_not_declare<P: SemanticProvider + ?Sized>(
     if path == "java.util.*" {
         return true;
     }
-    let Some(package) = path.strip_suffix(".*") else {
-        return false;
-    };
-    provider.has_source_package(package)
-        && !provider
-            .symbols_named(name)
-            .iter()
-            .any(|symbol| symbol.id.package == package && symbol.id.owner_path.is_empty())
+    path.strip_suffix(".*")
+        .is_some_and(|scope| source_import_scope::excludes_name(scope, name, provider))
 }
 
 fn kotlin_import_lines(source: &str) -> impl Iterator<Item = &str> {

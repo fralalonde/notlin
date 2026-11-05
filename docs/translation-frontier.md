@@ -1,5 +1,52 @@
 # Translation frontier
 
+## Call resolution acceptance — 2026-11-05
+
+The accepted incremental conversion now translates **5345 / 6694 original
+declarations (79.9%)**, adding **nine classes** to the 5336-owner baseline and
+retaining 1349. Examples include `AmrPickingProperties`, `CartPickingProperties`
+and `AtlasDriverConfiguration`. All **8113 prior Java files** remain byte for
+byte identical. The conversion writes nine Java files in 375.6 seconds and
+converges in four rounds. This is an accepted baseline conversion, not a new
+pristine conversion.
+
+Indexed Java member wildcard imports share the existing non-shadowing proof
+with collection factories and standard type binding. Argument-taking `super`
+calls search the inherited overload family and select a proven direct parent.
+Signed integer literals participate in exact Kotlin overload filtering; Java
+large-integer suffixes use the same primitive model. Ordinary source calls and
+super calls share range-checked Byte/Short argument casts. Source discovery and
+disk-cache I/O are unchanged.
+
+The full Gradle build passes in **449.7 seconds**. All **3146 original test
+identities and outcomes match**: 3070 pass, 76 skip, zero fail. Hastings imports
+**9745 records**, then remains free of errors and stack traces for **105.9
+seconds**. The owned app is stopped and independently checked. The live reference
+stays unchanged; the accepted behavior baseline is still `exp/kotlin-killer2`
+at `3382c909b00c61725c80892cd26acc5917b4c7b6`.
+
+Formatting, Clippy, the native original/mixed execution controls, release build
+and all four javac samples pass. After the contextual-argument repair, affected
+source-call controls are rerun; the earlier zero-argument JVM matrix is retained
+with its source snapshot because those paths are unchanged. The complete Windows
+Rust run has **1743 passes, 62 known helper failures and 192 ignored tests**, with
+no new failure identities. The previously recorded concurrent-deletion race
+passes on this run; this does not claim the race is fixed. All 473 final
+runtime/test/tool inputs are frozen through the final controls and application
+gate.
+
+The real receiving and inventory examples now report retained parent interfaces;
+they are not counted as gains. Workflow `super.properties(properties)` still
+reports an unresolved call. A source-fact probe proves its hierarchy, visibility,
+parameter ABI and arity are available. The next investigation is the shared local
+shadow check, which currently runs before explicit-super member lookup and can
+mistake the same-named parameter for the qualified method. Nested Kotlin
+interface-parent lookup also remains a separate frontier.
+
+Evidence: `target/call-frontier-reference-gate-20261104/acceptance.json` and
+`target/member-star-imports-20261103`.
+Binary SHA256: `ebdfdd4b6f97a6d426b04c69c2a6dd1fb6508a58f341cef4c6579f54a8c8b53f`.
+
 ## CPU stabilization closeout — 2026-11-03
 
 The accepted incremental baseline remains **5336 / 6694 declarations (79.7%)**,

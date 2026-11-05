@@ -134,7 +134,7 @@ class Child : Middle, Direct {
 }
 
 #[test]
-fn rejects_missing_methods_wrong_qualified_parent_and_arguments() {
+fn rejects_missing_methods_and_wrong_qualified_parent() {
     let absent = r#"package p
 open class Parent
 class Child : Parent() {
@@ -164,7 +164,119 @@ class Child : Parent() {
     fun run(): String = super.value(1)
 }
 "#;
-    assert_eq!(resolve_super(arguments, "value"), FactStatus::Unknown);
+    assert_eq!(
+        resolve_super(arguments, "value"),
+        FactStatus::Established(expected_member(arguments, "Parent"))
+    );
+}
+
+#[test]
+fn argument_super_lookup_preserves_inherited_overloads_and_exact_branch_selection() {
+    let source = r#"package p
+open class Root {
+    open fun value(x: String): String = x
+}
+open class Parent : Root() {
+    fun value(x: Int): String = "int"
+}
+class Child : Parent() {
+    fun run(): String = super.value("root")
+}
+"#;
+    assert_eq!(
+        resolve_super(source, "value"),
+        FactStatus::Established(expected_member(source, "Root"))
+    );
+    let qualified = r#"package p
+interface Left { fun value(x: Int): String = "left" }
+interface Right { fun value(x: Int): String = "right" }
+class Child : Left, Right {
+    override fun value(x: Int): String = super<Right>.value(x)
+}
+"#;
+    assert_eq!(
+        resolve_super(qualified, "value"),
+        FactStatus::Established(expected_member(qualified, "Right"))
+    );
+    let ambiguous = qualified.replace("super<Right>", "super");
+    assert!(matches!(
+        resolve_super(&ambiguous, "value"),
+        FactStatus::Ambiguous(_)
+    ));
+}
+
+#[test]
+fn argument_super_lookup_rejects_unproved_call_shapes() {
+    for (parameter, argument) in [
+        ("x: Int = 2", "1"),
+        ("vararg x: Int", "1"),
+        ("x: Int", "x = 1"),
+    ] {
+        let source = format!(
+            "package p\nopen class Parent {{ open fun value({parameter}): String = \"parent\" }}\nclass Child : Parent() {{ fun run():String = super.value({argument}) }}\n"
+        );
+        assert_eq!(
+            resolve_super(&source, "value"),
+            FactStatus::Unknown,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn nearest_override_uses_bound_nominal_parameters() {
+    let source = r#"package p
+interface Input
+open class Root { open fun value(x: Input): String = "root" }
+open class Parent : Root() { override fun value(x: Input): String = "parent" }
+class Child : Parent() { fun run(x: Input): String = super.value(x) }
+"#;
+    assert_eq!(
+        resolve_super(source, "value"),
+        FactStatus::Established(expected_member(source, "Parent"))
+    );
+}
+
+#[test]
+fn contextual_narrow_super_arguments_require_a_proven_in_range_cast() {
+    for (parameter, argument) in [
+        ("Byte", "128"),
+        ("Short", "32768"),
+        ("Byte", "1L"),
+        ("Byte", "1 + 2"),
+    ] {
+        let source = format!(
+            "package p\nopen class Parent {{fun value(x:{parameter}):Int=1}}\nclass Child:Parent(){{fun run():Int=super.value({argument})}}\n"
+        );
+        assert_eq!(
+            resolve_super(&source, "value"),
+            FactStatus::Unknown,
+            "{source}"
+        );
+    }
+    for (parameter, argument, cast) in [
+        ("Byte", "127", "byte"),
+        ("Byte", "-128", "byte"),
+        ("Short", "32767", "short"),
+        ("Short", "(-32768)", "short"),
+    ] {
+        let source = format!(
+            "package p\nopen class Parent {{fun value(x:{parameter}):Int=1}}\nclass Child:Parent(){{fun run():Int=super.value({argument})}}\n"
+        );
+        let file = Path::new("super_resolution.kt");
+        let provider = SyntaxSemanticProvider::new([(file.to_path_buf(), source.clone())]);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let mut plan = notlin::translation_plan::analyze(&source, tree.root_node(), file);
+        plan_required_calls(&source, &tree, file, &provider, false, &mut plan);
+        let [call] = plan.ordinary_source_calls.as_slice() else {
+            panic!("expected planned narrow argument: {source}");
+        };
+        assert_eq!(call.argument_casts, [Some(cast.into())]);
+    }
 }
 
 #[test]

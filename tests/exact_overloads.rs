@@ -103,6 +103,59 @@ fn exact_lexical_parameter_selects_primitive_overload() {
 }
 
 #[test]
+fn integer_literals_select_exact_kotlin_overloads_with_proven_wildcard_scopes() {
+    for (literal, expected) in [
+        ("95", "Int"),
+        ("95L", "Long"),
+        ("2_147_483_648", "Long"),
+        ("0x5F", "Int"),
+        ("0b101", "Int"),
+    ] {
+        let factory = "package overloads\nimport support.*\nclass Factory { companion object { fun create(value: Int): String = \"int\"\nfun create(value: Long): String = \"long\"\nfun create(value: String): String = value } }\n";
+        let consumer = format!("package overloads\nfun use():String = Factory.create({literal})\n");
+        let provider = checked_provider(vec![
+            ("Factory.kt".into(), factory.into()),
+            ("Consumer.kt".into(), consumer.clone()),
+            (
+                "Support.java".into(),
+                "package support; public class Support {}".into(),
+            ),
+        ]);
+        let FactStatus::Established(symbol) = selected_type(&consumer, &provider) else {
+            panic!("literal {literal} must select {expected}");
+        };
+        assert_eq!(symbol.parameters, [expected]);
+    }
+}
+
+#[test]
+fn contextual_and_unsupported_numeric_literals_remain_unresolved() {
+    for (parameter, literal) in [
+        ("Byte", "95"),
+        ("Short", "95"),
+        ("Int", "95u"),
+        ("Int", "1.5"),
+        ("Long", "9223372036854775808"),
+    ] {
+        let factory = format!(
+            "package overloads\nclass Factory {{ companion object {{ fun create(value:{parameter}):String = \"number\"\nfun create(value:String):String=value }} }}\n"
+        );
+        let consumer = format!("package overloads\nfun use():String = Factory.create({literal})\n");
+        let provider = checked_provider(vec![
+            ("Factory.kt".into(), factory),
+            ("Consumer.kt".into(), consumer.clone()),
+        ]);
+        assert!(
+            matches!(
+                dependencies(&consumer, "Consumer.kt", &provider).last(),
+                Some(FactStatus::Ambiguous(_))
+            ),
+            "{parameter}: {literal}"
+        );
+    }
+}
+
+#[test]
 fn object_to_string_result_selects_string_overload() {
     let consumer = "package overloads\nfun use(value: Any) = Factory.create(value.toString())\n";
     let provider = factory_provider(consumer);

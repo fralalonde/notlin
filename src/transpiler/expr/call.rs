@@ -542,13 +542,22 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             .cloned()
         {
             assert_eq!(fact.location.snapshot_hash, self.unit.source_hash);
+            for (argument, cast) in args.iter_mut().zip(&fact.argument_casts) {
+                if let Some(cast) = cast {
+                    *argument = format!("({cast}) ({argument})");
+                }
+            }
             let callee = callee.expect("planned source call has a callee");
             let java = if callee.kind() == "navigation_expression" {
                 let (base, _) = self
                     .unit
                     .nav_base_member(callee)
                     .expect("planned member call has a receiver");
-                format!("{}.{}", self.transpile(base), fact.target.name)
+                if base.kind() == "super_expression" {
+                    self.planned_super_method_callee(node, base, &fact.target)
+                } else {
+                    format!("{}.{}", self.transpile(base), fact.target.name)
+                }
             } else {
                 fact.target.name
             };
@@ -2559,6 +2568,118 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
 }
 
 impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
+    fn planned_super_method_callee(
+        &mut self,
+        call: tree_sitter::Node<'_>,
+        base: tree_sitter::Node<'_>,
+        target: &crate::semantics::SymbolId,
+    ) -> String {
+        let proven = (|| {
+            let index = self.unit.workspace?;
+            let provider = self.unit.semantic_provider?;
+            let declaring = self
+                .unit
+                .workspace_file
+                .as_deref()
+                .unwrap_or(self.unit.file);
+            let file = index.source_file(declaring)?;
+            let name = self.enclosing_type_name()?;
+            let owners = file
+                .declarations
+                .iter()
+                .filter(|owner| owner.name == name)
+                .collect::<Vec<_>>();
+            let [owner] = owners.as_slice() else {
+                return None;
+            };
+            let (target_name, target_path) = target.owner_path.split_last()?;
+            let target_owners = provider
+                .symbols_named(target_name)
+                .into_iter()
+                .filter(|owner| {
+                    owner.id.file == target.file
+                        && owner.id.owner_path == target_path
+                        && matches!(owner.id.kind.as_str(), "class" | "interface" | "enum")
+                })
+                .collect::<Vec<_>>();
+            let [target_owner] = target_owners.as_slice() else {
+                return None;
+            };
+            let explicit = kt::child(base, "user_type")
+                .and_then(|qualifier| index.resolve_type(file, self.unit.text(qualifier)));
+            let mut parents = Vec::new();
+            for spelling in &owner.supertypes {
+                let parent = index.resolve_type(file, spelling)?;
+                let id = crate::semantics::workspace_symbol(index, parent);
+                if (explicit.is_none_or(|selected| std::ptr::eq(selected, parent)))
+                    && (id == target_owner.id || provider.inherits_type(&id, &target_owner.id))
+                {
+                    parents.push(parent);
+                }
+            }
+            let [parent] = parents.as_slice() else {
+                return None;
+            };
+            if parent.kind != crate::workspace::DeclarationKind::Interface {
+                return Some(format!("super.{}", target.name));
+            }
+            // A retained Kotlin default has a callable interface method only
+            // when the configured JVM-default mode proves it exists.
+            let available = |declaration: &crate::workspace::Declaration| {
+                declaration.language == crate::workspace::SourceLanguage::Java
+                    || index.has_modern_kotlin_interface_defaults()
+                    || self.unit.retained_hint.is_some_and(|retained| {
+                        !index.declaration_retained(declaration, retained)
+                            && index
+                                .declaration_source_file(declaration)
+                                .is_some_and(|source| {
+                                    index.is_selected(&source.path, self.unit.translation_roots)
+                                })
+                    })
+            };
+            let target_file = index.source_file(&target.file)?;
+            let target_declaration = target_file.declarations.iter().find(|declaration| {
+                crate::semantics::workspace_symbol(index, declaration) == target_owner.id
+            })?;
+            if !available(parent)
+                || !available(target_declaration)
+                || !target_declaration.members.iter().any(|member| {
+                    member.name == target.name
+                        && member.parameter_types == target.parameters
+                        && member.has_body
+                })
+            {
+                return None;
+            }
+            // Java cannot bypass a more specific provider through a sibling
+            // branch. Keep uncertain diamonds rather than change dispatch.
+            for spelling in &owner.supertypes {
+                let sibling = index.resolve_type(file, spelling)?;
+                if std::ptr::eq(sibling, *parent) {
+                    continue;
+                }
+                let id = crate::semantics::workspace_symbol(index, sibling);
+                if provider.inherits_type(&id, &target_owner.id)
+                    || provider
+                        .inherits_type(&id, &crate::semantics::workspace_symbol(index, parent))
+                {
+                    return None;
+                }
+            }
+            Some(format!("{}.super.{}", parent.name, target.name))
+        })();
+        proven.unwrap_or_else(|| {
+            self.unit.diag_untranslatable(
+                call,
+                format!(
+                    "selected super method `{}` has no proven Java-callable direct parent",
+                    target.name
+                ),
+            );
+            "super.__notlin_unproved".into()
+        })
+    }
+
     fn source_super_call(&mut self, call: tree_sitter::Node<'_>) -> Option<String> {
         let children = call
             .named_children(&mut call.walk())

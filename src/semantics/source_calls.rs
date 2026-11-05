@@ -10,6 +10,19 @@ use std::path::Path;
 pub struct OrdinarySourceCall {
     pub location: SourceLocation,
     pub target: SymbolId,
+    #[serde(default)]
+    pub argument_casts: Vec<Option<String>>,
+}
+
+pub(super) fn requires_narrow_argument_plan(target: &SymbolId) -> bool {
+    target.parameters.iter().any(|parameter| {
+        matches!(
+            parameter
+                .trim_end_matches('?')
+                .trim_start_matches("kotlin."),
+            "Byte" | "Short" | "byte" | "short"
+        )
+    })
 }
 
 pub(super) fn ordinary_call<P: SemanticProvider + ?Sized>(
@@ -76,9 +89,11 @@ pub(super) fn ordinary_call<P: SemanticProvider + ?Sized>(
     {
         return None;
     }
-    for argument in arguments
+    let mut argument_casts = Vec::new();
+    for (index, argument) in arguments
         .named_children(&mut arguments.walk())
         .filter(|node| !node.is_extra())
+        .enumerate()
     {
         let values: Vec<_> = argument
             .named_children(&mut argument.walk())
@@ -87,6 +102,51 @@ pub(super) fn ordinary_call<P: SemanticProvider + ?Sized>(
         if values.len() != 1 || matches!(values[0].kind(), "spread_expression" | "lambda_literal") {
             return None;
         }
+        let parameter = target.parameters.get(index)?;
+        let primitive = super::overloads::primitive_parameter(target, parameter, provider);
+        let spelling = parameter
+            .trim_end_matches('?')
+            .strip_prefix("kotlin.")
+            .unwrap_or(parameter.trim_end_matches('?'));
+        if matches!(spelling, "Byte" | "Short") && primitive.is_none() {
+            return None;
+        }
+        let mut cast = None;
+        if let Some(primitive) =
+            primitive.filter(|primitive| matches!(primitive.kotlin, "Byte" | "Short"))
+        {
+            if provider.plain_fixed_callable_arity(target) != Some(target.parameters.len()) {
+                return None;
+            }
+            let argument_type =
+                super::overloads::primitive_argument(source, file, call, values[0], provider);
+            if !argument_type.is_some_and(|argument| argument.kotlin == primitive.kotlin) {
+                let mut expression = values[0];
+                while expression.kind() == "parenthesized_expression" {
+                    let children = expression
+                        .named_children(&mut expression.walk())
+                        .filter(|node| !node.is_extra())
+                        .collect::<Vec<_>>();
+                    let [inner] = children.as_slice() else {
+                        return None;
+                    };
+                    expression = *inner;
+                }
+                let value = crate::jvm_primitive::JvmPrimitive::contextual_integer_literal(
+                    expression.utf8_text(source.as_bytes()).ok()?.trim(),
+                )?;
+                let fits = if primitive.kotlin == "Byte" {
+                    i8::try_from(value).is_ok()
+                } else {
+                    i16::try_from(value).is_ok()
+                };
+                if !fits {
+                    return None;
+                }
+                cast = Some(primitive.java.to_owned());
+            }
+        }
+        argument_casts.push(cast);
     }
     Some(OrdinarySourceCall {
         location: SourceLocation {
@@ -96,6 +156,7 @@ pub(super) fn ordinary_call<P: SemanticProvider + ?Sized>(
             end_byte: call.end_byte(),
         },
         target: target.clone(),
+        argument_casts,
     })
 }
 

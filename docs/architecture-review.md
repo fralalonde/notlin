@@ -440,3 +440,40 @@ The separate wildcard-import prototype has source and tests but is uncompiled
 and unaccepted. It remains outside production for a future resume. The requested
 closeout is the reviewed CPU batch, documentation, a passing application gate,
 commit/push and a paused translation goal.
+
+## Call resolution frontier — 2026-11-05
+
+Indexed Java class/member wildcard imports now use the existing source-wildcard
+absence proof. Complete declarations, fields, ancestry and source snapshots
+establish that an unrelated enum import cannot hide `mapOf`, `listOf` or a
+standard type. Real shadows, aliases, generated members and unknown scopes keep
+their existing binding obligations. Collection factory and platform binding
+rules consume the same proof; source discovery and disk-cache I/O are unchanged.
+
+Argument-taking `super` calls search the inherited overload family instead of
+rejecting every nonzero arity. A nearer method hides only an equal bound
+parameter contract. Candidate selection reuses exact overload applicability and
+ordinary source-call ABI facts. The emitter selects the proven direct parent,
+qualifies Java interface defaults and retains uncertain sibling dispatch or
+legacy Kotlin defaults. Existing no-argument rules remain intact. Defaults,
+varargs, named arguments and uncertain generic substitutions need further work.
+
+Signed integer literals participate in exact Kotlin overload filtering. The
+existing JVM primitive model supplies the shared literal type and Java suffix
+rule: a large unsuffixed Kotlin integer becomes a Java `long` literal with `L`.
+Decimal, hexadecimal, binary, explicit `Long` and the signed `Int` minimum are
+covered by original-versus-mixed execution. Contextual narrowing, unsigned
+constants and Java widening/boxing are outside this exact filtering rule.
+Fixed-arity source calls also plan range-checked Java casts for Kotlin's
+contextual `Byte` and `Short` integer literals. Super calls and ordinary member
+calls share that plan; typed narrow arguments need no cast, while uncertain
+constant expressions stay Kotlin.
+
+The combined execution fixture covers plain and Lombok output under disabled,
+enabled and no-compatibility JVM-default modes, retained parent implementations,
+inherited overloads and explicitly selected interface branches. A separate
+wildcard fixture preserves custom static methods and callable fields named
+`mapOf`; the previous accepted compiler fails its positive translation assertion.
+
+The nested Kotlin interface-parent probe remains unresolved before Java emission;
+it is a separate follow-up, not a claimed gain in this batch.

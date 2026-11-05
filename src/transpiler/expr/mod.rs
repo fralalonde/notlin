@@ -137,6 +137,22 @@ impl<'a, 'src, 'tree> Expr<'a, 'src, 'tree> {
             "number_literal" | "boolean_literal" | "hex_literal" | "long_literal"
             | "real_literal" | "float_literal" => {
                 let raw = self.unit.text(node).trim().to_string();
+                if !raw.ends_with('L')
+                    && crate::jvm_primitive::JvmPrimitive::integer_literal(&raw)
+                        .is_some_and(|primitive| primitive.kotlin == "Long")
+                    && !(raw.replace('_', "") == "2147483648"
+                        && node.parent().is_some_and(|parent| {
+                            self.unit
+                                .text(parent)
+                                .trim()
+                                .strip_prefix('-')
+                                .is_some_and(|tail| tail.trim() == raw)
+                        }))
+                {
+                    // Kotlin infers Long for large unsuffixed integers; javac
+                    // requires L even when the selected parameter is long.
+                    return format!("{raw}L");
+                }
                 if matches!(node.kind(), "float_literal" | "real_literal") {
                     let clean = raw.replace('_', "");
                     let single = clean.ends_with(['f', 'F']);

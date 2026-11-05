@@ -188,7 +188,13 @@ explicit capability proof; recognizing an annotation is insufficient.
   calls and nullable queries evaluate the receiver once. Import aliases retain
   callable identity; foreign bindings and unsupported overloads keep their guards.
   An indexed source wildcard that declares no conflicting name can preserve a
-  standard type binding. Unknown library and member wildcards remain guarded.
+  standard type binding. Indexed Java member stars use complete declaration,
+  field and ancestor facts too. Unknown library or member scopes remain guarded.
+- Fixed-arity `super` calls share source-call ABI and exact overload planning.
+  Interface defaults select a proven direct parent; legacy or uncertain sibling
+  dispatch stays Kotlin. Source calls carry range-checked Byte/Short literal
+  casts. `tests/member_star_imports_jvm.rs` compares original Kotlin with plain
+  and Lombok output across JVM-default modes, including real wildcard shadows.
 - Expression-bodied calls use the selected source method's declared return,
   including qualified parent-interface calls. Java return contracts share the
   getter proof for scope, nullness and boxing. Inferred nullable results become

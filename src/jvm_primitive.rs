@@ -100,6 +100,50 @@ const PRIMITIVES: [JvmPrimitive; 8] = [
 ];
 
 impl JvmPrimitive {
+    /// Default signed integer-literal type, independent of imported type names.
+    /// Contextual narrowing and unsigned constants require separate proofs.
+    pub fn integer_literal(spelling: &str) -> Option<&'static Self> {
+        let (value, explicit_long) = Self::integer_literal_parts(spelling)?;
+        Self::kotlin(if explicit_long || value > i32::MAX as i64 {
+            "Long"
+        } else {
+            "Int"
+        })
+    }
+
+    /// A signed, unsuffixed constant that Kotlin can narrow contextually.
+    pub fn contextual_integer_literal(spelling: &str) -> Option<i64> {
+        let (digits, negative) = spelling
+            .strip_prefix('-')
+            .map_or((spelling, false), |digits| (digits.trim(), true));
+        let digits = digits.strip_prefix('+').unwrap_or(digits).trim();
+        let (value, explicit_long) = Self::integer_literal_parts(digits)?;
+        if explicit_long {
+            return None;
+        }
+        if negative {
+            value.checked_neg()
+        } else {
+            Some(value)
+        }
+    }
+
+    fn integer_literal_parts(spelling: &str) -> Option<(i64, bool)> {
+        let spelling = spelling.replace('_', "");
+        let (digits, explicit_long) = spelling
+            .strip_suffix('L')
+            .map_or((spelling.as_str(), false), |digits| (digits, true));
+        let (digits, radix) = digits
+            .strip_prefix("0x")
+            .map(|digits| (digits, 16))
+            .or_else(|| digits.strip_prefix("0X").map(|digits| (digits, 16)))
+            .or_else(|| digits.strip_prefix("0b").map(|digits| (digits, 2)))
+            .or_else(|| digits.strip_prefix("0B").map(|digits| (digits, 2)))
+            .unwrap_or((digits, 10));
+        let value = i64::from_str_radix(digits, radix).ok()?;
+        Some((value, explicit_long))
+    }
+
     /// Bare Kotlin builtin spelling, without making a source binding claim.
     pub fn kotlin(name: &str) -> Option<&'static Self> {
         PRIMITIVES.iter().find(|ty| ty.kotlin == name)
